@@ -13,8 +13,6 @@ services:
         value: "3.12"
       - key: RENDER_BACKEND_URL
         value: "https://desktop-backend-vhf0.onrender.com"
-      - key: RENDER_MCP_URL
-        value: "https://desktop-backend-vhf0.onrender.com"
 
 databases:
   - name: consumption-db
