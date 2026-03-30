@@ -87,6 +87,13 @@ app.include_router(so_router)
 app.include_router(purchase_router)
 app.include_router(production_router)
 
+# Mount MCP server on /mcp path (same process, same port)
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from mcp_server import mcp as mcp_instance
+app.mount("/mcp", mcp_instance.streamable_http_app())
+logger.info("MCP server mounted at /mcp")
+
 
 @app.get("/health")
 async def health():
