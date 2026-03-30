@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find e:ConsumptionBackend -type f -name *.js -o -name *.sql -o -name *.json)",
+      "Bash(xargs grep:*)",
+      "Bash(find 'd:\\\\Candor Foods\\\\Consumption\\\\Backend' -name *.sql -o -name migrations -o -name schema*)",
+      "Bash(find e:ConsumptionBackend -maxdepth 3 -type f \\\\\\(-name *.md -o -name *.txt -o -name *.pdf \\\\\\))",
+      "Bash(find 'd:\\\\Candor Foods\\\\Consumption' -type f -name *.xlsx -o -name *.xls -o -name *.csv)",
+      "Bash(python -c \":*)",
+      "Read(//e/Consumption/**)",
+      "Bash(ls -la \"e:\\\\Consumption\\\\Backend\\\\app\\\\Plan\"\" 2>/dev/null || echo \"Directory not found or inaccessible \")",
+      "Bash(find /e/Consumption/Backend/app -type f \\\\\\(-iname *.csv -o -iname *.json -o -iname *.xlsx -o -iname *.xls \\\\\\))",
+      "Bash(python3:*)",
+      "Bash(python:*)",
+      "Bash(ls -lh /e/Consumption/Backend/app/data/*.xlsx)",
+      "Read(//e/Consumption/Backend/**)",
+      "Bash(where python:*)"
+    ]
+  }
+}

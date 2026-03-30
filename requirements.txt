@@ -1,0 +1,11 @@
+anthropic
+asyncpg
+mcp
+fastapi
+httpx
+openpyxl
+pydantic
+pydantic-settings
+python-multipart
+rapidfuzz
+uvicorn[standard]

@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Environment
+.env
+
+# Uploaded files
+so_pdfs/
+
+# Temp/test files
+planning_prompt*.txt
+sample_planning_prompt.txt
+test_plan_generation.py
+gen_pdf.py
