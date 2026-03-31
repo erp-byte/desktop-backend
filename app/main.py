@@ -87,6 +87,12 @@ app.include_router(purchase_router)
 app.include_router(production_router)
 
 # Mount MCP servers alongside FastAPI on the same port
+# Ensure repo root is in sys.path (mcp_server.py and mcp_viewer_server.py live there)
+import sys as _sys
+_repo_root = str(Path(__file__).parent.parent)
+if _repo_root not in _sys.path:
+    _sys.path.insert(0, _repo_root)
+
 # Full access (77 tools) at /mcp/
 from mcp_server import mcp as _mcp_instance  # noqa: E402
 _mcp_starlette = _mcp_instance.streamable_http_app()
