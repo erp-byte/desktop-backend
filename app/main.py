@@ -143,15 +143,19 @@ app.include_router(purchase_router)
 app.include_router(production_router)
 
 # ── MCP mounts ────────────────────────────────────────────────────────────────
-# Full access (77 tools) at /mcp/
-_mcp_starlette = _mcp_instance.streamable_http_app()
-_mcp_starlette.router.lifespan_context = None  # lifespan managed above
-app.mount("/mcp", _mcp_starlette)
+# NOTE: Claude Desktop always sends POST / regardless of URL path.
+# So we mount the full MCP at root. Viewer gets /viewer/.
+# FastAPI routes (/api/v1/*, /health, /.well-known/*) take priority over mount.
 
-# Viewer access (34 tools, read-only) at /mcp-viewer/
+# Viewer access (34 tools, read-only) at /viewer/ — must be before root mount
 _mcp_viewer_starlette = _mcp_viewer_instance.streamable_http_app()
 _mcp_viewer_starlette.router.lifespan_context = None
-app.mount("/mcp-viewer", _mcp_viewer_starlette)
+app.mount("/viewer", _mcp_viewer_starlette)
+
+# Full access (77 tools) at / — LAST mount (catch-all)
+_mcp_starlette = _mcp_instance.streamable_http_app()
+_mcp_starlette.router.lifespan_context = None  # lifespan managed above
+app.mount("/", _mcp_starlette)
 
 # ── Health ────────────────────────────────────────────────────────────────────
 @app.get("/health")
@@ -162,4 +166,3 @@ async def health():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
-https://desktop-backend-vhf0.onrender.com/.well-known/oauth-protected-resource
