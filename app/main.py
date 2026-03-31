@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import sys as _sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -18,6 +19,14 @@ from app.modules.production.services.master_ingest import run_master_ingest
 logger = logging.getLogger(__name__)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+# Ensure repo root is in sys.path (mcp_server.py and mcp_viewer_server.py live there)
+_repo_root = str(Path(__file__).parent.parent)
+if _repo_root not in _sys.path:
+    _sys.path.insert(0, _repo_root)
+
+from mcp_server import mcp as _mcp_instance  # noqa: E402
+from mcp_viewer_server import mcp_viewer as _mcp_viewer_instance  # noqa: E402
 
 
 @asynccontextmanager
@@ -46,7 +55,6 @@ async def lifespan(app: FastAPI):
     app.state.master_items = master_items
 
     # Ingest production master data (BOM, machines) — idempotent
-    # data/ can be at app/data/ or repo root data/
     data_dir = Path(__file__).parent / "data"
     if not data_dir.exists():
         data_dir = Path(__file__).parent.parent / "data"
@@ -75,10 +83,10 @@ async def lifespan(app: FastAPI):
         async with _mcp_viewer_instance.session_manager.run():
             yield
 
-        if keep_alive_task:
-            keep_alive_task.cancel()
-        await close_pool(pool)
-        logger.info("Shutdown complete")
+            if keep_alive_task:
+                keep_alive_task.cancel()
+            await close_pool(pool)
+            logger.info("Shutdown complete")
 
 
 app = FastAPI(title="Candor Foods — Consumption Backend", version="0.3.0", lifespan=lifespan)
@@ -87,24 +95,15 @@ app.include_router(purchase_router)
 app.include_router(production_router)
 
 # Mount MCP servers alongside FastAPI on the same port
-# Ensure repo root is in sys.path (mcp_server.py and mcp_viewer_server.py live there)
-import sys as _sys
-_repo_root = str(Path(__file__).parent.parent)
-if _repo_root not in _sys.path:
-    _sys.path.insert(0, _repo_root)
-
 # Full access (77 tools) at /mcp/
-from mcp_server import mcp as _mcp_instance  # noqa: E402
 _mcp_starlette = _mcp_instance.streamable_http_app()
 _mcp_starlette.router.lifespan_context = None  # lifespan managed above
 app.mount("/mcp", _mcp_starlette)
 
 # Viewer access (34 tools, read-only) at /mcp-viewer/
-from mcp_viewer_server import mcp_viewer as _mcp_viewer_instance  # noqa: E402
 _mcp_viewer_starlette = _mcp_viewer_instance.streamable_http_app()
 _mcp_viewer_starlette.router.lifespan_context = None
 app.mount("/mcp-viewer", _mcp_viewer_starlette)
-
 
 
 @app.get("/health")
