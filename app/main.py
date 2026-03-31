@@ -46,7 +46,10 @@ async def lifespan(app: FastAPI):
     app.state.master_items = master_items
 
     # Ingest production master data (BOM, machines) — idempotent
+    # data/ can be at app/data/ or repo root data/
     data_dir = Path(__file__).parent / "data"
+    if not data_dir.exists():
+        data_dir = Path(__file__).parent.parent / "data"
     await run_master_ingest(pool, data_dir, master_items)
 
     # Keep-alive poller for Render free tier (pings every 7 min to prevent spin-down)
@@ -67,12 +70,14 @@ async def lifespan(app: FastAPI):
         keep_alive_task = asyncio.create_task(_keep_alive())
         logger.info("Keep-alive poller started for: %s", backend_url)
 
-    yield
+    # Start the MCP session manager (initialises the task group)
+    async with _mcp_instance.session_manager.run():
+        yield
 
-    if keep_alive_task:
-        keep_alive_task.cancel()
-    await close_pool(pool)
-    logger.info("Shutdown complete")
+        if keep_alive_task:
+            keep_alive_task.cancel()
+        await close_pool(pool)
+        logger.info("Shutdown complete")
 
 
 app = FastAPI(title="Candor Foods — Consumption Backend", version="0.3.0", lifespan=lifespan)
@@ -82,7 +87,9 @@ app.include_router(production_router)
 
 # Mount the MCP server alongside FastAPI on the same port
 from mcp_server import mcp as _mcp_instance  # noqa: E402
-app.mount("/mcp", _mcp_instance.streamable_http_app())
+_mcp_starlette = _mcp_instance.streamable_http_app()
+_mcp_starlette.router.lifespan_context = None  # lifespan managed above
+app.mount("/mcp", _mcp_starlette)
 
 
 

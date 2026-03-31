@@ -14,7 +14,10 @@
       "Bash(python:*)",
       "Bash(ls -lh /e/Consumption/Backend/app/data/*.xlsx)",
       "Read(//e/Consumption/Backend/**)",
-      "Bash(where python:*)"
+      "Bash(where python:*)",
+      "Bash(git config:*)",
+      "Bash(where gh:*)",
+      "Bash(where.exe gh:*)"
     ]
   }
 }
