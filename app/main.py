@@ -6,7 +6,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app.config import Settings
 from app.db.connection import create_pool, close_pool
@@ -27,6 +29,8 @@ if _repo_root not in _sys.path:
 
 from mcp_server import mcp as _mcp_instance  # noqa: E402
 from mcp_viewer_server import mcp_viewer as _mcp_viewer_instance  # noqa: E402
+
+BASE_URL = "https://desktop-backend-vhf0.onrender.com"
 
 
 @asynccontextmanager
@@ -90,11 +94,55 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Candor Foods — Consumption Backend", version="0.3.0", lifespan=lifespan)
+
+# ── CORS ──────────────────────────────────────────────────────────────────────
+# Must be registered FIRST — before any routers or mounts.
+# Anthropic's servers (160.79.106.x) call your endpoints cross-origin.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://claude.ai", "https://claude.com", "https://anthropic.com"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+    allow_credentials=False,
+)
+
+# ── OAuth / auth discovery endpoints ─────────────────────────────────────────
+# Claude probes these on the ROOT domain before connecting to any MCP subpath.
+# Returning the correct structure for an authless server stops the 404 loop.
+
+@app.get("/.well-known/oauth-protected-resource")
+async def oauth_protected_resource():
+    """
+    Tells Claude's MCP client this server requires NO OAuth.
+    An empty authorization_servers list = authless server.
+    """
+    return JSONResponse(
+        content={
+            "resource": BASE_URL,
+            "authorization_servers": [],
+        },
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
+
+
+@app.get("/.well-known/oauth-authorization-server")
+async def oauth_authorization_server():
+    # Not applicable for authless server — return 404 cleanly
+    return JSONResponse(status_code=404, content={})
+
+
+@app.post("/register")
+async def oauth_register():
+    # Dynamic Client Registration not supported
+    return JSONResponse(status_code=404, content={})
+
+
+# ── Routers ───────────────────────────────────────────────────────────────────
 app.include_router(so_router)
 app.include_router(purchase_router)
 app.include_router(production_router)
 
-# Mount MCP servers alongside FastAPI on the same port
+# ── MCP mounts ────────────────────────────────────────────────────────────────
 # Full access (77 tools) at /mcp/
 _mcp_starlette = _mcp_instance.streamable_http_app()
 _mcp_starlette.router.lifespan_context = None  # lifespan managed above
@@ -105,7 +153,7 @@ _mcp_viewer_starlette = _mcp_viewer_instance.streamable_http_app()
 _mcp_viewer_starlette.router.lifespan_context = None
 app.mount("/mcp-viewer", _mcp_viewer_starlette)
 
-
+# ── Health ────────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -114,3 +162,4 @@ async def health():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
+https://desktop-backend-vhf0.onrender.com/.well-known/oauth-protected-resource
