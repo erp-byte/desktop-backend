@@ -28,12 +28,7 @@ if _repo_root not in _sys.path:
     _sys.path.insert(0, _repo_root)
 
 from mcp_server import mcp as _mcp_instance  # noqa: E402
-from mcp_viewer_server import mcp_viewer as _mcp_viewer_instance  # noqa: E402
 
-
-# ---------------------------------------------------------------------------
-# FastAPI app (REST API only — no MCP mount)
-# ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(fastapi_app: FastAPI):
@@ -106,18 +101,13 @@ async def health():
     return {"status": "ok"}
 
 
-# ---------------------------------------------------------------------------
-# Combined ASGI app — MCP at root, FastAPI at /api, viewer at /viewer
-# ---------------------------------------------------------------------------
-# Claude Desktop sends POST / → hits MCP directly (no subpath needed)
-# REST API lives at /api/v1/... (prefixed by routers, works as-is)
-# Viewer MCP at /viewer/
-
+# Combined ASGI app: MCP at root /, FastAPI at /api/
+# Claude Desktop sends POST / → hits MCP directly
+# REST API at /api/v1/... works as before
 app = Starlette(
     routes=[
         Mount("/api", app=fastapi_app),
         Mount("/health", app=fastapi_app),
-        Mount("/viewer", app=_mcp_viewer_instance.streamable_http_app()),
         Mount("/", app=_mcp_instance.streamable_http_app()),
     ],
 )
