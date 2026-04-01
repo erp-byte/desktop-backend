@@ -387,5 +387,84 @@ async def list_ai_recommendations(entity: str = "") -> str:
     return json.dumps([dict(r) for r in rows], default=str, indent=2)
 
 
+@mcp.tool()
+async def get_machine_master(entity: str, floor: str = "", stage: str = "") -> str:
+    """Get machine master with capacity info. Filter by floor or production stage."""
+    pool = await get_pool()
+    conditions = ["m.entity=$1"]; params = [entity]; idx = 2
+    if floor:
+        conditions.append(f"m.floor ILIKE ${idx}"); params.append(f"%{floor}%"); idx += 1
+    if stage:
+        conditions.append(f"mc.stage ILIKE ${idx}"); params.append(f"%{stage}%"); idx += 1
+    where = " AND ".join(conditions)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"SELECT m.machine_id, m.machine_name, m.floor, m.allocation, m.status, "
+            f"mc.stage, mc.item_group, mc.capacity_kg_per_hr "
+            f"FROM machine m LEFT JOIN machine_capacity mc ON m.machine_id=mc.machine_id "
+            f"WHERE {where} ORDER BY m.floor, m.machine_name",
+            *params
+        )
+    machines: dict = {}
+    for r in rows:
+        mid = r['machine_id']
+        if mid not in machines:
+            machines[mid] = {"machine_id": mid, "name": r['machine_name'], "floor": r['floor'],
+                             "allocation": r['allocation'], "status": r['status'], "capacity": []}
+        if r['stage']:
+            machines[mid]["capacity"].append({"stage": r['stage'], "item_group": r['item_group'],
+                                               "kg_per_hr": float(r['capacity_kg_per_hr'])})
+    return json.dumps(list(machines.values()), default=str, indent=2)
+
+
+@mcp.tool()
+async def get_inventory(entity: str, floor_location: str = "", search: str = "") -> str:
+    """Get current floor inventory. floor_location: rm_store, pm_store, fg_store, production_floor."""
+    pool = await get_pool()
+    conditions = ["entity=$1", "quantity_kg > 0"]; params = [entity]; idx = 2
+    if floor_location:
+        conditions.append(f"floor_location=${idx}"); params.append(floor_location); idx += 1
+    if search:
+        conditions.append(f"sku_name ILIKE ${idx}"); params.append(f"%{search}%"); idx += 1
+    where = " AND ".join(conditions)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"SELECT sku_name, floor_location, quantity_kg, uom, last_updated "
+            f"FROM floor_inventory WHERE {where} ORDER BY floor_location, sku_name",
+            *params
+        )
+    return json.dumps([dict(r) for r in rows], default=str, indent=2)
+
+
+@mcp.tool()
+async def get_bom_detail(fg_sku_name: str) -> str:
+    """Get Bill of Materials for a finished good — materials, quantities, process route."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        header = await conn.fetchrow(
+            "SELECT bom_id, fg_sku_name, process_category, output_uom, is_active FROM bom_header WHERE fg_sku_name ILIKE $1 AND is_active=TRUE LIMIT 1",
+            f"%{fg_sku_name}%"
+        )
+        if not header:
+            return json.dumps({"error": f"No active BOM found for '{fg_sku_name}'"})
+        bom_id = header['bom_id']
+        lines = await conn.fetch(
+            "SELECT material_sku_name, item_type, quantity_per_unit, uom, loss_pct FROM bom_line WHERE bom_id=$1 ORDER BY item_type, material_sku_name",
+            bom_id
+        )
+        route = await conn.fetch(
+            "SELECT step_number, stage, process_name FROM bom_process_route WHERE bom_id=$1 ORDER BY step_number",
+            bom_id
+        )
+    return json.dumps({
+        "bom_id": header['bom_id'],
+        "fg_sku_name": header['fg_sku_name'],
+        "process_category": header['process_category'],
+        "output_uom": header['output_uom'],
+        "materials": [dict(l) for l in lines],
+        "process_route": [dict(r) for r in route],
+    }, default=str, indent=2)
+
+
 if __name__ == "__main__":
     mcp.run(transport="streamable-http")
