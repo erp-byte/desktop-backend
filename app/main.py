@@ -58,23 +58,35 @@ async def lifespan(fastapi_app: FastAPI):
         data_dir = Path(__file__).parent.parent / "data"
     await run_master_ingest(pool, data_dir, master_items)
 
-    # Keep-alive poller
+    # Keep-alive poller — pings all Render services every 7 min to prevent spin-down
     keep_alive_task = None
-    backend_url = os.environ.get("RENDER_BACKEND_URL")
+    keep_alive_urls = []
+    for env_key in ["RENDER_BACKEND_URL", "RENDER_PLANNER_MCP_URL", "RENDER_TRACKER_MCP_URL"]:
+        url = os.environ.get(env_key, "")
+        if url:
+            keep_alive_urls.append(url.rstrip("/"))
+    # Hardcoded fallback if env vars not set
+    if not keep_alive_urls:
+        keep_alive_urls = [
+            "https://desktop-backend-vhf0.onrender.com",
+            "https://desktop-backend-nk6k.onrender.com",
+            "https://desktop-backend-el31.onrender.com",
+        ]
 
     async def _keep_alive():
         async with httpx.AsyncClient(timeout=30) as client:
             while True:
-                await asyncio.sleep(420)
-                try:
-                    resp = await client.get(backend_url.rstrip("/") + "/api/v1/production/health")
-                    logger.debug("Keep-alive → %s", resp.status_code)
-                except Exception as e:
-                    logger.warning("Keep-alive failed: %s", e)
+                await asyncio.sleep(420)  # 7 minutes
+                for url in keep_alive_urls:
+                    try:
+                        resp = await client.get(url + "/health" if "/api" not in url else url)
+                        logger.debug("Keep-alive %s → %s", url, resp.status_code)
+                    except Exception as e:
+                        logger.warning("Keep-alive failed %s: %s", url, e)
 
-    if backend_url:
+    if keep_alive_urls:
         keep_alive_task = asyncio.create_task(_keep_alive())
-        logger.info("Keep-alive poller started")
+        logger.info("Keep-alive poller started for: %s", keep_alive_urls)
 
     yield
 
