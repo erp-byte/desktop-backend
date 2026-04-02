@@ -1378,6 +1378,59 @@ async def floor_summary(request: Request, entity: str = Query(...)):
         return await get_floor_summary(conn, entity)
 
 
+class InventorySeedItem(BaseModel):
+    sku_name: str
+    item_type: str          # rm, pm, fg, wip
+    floor_location: str     # rm_store, pm_store, fg_store, production_floor
+    quantity_kg: float
+    uom: str = "kg"
+    lot_number: str | None = None
+
+
+class InventorySeedRequest(BaseModel):
+    entity: str
+    items: list[InventorySeedItem]
+    overwrite: bool = False  # if True, SET quantity; if False, ADD to existing
+
+
+@router.post("/floor-inventory/seed")
+async def seed_floor_inventory(request: Request, body: InventorySeedRequest):
+    """Manually seed opening stock for PM/FG or any store that wasn't in the Excel ingest.
+    overwrite=false adds to existing qty; overwrite=true sets it absolutely."""
+    pool = request.app.state.db_pool
+    inserted = updated = 0
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            for item in body.items:
+                if body.overwrite:
+                    result = await conn.execute(
+                        """
+                        INSERT INTO floor_inventory (sku_name, item_type, floor_location, quantity_kg, uom, lot_number, entity)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7)
+                        ON CONFLICT (sku_name, floor_location, lot_number, entity)
+                        DO UPDATE SET quantity_kg = $4, uom = $5, last_updated = NOW()
+                        """,
+                        item.sku_name, item.item_type, item.floor_location,
+                        item.quantity_kg, item.uom, item.lot_number or '', body.entity,
+                    )
+                else:
+                    result = await conn.execute(
+                        """
+                        INSERT INTO floor_inventory (sku_name, item_type, floor_location, quantity_kg, uom, lot_number, entity)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7)
+                        ON CONFLICT (sku_name, floor_location, lot_number, entity)
+                        DO UPDATE SET quantity_kg = floor_inventory.quantity_kg + $4, uom = $5, last_updated = NOW()
+                        """,
+                        item.sku_name, item.item_type, item.floor_location,
+                        item.quantity_kg, item.uom, item.lot_number or '', body.entity,
+                    )
+                if 'INSERT 0 1' in result:
+                    inserted += 1
+                else:
+                    updated += 1
+    return {"inserted": inserted, "updated": updated, "total": len(body.items)}
+
+
 @router.post("/floor-inventory/move")
 async def move_material_endpoint(request: Request, body: MoveRequest):
     """Manual material movement between floors."""
