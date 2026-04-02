@@ -490,15 +490,34 @@ async def get_inventory(entity: str, floor_location: str = "", search: str = "")
 
 @mcp.tool()
 async def get_bom_detail(fg_sku_name: str) -> str:
-    """Get Bill of Materials for a finished good — materials, quantities, process route."""
+    """Get Bill of Materials for a finished good.
+    Pass fg_sku_name as a name substring (case-insensitive) OR a numeric BOM ID string e.g. '445'.
+    Returns materials, quantities, process route, and is_active flag.
+    If not found, returns closest name matches for diagnosis."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        header = await conn.fetchrow(
-            "SELECT bom_id, fg_sku_name, process_category, output_uom, is_active FROM bom_header WHERE fg_sku_name ILIKE $1 AND is_active=TRUE LIMIT 1",
-            f"%{fg_sku_name}%"
-        )
+        # Try by BOM ID first if input is numeric
+        header = None
+        if fg_sku_name.strip().isdigit():
+            header = await conn.fetchrow(
+                "SELECT bom_id, fg_sku_name, process_category, output_uom, is_active FROM bom_header WHERE bom_id=$1",
+                int(fg_sku_name.strip())
+            )
         if not header:
-            return json.dumps({"error": f"No active BOM found for '{fg_sku_name}'"})
+            header = await conn.fetchrow(
+                "SELECT bom_id, fg_sku_name, process_category, output_uom, is_active FROM bom_header WHERE fg_sku_name ILIKE $1 LIMIT 1",
+                f"%{fg_sku_name}%"
+            )
+        if not header:
+            # Return candidates to help diagnose name mismatch
+            candidates = await conn.fetch(
+                "SELECT bom_id, fg_sku_name, is_active FROM bom_header ORDER BY fg_sku_name LIMIT 20"
+            )
+            return json.dumps({
+                "error": f"No BOM found for '{fg_sku_name}'",
+                "hint": "Check exact name below and retry with the correct string or BOM ID",
+                "sample_boms": [{"bom_id": r['bom_id'], "fg_sku_name": r['fg_sku_name'], "is_active": r['is_active']} for r in candidates],
+            }, indent=2)
         bom_id = header['bom_id']
         lines = await conn.fetch(
             "SELECT material_sku_name, item_type, quantity_per_unit, uom, loss_pct FROM bom_line WHERE bom_id=$1 ORDER BY item_type, material_sku_name",
@@ -513,6 +532,7 @@ async def get_bom_detail(fg_sku_name: str) -> str:
         "fg_sku_name": header['fg_sku_name'],
         "process_category": header['process_category'],
         "output_uom": header['output_uom'],
+        "is_active": header['is_active'],
         "materials": [dict(l) for l in lines],
         "process_route": [dict(r) for r in route],
     }, default=str, indent=2)
