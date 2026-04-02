@@ -439,23 +439,15 @@ async def get_inventory(entity: str, floor_location: str = "", search: str = "")
 @mcp.tool()
 async def get_bom_detail(fg_sku_name: str) -> str:
     """Get Bill of Materials for a finished good.
-    Pass fg_sku_name as a name substring (case-insensitive) OR a numeric BOM ID string e.g. '445'.
+    Pass any substring of the FG name (case-insensitive fuzzy match).
     Returns materials, quantities, process route, and is_active flag.
-    If not found, returns closest name matches for diagnosis."""
+    If not found, returns a sample of stored BOM names for diagnosis."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # Try by BOM ID first if input is numeric
-        header = None
-        if fg_sku_name.strip().isdigit():
-            header = await conn.fetchrow(
-                "SELECT bom_id, fg_sku_name, process_category, output_uom, is_active FROM bom_header WHERE bom_id=$1",
-                int(fg_sku_name.strip())
-            )
-        if not header:
-            header = await conn.fetchrow(
-                "SELECT bom_id, fg_sku_name, process_category, output_uom, is_active FROM bom_header WHERE fg_sku_name ILIKE $1 LIMIT 1",
-                f"%{fg_sku_name}%"
-            )
+        header = await conn.fetchrow(
+            "SELECT bom_id, fg_sku_name, process_category, output_uom, is_active FROM bom_header WHERE fg_sku_name ILIKE $1 LIMIT 1",
+            f"%{fg_sku_name}%"
+        )
         if not header:
             # Return candidates to help diagnose name mismatch
             candidates = await conn.fetch(
