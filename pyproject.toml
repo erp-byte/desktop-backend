@@ -1,0 +1,20 @@
+[project]
+name = "backend"
+version = "0.1.0"
+description = "Candor Foods — SO Upload & Extraction Backend"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi==0.135.1",
+    "uvicorn[standard]==0.42.0",
+    "python-multipart==0.0.22",
+    "asyncpg==0.31.0",
+    "pydantic==2.12.5",
+    "pydantic-settings==2.13.1",
+    "rapidfuzz==3.14.3",
+    "openpyxl==3.1.5",
+    "anthropic==0.86.0",
+    "cryptography==44.0.3",
+    "httpx==0.28.1",
+    "mcp==1.26.0",
+]
