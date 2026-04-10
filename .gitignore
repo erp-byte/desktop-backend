@@ -15,6 +15,9 @@ wheels/
 # Uploaded files
 so_pdfs/
 
+# Git worktrees
+.worktrees/
+
 # Temp/test files
 planning_prompt*.txt
 sample_planning_prompt.txt
