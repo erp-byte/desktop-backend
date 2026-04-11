@@ -7,10 +7,34 @@ Tools: 18 (plan generation, fulfillment, MRP, indents — view + create only)
 import json
 import logging
 import os
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from decimal import Decimal
 
 import asyncpg
 from mcp.server.fastmcp import FastMCP
+
+
+def _clean_row(row):
+    """Convert asyncpg Record to a JSON-safe dict.
+    None stays None (→ JSON null), Decimal→float, datetime→ISO string."""
+    d = dict(row)
+    for k, v in d.items():
+        if isinstance(v, Decimal):
+            d[k] = float(v)
+        elif isinstance(v, (datetime, date)):
+            d[k] = v.isoformat()
+    return d
+
+
+def _dumps(obj):
+    """json.dumps that handles date/Decimal without converting None→'None'."""
+    def _default(o):
+        if isinstance(o, Decimal):
+            return float(o)
+        if isinstance(o, (datetime, date)):
+            return o.isoformat()
+        return str(o)
+    return json.dumps(obj, default=_default, indent=2)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -40,7 +64,7 @@ async def get_pool():
                         db_url = line.strip().split("=", 1)[1]
         if not db_url:
             raise RuntimeError("DATABASE_URL not set")
-        _pool = await asyncpg.create_pool(db_url, min_size=1, max_size=5)
+        _pool = await asyncpg.create_pool(db_url, min_size=0, max_size=3)
     return _pool
 
 
@@ -104,7 +128,7 @@ async def get_fulfillment_list(entity: str = "", status: str = "open,partial", p
             f"SELECT fulfillment_id, fg_sku_name, customer_name, pending_qty_kg, delivery_deadline, priority, order_status, financial_year FROM so_fulfillment WHERE {where} ORDER BY delivery_deadline, priority LIMIT ${idx} OFFSET ${idx+1}",
             *params, page_size, offset
         )
-    return json.dumps({"total": total, "page": page, "results": [dict(r) for r in rows]}, default=str, indent=2)
+    return _dumps({"total": total, "page": page, "results": [_clean_row(r) for r in rows]})
 
 
 @mcp.tool()
@@ -120,7 +144,7 @@ async def get_demand_summary(entity: str = "", financial_year: str = "") -> str:
     query += " GROUP BY fg_sku_name, customer_name ORDER BY MIN(delivery_deadline)"
     async with pool.acquire() as conn:
         rows = await conn.fetch(query, *params)
-    return json.dumps([dict(r) for r in rows], default=str, indent=2)
+    return _dumps([_clean_row(r) for r in rows])
 
 
 # ── Planning Context + Save ──────────────────────────────────────────────
@@ -178,7 +202,107 @@ async def get_planning_context(entity: str, fulfillment_ids: list[int], target_d
         "inventory": inventory, "machines": [m for m in machines_map.values() if m['capacity']],
         "in_progress_jobs": [], "pending_indents": []
     }
-    return json.dumps(context, default=str, indent=2)
+    return _dumps(context)
+
+
+@mcp.tool()
+async def get_plan_template(plan_type: str = "daily") -> str:
+    """Return the expected JSON structure for save_production_plan's schedule_json.
+
+    plan_type: "daily" | "weekly" | "revision"
+
+    Use this BEFORE calling save_production_plan so you know the exact field names.
+    """
+    daily = {
+        "schedule": [
+            {
+                "fg_sku_name": "Product Name 500g",
+                "customer_name": "Customer Ltd.",
+                "qty_kg": 500,
+                "qty_units": 2000,
+                "bom_id": 15,
+                "production_type": "production",
+                "machine_name": "Machine Name",
+                "priority": 1,
+                "shift": "day",
+                "stage_sequence": ["sorting", "roasting", "packaging"],
+                "estimated_hours": 5.0,
+                "linked_fulfillment_ids": [42],
+                "reasoning": "Earliest deadline, sufficient RM stock"
+            }
+        ],
+        "material_check": [
+            {
+                "material": "Raw Material Name",
+                "type": "rm",
+                "needed_kg": 525.0,
+                "available_kg": 2000.0,
+                "status": "SUFFICIENT"
+            }
+        ],
+        "risk_flags": [
+            {
+                "flag": "Short description of risk",
+                "severity": "warning",
+                "details": "Extended explanation"
+            }
+        ]
+    }
+    weekly = {
+        "schedule": [
+            {
+                "date": "2026-04-14",
+                "fg_sku_name": "Product Name 500g",
+                "customer_name": "Customer Ltd.",
+                "qty_kg": 500,
+                "qty_units": 2000,
+                "bom_id": 15,
+                "production_type": "production",
+                "machine_name": "Machine Name",
+                "priority": 1,
+                "shift": "day",
+                "stage_sequence": ["sorting", "roasting", "packaging"],
+                "estimated_hours": 5.0,
+                "linked_fulfillment_ids": [42],
+                "reasoning": "Grouped with similar products to minimize changeover"
+            }
+        ],
+        "material_check": [
+            {"material": "Raw Material Name", "type": "rm", "needed_kg": 525.0, "available_kg": 2000.0, "status": "SUFFICIENT"}
+        ],
+        "risk_flags": [
+            {"flag": "Risk description", "severity": "warning", "details": "Details"}
+        ]
+    }
+    revision = {
+        "revised_schedule": [
+            {"action": "keep", "plan_line_id": 1, "reasoning": "Already in_progress, no change"},
+            {"action": "reschedule", "plan_line_id": 2, "new_priority": 3, "new_machine_name": "Machine B", "new_shift": "night", "reasoning": "Moved to night shift"},
+            {"action": "cancel", "plan_line_id": 3, "reasoning": "Material failed QC"},
+            {
+                "action": "add",
+                "fg_sku_name": "New Product 500g",
+                "customer_name": "Customer Ltd.",
+                "qty_kg": 300,
+                "bom_id": 42,
+                "machine_name": "Machine A",
+                "priority": 1,
+                "shift": "day",
+                "stage_sequence": ["sorting", "packaging"],
+                "estimated_hours": 3.0,
+                "linked_fulfillment_ids": [99],
+                "reasoning": "Adhoc order, urgent deadline"
+            }
+        ],
+        "material_check": [
+            {"material": "Raw Material Name", "type": "rm", "needed_kg": 300.0, "available_kg": 500.0, "status": "SUFFICIENT"}
+        ],
+        "risk_flags": [
+            {"flag": "Risk description", "severity": "warning", "details": "Details"}
+        ]
+    }
+    templates = {"daily": daily, "weekly": weekly, "revision": revision}
+    return _dumps(templates.get(plan_type, daily))
 
 
 @mcp.tool()
@@ -191,7 +315,20 @@ async def save_production_plan(
     material_check_json: str = "[]",
     risk_flags_json: str = "[]",
 ) -> str:
-    """Save a production plan to the database. Pass the schedule as JSON array."""
+    """Save a production plan to the database.
+
+    Call get_plan_template first to see the expected JSON structure.
+
+    schedule_json  — JSON array of schedule items (see get_plan_template)
+    material_check_json — JSON array of material availability checks
+    risk_flags_json — JSON array of risk/warning flags
+
+    Each schedule item fields:
+      fg_sku_name, customer_name, qty_kg, qty_units, bom_id,
+      machine_name, priority (1=highest), shift (day/night),
+      stage_sequence (list), estimated_hours,
+      linked_fulfillment_ids (list of int), reasoning
+    """
     schedule = json.loads(schedule_json)
     full = {
         "schedule": schedule,
@@ -199,10 +336,6 @@ async def save_production_plan(
         "risk_flags": json.loads(risk_flags_json),
     }
 
-    # FIX: parse date strings into Python date objects before passing to asyncpg.
-    # asyncpg calls .toordinal() internally when serialising date parameters, so
-    # raw strings must be converted first. The ::date SQL casts are also removed
-    # since asyncpg handles native date objects without them.
     d_from = date.fromisoformat(date_from)
     d_to = date.fromisoformat(date_to) if date_to else d_from
 
@@ -213,12 +346,9 @@ async def save_production_plan(
                 "INSERT INTO production_plan (plan_name, entity, plan_type, plan_date, date_from, date_to, status, ai_generated, ai_analysis_json) "
                 "VALUES ($1,$2,$3,$4,$5,$6,'draft',TRUE,$7) RETURNING plan_id",
                 f"{plan_type.title()} Plan — {d_from}",
-                entity,
-                plan_type,
-                d_from,   # plan_date
-                d_from,   # date_from
-                d_to,     # date_to
-                json.dumps(full, default=str),
+                entity, plan_type,
+                d_from, d_from, d_to,
+                _dumps(full),
             )
             machines = await conn.fetch("SELECT machine_id, machine_name FROM machine WHERE entity=$1", entity)
             ml = {r['machine_name'].strip().lower(): r['machine_id'] for r in machines}
@@ -227,28 +357,44 @@ async def save_production_plan(
                 fg = item.get("fg_sku_name", "")
                 mn = item.get("machine_name", "")
                 mid = ml.get(mn.strip().lower())
+
                 bom_id = item.get("bom_id") or await conn.fetchval(
                     "SELECT bom_id FROM bom_header WHERE fg_sku_name=$1 AND is_active=TRUE LIMIT 1", fg
                 )
+
+                # Normalise field name variants the AI may use
+                customer_name = item.get("customer_name") or item.get("customer")
+                reasoning = item.get("reasoning") or item.get("notes")
+                linked_ids = item.get("linked_fulfillment_ids") or item.get("linked_ids") or []
+                if not linked_ids and item.get("fulfillment_id"):
+                    linked_ids = [item["fulfillment_id"]]
+
+                # Fallback: pull customer_name from linked fulfillment if still missing
+                if not customer_name and linked_ids:
+                    customer_name = await conn.fetchval(
+                        "SELECT customer_name FROM so_fulfillment WHERE fulfillment_id=$1",
+                        linked_ids[0],
+                    )
+
+                stage_seq = item.get("stage_sequence") or []
+                if not stage_seq and item.get("process_stage"):
+                    stage_seq = [item["process_stage"]]
+
                 await conn.execute(
                     "INSERT INTO production_plan_line "
                     "(plan_id, fg_sku_name, customer_name, bom_id, planned_qty_kg, planned_qty_units, "
                     "machine_id, priority, shift, stage_sequence, estimated_hours, "
                     "linked_so_fulfillment_ids, reasoning) "
                     "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
-                    plan_id,
-                    fg,
-                    item.get("customer_name"),
-                    bom_id,
-                    item.get("qty_kg", 0),
-                    item.get("qty_units"),
+                    plan_id, fg, customer_name, bom_id,
+                    item.get("qty_kg", 0), item.get("qty_units"),
                     mid,
                     item.get("priority", 5),
                     item.get("shift", "day"),
-                    item.get("stage_sequence") or None,
+                    stage_seq or None,
                     item.get("estimated_hours"),
-                    item.get("linked_fulfillment_ids") or None,
-                    item.get("reasoning"),
+                    linked_ids or None,
+                    reasoning,
                 )
                 created += 1
     return f"Plan saved! plan_id={plan_id}, {created} lines. Status: draft."
@@ -271,7 +417,7 @@ async def list_plans(entity: str = "", status: str = "", plan_type: str = "") ->
             f"SELECT plan_id, plan_name, entity, plan_type, plan_date, date_from, date_to, status, ai_generated, revision_number, created_at FROM production_plan WHERE {where} ORDER BY created_at DESC LIMIT 20",
             *params
         )
-    return json.dumps([dict(r) for r in rows], default=str, indent=2)
+    return _dumps([_clean_row(r) for r in rows])
 
 
 @mcp.tool()
@@ -283,15 +429,15 @@ async def get_plan_detail(plan_id: int) -> str:
         if not plan:
             return "Plan not found."
         lines = await conn.fetch("SELECT * FROM production_plan_line WHERE plan_id=$1 ORDER BY priority", plan_id)
-    result = dict(plan)
-    result["lines"] = [dict(l) for l in lines]
+    result = _clean_row(plan)
+    result["lines"] = [_clean_row(l) for l in lines]
     ai = result.get("ai_analysis_json")
     if ai:
         if isinstance(ai, str):
             ai = json.loads(ai)
         result["material_check"] = ai.get("material_check", [])
         result["risk_flags"] = ai.get("risk_flags", [])
-    return json.dumps(result, default=str, indent=2)
+    return _dumps(result)
 
 
 @mcp.tool()
@@ -338,7 +484,7 @@ async def list_indents(entity: str = "", status: str = "") -> str:
             f"SELECT * FROM purchase_indent WHERE {where} ORDER BY created_at DESC LIMIT 50",
             *params
         )
-    return json.dumps([dict(r) for r in rows], default=str, indent=2)
+    return _dumps([_clean_row(r) for r in rows])
 
 
 @mcp.tool()
@@ -466,7 +612,7 @@ async def get_machine_master(entity: str, floor: str = "", stage: str = "") -> s
         if r['stage']:
             machines[mid]["capacity"].append({"stage": r['stage'], "item_group": r['item_group'],
                                                "kg_per_hr": float(r['capacity_kg_per_hr'])})
-    return json.dumps(list(machines.values()), default=str, indent=2)
+    return _dumps(list(machines.values()))
 
 
 @mcp.tool()
@@ -485,7 +631,7 @@ async def get_inventory(entity: str, floor_location: str = "", search: str = "")
             f"FROM floor_inventory WHERE {where} ORDER BY floor_location, sku_name",
             *params
         )
-    return json.dumps([dict(r) for r in rows], default=str, indent=2)
+    return _dumps([_clean_row(r) for r in rows])
 
 
 @mcp.tool()
