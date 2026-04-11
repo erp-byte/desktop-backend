@@ -4,8 +4,11 @@ Reads so_header + so_line, creates so_fulfillment records with FY tracking,
 supports carryforward and revision with audit logging.
 """
 
+import asyncio
+import json
 import logging
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from decimal import Decimal
 
 logger = logging.getLogger(__name__)
 
@@ -999,26 +1002,457 @@ async def save_floor_stock(conn, fulfillment_id: int, entries: list[dict],
 
 
 async def get_floor_locations(conn, entity: str | None = None) -> dict:
-    """Distinct floor locations from machines + floor_inventory."""
-    params = []
+    """Distinct floor locations from machines + floor_inventory.
+
+    Returns:
+        {
+            "floors": ["Floor 1", "Floor 2", ...],
+            "machines_by_floor": {
+                "Floor 1": [
+                    {"machine_name": "M-A", "machine_type": "Sealer", "has_active_job": false},
+                    ...
+                ],
+                ...
+            }
+        }
+    A machine has has_active_job=true if its allocation != 'idle'
+    OR if it has a job_card in status 'pending'/'in_progress'.
+    """
+    params: list = []
     idx = 1
 
-    # From machines
-    machine_q = "SELECT DISTINCT floor FROM machine WHERE floor IS NOT NULL AND status = 'active'"
+    entity_clause_m = ""
     if entity:
-        machine_q += f" AND entity = ${idx}"
+        entity_clause_m = f" AND m.entity = ${idx}"
         params.append(entity)
         idx += 1
 
-    machine_floors = await conn.fetch(machine_q, *params)
+    machine_rows = await conn.fetch(
+        f"""
+        SELECT
+            m.floor,
+            m.machine_id,
+            m.machine_name,
+            m.machine_type,
+            CASE
+                WHEN m.allocation IS DISTINCT FROM 'idle' THEN true
+                WHEN EXISTS(
+                    SELECT 1 FROM job_card jc
+                    WHERE jc.machine_id = m.machine_id
+                      AND jc.status IN ('pending', 'in_progress')
+                ) THEN true
+                ELSE false
+            END AS has_active_job
+        FROM machine m
+        WHERE m.floor IS NOT NULL
+          AND m.status = 'active'
+          {entity_clause_m}
+        ORDER BY m.floor, m.machine_name
+        """,
+        *params,
+    )
 
-    # From floor_inventory
-    inv_params = []
+    inv_params: list = []
     inv_q = "SELECT DISTINCT floor_location FROM floor_inventory WHERE floor_location IS NOT NULL"
     if entity:
-        inv_q += f" AND entity = $1"
+        inv_q += " AND entity = $1"
         inv_params.append(entity)
-    inv_floors = await conn.fetch(inv_q, *inv_params)
+    inv_floors_rows = await conn.fetch(inv_q, *inv_params)
 
-    all_floors = sorted({r['floor'] for r in machine_floors} | {r['floor_location'] for r in inv_floors})
-    return {"floors": all_floors}
+    machines_by_floor: dict[str, list] = {}
+    machine_floor_names: set[str] = set()
+
+    for r in machine_rows:
+        floor = r["floor"]
+        machine_floor_names.add(floor)
+        if floor not in machines_by_floor:
+            machines_by_floor[floor] = []
+        machines_by_floor[floor].append({
+            "machine_name": r["machine_name"],
+            "machine_type": r["machine_type"] or "",
+            "has_active_job": bool(r["has_active_job"]),
+        })
+
+    inv_floor_names = {r["floor_location"] for r in inv_floors_rows}
+    all_floors = sorted(machine_floor_names | inv_floor_names)
+
+    return {"floors": all_floors, "machines_by_floor": machines_by_floor}
+
+
+# ---------------------------------------------------------------------------
+# Single-fulfillment detail
+# ---------------------------------------------------------------------------
+
+async def get_fulfillment_detail(conn, fulfillment_id: int) -> dict | None:
+    """Full detail for one fulfillment: BOM lines + inventory, floor machines, linked SO, logs."""
+
+    def _to_float(v):
+        if v is None:
+            return None
+        if isinstance(v, Decimal):
+            return float(v)
+        return float(v)
+
+    def _to_str(v):
+        if v is None:
+            return None
+        if isinstance(v, (date, datetime)):
+            return v.isoformat()
+        return str(v)
+
+    def _serialize_row(row):
+        out = {}
+        for k, v in dict(row).items():
+            if isinstance(v, Decimal):
+                out[k] = float(v)
+            elif isinstance(v, (date, datetime)):
+                out[k] = v.isoformat()
+            else:
+                out[k] = v
+        return out
+
+    # ------------------------------------------------------------------
+    # Query 1 — Fulfillment row + so_number
+    # ------------------------------------------------------------------
+    row = await conn.fetchrow(
+        """
+        SELECT sf.*, h.so_number
+        FROM so_fulfillment sf
+        LEFT JOIN so_header h ON sf.so_id = h.so_id
+        WHERE sf.fulfillment_id = $1
+        """,
+        fulfillment_id,
+    )
+    if row is None:
+        return None
+
+    fulfillment = _serialize_row(row)
+
+    # ------------------------------------------------------------------
+    # Query 2 — is_planned check
+    # ------------------------------------------------------------------
+    plan_row = await conn.fetchrow(
+        """
+        SELECT plan_line_id FROM production_plan_line
+        WHERE $1 = ANY(linked_so_fulfillment_ids) LIMIT 1
+        """,
+        fulfillment_id,
+    )
+    fulfillment["is_planned"] = plan_row is not None
+    fulfillment["plan_line_id"] = plan_row["plan_line_id"] if plan_row else None
+    fulfillment["pending_qty_warning"] = not bool(fulfillment.get("pending_qty_kg"))
+
+    # ------------------------------------------------------------------
+    # Query 3 — Linked SO line (fetched early so item_type is available for BOM check)
+    # ------------------------------------------------------------------
+    so_line_id = row.get("so_line_id")
+    linked_so = None
+    if so_line_id is not None:
+        so_row = await conn.fetchrow(
+            """
+            SELECT h.so_number, h.so_date, h.customer_name, h.voucher_type,
+                   l.line_number, l.sku_name, l.quantity, l.rate_inr,
+                   l.amount_inr, l.total_amount_inr, l.item_type
+            FROM so_line l
+            JOIN so_header h ON l.so_id = h.so_id
+            WHERE l.so_line_id = $1
+            """,
+            so_line_id,
+        )
+        if so_row:
+            linked_so = _serialize_row(so_row)
+
+    so_item_type = (linked_so or {}).get("item_type", "")
+
+    # ------------------------------------------------------------------
+    # Query 4 — BOM header
+    # ------------------------------------------------------------------
+    fg_sku = row["fg_sku_name"]
+    bom_row = await conn.fetchrow(
+        """
+        SELECT bom_id, machines, floors, item_group, notes
+        FROM bom_header
+        WHERE fg_sku_name ILIKE $1 AND is_active = TRUE
+        ORDER BY version DESC LIMIT 1
+        """,
+        fg_sku,
+    )
+
+    bom_id = bom_row["bom_id"] if bom_row else None
+    bom_machines_raw = bom_row["machines"] if bom_row else []
+
+    # Normalise bom machines to lowercased list for is_in_bom comparison
+    bom_machine_names_lower = set()
+    if bom_machines_raw:
+        for m in bom_machines_raw:
+            bom_machine_names_lower.add((m or "").strip().lower())
+
+    process_routes = []
+    lines = []
+    bom_note = None
+
+    if bom_id is None:
+        if (so_item_type or "").lower() == "rm":
+            bom_note = "RM SO — no BOM expected"
+        else:
+            bom_note = "No BOM found"
+    else:
+        # ------------------------------------------------------------------
+        # Query 5 — BOM process routes
+        # ------------------------------------------------------------------
+        route_rows = await conn.fetch(
+            """
+            SELECT step_number, process_name, stage, std_time_min, loss_pct, machine_type
+            FROM bom_process_route
+            WHERE bom_id = $1
+            ORDER BY step_number
+            """,
+            bom_id,
+        )
+        for r in route_rows:
+            process_routes.append({
+                "step_number": r["step_number"],
+                "process_name": r["process_name"],
+                "stage": r["stage"],
+                "std_time_min": _to_float(r["std_time_min"]),
+                "loss_pct": float(r["loss_pct"]) if r["loss_pct"] is not None else 0.0,
+                "machine_type": r["machine_type"],
+            })
+
+        # ------------------------------------------------------------------
+        # Query 6 — BOM lines merged with overrides
+        # ------------------------------------------------------------------
+        line_rows = await conn.fetch(
+            """
+            SELECT
+              bl.bom_line_id,
+              COALESCE(o.material_sku_name, bl.material_sku_name) AS material_sku_name,
+              bl.item_type,
+              COALESCE(o.quantity_per_unit, bl.quantity_per_unit) AS quantity_per_unit,
+              COALESCE(o.loss_pct, bl.loss_pct) AS loss_pct,
+              COALESCE(o.uom, bl.uom) AS uom,
+              COALESCE(o.godown, bl.godown) AS godown,
+              COALESCE(o.is_removed, FALSE) AS is_removed,
+              CASE WHEN o.override_id IS NOT NULL THEN TRUE ELSE FALSE END AS is_overridden,
+              o.override_reason,
+              bl.process_stage,
+              bl.can_use_offgrade
+            FROM bom_line bl
+            LEFT JOIN fulfillment_bom_override o
+              ON o.bom_line_id = bl.bom_line_id AND o.fulfillment_id = $2
+            WHERE bl.bom_id = $1
+            ORDER BY bl.line_number
+            """,
+            bom_id,
+            fulfillment_id,
+        )
+
+        # ------------------------------------------------------------------
+        # Query 7 — Added overrides (bom_line_id IS NULL)
+        # ------------------------------------------------------------------
+        added_rows = await conn.fetch(
+            """
+            SELECT override_id, material_sku_name, quantity_per_unit, loss_pct, uom, godown,
+                   override_reason, is_removed
+            FROM fulfillment_bom_override
+            WHERE fulfillment_id = $1 AND bom_line_id IS NULL
+            ORDER BY created_at
+            """,
+            fulfillment_id,
+        )
+
+        pending_qty_kg = float(row.get("pending_qty_kg") or 0)
+
+        def _build_line(mat_sku, item_type, qty_per_unit, loss_pct_val,
+                        uom, godown, is_removed, is_overridden,
+                        override_reason, process_stage, can_use_offgrade,
+                        bom_line_id=None):
+            qty_per = float(qty_per_unit) if qty_per_unit is not None else 0.0
+            lp = float(loss_pct_val) if loss_pct_val is not None else 0.0
+            if lp < 100:
+                gross = pending_qty_kg * qty_per / (1 - lp / 100) if (1 - lp / 100) != 0 else pending_qty_kg * qty_per
+                on_hand_kg = 0.0        # filled in after inventory fetch
+                inventory_status = "SHORTAGE"  # filled in after
+                shortage_kg = 0.0       # filled in after
+            else:
+                # loss_pct >= 100 means denominator is zero — gross is undefined
+                gross = None
+                on_hand_kg = 0.0
+                inventory_status = "INDETERMINATE"
+                shortage_kg = None
+            return {
+                "bom_line_id": bom_line_id,
+                "material_sku_name": mat_sku,
+                "item_type": item_type,
+                "quantity_per_unit": qty_per,
+                "loss_pct": lp,
+                "uom": uom,
+                "godown": godown,
+                "gross_requirement_kg": gross,
+                "on_hand_kg": on_hand_kg,
+                "inventory_status": inventory_status,
+                "shortage_kg": shortage_kg,
+                "is_overridden": is_overridden,
+                "is_removed": is_removed,
+                "override_reason": override_reason,
+                "process_stage": process_stage,
+                "can_use_offgrade": bool(can_use_offgrade) if can_use_offgrade is not None else False,
+            }
+
+        for r in line_rows:
+            lines.append(_build_line(
+                mat_sku=r["material_sku_name"],
+                item_type=r["item_type"],
+                qty_per_unit=r["quantity_per_unit"],
+                loss_pct_val=r["loss_pct"],
+                uom=r["uom"],
+                godown=r["godown"],
+                is_removed=bool(r["is_removed"]),
+                is_overridden=bool(r["is_overridden"]),
+                override_reason=r["override_reason"],
+                process_stage=r["process_stage"],
+                can_use_offgrade=r["can_use_offgrade"],
+                bom_line_id=r["bom_line_id"],
+            ))
+
+        for r in added_rows:
+            lines.append(_build_line(
+                mat_sku=r["material_sku_name"],
+                item_type=None,
+                qty_per_unit=r["quantity_per_unit"],
+                loss_pct_val=r["loss_pct"],
+                uom=r["uom"],
+                godown=r["godown"],
+                is_removed=bool(r["is_removed"]),
+                is_overridden=True,
+                override_reason=r["override_reason"],
+                process_stage=None,
+                can_use_offgrade=False,
+                bom_line_id=None,
+            ))
+
+    # ------------------------------------------------------------------
+    # Query 8 — Inventory (entity from fulfillment row)
+    # ------------------------------------------------------------------
+    entity_val = row.get("entity") or "cfpl"
+    if not row.get("entity"):
+        logger.warning("fulfillment_id=%d has no entity set; defaulting to 'cfpl' for inventory/machine queries", fulfillment_id)
+    inv_rows = await conn.fetch(
+        """
+        SELECT sku_name, SUM(quantity_kg) AS total_kg
+        FROM floor_inventory
+        WHERE entity = $1 AND quantity_kg > 0
+        GROUP BY sku_name
+        """,
+        entity_val,
+    )
+    inventory: dict[str, float] = {}
+    for inv in inv_rows:
+        inventory[(inv["sku_name"] or "").strip().lower()] = float(inv["total_kg"])
+
+    # Match each line by fuzzy name
+    for line in lines:
+        if line["inventory_status"] == "INDETERMINATE":
+            # gross is undefined (loss_pct >= 100) — skip inventory computation
+            continue
+        mat_lower = (line["material_sku_name"] or "").strip().lower()
+        on_hand = 0.0
+        for inv_name, inv_qty in inventory.items():
+            if inv_name and mat_lower and (inv_name in mat_lower or mat_lower in inv_name):
+                on_hand += inv_qty
+        gross = line["gross_requirement_kg"]
+        line["on_hand_kg"] = round(on_hand, 3)
+        line["inventory_status"] = "SUFFICIENT" if on_hand >= gross else "SHORTAGE"
+        line["shortage_kg"] = round(max(0.0, gross - on_hand), 3)
+
+    # ------------------------------------------------------------------
+    # Query 9 — Floor machines
+    # ------------------------------------------------------------------
+    machine_rows = await conn.fetch(
+        """
+        SELECT m.machine_id, m.machine_name, m.machine_type, m.floor,
+               m.status, m.allocation,
+               array_agg(
+                 json_build_object(
+                   'stage', mc.stage,
+                   'item_group', mc.item_group,
+                   'capacity_kg_per_hr', mc.capacity_kg_per_hr
+                 )
+               ) FILTER (WHERE mc.machine_id IS NOT NULL) AS capacity
+        FROM machine m
+        LEFT JOIN machine_capacity mc ON m.machine_id = mc.machine_id
+        WHERE m.entity = $1
+        GROUP BY m.machine_id, m.machine_name, m.machine_type, m.floor, m.status, m.allocation
+        ORDER BY m.floor, m.machine_name
+        """,
+        entity_val,
+    )
+
+    floor_machines = []
+    for m in machine_rows:
+        mname_lower = (m["machine_name"] or "").strip().lower()
+        is_in_bom = mname_lower in bom_machine_names_lower if bom_machine_names_lower else False
+
+        # Parse capacity — asyncpg may return list of dicts or JSON strings
+        raw_cap = m["capacity"]
+        capacity = []
+        if raw_cap:
+            for cap_item in raw_cap:
+                if isinstance(cap_item, str):
+                    cap_item = json.loads(cap_item)
+                capacity.append({
+                    "stage": cap_item.get("stage"),
+                    "item_group": cap_item.get("item_group"),
+                    "capacity_kg_per_hr": _to_float(cap_item.get("capacity_kg_per_hr")),
+                })
+
+        floor_machines.append({
+            "machine_id": m["machine_id"],
+            "machine_name": m["machine_name"],
+            "machine_type": m["machine_type"],
+            "floor": m["floor"],
+            "status": m["status"],
+            "allocation": m["allocation"],
+            "is_in_bom": is_in_bom,
+            "capacity": capacity,
+        })
+
+    # ------------------------------------------------------------------
+    # Query 10 — Revision log + floor stock
+    # ------------------------------------------------------------------
+    # asyncpg connections are single-threaded — asyncio.gather on the same conn
+    # raises "another operation is in progress". Run sequentially instead.
+    rev_rows = await conn.fetch(
+        """
+        SELECT * FROM so_revision_log
+        WHERE fulfillment_id = $1
+        ORDER BY revised_at DESC LIMIT 10
+        """,
+        fulfillment_id,
+    )
+    stock_rows = await conn.fetch(
+        """
+        SELECT * FROM fulfillment_floor_stock
+        WHERE fulfillment_id = $1
+        ORDER BY created_at
+        """,
+        fulfillment_id,
+    )
+
+    revision_log = [_serialize_row(r) for r in rev_rows]
+    floor_stock = [_serialize_row(r) for r in stock_rows]
+
+    return {
+        "fulfillment": fulfillment,
+        "bom": {
+            "bom_id": bom_id,
+            "bom_note": bom_note,
+            "process_routes": process_routes,
+            "lines": lines,
+            "floors": list(bom_row["floors"] or []) if bom_row else [],
+        },
+        "floor_machines": floor_machines,
+        "linked_so": linked_so,
+        "revision_log": revision_log,
+        "floor_stock": floor_stock,
+    }
