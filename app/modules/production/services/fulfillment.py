@@ -1015,43 +1015,36 @@ async def get_floor_locations(conn, entity: str | None = None) -> dict:
                 ...
             }
         }
-    A machine has has_active_job=true if its allocation != 'idle'
+    A machine has has_active_job=true if allocation != 'idle'
     OR if it has a job_card in status 'pending'/'in_progress'.
     """
+    # Query 1: active machines with floor assignment
     params: list = []
-    idx = 1
-
-    entity_clause_m = ""
+    entity_clause = ""
     if entity:
-        entity_clause_m = f" AND m.entity = ${idx}"
+        entity_clause = " AND entity = $1"
         params.append(entity)
-        idx += 1
 
     machine_rows = await conn.fetch(
-        f"""
-        SELECT
-            m.floor,
-            m.machine_id,
-            m.machine_name,
-            m.machine_type,
-            CASE
-                WHEN m.allocation IS DISTINCT FROM 'idle' THEN true
-                WHEN EXISTS(
-                    SELECT 1 FROM job_card jc
-                    WHERE jc.machine_id = m.machine_id
-                      AND jc.status IN ('pending', 'in_progress')
-                ) THEN true
-                ELSE false
-            END AS has_active_job
-        FROM machine m
-        WHERE m.floor IS NOT NULL
-          AND m.status = 'active'
-          {entity_clause_m}
-        ORDER BY m.floor, m.machine_name
-        """,
+        f"SELECT machine_id, floor, machine_name, machine_type, allocation "
+        f"FROM machine "
+        f"WHERE floor IS NOT NULL AND status = 'active'{entity_clause} "
+        f"ORDER BY floor, machine_name",
         *params,
     )
 
+    # Query 2: which of those machines have an active job card
+    active_machine_ids: set = set()
+    if machine_rows:
+        mid_list = [r["machine_id"] for r in machine_rows]
+        active_rows = await conn.fetch(
+            "SELECT DISTINCT machine_id FROM job_card "
+            "WHERE machine_id = ANY($1) AND status IN ('pending', 'in_progress')",
+            mid_list,
+        )
+        active_machine_ids = {r["machine_id"] for r in active_rows}
+
+    # Query 3: floor names from inventory (no machines, just names)
     inv_params: list = []
     inv_q = "SELECT DISTINCT floor_location FROM floor_inventory WHERE floor_location IS NOT NULL"
     if entity:
@@ -1067,10 +1060,12 @@ async def get_floor_locations(conn, entity: str | None = None) -> dict:
         machine_floor_names.add(floor)
         if floor not in machines_by_floor:
             machines_by_floor[floor] = []
+        allocation = r["allocation"] or "idle"
+        has_active_job = (allocation != "idle") or (r["machine_id"] in active_machine_ids)
         machines_by_floor[floor].append({
             "machine_name": r["machine_name"],
             "machine_type": r["machine_type"] or "",
-            "has_active_job": bool(r["has_active_job"]),
+            "has_active_job": has_active_job,
         })
 
     inv_floor_names = {r["floor_location"] for r in inv_floors_rows}
