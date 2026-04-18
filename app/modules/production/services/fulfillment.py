@@ -10,6 +10,8 @@ import logging
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
+from app.webhooks import events
+
 logger = logging.getLogger(__name__)
 
 
@@ -36,7 +38,7 @@ async def sync_fulfillment(conn, entity: str | None = None) -> dict:
 
     # Find SO lines not yet in so_fulfillment
     query = """
-        SELECT h.so_id, h.so_date, h.customer_name, h.company,
+        SELECT h.so_id, h.so_number, h.so_date, h.customer_name, h.company,
                l.so_line_id, l.sku_name, l.quantity, l.quantity_units
         FROM so_header h
         JOIN so_line l ON h.so_id = l.so_id
@@ -66,13 +68,13 @@ async def sync_fulfillment(conn, entity: str | None = None) -> dict:
         result = await conn.execute(
             """
             INSERT INTO so_fulfillment (
-                so_line_id, so_id, financial_year, fg_sku_name, customer_name,
+                so_line_id, so_id, so_number, financial_year, fg_sku_name, customer_name,
                 original_qty_kg, pending_qty_kg, entity, delivery_deadline,
                 priority, order_status
-            ) VALUES ($1, $2, $3, $4, $5, $6, $6, $7, $8, 5, 'open')
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9, 5, 'open')
             ON CONFLICT (so_line_id, financial_year) DO NOTHING
             """,
-            r['so_line_id'], r['so_id'], fy, r['sku_name'], r['customer_name'],
+            r['so_line_id'], r['so_id'], r['so_number'], fy, r['sku_name'], r['customer_name'],
             qty_kg, ent, deadline,
         )
         if result == 'INSERT 0 1':
@@ -82,6 +84,8 @@ async def sync_fulfillment(conn, entity: str | None = None) -> dict:
 
     total = synced + skipped
     logger.info("Fulfillment sync: %d synced, %d skipped, %d total", synced, skipped, total)
+    if synced > 0:
+        await events.fulfillment_synced(entity or "", synced=synced, skipped=skipped, total=total)
     return {"synced": synced, "skipped": skipped, "total": total}
 
 
@@ -171,7 +175,7 @@ async def get_fulfillment_list(conn, *, entity=None, status=None, financial_year
     offset = (page - 1) * page_size
     rows = await conn.fetch(
         f"""
-        SELECT f.*, h.so_number, h.so_date
+        SELECT f.*, h.so_number AS so_number, h.so_date
         FROM so_fulfillment f
         LEFT JOIN so_header h ON f.so_id = h.so_id
         WHERE {where}
@@ -201,7 +205,7 @@ async def get_fy_review(conn, entity: str | None = None, financial_year: str | N
         fy = _derive_fy(today)
 
     query = """
-        SELECT f.*, h.so_number
+        SELECT f.*, h.so_number AS so_number
         FROM so_fulfillment f
         LEFT JOIN so_header h ON f.so_id = h.so_id
         WHERE f.financial_year = $1
@@ -299,6 +303,8 @@ async def revise_order(conn, fulfillment_id: int, *, new_qty: float | None = Non
             fulfillment_id, str(old['delivery_deadline']), str(new_date), reason, revised_by,
         )
 
+    await events.fulfillment_revised(old['entity'] or "", fulfillment_id=fulfillment_id, new_qty=new_qty, new_date=str(new_date) if new_date else None, revised_by=revised_by)
+
     return {"fulfillment_id": fulfillment_id, "revised": True}
 
 
@@ -386,7 +392,7 @@ async def get_enriched_fulfillment(conn, *, entity: str | None = None,
         f"""
         SELECT f.fulfillment_id, f.fg_sku_name, f.customer_name, f.pending_qty_kg,
                f.delivery_deadline, f.priority, f.order_status, f.entity,
-               h.so_number
+               h.so_number AS so_number
         FROM so_fulfillment f
         LEFT JOIN so_header h ON f.so_id = h.so_id
         WHERE {where}
@@ -909,7 +915,9 @@ async def get_filter_options(conn, *, entity=None, financial_year=None) -> dict:
         f"SELECT DISTINCT f.customer_name {base} ORDER BY f.customer_name", *params,
     )
     so_numbers = await conn.fetch(
-        f"SELECT DISTINCT h.so_number {base} AND h.so_number IS NOT NULL ORDER BY h.so_number", *params,
+        f"SELECT DISTINCT h.so_number AS so_number {base}"
+        f" AND h.so_number IS NOT NULL"
+        f" ORDER BY so_number", *params,
     )
     articles = await conn.fetch(
         f"SELECT DISTINCT f.fg_sku_name {base} ORDER BY f.fg_sku_name", *params,
@@ -1111,7 +1119,7 @@ async def get_fulfillment_detail(conn, fulfillment_id: int) -> dict | None:
     # ------------------------------------------------------------------
     row = await conn.fetchrow(
         """
-        SELECT sf.*, h.so_number
+        SELECT sf.*, h.so_number AS so_number
         FROM so_fulfillment sf
         LEFT JOIN so_header h ON sf.so_id = h.so_id
         WHERE sf.fulfillment_id = $1
