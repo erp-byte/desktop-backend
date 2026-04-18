@@ -12,5 +12,8 @@ class Settings(BaseSettings):
     MAX_PDF_SIZE_MB: int = 20
     EXTRACTION_MAX_RETRIES: int = 3
     CLAUDE_MODEL: str = "claude-sonnet-4-20250514"
+    INTERNAL_WEBHOOK_TOKEN: str = ""
+    WS_TOKEN_SECRET: str = ""
+    WS_TOKEN_EXPIRY_MINUTES: int = 5
 
     model_config = {"env_file": ".env", "extra": "ignore"}
