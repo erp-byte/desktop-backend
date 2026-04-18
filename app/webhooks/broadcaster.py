@@ -77,7 +77,9 @@ class ConnectionManager:
             targets = list(self._connections.items())
 
         for ws_id, info in targets:
-            if info["entity"] != event.entity:
+            # "*" in a role's event prefixes also waives entity scoping (admin sees all entities).
+            role_prefixes = ROLE_EVENT_MAP.get(info["role"], [])
+            if "*" not in role_prefixes and info["entity"] != event.entity:
                 continue
             if not self._should_receive(info["role"], event):
                 continue
