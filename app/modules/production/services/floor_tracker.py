@@ -12,6 +12,7 @@ Allowed transitions:
 """
 
 import logging
+from app.webhooks import events
 from datetime import date
 
 logger = logging.getLogger(__name__)
@@ -107,6 +108,8 @@ async def move_material(conn, sku_name: str, from_location: str, to_location: st
         sku_name, from_location, to_location, qty_kg,
         reason, job_card_id, scanned_qr_codes, entity, moved_by,
     )
+
+    await events.material_moved(entity, sku_name=sku_name, from_location=from_location, to_location=to_location, qty_kg=qty_kg, movement_id=movement_id)
 
     logger.info("Moved %.3f kg of '%s' from %s → %s (entity=%s)", qty_kg, sku_name, from_location, to_location, entity)
     return {

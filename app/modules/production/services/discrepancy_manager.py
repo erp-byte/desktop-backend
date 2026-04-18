@@ -6,6 +6,7 @@ Auto-holds affected job cards. 5 resolution paths with audit trail.
 
 import logging
 from datetime import datetime
+from app.webhooks import events
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +137,8 @@ async def report_discrepancy(conn, *, discrepancy_type: str, severity: str = "ma
         f"{customer_impact or ''}",
         disc_id, entity,
     )
+
+    await events.dayend_discrepancy_found(entity, discrepancy_type=discrepancy_type, severity=severity, affected_material=affected_material, affected_job_cards=len(affected_jc_ids))
 
     logger.info("Discrepancy %d reported: %s, %d JCs held, %d alerted",
                 disc_id, discrepancy_type, held, alerted)

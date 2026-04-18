@@ -9,6 +9,8 @@ Runs against approved production plan lines:
 
 import logging
 
+from app.webhooks import events
+
 logger = logging.getLogger(__name__)
 
 
@@ -135,7 +137,7 @@ async def run_mrp(conn, plan_id: int, entity: str) -> dict:
     logger.info("MRP run for plan %d: %d materials, %d sufficient, %d shortage (%.1f kg total)",
                 plan_id, len(materials), sufficient, shortage_count, total_shortage)
 
-    return {
+    result = {
         "plan_id": plan_id,
         "materials": materials,
         "summary": {
@@ -145,6 +147,12 @@ async def run_mrp(conn, plan_id: int, entity: str) -> dict:
             "total_shortage_kg": round(total_shortage, 3),
         },
     }
+
+    await events.mrp_completed(entity, plan_id=plan_id, summary=result["summary"])
+    if shortage_count > 0:
+        await events.mrp_shortage_detected(entity, plan_id=plan_id, shortage_count=shortage_count, total_shortage_kg=round(total_shortage, 3))
+
+    return result
 
 
 async def check_availability(conn, material_sku: str, qty_needed: float, entity: str) -> dict:

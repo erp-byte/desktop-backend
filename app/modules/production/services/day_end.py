@@ -6,6 +6,7 @@
 
 import logging
 from datetime import date, datetime, timedelta
+from app.webhooks import events
 
 logger = logging.getLogger(__name__)
 
@@ -308,6 +309,8 @@ async def reconcile_scan(conn, scan_id: int, reviewed_by: str) -> dict:
         "UPDATE day_end_balance_scan SET status = 'reconciled', reviewed_by = $2, reviewed_at = NOW() WHERE scan_id = $1",
         scan_id, reviewed_by,
     )
+
+    await events.dayend_reconciled(scan['entity'], scan_id=scan_id, floor_location=scan['floor_location'])
 
     logger.info("Reconciled scan %d: %d adjustments", scan_id, adjustments)
     return {"scan_id": scan_id, "status": "reconciled", "adjustments": adjustments, "reviewed_by": reviewed_by}
