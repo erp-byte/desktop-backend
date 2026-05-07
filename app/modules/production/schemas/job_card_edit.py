@@ -7,22 +7,21 @@ fields the client actually sent appear in the dict — that is what guarantees
 the 'preserve unspecified columns' behavior.
 """
 
-from typing import Optional, List
 from pydantic import BaseModel, Field
 
 
 class JobCardPatchRequest(BaseModel):
-    machine_id:              Optional[int]       = None
-    assigned_to_team_leader: Optional[str]       = None
-    team_members:            Optional[List[str]] = None
-    factory:                 Optional[str]       = None
-    floor:                   Optional[str]       = None
-    customer_name:           Optional[str]       = None
-    batch_number:            Optional[str]       = None
-    batch_size_kg:           Optional[float]     = Field(None, gt=0)
-    bom_id:                  Optional[int]       = None
-    process_name:            Optional[str]       = None
-    stage:                   Optional[str]       = None
+    machine_id:              int | None       = None
+    assigned_to_team_leader: str | None       = None
+    team_members:            list[str] | None = None
+    factory:                 str | None       = None
+    floor:                   str | None       = None
+    customer_name:           str | None       = None
+    batch_number:            str | None       = None
+    batch_size_kg:           float | None     = Field(None, gt=0)
+    bom_id:                  int | None       = None
+    process_name:            str | None       = None
+    stage:                   str | None       = None
     updated_by:              str
 
 
@@ -32,42 +31,42 @@ class JobCardCancelRequest(BaseModel):
 
 
 class EnvironmentPatchRequest(BaseModel):
-    parameter_name: Optional[str] = None
-    value:          Optional[str] = None
+    parameter_name: str | None = None
+    value:          str | None = None
     updated_by:     str
 
 
 class MetalDetectionPatchRequest(BaseModel):
-    check_type:   Optional[str]  = None
-    fe_pass:      Optional[bool] = None
-    nfe_pass:     Optional[bool] = None
-    ss_pass:      Optional[bool] = None
-    failed_units: Optional[int]  = Field(None, ge=0)
-    remarks:      Optional[str]  = None
+    check_type:   str | None  = None
+    fe_pass:      bool | None = None
+    nfe_pass:     bool | None = None
+    ss_pass:      bool | None = None
+    failed_units: int | None  = Field(None, ge=0)
+    remarks:      str | None  = None
     updated_by:   str
 
 
 class WeightCheckPatchRequest(BaseModel):
-    sample_number:  Optional[int]   = Field(None, gt=0)
-    net_weight:     Optional[float] = Field(None, ge=0)
-    gross_weight:   Optional[float] = Field(None, ge=0)
-    leak_test_pass: Optional[bool]  = None
+    sample_number:  int | None   = Field(None, gt=0)
+    net_weight:     float | None = Field(None, ge=0)
+    gross_weight:   float | None = Field(None, ge=0)
+    leak_test_pass: bool | None  = None
     updated_by:     str
 
 
 class LossReconciliationPatchRequest(BaseModel):
-    loss_category:     Optional[str]   = None
-    budgeted_loss_pct: Optional[float] = Field(None, ge=0)
-    budgeted_loss_kg:  Optional[float] = Field(None, ge=0)
-    actual_loss_kg:    Optional[float] = Field(None, ge=0)
-    variance_kg:       Optional[float] = None
-    remarks:           Optional[str]   = None
+    loss_category:     str | None   = None
+    budgeted_loss_pct: float | None = Field(None, ge=0)
+    budgeted_loss_kg:  float | None = Field(None, ge=0)
+    actual_loss_kg:    float | None = Field(None, ge=0)
+    variance_kg:       float | None = None
+    remarks:           str | None   = None
     updated_by:        str
 
 
 class RemarkPatchRequest(BaseModel):
-    remark_type: Optional[str] = None
-    content:     Optional[str] = None
+    remark_type: str | None = None
+    content:     str | None = None
     updated_by:  str
 
 
