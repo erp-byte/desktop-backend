@@ -561,8 +561,8 @@ async def approve_plan(plan_id: int, approved_by: str) -> str:
                     "UPDATE production_plan SET status='approved', approved_by=$2, approved_at=NOW() WHERE plan_id=$1",
                     plan_id, approved_by
                 )
-                from modules.production.services.mrp import run_mrp
-                from modules.production.services.indent_manager import generate_draft_indents
+                from app.modules.production.services.mrp import run_mrp
+                from app.modules.production.services.indent_manager import generate_draft_indents
                 mrp = await run_mrp(conn, plan_id, plan['entity'])
                 indents = await generate_draft_indents(conn, mrp, plan_id, plan['entity'])
     await emit_event("plan.approved", plan['entity'], {"plan_id": plan_id, "approved_by": approved_by}, target_roles=["planner", "admin"])

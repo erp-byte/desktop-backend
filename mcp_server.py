@@ -686,8 +686,8 @@ async def approve_plan(plan_id: int, approved_by: str) -> str:
             async with conn.transaction():
                 await conn.execute("UPDATE production_plan SET status='approved', approved_by=$2, approved_at=NOW() WHERE plan_id=$1", plan_id, approved_by)
                 # Import and run MRP
-                from modules.production.services.mrp import run_mrp
-                from modules.production.services.indent_manager import generate_draft_indents
+                from app.modules.production.services.mrp import run_mrp
+                from app.modules.production.services.indent_manager import generate_draft_indents
                 mrp_result = await run_mrp(conn, plan_id, plan['entity'])
                 draft_result = await generate_draft_indents(conn, mrp_result, plan_id, plan['entity'])
     await emit_event("plan.approved", plan['entity'], {"plan_id": plan_id, "approved_by": approved_by, "mrp_summary": mrp_result["summary"]}, target_roles=["planner", "admin"])
@@ -726,8 +726,8 @@ async def run_mrp(plan_id: int) -> str:
         from app.webhooks.event_bus import deferred_events
         async with deferred_events():
             async with conn.transaction():
-                from modules.production.services.mrp import run_mrp as _mrp
-                from modules.production.services.indent_manager import generate_draft_indents
+                from app.modules.production.services.mrp import run_mrp as _mrp
+                from app.modules.production.services.indent_manager import generate_draft_indents
                 mrp_result = await _mrp(conn, plan_id, plan['entity'])
                 draft_result = await generate_draft_indents(conn, mrp_result, plan_id, plan['entity'])
     mrp_result["draft_indents"] = draft_result["indents"]
@@ -906,7 +906,7 @@ async def create_production_orders(plan_id: int) -> str:
             return "Plan not found."
         async with conn.transaction():
             import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-            from modules.production.services.job_card_engine import create_production_orders as _create
+            from app.modules.production.services.job_card_engine import create_production_orders as _create
             result = await _create(conn, plan_id, plan['entity'])
     return _dumps(result)
 
@@ -949,7 +949,7 @@ async def generate_job_cards(prod_order_id: int) -> str:
     async with pool.acquire() as conn:
         async with conn.transaction():
             import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-            from modules.production.services.job_card_engine import create_job_cards as _create
+            from app.modules.production.services.job_card_engine import create_job_cards as _create
             result = await _create(conn, prod_order_id)
     return _dumps(result)
 
@@ -983,7 +983,7 @@ async def get_job_card_detail(job_card_id: int) -> str:
     pool = await get_pool()
     async with pool.acquire() as conn:
         import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-        from modules.production.services.job_card_engine import get_job_card_detail as _detail
+        from app.modules.production.services.job_card_engine import get_job_card_detail as _detail
         result = await _detail(conn, job_card_id)
     if not result:
         return "Job card not found."
@@ -1025,7 +1025,7 @@ async def assign_job_card(job_card_id: int, team_leader: str, team_members: list
     pool = await get_pool()
     async with pool.acquire() as conn:
         import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-        from modules.production.services.job_card_engine import assign_job_card as _assign
+        from app.modules.production.services.job_card_engine import assign_job_card as _assign
         result = await _assign(conn, job_card_id, team_leader, team_members or None)
     return _dumps(result)
 
@@ -1040,7 +1040,7 @@ async def receive_material_qr(job_card_id: int, box_ids: list[str]) -> str:
             return "Job card not found."
         async with conn.transaction():
             import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-            from modules.production.services.qr_service import receive_material_via_qr
+            from app.modules.production.services.qr_service import receive_material_via_qr
             result = await receive_material_via_qr(conn, job_card_id, box_ids, jc['entity'])
     return _dumps(result)
 
@@ -1051,7 +1051,7 @@ async def start_job_card(job_card_id: int) -> str:
     pool = await get_pool()
     async with pool.acquire() as conn:
         import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-        from modules.production.services.job_card_engine import start_job_card as _start
+        from app.modules.production.services.job_card_engine import start_job_card as _start
         result = await _start(conn, job_card_id)
     return _dumps(result)
 
@@ -1062,7 +1062,7 @@ async def complete_process_step(job_card_id: int, step_number: int, operator_nam
     pool = await get_pool()
     async with pool.acquire() as conn:
         import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-        from modules.production.services.job_card_engine import complete_process_step as _complete
+        from app.modules.production.services.job_card_engine import complete_process_step as _complete
         result = await _complete(conn, job_card_id, step_number, operator_name, qc_passed)
     return _dumps(result)
 
@@ -1075,7 +1075,7 @@ async def record_output(job_card_id: int, fg_actual_units: int = 0, fg_actual_kg
     async with pool.acquire() as conn:
         async with conn.transaction():
             import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-            from modules.production.services.job_card_engine import record_output as _record
+            from app.modules.production.services.job_card_engine import record_output as _record
             result = await _record(conn, job_card_id, data)
     return _dumps(result)
 
@@ -1090,7 +1090,7 @@ async def complete_job_card(job_card_id: int) -> str:
             return "Job card not found."
         async with conn.transaction():
             import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-            from modules.production.services.job_card_engine import complete_job_card as _complete
+            from app.modules.production.services.job_card_engine import complete_job_card as _complete
             result = await _complete(conn, job_card_id, jc['entity'])
     return _dumps(result)
 
@@ -1110,7 +1110,7 @@ async def close_job_card(job_card_id: int) -> str:
     pool = await get_pool()
     async with pool.acquire() as conn:
         import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-        from modules.production.services.job_card_engine import close_job_card as _close
+        from app.modules.production.services.job_card_engine import close_job_card as _close
         result = await _close(conn, job_card_id)
     return _dumps(result)
 
@@ -1125,7 +1125,7 @@ async def force_unlock_job_card(job_card_id: int, authority: str, reason: str) -
             return "Job card not found."
         async with conn.transaction():
             import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-            from modules.production.services.job_card_engine import force_unlock as _force
+            from app.modules.production.services.job_card_engine import force_unlock as _force
             result = await _force(conn, job_card_id, authority, reason, jc['entity'])
     return _dumps(result)
 
@@ -1223,7 +1223,7 @@ async def move_material(sku_name: str, from_location: str, to_location: str, qua
     async with pool.acquire() as conn:
         async with conn.transaction():
             import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-            from modules.production.services.floor_tracker import move_material as _move
+            from app.modules.production.services.floor_tracker import move_material as _move
             result = await _move(conn, sku_name, from_location, to_location, quantity_kg, entity, reason=reason, moved_by=moved_by)
     if "error" in result:
         return result["message"]
@@ -1257,7 +1257,7 @@ async def check_idle_materials(entity: str) -> str:
     async with pool.acquire() as conn:
         async with conn.transaction():
             import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-            from modules.production.services.idle_checker import check_idle_materials as _check
+            from app.modules.production.services.idle_checker import check_idle_materials as _check
             result = await _check(conn, entity)
     return _dumps(result)
 
@@ -1341,7 +1341,7 @@ async def get_day_end_summary(entity: str, target_date: str = "") -> str:
     pool = await get_pool()
     async with pool.acquire() as conn:
         import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-        from modules.production.services.day_end import get_day_end_summary as _summary
+        from app.modules.production.services.day_end import get_day_end_summary as _summary
         d = date.fromisoformat(target_date) if target_date else None
         result = await _summary(conn, entity, d)
     return _dumps(result)
@@ -1355,7 +1355,7 @@ async def submit_dispatch(dispatches_json: str, entity: str) -> str:
     async with pool.acquire() as conn:
         async with conn.transaction():
             import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-            from modules.production.services.day_end import bulk_dispatch
+            from app.modules.production.services.day_end import bulk_dispatch
             result = await bulk_dispatch(conn, dispatches, entity)
     return _dumps(result)
 
@@ -1368,7 +1368,7 @@ async def submit_balance_scan(floor_location: str, entity: str, submitted_by: st
     async with pool.acquire() as conn:
         async with conn.transaction():
             import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-            from modules.production.services.day_end import submit_balance_scan as _submit
+            from app.modules.production.services.day_end import submit_balance_scan as _submit
             result = await _submit(conn, floor_location, entity, submitted_by, scan_lines)
     return _dumps(result)
 
@@ -1379,7 +1379,7 @@ async def get_scan_status(entity: str, target_date: str = "") -> str:
     pool = await get_pool()
     async with pool.acquire() as conn:
         import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-        from modules.production.services.day_end import get_scan_status as _status
+        from app.modules.production.services.day_end import get_scan_status as _status
         d = date.fromisoformat(target_date) if target_date else None
         result = await _status(conn, entity, d)
     return _dumps(result)
@@ -1391,7 +1391,7 @@ async def get_scan_detail(scan_id: int) -> str:
     pool = await get_pool()
     async with pool.acquire() as conn:
         import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-        from modules.production.services.day_end import get_scan_detail as _detail
+        from app.modules.production.services.day_end import get_scan_detail as _detail
         result = await _detail(conn, scan_id)
     if not result:
         return "Scan not found."
@@ -1405,7 +1405,7 @@ async def reconcile_scan(scan_id: int, reviewed_by: str) -> str:
     async with pool.acquire() as conn:
         async with conn.transaction():
             import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-            from modules.production.services.day_end import reconcile_scan as _reconcile
+            from app.modules.production.services.day_end import reconcile_scan as _reconcile
             result = await _reconcile(conn, scan_id, reviewed_by)
     return _dumps(result)
 
@@ -1417,7 +1417,7 @@ async def check_missing_scans(entity: str, target_date: str = "") -> str:
     async with pool.acquire() as conn:
         async with conn.transaction():
             import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-            from modules.production.services.day_end import check_missing_scans as _check
+            from app.modules.production.services.day_end import check_missing_scans as _check
             d = date.fromisoformat(target_date) if target_date else None
             result = await _check(conn, entity, d)
     return _dumps(result)
@@ -1454,7 +1454,7 @@ async def revise_plan(plan_id: int, change_event: str) -> str:
         if not plan:
             return "Plan not found."
         import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-        from modules.production.services.ai_planner import collect_revision_context
+        from app.modules.production.services.ai_planner import collect_revision_context
         context = await collect_revision_context(conn, plan_id, change_event, plan['entity'])
     return _dumps(context)
 
@@ -1492,7 +1492,7 @@ async def report_discrepancy(discrepancy_type: str, entity: str, severity: str =
     async with pool.acquire() as conn:
         async with conn.transaction():
             import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-            from modules.production.services.discrepancy_manager import report_discrepancy as _report
+            from app.modules.production.services.discrepancy_manager import report_discrepancy as _report
             result = await _report(conn, discrepancy_type=discrepancy_type, severity=severity, affected_material=affected_material or None, affected_machine_id=affected_machine_id or None, details=details, reported_by=reported_by, entity=entity)
     return _dumps(result)
 
@@ -1520,7 +1520,7 @@ async def get_discrepancy_detail(discrepancy_id: int) -> str:
     pool = await get_pool()
     async with pool.acquire() as conn:
         import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-        from modules.production.services.discrepancy_manager import get_discrepancy_detail as _detail
+        from app.modules.production.services.discrepancy_manager import get_discrepancy_detail as _detail
         result = await _detail(conn, discrepancy_id)
     if not result:
         return "Discrepancy not found."
@@ -1537,7 +1537,7 @@ async def resolve_discrepancy(discrepancy_id: int, resolution_type: str, resolut
             return "Discrepancy not found."
         async with conn.transaction():
             import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-            from modules.production.services.discrepancy_manager import resolve_discrepancy as _resolve
+            from app.modules.production.services.discrepancy_manager import resolve_discrepancy as _resolve
             result = await _resolve(conn, discrepancy_id, resolution_type=resolution_type, resolution_details=resolution_details, resolved_by=resolved_by, entity=disc['entity'])
     return _dumps(result)
 

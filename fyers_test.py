@@ -161,7 +161,7 @@ def get_index_symbols(cm_df: pd.DataFrame) -> list:
     return index_list
 
 
-def build_futures_symbol(nse_symbol: str, year: int = None, month: int = None) -> str:
+def build_futures_symbol(nse_symbol: str, year: int | None = None, month: int | None = None) -> str:
     """Build current month futures symbol."""
     if year is None or month is None:
         today = date.today()

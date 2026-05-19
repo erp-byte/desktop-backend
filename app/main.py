@@ -11,19 +11,19 @@ from mangum import Mangum
 from pydantic import BaseModel
 
 from app.config import Settings
-from core.middleware import request_context
-from db.connection import create_pool, close_pool
-from modules.auth.router import router as auth_router
-from modules.so.router import router as so_router
-from modules.purchase.router import router as purchase_router
-from modules.purchase.po_router import router as po_router
-from modules.receipt.router import router as receipt_router
-from modules.ncr.router import router as ncr_router
-from modules.production.router import router as production_router
-from modules.amendment_router import router as amendment_router
-from modules.vendor.router import router as vendor_router
-from modules.so.services.item_matcher import load_master_items
-from modules.production.services.master_ingest import run_master_ingest
+from app.core.middleware import request_context
+from app.db.connection import create_pool, close_pool
+from app.modules.auth.router import router as auth_router
+from app.modules.so.router import router as so_router
+from app.modules.purchase.router import router as purchase_router
+from app.modules.purchase.po_router import router as po_router
+from app.modules.receipt.router import router as receipt_router
+from app.modules.ncr.router import router as ncr_router
+from app.modules.production.router import router as production_router
+from app.modules.amendment_router import router as amendment_router
+from app.modules.vendor.router import router as vendor_router
+from app.modules.so.services.item_matcher import load_master_items
+from app.modules.production.services.master_ingest import run_master_ingest
 
 from app.webhooks.event_bus import event_bus, Event
 from app.webhooks.dispatcher import dispatcher_loop

@@ -10,7 +10,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
-from modules.auth.middleware import require_permission
+from app.modules.auth.middleware import require_permission
 from .event_bus import Event, event_bus
 from .signer import sign_payload
 
