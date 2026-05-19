@@ -53,8 +53,13 @@ class EventBus:
                 try:
                     q.put_nowait(event)
                 except asyncio.QueueFull:
-                    logger.warning(
-                        "Subscriber queue full, dropping event %s", event.event_id
+                    # HI-03: elevate to error — a full subscriber queue means
+                    # the dispatcher (or broadcaster) is backlogged and events
+                    # are being silently dropped. Ops needs visibility.
+                    logger.error(
+                        "Subscriber queue full, DROPPING event %s (type=%s entity=%s). "
+                        "Dispatcher/broadcaster is backlogged.",
+                        event.event_id, event.event_type, event.entity,
                     )
 
     async def subscribe(self) -> "Subscription":

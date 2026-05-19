@@ -18,6 +18,23 @@ BACKOFF_SECONDS = [10, 40, 90]
 
 _delivery_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DELIVERIES)
 
+# CR-02: cap per-event fan-out so a burst of events with many subscribers
+# cannot spawn thousands of concurrent tasks competing for the DB pool.
+_dispatch_concurrency = asyncio.Semaphore(8)
+
+# HI-01: strong refs for in-flight delivery tasks. asyncio.create_task only
+# holds weak refs, so without this tasks can be GC'd mid-flight. The set is
+# also used by the lifespan shutdown path (if wired up) to drain cleanly.
+_inflight_tasks: set[asyncio.Task] = set()
+
+
+def _spawn(coro) -> asyncio.Task:
+    """Track the task so it can't be GC'd mid-flight (HI-01)."""
+    t = asyncio.create_task(coro)
+    _inflight_tasks.add(t)
+    t.add_done_callback(_inflight_tasks.discard)
+    return t
+
 
 async def dispatcher_loop(pool) -> None:
     """Main loop — subscribe to event bus, match subscriptions, deliver."""
@@ -40,24 +57,25 @@ async def dispatcher_loop(pool) -> None:
 
 async def _dispatch_event(client: httpx.AsyncClient, pool, event: Event) -> None:
     """Find matching subscriptions and deliver to each."""
-    async with pool.acquire() as conn:
-        subs = await conn.fetch(
-            """
-            SELECT e.id AS endpoint_id, e.url, e.secret, s.event_type
-            FROM webhook_subscription s
-            JOIN webhook_endpoint e ON e.id = s.endpoint_id
-            WHERE s.event_type IN ($1, '*')
-              AND e.entity = $2
-              AND e.is_active = TRUE
-              AND s.is_active = TRUE
-            """,
-            event.event_type, event.entity,
-        )
+    # CR-02: bound concurrent dispatch so a burst of events cannot flood the pool.
+    async with _dispatch_concurrency:
+        async with pool.acquire() as conn:
+            subs = await conn.fetch(
+                """
+                SELECT e.id AS endpoint_id, e.url, e.secret, s.event_type
+                FROM webhook_subscription s
+                JOIN webhook_endpoint e ON e.id = s.endpoint_id
+                WHERE s.event_type IN ($1, '*')
+                  AND e.entity = $2
+                  AND e.is_active = TRUE
+                  AND s.is_active = TRUE
+                """,
+                event.event_type, event.entity,
+            )
 
-    for sub in subs:
-        asyncio.create_task(
-            _throttled_deliver(client, pool, sub, event)
-        )
+        for sub in subs:
+            # HI-01: use _spawn so the task is strong-ref'd until completion.
+            _spawn(_throttled_deliver(client, pool, sub, event))
 
 
 async def _throttled_deliver(client, pool, sub, event: Event) -> None:
@@ -95,12 +113,14 @@ async def _deliver(client: httpx.AsyncClient, pool, sub, event: Event,
                 delivery_id = await conn.fetchval(
                     """
                     INSERT INTO webhook_delivery
-                        (endpoint_id, event_type, event_id, payload, status, attempts, last_attempt_at)
-                    VALUES ($1, $2, $3, $4::jsonb, 'pending', 0, $5)
+                        (endpoint_id, event_type, event_id, payload, target_roles,
+                         status, attempts, last_attempt_at)
+                    VALUES ($1, $2, $3, $4::jsonb, $5, 'pending', 0, $6)
                     RETURNING id
                     """,
                     sub["endpoint_id"], event.event_type, event.event_id,
-                    body, datetime.now(timezone.utc),
+                    body, list(event.target_roles or []),
+                    datetime.now(timezone.utc),
                 )
         except Exception:
             logger.exception("Failed to create delivery record")

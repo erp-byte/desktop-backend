@@ -7,7 +7,7 @@ import jwt
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
-from app.modules.auth.middleware import get_current_user
+from modules.auth.middleware import get_current_user
 from .broadcaster import manager
 
 logger = logging.getLogger(__name__)

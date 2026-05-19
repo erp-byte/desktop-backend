@@ -18,10 +18,33 @@ Deploy:       Add to Render as web service, start command: python mcp_server.py
 import json
 import logging
 import os
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from decimal import Decimal
 
 import asyncpg
 from mcp.server.fastmcp import FastMCP
+
+
+def _clean_row(row):
+    """Convert asyncpg Record to JSON-safe dict. None stays None (→ JSON null)."""
+    d = dict(row)
+    for k, v in d.items():
+        if isinstance(v, Decimal):
+            d[k] = float(v)
+        elif isinstance(v, (datetime, date)):
+            d[k] = v.isoformat()
+    return d
+
+
+def _dumps(obj):
+    """json.dumps handling Decimal/datetime without converting None→'None'."""
+    def _default(o):
+        if isinstance(o, Decimal):
+            return float(o)
+        if isinstance(o, (datetime, date)):
+            return o.isoformat()
+        return str(o)
+    return json.dumps(obj, default=_default, indent=2)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -58,8 +81,36 @@ async def get_pool() -> asyncpg.Pool:
                         break
         if not db_url:
             raise RuntimeError("DATABASE_URL not set")
-        _pool = await asyncpg.create_pool(db_url, min_size=1, max_size=5)
+        _pool = await asyncpg.create_pool(db_url, min_size=0, max_size=3)
     return _pool
+
+
+# ---------------------------------------------------------------------------
+# Event bridge — fire-and-forget to main server's webhook bus
+# ---------------------------------------------------------------------------
+
+async def emit_event(event_type: str, entity: str, payload: dict,
+                     actor: str = "mcp", target_roles: list[str] | None = None) -> None:
+    url = os.environ.get("MAIN_SERVER_URL", "")
+    token = os.environ.get("INTERNAL_WEBHOOK_TOKEN", "")
+    if not url or not token:
+        return
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=5) as client:
+            await client.post(
+                f"{url}/internal/events",
+                json={
+                    "event_type": event_type,
+                    "entity": entity,
+                    "payload": payload,
+                    "actor": actor,
+                    "target_roles": target_roles or [],
+                },
+                headers={"Authorization": f"Bearer {token}"},
+            )
+    except Exception as e:
+        logger.warning("emit_event(%s) failed: %s", event_type, e)
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +233,7 @@ async def get_planning_context(entity: str, fulfillment_ids: list[int], target_d
 
             demand.append({
                 "fulfillment_id": r['fulfillment_id'], "fg_sku_name": r['fg_sku_name'],
-                "customer": r['customer_name'], "qty_kg": qty_kg,
+                "customer_name": r['customer_name'], "qty_kg": qty_kg,
                 "deadline": str(r['delivery_deadline']), "priority": r['priority'],
                 "production_type": production_type, "bom_id": bom_id,
                 "process_route": process_route or ['packaging'], "materials": materials,
@@ -235,7 +286,7 @@ async def get_planning_context(entity: str, fulfillment_ids: list[int], target_d
         "in_progress_jobs": [dict(j) for j in jobs],
         "pending_indents": [dict(i) for i in indents],
     }
-    return json.dumps(context, default=str, indent=2)
+    return _dumps(context)
 
 
 # ---------------------------------------------------------------------------
@@ -265,7 +316,7 @@ async def get_demand_summary(entity: str = "", financial_year: str = "") -> str:
         query += " GROUP BY fg_sku_name, customer_name ORDER BY MIN(delivery_deadline)"
         rows = await conn.fetch(query, *params)
 
-    return json.dumps([dict(r) for r in rows], default=str, indent=2)
+    return _dumps([_clean_row(r) for r in rows])
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +353,7 @@ async def get_fulfillment_list(entity: str = "", status: str = "open,partial", p
             *params, page_size, offset,
         )
 
-    return json.dumps({"total": count, "page": page, "results": [dict(r) for r in rows]}, default=str, indent=2)
+    return _dumps({"total": count, "page": page, "results": [_clean_row(r) for r in rows]})
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +405,7 @@ async def save_production_plan(
                 """,
                 f"{plan_type.title()} Plan — {date_from}",
                 entity, plan_type, date_from, date_from, date_to,
-                json.dumps(full_analysis, default=str),
+                _dumps(full_analysis),
             )
 
             # Machine lookup
@@ -373,8 +424,24 @@ async def save_production_plan(
                         "SELECT bom_id FROM bom_header WHERE fg_sku_name = $1 AND is_active = TRUE LIMIT 1", fg_name,
                     )
 
-                stage_seq = item.get("stage_sequence", [])
-                linked_ids = item.get("linked_fulfillment_ids", [])
+                # Normalize field name variants from AI responses
+                customer_name = item.get("customer_name") or item.get("customer")
+                reasoning = item.get("reasoning") or item.get("notes")
+                linked_ids = item.get("linked_fulfillment_ids") or item.get("linked_ids") or []
+                # Support single fulfillment_id → array
+                if not linked_ids and item.get("fulfillment_id"):
+                    linked_ids = [item["fulfillment_id"]]
+
+                # Fallback: pull customer_name from linked fulfillment if still missing
+                if not customer_name and linked_ids:
+                    customer_name = await conn.fetchval(
+                        "SELECT customer_name FROM so_fulfillment WHERE fulfillment_id = $1",
+                        linked_ids[0],
+                    )
+
+                stage_seq = item.get("stage_sequence") or []
+                if not stage_seq and item.get("process_stage"):
+                    stage_seq = [item["process_stage"]]
 
                 await conn.execute(
                     """
@@ -385,11 +452,11 @@ async def save_production_plan(
                         linked_so_fulfillment_ids, reasoning
                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                     """,
-                    plan_id, fg_name, item.get("customer_name"),
+                    plan_id, fg_name, customer_name,
                     bom_id, item.get("qty_kg", 0), item.get("qty_units"),
                     machine_id, item.get("priority", 5), item.get("shift", "day"),
                     stage_seq or None, item.get("estimated_hours"),
-                    linked_ids or None, item.get("reasoning"),
+                    linked_ids or None, reasoning,
                 )
                 lines_created += 1
 
@@ -422,7 +489,7 @@ async def list_plans(entity: str = "", status: str = "", plan_type: str = "") ->
                 FROM production_plan WHERE {where} ORDER BY created_at DESC LIMIT 20""",
             *params,
         )
-    return json.dumps([dict(r) for r in rows], default=str, indent=2)
+    return _dumps([_clean_row(r) for r in rows])
 
 
 # ---------------------------------------------------------------------------
@@ -441,8 +508,8 @@ async def get_plan_detail(plan_id: int) -> str:
             "SELECT * FROM production_plan_line WHERE plan_id = $1 ORDER BY priority", plan_id,
         )
 
-    result = dict(plan)
-    result["lines"] = [dict(l) for l in lines]
+    result = _clean_row(plan)
+    result["lines"] = [_clean_row(l) for l in lines]
     ai_json = result.get("ai_analysis_json")
     if ai_json:
         if isinstance(ai_json, str):
@@ -450,7 +517,7 @@ async def get_plan_detail(plan_id: int) -> str:
         result["material_check"] = ai_json.get("material_check", [])
         result["risk_flags"] = ai_json.get("risk_flags", [])
 
-    return json.dumps(result, default=str, indent=2)
+    return _dumps(result)
 
 
 # ---------------------------------------------------------------------------
@@ -475,7 +542,7 @@ async def fy_review(entity: str = "", financial_year: str = "") -> str:
             params.append(entity)
         query += " ORDER BY f.customer_name, f.delivery_deadline"
         rows = await conn.fetch(query, *params)
-    return json.dumps([dict(r) for r in rows], default=str, indent=2)
+    return _dumps([_clean_row(r) for r in rows])
 
 
 @mcp.tool()
@@ -612,15 +679,19 @@ async def approve_plan(plan_id: int, approved_by: str) -> str:
             return "Plan not found."
         if plan['status'] != 'draft':
             return "Only draft plans can be approved."
-        async with conn.transaction():
-            await conn.execute("UPDATE production_plan SET status='approved', approved_by=$2, approved_at=NOW() WHERE plan_id=$1", plan_id, approved_by)
-            # Import and run MRP
-            import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-            from app.modules.production.services.mrp import run_mrp
-            from app.modules.production.services.indent_manager import generate_draft_indents
-            mrp_result = await run_mrp(conn, plan_id, plan['entity'])
-            draft_result = await generate_draft_indents(conn, mrp_result, plan_id, plan['entity'])
-    return json.dumps({"plan_id": plan_id, "status": "approved", "approved_by": approved_by, "mrp_summary": mrp_result["summary"], "draft_indents": draft_result["indents"]}, default=str, indent=2)
+        # C2: buffer events inside the transaction and flush only on commit.
+        import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
+        from app.webhooks.event_bus import deferred_events
+        async with deferred_events():
+            async with conn.transaction():
+                await conn.execute("UPDATE production_plan SET status='approved', approved_by=$2, approved_at=NOW() WHERE plan_id=$1", plan_id, approved_by)
+                # Import and run MRP
+                from modules.production.services.mrp import run_mrp
+                from modules.production.services.indent_manager import generate_draft_indents
+                mrp_result = await run_mrp(conn, plan_id, plan['entity'])
+                draft_result = await generate_draft_indents(conn, mrp_result, plan_id, plan['entity'])
+    await emit_event("plan.approved", plan['entity'], {"plan_id": plan_id, "approved_by": approved_by, "mrp_summary": mrp_result["summary"]}, target_roles=["planner", "admin"])
+    return _dumps({"plan_id": plan_id, "status": "approved", "approved_by": approved_by, "mrp_summary": mrp_result["summary"], "draft_indents": draft_result["indents"]})
 
 
 @mcp.tool()
@@ -650,14 +721,17 @@ async def run_mrp(plan_id: int) -> str:
         plan = await conn.fetchrow("SELECT status, entity FROM production_plan WHERE plan_id=$1", plan_id)
         if not plan:
             return "Plan not found."
-        async with conn.transaction():
-            import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-            from app.modules.production.services.mrp import run_mrp as _mrp
-            from app.modules.production.services.indent_manager import generate_draft_indents
-            mrp_result = await _mrp(conn, plan_id, plan['entity'])
-            draft_result = await generate_draft_indents(conn, mrp_result, plan_id, plan['entity'])
+        # C2: buffer events inside the transaction and flush only on commit.
+        import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
+        from app.webhooks.event_bus import deferred_events
+        async with deferred_events():
+            async with conn.transaction():
+                from modules.production.services.mrp import run_mrp as _mrp
+                from modules.production.services.indent_manager import generate_draft_indents
+                mrp_result = await _mrp(conn, plan_id, plan['entity'])
+                draft_result = await generate_draft_indents(conn, mrp_result, plan_id, plan['entity'])
     mrp_result["draft_indents"] = draft_result["indents"]
-    return json.dumps(mrp_result, default=str, indent=2)
+    return _dumps(mrp_result)
 
 
 @mcp.tool()
@@ -688,7 +762,7 @@ async def list_indents(entity: str = "", status: str = "", page: int = 1, page_s
     async with pool.acquire() as conn:
         total = await conn.fetchval(f"SELECT COUNT(*) FROM purchase_indent WHERE {where}", *params)
         rows = await conn.fetch(f"SELECT * FROM purchase_indent WHERE {where} ORDER BY created_at DESC LIMIT ${idx} OFFSET ${idx+1}", *params, page_size, offset)
-    return json.dumps({"total": total, "page": page, "results": [dict(r) for r in rows]}, default=str, indent=2)
+    return _dumps({"total": total, "page": page, "results": [_clean_row(r) for r in rows]})
 
 
 @mcp.tool()
@@ -703,7 +777,7 @@ async def get_indent_detail(indent_id: int) -> str:
         if indent['plan_line_id']:
             pl = await conn.fetchrow("SELECT fg_sku_name, customer_name, planned_qty_kg FROM production_plan_line WHERE plan_line_id=$1", indent['plan_line_id'])
             result["plan_line"] = dict(pl) if pl else None
-    return json.dumps(result, default=str, indent=2)
+    return _dumps(result)
 
 
 @mcp.tool()
@@ -743,6 +817,7 @@ async def send_indent(indent_id: int) -> str:
             mat = indent['material_sku_name']; qty = float(indent['required_qty_kg']); dl = indent['required_by_date']
             await conn.execute("INSERT INTO store_alert (alert_type, target_team, message, related_id, related_type, entity) VALUES ('material_shortage','purchase',$1,$2,'indent',$3)", f"SHORTAGE: {mat} — Need {qty:.1f} kg by {dl}", indent_id, indent['entity'])
             await conn.execute("INSERT INTO store_alert (alert_type, target_team, message, related_id, related_type, entity) VALUES ('indent_raised','stores',$1,$2,'indent',$3)", f"Indent raised for {mat} — {qty:.1f} kg. Check existing stock.", indent_id, indent['entity'])
+    await emit_event("indent.sent", indent['entity'], {"indent_id": indent_id, "material": mat, "qty_kg": qty}, target_roles=["store_manager", "purchase", "admin"])
     return f"Indent {indent['indent_number']} sent (raised). 2 alerts created."
 
 
@@ -751,6 +826,7 @@ async def send_bulk_indents(indent_ids: list[int]) -> str:
     """Send multiple draft indents at once."""
     pool = await get_pool()
     sent = 0
+    last_entity = ""
     async with pool.acquire() as conn:
         async with conn.transaction():
             for iid in indent_ids:
@@ -761,7 +837,9 @@ async def send_bulk_indents(indent_ids: list[int]) -> str:
                 mat = indent['material_sku_name']; qty = float(indent['required_qty_kg'])
                 await conn.execute("INSERT INTO store_alert (alert_type, target_team, message, related_id, related_type, entity) VALUES ('material_shortage','purchase',$1,$2,'indent',$3)", f"SHORTAGE: {mat} — {qty:.1f} kg", iid, indent['entity'])
                 await conn.execute("INSERT INTO store_alert (alert_type, target_team, message, related_id, related_type, entity) VALUES ('indent_raised','stores',$1,$2,'indent',$3)", f"Indent for {mat} — {qty:.1f} kg", iid, indent['entity'])
+                last_entity = indent['entity']
                 sent += 1
+    await emit_event("indent.bulk_sent", last_entity, {"indent_ids": indent_ids, "sent": sent}, target_roles=["store_manager", "purchase", "admin"])
     return f"Sent {sent} of {len(indent_ids)} indents."
 
 
@@ -801,7 +879,7 @@ async def list_alerts(target_team: str = "", entity: str = "", is_read: str = ""
     where = " AND ".join(conditions) if conditions else "TRUE"
     async with pool.acquire() as conn:
         rows = await conn.fetch(f"SELECT * FROM store_alert WHERE {where} ORDER BY created_at DESC LIMIT 50", *params)
-    return json.dumps([dict(r) for r in rows], default=str, indent=2)
+    return _dumps([_clean_row(r) for r in rows])
 
 
 @mcp.tool()
@@ -828,9 +906,9 @@ async def create_production_orders(plan_id: int) -> str:
             return "Plan not found."
         async with conn.transaction():
             import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-            from app.modules.production.services.job_card_engine import create_production_orders as _create
+            from modules.production.services.job_card_engine import create_production_orders as _create
             result = await _create(conn, plan_id, plan['entity'])
-    return json.dumps(result, default=str, indent=2)
+    return _dumps(result)
 
 
 @mcp.tool()
@@ -847,7 +925,7 @@ async def list_orders(entity: str = "", status: str = "", page: int = 1, page_si
     async with pool.acquire() as conn:
         total = await conn.fetchval(f"SELECT COUNT(*) FROM production_order WHERE {where}", *params)
         rows = await conn.fetch(f"SELECT * FROM production_order WHERE {where} ORDER BY created_at DESC LIMIT ${idx} OFFSET ${idx+1}", *params, page_size, offset)
-    return json.dumps({"total": total, "results": [dict(r) for r in rows]}, default=str, indent=2)
+    return _dumps({"total": total, "results": [_clean_row(r) for r in rows]})
 
 
 @mcp.tool()
@@ -861,7 +939,7 @@ async def get_order_detail(prod_order_id: int) -> str:
         jcs = await conn.fetch("SELECT job_card_id, job_card_number, step_number, process_name, stage, status, is_locked FROM job_card WHERE prod_order_id=$1 ORDER BY step_number", prod_order_id)
     result = dict(order)
     result["job_cards"] = [dict(j) for j in jcs]
-    return json.dumps(result, default=str, indent=2)
+    return _dumps(result)
 
 
 @mcp.tool()
@@ -871,9 +949,9 @@ async def generate_job_cards(prod_order_id: int) -> str:
     async with pool.acquire() as conn:
         async with conn.transaction():
             import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-            from app.modules.production.services.job_card_engine import create_job_cards as _create
+            from modules.production.services.job_card_engine import create_job_cards as _create
             result = await _create(conn, prod_order_id)
-    return json.dumps(result, default=str, indent=2)
+    return _dumps(result)
 
 
 @mcp.tool()
@@ -896,7 +974,7 @@ async def list_job_cards(entity: str = "", status: str = "", team_leader: str = 
     async with pool.acquire() as conn:
         total = await conn.fetchval(f"SELECT COUNT(*) FROM job_card WHERE {where}", *params)
         rows = await conn.fetch(f"SELECT job_card_id, job_card_number, prod_order_id, step_number, process_name, stage, fg_sku_name, customer_name, batch_number, batch_size_kg, assigned_to_team_leader, is_locked, status, start_time, factory, floor, entity FROM job_card WHERE {where} ORDER BY created_at DESC LIMIT ${idx} OFFSET ${idx+1}", *params, page_size, offset)
-    return json.dumps({"total": total, "results": [dict(r) for r in rows]}, default=str, indent=2)
+    return _dumps({"total": total, "results": [_clean_row(r) for r in rows]})
 
 
 @mcp.tool()
@@ -905,11 +983,11 @@ async def get_job_card_detail(job_card_id: int) -> str:
     pool = await get_pool()
     async with pool.acquire() as conn:
         import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-        from app.modules.production.services.job_card_engine import get_job_card_detail as _detail
+        from modules.production.services.job_card_engine import get_job_card_detail as _detail
         result = await _detail(conn, job_card_id)
     if not result:
         return "Job card not found."
-    return json.dumps(result, default=str, indent=2)
+    return _dumps(result)
 
 
 @mcp.tool()
@@ -924,7 +1002,7 @@ async def team_dashboard(team_leader: str, entity: str = "") -> str:
     where = " AND ".join(conditions)
     async with pool.acquire() as conn:
         rows = await conn.fetch(f"SELECT * FROM job_card WHERE {where} AND status NOT IN ('closed','completed') ORDER BY CASE status WHEN 'in_progress' THEN 1 WHEN 'material_received' THEN 2 WHEN 'assigned' THEN 3 WHEN 'unlocked' THEN 4 ELSE 5 END, created_at", *params)
-    return json.dumps([dict(r) for r in rows], default=str, indent=2)
+    return _dumps([_clean_row(r) for r in rows])
 
 
 @mcp.tool()
@@ -938,7 +1016,7 @@ async def floor_dashboard(floor: str, entity: str = "") -> str:
     where = " AND ".join(conditions)
     async with pool.acquire() as conn:
         rows = await conn.fetch(f"SELECT * FROM job_card WHERE {where} ORDER BY status, created_at", *params)
-    return json.dumps([dict(r) for r in rows], default=str, indent=2)
+    return _dumps([_clean_row(r) for r in rows])
 
 
 @mcp.tool()
@@ -947,9 +1025,9 @@ async def assign_job_card(job_card_id: int, team_leader: str, team_members: list
     pool = await get_pool()
     async with pool.acquire() as conn:
         import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-        from app.modules.production.services.job_card_engine import assign_job_card as _assign
+        from modules.production.services.job_card_engine import assign_job_card as _assign
         result = await _assign(conn, job_card_id, team_leader, team_members or None)
-    return json.dumps(result, default=str)
+    return _dumps(result)
 
 
 @mcp.tool()
@@ -962,9 +1040,9 @@ async def receive_material_qr(job_card_id: int, box_ids: list[str]) -> str:
             return "Job card not found."
         async with conn.transaction():
             import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-            from app.modules.production.services.qr_service import receive_material_via_qr
+            from modules.production.services.qr_service import receive_material_via_qr
             result = await receive_material_via_qr(conn, job_card_id, box_ids, jc['entity'])
-    return json.dumps(result, default=str, indent=2)
+    return _dumps(result)
 
 
 @mcp.tool()
@@ -973,9 +1051,9 @@ async def start_job_card(job_card_id: int) -> str:
     pool = await get_pool()
     async with pool.acquire() as conn:
         import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-        from app.modules.production.services.job_card_engine import start_job_card as _start
+        from modules.production.services.job_card_engine import start_job_card as _start
         result = await _start(conn, job_card_id)
-    return json.dumps(result, default=str)
+    return _dumps(result)
 
 
 @mcp.tool()
@@ -984,9 +1062,9 @@ async def complete_process_step(job_card_id: int, step_number: int, operator_nam
     pool = await get_pool()
     async with pool.acquire() as conn:
         import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-        from app.modules.production.services.job_card_engine import complete_process_step as _complete
+        from modules.production.services.job_card_engine import complete_process_step as _complete
         result = await _complete(conn, job_card_id, step_number, operator_name, qc_passed)
-    return json.dumps(result, default=str)
+    return _dumps(result)
 
 
 @mcp.tool()
@@ -997,9 +1075,9 @@ async def record_output(job_card_id: int, fg_actual_units: int = 0, fg_actual_kg
     async with pool.acquire() as conn:
         async with conn.transaction():
             import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-            from app.modules.production.services.job_card_engine import record_output as _record
+            from modules.production.services.job_card_engine import record_output as _record
             result = await _record(conn, job_card_id, data)
-    return json.dumps(result, default=str)
+    return _dumps(result)
 
 
 @mcp.tool()
@@ -1012,9 +1090,9 @@ async def complete_job_card(job_card_id: int) -> str:
             return "Job card not found."
         async with conn.transaction():
             import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-            from app.modules.production.services.job_card_engine import complete_job_card as _complete
+            from modules.production.services.job_card_engine import complete_job_card as _complete
             result = await _complete(conn, job_card_id, jc['entity'])
-    return json.dumps(result, default=str, indent=2)
+    return _dumps(result)
 
 
 @mcp.tool()
@@ -1032,9 +1110,9 @@ async def close_job_card(job_card_id: int) -> str:
     pool = await get_pool()
     async with pool.acquire() as conn:
         import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-        from app.modules.production.services.job_card_engine import close_job_card as _close
+        from modules.production.services.job_card_engine import close_job_card as _close
         result = await _close(conn, job_card_id)
-    return json.dumps(result, default=str)
+    return _dumps(result)
 
 
 @mcp.tool()
@@ -1047,9 +1125,9 @@ async def force_unlock_job_card(job_card_id: int, authority: str, reason: str) -
             return "Job card not found."
         async with conn.transaction():
             import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-            from app.modules.production.services.job_card_engine import force_unlock as _force
+            from modules.production.services.job_card_engine import force_unlock as _force
             result = await _force(conn, job_card_id, authority, reason, jc['entity'])
-    return json.dumps(result, default=str)
+    return _dumps(result)
 
 
 @mcp.tool()
@@ -1126,7 +1204,7 @@ async def get_floor_inventory(entity: str, floor_location: str = "", search: str
     async with pool.acquire() as conn:
         total = await conn.fetchval(f"SELECT COUNT(*) FROM floor_inventory WHERE {where}", *params)
         rows = await conn.fetch(f"SELECT * FROM floor_inventory WHERE {where} ORDER BY quantity_kg DESC LIMIT ${idx} OFFSET ${idx+1}", *params, page_size, offset)
-    return json.dumps({"total": total, "results": [dict(r) for r in rows]}, default=str, indent=2)
+    return _dumps({"total": total, "results": [_clean_row(r) for r in rows]})
 
 
 @mcp.tool()
@@ -1145,11 +1223,12 @@ async def move_material(sku_name: str, from_location: str, to_location: str, qua
     async with pool.acquire() as conn:
         async with conn.transaction():
             import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-            from app.modules.production.services.floor_tracker import move_material as _move
+            from modules.production.services.floor_tracker import move_material as _move
             result = await _move(conn, sku_name, from_location, to_location, quantity_kg, entity, reason=reason, moved_by=moved_by)
     if "error" in result:
         return result["message"]
-    return json.dumps(result, default=str)
+    await emit_event("material.moved", entity, {"sku_name": sku_name, "from": from_location, "to": to_location, "qty_kg": quantity_kg}, target_roles=["store_manager", "admin"])
+    return _dumps(result)
 
 
 @mcp.tool()
@@ -1168,7 +1247,7 @@ async def get_movement_history(entity: str, sku_name: str = "", from_location: s
     async with pool.acquire() as conn:
         total = await conn.fetchval(f"SELECT COUNT(*) FROM floor_movement WHERE {where}", *params)
         rows = await conn.fetch(f"SELECT * FROM floor_movement WHERE {where} ORDER BY moved_at DESC LIMIT ${idx} OFFSET ${idx+1}", *params, page_size, offset)
-    return json.dumps({"total": total, "results": [dict(r) for r in rows]}, default=str, indent=2)
+    return _dumps({"total": total, "results": [_clean_row(r) for r in rows]})
 
 
 @mcp.tool()
@@ -1178,9 +1257,9 @@ async def check_idle_materials(entity: str) -> str:
     async with pool.acquire() as conn:
         async with conn.transaction():
             import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-            from app.modules.production.services.idle_checker import check_idle_materials as _check
+            from modules.production.services.idle_checker import check_idle_materials as _check
             result = await _check(conn, entity)
-    return json.dumps(result, default=str)
+    return _dumps(result)
 
 
 @mcp.tool()
@@ -1197,7 +1276,7 @@ async def list_offgrade_inventory(entity: str = "", status: str = "available", i
     where = " AND ".join(conditions) if conditions else "TRUE"
     async with pool.acquire() as conn:
         rows = await conn.fetch(f"SELECT * FROM offgrade_inventory WHERE {where} ORDER BY created_at DESC LIMIT 100", *params)
-    return json.dumps([dict(r) for r in rows], default=str, indent=2)
+    return _dumps([_clean_row(r) for r in rows])
 
 
 @mcp.tool()
@@ -1206,7 +1285,7 @@ async def list_offgrade_rules() -> str:
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch("SELECT * FROM offgrade_reuse_rule ORDER BY source_item_group")
-    return json.dumps([dict(r) for r in rows], default=str, indent=2)
+    return _dumps([_clean_row(r) for r in rows])
 
 
 @mcp.tool()
@@ -1233,7 +1312,7 @@ async def get_loss_analysis(entity: str = "", group_by: str = "product", product
     group_col = {"product": "product_name", "stage": "stage", "month": "TO_CHAR(production_date,'YYYY-MM')", "machine": "machine_name"}.get(group_by, "product_name")
     async with pool.acquire() as conn:
         rows = await conn.fetch(f"SELECT {group_col} AS group_key, COUNT(*) AS batch_count, ROUND(AVG(loss_pct)::numeric,3) AS avg_loss_pct, ROUND(SUM(loss_kg)::numeric,3) AS total_loss_kg FROM process_loss WHERE {where} GROUP BY {group_col} ORDER BY SUM(loss_kg) DESC", *params)
-    return json.dumps([dict(r) for r in rows], default=str, indent=2)
+    return _dumps([_clean_row(r) for r in rows])
 
 
 @mcp.tool()
@@ -1248,7 +1327,7 @@ async def get_loss_anomalies(entity: str = "", threshold_multiplier: float = 2.0
     where = " AND ".join(conditions) if conditions else "TRUE"
     async with pool.acquire() as conn:
         rows = await conn.fetch(f"WITH stats AS (SELECT product_name, stage, AVG(loss_pct) AS avg_pct FROM process_loss WHERE {where.replace('p.','')} GROUP BY product_name, stage) SELECT p.*, s.avg_pct FROM process_loss p JOIN stats s ON p.product_name=s.product_name AND p.stage=s.stage WHERE {where} AND p.loss_pct > s.avg_pct * ${idx} ORDER BY (p.loss_pct - s.avg_pct) DESC LIMIT 50", *params, threshold_multiplier)
-    return json.dumps([dict(r) for r in rows], default=str, indent=2)
+    return _dumps([_clean_row(r) for r in rows])
 
 
 # ---------------------------------------------------------------------------
@@ -1262,10 +1341,10 @@ async def get_day_end_summary(entity: str, target_date: str = "") -> str:
     pool = await get_pool()
     async with pool.acquire() as conn:
         import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-        from app.modules.production.services.day_end import get_day_end_summary as _summary
+        from modules.production.services.day_end import get_day_end_summary as _summary
         d = date.fromisoformat(target_date) if target_date else None
         result = await _summary(conn, entity, d)
-    return json.dumps(result, default=str, indent=2)
+    return _dumps(result)
 
 
 @mcp.tool()
@@ -1276,9 +1355,9 @@ async def submit_dispatch(dispatches_json: str, entity: str) -> str:
     async with pool.acquire() as conn:
         async with conn.transaction():
             import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-            from app.modules.production.services.day_end import bulk_dispatch
+            from modules.production.services.day_end import bulk_dispatch
             result = await bulk_dispatch(conn, dispatches, entity)
-    return json.dumps(result, default=str)
+    return _dumps(result)
 
 
 @mcp.tool()
@@ -1289,9 +1368,9 @@ async def submit_balance_scan(floor_location: str, entity: str, submitted_by: st
     async with pool.acquire() as conn:
         async with conn.transaction():
             import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-            from app.modules.production.services.day_end import submit_balance_scan as _submit
+            from modules.production.services.day_end import submit_balance_scan as _submit
             result = await _submit(conn, floor_location, entity, submitted_by, scan_lines)
-    return json.dumps(result, default=str, indent=2)
+    return _dumps(result)
 
 
 @mcp.tool()
@@ -1300,10 +1379,10 @@ async def get_scan_status(entity: str, target_date: str = "") -> str:
     pool = await get_pool()
     async with pool.acquire() as conn:
         import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-        from app.modules.production.services.day_end import get_scan_status as _status
+        from modules.production.services.day_end import get_scan_status as _status
         d = date.fromisoformat(target_date) if target_date else None
         result = await _status(conn, entity, d)
-    return json.dumps(result, default=str, indent=2)
+    return _dumps(result)
 
 
 @mcp.tool()
@@ -1312,11 +1391,11 @@ async def get_scan_detail(scan_id: int) -> str:
     pool = await get_pool()
     async with pool.acquire() as conn:
         import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-        from app.modules.production.services.day_end import get_scan_detail as _detail
+        from modules.production.services.day_end import get_scan_detail as _detail
         result = await _detail(conn, scan_id)
     if not result:
         return "Scan not found."
-    return json.dumps(result, default=str, indent=2)
+    return _dumps(result)
 
 
 @mcp.tool()
@@ -1326,9 +1405,9 @@ async def reconcile_scan(scan_id: int, reviewed_by: str) -> str:
     async with pool.acquire() as conn:
         async with conn.transaction():
             import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-            from app.modules.production.services.day_end import reconcile_scan as _reconcile
+            from modules.production.services.day_end import reconcile_scan as _reconcile
             result = await _reconcile(conn, scan_id, reviewed_by)
-    return json.dumps(result, default=str)
+    return _dumps(result)
 
 
 @mcp.tool()
@@ -1338,10 +1417,10 @@ async def check_missing_scans(entity: str, target_date: str = "") -> str:
     async with pool.acquire() as conn:
         async with conn.transaction():
             import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-            from app.modules.production.services.day_end import check_missing_scans as _check
+            from modules.production.services.day_end import check_missing_scans as _check
             d = date.fromisoformat(target_date) if target_date else None
             result = await _check(conn, entity, d)
-    return json.dumps(result, default=str)
+    return _dumps(result)
 
 
 @mcp.tool()
@@ -1358,7 +1437,7 @@ async def get_yield_summary(entity: str = "", product_name: str = "", period: st
     where = " AND ".join(conditions) if conditions else "TRUE"
     async with pool.acquire() as conn:
         rows = await conn.fetch(f"SELECT * FROM yield_summary WHERE {where} ORDER BY computed_at DESC LIMIT 100", *params)
-    return json.dumps([dict(r) for r in rows], default=str, indent=2)
+    return _dumps([_clean_row(r) for r in rows])
 
 
 # ---------------------------------------------------------------------------
@@ -1375,9 +1454,9 @@ async def revise_plan(plan_id: int, change_event: str) -> str:
         if not plan:
             return "Plan not found."
         import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-        from app.modules.production.services.ai_planner import collect_revision_context
+        from modules.production.services.ai_planner import collect_revision_context
         context = await collect_revision_context(conn, plan_id, change_event, plan['entity'])
-    return json.dumps(context, default=str, indent=2)
+    return _dumps(context)
 
 
 @mcp.tool()
@@ -1403,7 +1482,7 @@ async def get_revision_history(plan_id: int) -> str:
     seen = set()
     unique = [p for p in chain if p['plan_id'] not in seen and not seen.add(p['plan_id'])]
     unique.sort(key=lambda x: x.get('revision_number') or 0)
-    return json.dumps({"plan_id": plan_id, "revision_chain": unique}, default=str, indent=2)
+    return _dumps({"plan_id": plan_id, "revision_chain": unique})
 
 
 @mcp.tool()
@@ -1413,9 +1492,9 @@ async def report_discrepancy(discrepancy_type: str, entity: str, severity: str =
     async with pool.acquire() as conn:
         async with conn.transaction():
             import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-            from app.modules.production.services.discrepancy_manager import report_discrepancy as _report
+            from modules.production.services.discrepancy_manager import report_discrepancy as _report
             result = await _report(conn, discrepancy_type=discrepancy_type, severity=severity, affected_material=affected_material or None, affected_machine_id=affected_machine_id or None, details=details, reported_by=reported_by, entity=entity)
-    return json.dumps(result, default=str, indent=2)
+    return _dumps(result)
 
 
 @mcp.tool()
@@ -1432,7 +1511,7 @@ async def list_discrepancies(entity: str = "", status: str = "", discrepancy_typ
     where = " AND ".join(conditions) if conditions else "TRUE"
     async with pool.acquire() as conn:
         rows = await conn.fetch(f"SELECT * FROM discrepancy_report WHERE {where} ORDER BY created_at DESC LIMIT 50", *params)
-    return json.dumps([dict(r) for r in rows], default=str, indent=2)
+    return _dumps([_clean_row(r) for r in rows])
 
 
 @mcp.tool()
@@ -1441,11 +1520,11 @@ async def get_discrepancy_detail(discrepancy_id: int) -> str:
     pool = await get_pool()
     async with pool.acquire() as conn:
         import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-        from app.modules.production.services.discrepancy_manager import get_discrepancy_detail as _detail
+        from modules.production.services.discrepancy_manager import get_discrepancy_detail as _detail
         result = await _detail(conn, discrepancy_id)
     if not result:
         return "Discrepancy not found."
-    return json.dumps(result, default=str, indent=2)
+    return _dumps(result)
 
 
 @mcp.tool()
@@ -1458,9 +1537,9 @@ async def resolve_discrepancy(discrepancy_id: int, resolution_type: str, resolut
             return "Discrepancy not found."
         async with conn.transaction():
             import sys; sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
-            from app.modules.production.services.discrepancy_manager import resolve_discrepancy as _resolve
+            from modules.production.services.discrepancy_manager import resolve_discrepancy as _resolve
             result = await _resolve(conn, discrepancy_id, resolution_type=resolution_type, resolution_details=resolution_details, resolved_by=resolved_by, entity=disc['entity'])
-    return json.dumps(result, default=str)
+    return _dumps(result)
 
 
 @mcp.tool()
@@ -1477,7 +1556,7 @@ async def list_ai_recommendations(entity: str = "", recommendation_type: str = "
     where = " AND ".join(conditions) if conditions else "TRUE"
     async with pool.acquire() as conn:
         rows = await conn.fetch(f"SELECT recommendation_id, recommendation_type, entity, tokens_used, latency_ms, model_used, status, feedback, plan_id, created_at FROM ai_recommendation WHERE {where} ORDER BY created_at DESC LIMIT 20", *params)
-    return json.dumps([dict(r) for r in rows], default=str, indent=2)
+    return _dumps([_clean_row(r) for r in rows])
 
 
 @mcp.tool()

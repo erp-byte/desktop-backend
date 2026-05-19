@@ -338,7 +338,7 @@ async def get_day_end_summary(entity: str, target_date: str = "") -> str:
     pool = await get_pool()
     d = target_date or str(date.today())
     async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT jc.job_card_id, jc.job_card_number, jc.fg_sku_name, jc.customer_name, jc.batch_size_kg, o.fg_actual_kg, o.process_loss_kg, o.offgrade_kg, o.dispatch_qty FROM job_card jc JOIN production_order po ON jc.prod_order_id=po.prod_order_id LEFT JOIN job_card_output o ON jc.job_card_id=o.job_card_id WHERE jc.entity=$1 AND jc.step_number=po.total_stages AND jc.status IN ('completed','closed') AND DATE(jc.end_time)=$2::date", entity, d)
+        rows = await conn.fetch("SELECT jc.job_card_id, jc.job_card_number, jc.fg_sku_name, jc.customer_name, jc.batch_size_kg, o.fg_actual_kg, o.process_loss_kg, COALESCE(bp.total_bp_kg, 0) AS offgrade_kg, jc.dispatched_to_next_kg AS dispatch_qty FROM job_card jc JOIN production_order po ON jc.prod_order_id=po.prod_order_id LEFT JOIN job_card_output o ON jc.job_card_id=o.job_card_id LEFT JOIN (SELECT job_card_id, SUM(quantity_kg) AS total_bp_kg FROM job_card_byproduct GROUP BY job_card_id) bp ON bp.job_card_id=jc.job_card_id WHERE jc.entity=$1 AND jc.step_number=po.total_stages AND jc.status IN ('completed','closed') AND DATE(jc.end_time)=$2::date", entity, d)
     items = [dict(r) for r in rows]
     return json.dumps({"date": d, "completed_orders": len(items), "total_fg_kg": sum(float(r.get('fg_actual_kg') or 0) for r in items), "total_dispatch_kg": sum(float(r.get('dispatch_qty') or 0) for r in items), "items": items}, default=str, indent=2)
 

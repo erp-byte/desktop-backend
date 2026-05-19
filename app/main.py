@@ -1,22 +1,35 @@
 import asyncio
 import logging
-import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-import httpx
-from fastapi import FastAPI
+import hmac as _hmac
+
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from mangum import Mangum
+from pydantic import BaseModel
 
 from app.config import Settings
-from app.db.connection import create_pool, close_pool
-from app.modules.auth.router import router as auth_router
-from app.modules.so.router import router as so_router
-from app.modules.purchase.router import router as purchase_router
-from app.modules.production.router import router as production_router
-from app.modules.amendment_router import router as amendment_router
-from app.modules.so.services.item_matcher import load_master_items
-from app.modules.production.services.master_ingest import run_master_ingest
+from core.middleware import request_context
+from db.connection import create_pool, close_pool
+from modules.auth.router import router as auth_router
+from modules.so.router import router as so_router
+from modules.purchase.router import router as purchase_router
+from modules.purchase.po_router import router as po_router
+from modules.receipt.router import router as receipt_router
+from modules.ncr.router import router as ncr_router
+from modules.production.router import router as production_router
+from modules.amendment_router import router as amendment_router
+from modules.vendor.router import router as vendor_router
+from modules.so.services.item_matcher import load_master_items
+from modules.production.services.master_ingest import run_master_ingest
+
+from app.webhooks.event_bus import event_bus, Event
+from app.webhooks.dispatcher import dispatcher_loop
+from app.webhooks.broadcaster import broadcaster_loop
+from app.webhooks.router import router as webhook_router
+from app.webhooks.ws_router import router as ws_router
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -30,23 +43,6 @@ async def lifespan(fastapi_app: FastAPI):
     pool = await create_pool(settings)
     fastapi_app.state.db_pool = pool
 
-    db_dir = Path(__file__).parent / "db"
-    async with pool.acquire() as conn:
-        await conn.execute((db_dir / "schema.sql").read_text())
-        await conn.execute((db_dir / "migrate.sql").read_text(encoding="utf-8"))
-        await conn.execute((db_dir / "po_schema.sql").read_text(encoding="utf-8"))
-        await conn.execute((db_dir / "po_migrate.sql").read_text(encoding="utf-8"))
-        await conn.execute((db_dir / "production_schema.sql").read_text(encoding="utf-8"))
-        await conn.execute((db_dir / "production_migrate.sql").read_text(encoding="utf-8"))
-        await conn.execute((db_dir / "auth_schema.sql").read_text(encoding="utf-8"))
-        await conn.execute((db_dir / "ims_new_schema.sql").read_text(encoding="utf-8"))
-        await conn.execute((db_dir / "sap_mm_align.sql").read_text(encoding="utf-8"))
-        # Seed test data (idempotent — ON CONFLICT DO NOTHING)
-        seed_file = db_dir / "seed_test_data.sql"
-        if seed_file.exists():
-            await conn.execute(seed_file.read_text(encoding="utf-8"))
-    logger.info("Database schema ensured")
-
     master_items = await load_master_items(pool)
     fastapi_app.state.master_items = master_items
 
@@ -55,60 +51,88 @@ async def lifespan(fastapi_app: FastAPI):
         data_dir = Path(__file__).parent.parent / "data"
     await run_master_ingest(pool, data_dir, master_items)
 
-    # Keep-alive poller — pings all Render services every 7 min to prevent spin-down
-    keep_alive_task = None
-    keep_alive_urls = []
-    for env_key in ["RENDER_BACKEND_URL", "RENDER_PLANNER_MCP_URL", "RENDER_TRACKER_MCP_URL"]:
-        url = os.environ.get(env_key, "")
-        if url:
-            keep_alive_urls.append(url.rstrip("/"))
-    # Hardcoded fallback if env vars not set
-    if not keep_alive_urls:
-        keep_alive_urls = [
-            "https://desktop-backend-vhf0.onrender.com",
-            "https://desktop-backend-nk6k.onrender.com",
-            "https://desktop-backend-el31.onrender.com",
-        ]
-
-    async def _keep_alive():
-        async with httpx.AsyncClient(timeout=30) as client:
-            while True:
-                await asyncio.sleep(420)  # 7 minutes
-                for url in keep_alive_urls:
-                    try:
-                        resp = await client.get(url + "/health" if "/api" not in url else url)
-                        logger.debug("Keep-alive %s → %s", url, resp.status_code)
-                    except Exception as e:
-                        logger.warning("Keep-alive failed %s: %s", url, e)
-
-    if keep_alive_urls:
-        keep_alive_task = asyncio.create_task(_keep_alive())
-        logger.info("Keep-alive poller started for: %s", keep_alive_urls)
+    # Start webhook dispatcher and WebSocket broadcaster as background tasks
+    bg_tasks = []
+    bg_tasks.append(asyncio.create_task(dispatcher_loop(pool)))
+    bg_tasks.append(asyncio.create_task(broadcaster_loop()))
+    fastapi_app.state._webhook_tasks = bg_tasks
 
     yield
 
-    if keep_alive_task:
-        keep_alive_task.cancel()
+    # Cancel background tasks
+    for t in bg_tasks:
+        t.cancel()
+    await asyncio.gather(*bg_tasks, return_exceptions=True)
+
     await close_pool(pool)
     logger.info("Shutdown complete")
 
 
-app = FastAPI(title="Candor Foods — Consumption Backend", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="Candor Foods — Consumption Backend", version="0.4.0", lifespan=lifespan)
 
+# Middleware order matters: Starlette runs the LAST-added middleware OUTERMOST.
+# We want RequestContext to wrap CORS so that:
+#   • CORS preflight (OPTIONS) responses also carry X-Request-ID
+#   • the structured error envelope wraps any failure CORS can produce
+# Therefore: add CORS FIRST, then request_context.install LAST.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Request-ID"],
 )
+request_context.install(app)
 
 app.include_router(auth_router)
 app.include_router(so_router)
 app.include_router(purchase_router)
+app.include_router(po_router)
+app.include_router(receipt_router)
+app.include_router(ncr_router)
 app.include_router(production_router)
 app.include_router(amendment_router)
+app.include_router(vendor_router)
+app.include_router(webhook_router)
+app.include_router(ws_router)
 
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+# ── Internal events endpoint (for MCP servers) ──
+
+class InternalEventBody(BaseModel):
+    event_type: str
+    entity: str
+    payload: dict
+    actor: str = "mcp"
+    target_roles: list[str] = []
+
+
+@app.post("/internal/events")
+async def receive_internal_event(body: InternalEventBody, request: Request):
+    """MCP servers on remote Render instances POST here to inject events."""
+    settings = request.app.state.settings
+    token = settings.INTERNAL_WEBHOOK_TOKEN
+    if not token:
+        raise HTTPException(503, "Internal events not configured")
+
+    auth = request.headers.get("Authorization", "")
+    if not _hmac.compare_digest(auth, f"Bearer {token}"):
+        raise HTTPException(401, "Invalid internal token")
+
+    await event_bus.publish(Event(
+        event_type=body.event_type,
+        entity=body.entity,
+        payload=body.payload,
+        actor=body.actor,
+        target_roles=body.target_roles,
+    ))
+    return {"accepted": True}
+
+
+# AWS Lambda entry point
+handler = Mangum(app, lifespan="on")

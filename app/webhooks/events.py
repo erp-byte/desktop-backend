@@ -12,7 +12,44 @@ Services call:
 No need to know about Event, event_bus, or target_roles.
 """
 
+import logging
+
 from .event_bus import event_bus, Event
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Helpers (H2/H3/H4/L4)
+# ---------------------------------------------------------------------------
+
+_ALLOWED_ENTITIES = {"cfpl", "cdpl", ""}
+
+
+def _validate_entity(entity, event_type: str) -> str:
+    """Normalize + validate the entity label for an event emit.
+
+    - Coerces None -> "" (broadcast / cross-entity).
+    - Strips + lowercases string entities.
+    - Warns (but does NOT raise) if the entity is unrecognised, so a malformed
+      caller cannot break the business flow — emit proceeds with the
+      normalized value.
+    """
+    if entity is None:
+        return ""
+    if not isinstance(entity, str):
+        logger.warning(
+            "event %s: entity has non-string type %s; coercing to string",
+            event_type, type(entity).__name__,
+        )
+        entity = str(entity)
+    norm = entity.strip().lower()
+    if norm not in _ALLOWED_ENTITIES:
+        logger.warning(
+            "event %s: unexpected entity %r (allowed: %s)",
+            event_type, entity, sorted(e for e in _ALLOWED_ENTITIES if e),
+        )
+    return norm
 
 
 # ---------------------------------------------------------------------------
@@ -20,6 +57,7 @@ from .event_bus import event_bus, Event
 # ---------------------------------------------------------------------------
 
 async def fulfillment_synced(entity: str, *, synced: int, skipped: int, total: int) -> None:
+    entity = _validate_entity(entity, "fulfillment.synced")
     await event_bus.publish(Event(
         event_type="fulfillment.synced",
         entity=entity,
@@ -32,6 +70,7 @@ async def fulfillment_revised(entity: str, *, fulfillment_id: int,
                                new_qty: float | None = None,
                                new_date: str | None = None,
                                revised_by: str = "") -> None:
+    entity = _validate_entity(entity, "fulfillment.revised")
     await event_bus.publish(Event(
         event_type="fulfillment.revised",
         entity=entity,
@@ -47,6 +86,7 @@ async def fulfillment_revised(entity: str, *, fulfillment_id: int,
 
 async def plan_approved(entity: str, *, plan_id: int, approved_by: str,
                         mrp_summary: dict | None = None) -> None:
+    entity = _validate_entity(entity, "plan.approved")
     await event_bus.publish(Event(
         event_type="plan.approved",
         entity=entity,
@@ -61,6 +101,7 @@ async def plan_approved(entity: str, *, plan_id: int, approved_by: str,
 # ---------------------------------------------------------------------------
 
 async def mrp_completed(entity: str, *, plan_id: int, summary: dict) -> None:
+    entity = _validate_entity(entity, "mrp.completed")
     await event_bus.publish(Event(
         event_type="mrp.completed",
         entity=entity,
@@ -72,6 +113,7 @@ async def mrp_completed(entity: str, *, plan_id: int, summary: dict) -> None:
 async def mrp_shortage_detected(entity: str, *, plan_id: int,
                                  shortage_count: int,
                                  total_shortage_kg: float) -> None:
+    entity = _validate_entity(entity, "mrp.shortage_detected")
     await event_bus.publish(Event(
         event_type="mrp.shortage_detected",
         entity=entity,
@@ -87,6 +129,7 @@ async def mrp_shortage_detected(entity: str, *, plan_id: int,
 
 async def indent_drafted(entity: str, *, plan_id: int, count: int,
                          total_shortage_kg: float) -> None:
+    entity = _validate_entity(entity, "indent.drafted")
     await event_bus.publish(Event(
         event_type="indent.drafted",
         entity=entity,
@@ -98,6 +141,7 @@ async def indent_drafted(entity: str, *, plan_id: int, count: int,
 
 async def indent_sent(entity: str, *, indent_id: int, material: str,
                       qty_kg: float, deadline: str | None = None) -> None:
+    entity = _validate_entity(entity, "indent.sent")
     await event_bus.publish(Event(
         event_type="indent.sent",
         entity=entity,
@@ -109,6 +153,7 @@ async def indent_sent(entity: str, *, indent_id: int, material: str,
 
 async def indent_bulk_sent(entity: str, *, indent_ids: list[int],
                            sent: int) -> None:
+    entity = _validate_entity(entity, "indent.bulk_sent")
     await event_bus.publish(Event(
         event_type="indent.bulk_sent",
         entity=entity,
@@ -123,6 +168,7 @@ async def indent_bulk_sent(entity: str, *, indent_ids: list[int],
 
 async def job_card_created(entity: str, *, prod_order_id: int,
                            job_card_count: int) -> None:
+    entity = _validate_entity(entity, "job_card.created")
     await event_bus.publish(Event(
         event_type="job_card.created",
         entity=entity,
@@ -135,6 +181,7 @@ async def job_card_created(entity: str, *, prod_order_id: int,
 async def job_card_started(entity: str, *, job_card_id: int,
                            job_card_number: str, fg_sku_name: str,
                            floor: str | None = None) -> None:
+    entity = _validate_entity(entity, "job_card.started")
     await event_bus.publish(Event(
         event_type="job_card.started",
         entity=entity,
@@ -147,6 +194,7 @@ async def job_card_started(entity: str, *, job_card_id: int,
 async def job_card_completed(entity: str, *, job_card_id: int,
                              job_card_number: str, fg_sku_name: str,
                              duration_minutes: float | None = None) -> None:
+    entity = _validate_entity(entity, "job_card.completed")
     await event_bus.publish(Event(
         event_type="job_card.completed",
         entity=entity,
@@ -159,6 +207,7 @@ async def job_card_completed(entity: str, *, job_card_id: int,
 async def job_card_team_assigned(entity: str, *, job_card_id: int,
                                   job_card_number: str, team_leader: str,
                                   member_count: int) -> None:
+    entity = _validate_entity(entity, "job_card.team_assigned")
     await event_bus.publish(Event(
         event_type="job_card.team_assigned",
         entity=entity,
@@ -171,6 +220,7 @@ async def job_card_team_assigned(entity: str, *, job_card_id: int,
 async def job_card_material_received(entity: str, *, job_card_id: int,
                                       job_card_number: str, boxes_scanned: int,
                                       total_kg: float) -> None:
+    entity = _validate_entity(entity, "job_card.material_received")
     await event_bus.publish(Event(
         event_type="job_card.material_received",
         entity=entity,
@@ -182,6 +232,7 @@ async def job_card_material_received(entity: str, *, job_card_id: int,
 
 async def job_card_material_acknowledged(entity: str, *, job_card_id: int,
                                           job_card_number: str) -> None:
+    entity = _validate_entity(entity, "job_card.material_acknowledged")
     await event_bus.publish(Event(
         event_type="job_card.material_acknowledged",
         entity=entity,
@@ -193,6 +244,7 @@ async def job_card_material_acknowledged(entity: str, *, job_card_id: int,
 async def job_card_dispatched_to_next(entity: str, *, job_card_id: int,
                                        job_card_number: str, qty_kg: float,
                                        dispatched_by: str) -> None:
+    entity = _validate_entity(entity, "job_card.dispatched_to_next")
     await event_bus.publish(Event(
         event_type="job_card.dispatched_to_next",
         entity=entity,
@@ -205,6 +257,7 @@ async def job_card_dispatched_to_next(entity: str, *, job_card_id: int,
 async def job_card_output_saved(entity: str, *, job_card_id: int,
                                  job_card_number: str, fg_actual_kg: float,
                                  yield_pct: float | None = None) -> None:
+    entity = _validate_entity(entity, "job_card.output_saved")
     await event_bus.publish(Event(
         event_type="job_card.output_saved",
         entity=entity,
@@ -217,6 +270,7 @@ async def job_card_output_saved(entity: str, *, job_card_id: int,
 async def job_card_signed_off(entity: str, *, job_card_id: int,
                                job_card_number: str, sign_off_type: str,
                                signed_by: str) -> None:
+    entity = _validate_entity(entity, "job_card.signed_off")
     await event_bus.publish(Event(
         event_type="job_card.signed_off",
         entity=entity,
@@ -229,6 +283,7 @@ async def job_card_signed_off(entity: str, *, job_card_id: int,
 async def job_card_force_unlocked(entity: str, *, job_card_id: int,
                                    job_card_number: str,
                                    reason: str) -> None:
+    entity = _validate_entity(entity, "job_card.force_unlocked")
     await event_bus.publish(Event(
         event_type="job_card.force_unlocked",
         entity=entity,
@@ -238,9 +293,60 @@ async def job_card_force_unlocked(entity: str, *, job_card_id: int,
     ))
 
 
+async def job_card_updated(entity: str, *, job_card_id: int,
+                            job_card_number: str,
+                            changed_fields: list[str], updated_by: str) -> None:
+    """A job card's editable header was changed via PATCH."""
+    entity = _validate_entity(entity, "job_card.updated")
+    await event_bus.publish(Event(
+        event_type="job_card.updated",
+        entity=entity,
+        payload={"job_card_id": job_card_id, "job_card_number": job_card_number,
+                 "changed_fields": changed_fields, "updated_by": updated_by},
+        target_roles=["floor_supervisor", "planner", "admin"],
+    ))
+
+
+async def job_card_cancelled(entity: str, *, job_card_id: int,
+                              job_card_number: str,
+                              cancellation_reason: str, deleted_by: str) -> None:
+    """A pre-start job card was soft-deleted with reason."""
+    entity = _validate_entity(entity, "job_card.cancelled")
+    await event_bus.publish(Event(
+        event_type="job_card.cancelled",
+        entity=entity,
+        payload={"job_card_id": job_card_id, "job_card_number": job_card_number,
+                 "cancellation_reason": cancellation_reason, "deleted_by": deleted_by},
+        target_roles=["floor_supervisor", "planner", "admin"],
+    ))
+
+
+async def job_card_annexure_changed(entity: str, *, job_card_id: int,
+                                     job_card_number: str,
+                                     annexure_type: str, annexure_id: int,
+                                     action: str, changed_by: str,
+                                     changed_fields: list[str] | None = None) -> None:
+    """Catch-all for annexure PATCH/DELETE.
+
+    annexure_type: 'environment' | 'metal_detection' | 'weight_check'
+                 | 'loss_reconciliation' | 'remarks'
+    action:        'updated' | 'deleted'
+    """
+    entity = _validate_entity(entity, f"job_card.annexure.{action}")
+    await event_bus.publish(Event(
+        event_type=f"job_card.annexure.{action}",
+        entity=entity,
+        payload={"job_card_id": job_card_id, "job_card_number": job_card_number,
+                 "annexure_type": annexure_type, "annexure_id": annexure_id,
+                 "changed_fields": changed_fields, "changed_by": changed_by},
+        target_roles=["floor_supervisor", "admin"],
+    ))
+
+
 async def indent_raised(entity: str, *, indent_id: int, material: str,
                         qty_kg: float, source: str = "manual",
                         job_card_id: int | None = None) -> None:
+    entity = _validate_entity(entity, "indent.raised")
     await event_bus.publish(Event(
         event_type="indent.raised",
         entity=entity,
@@ -256,6 +362,7 @@ async def indent_raised(entity: str, *, indent_id: int, material: str,
 # ---------------------------------------------------------------------------
 
 async def qc_passed(entity: str, *, inspection_id: str, findings: str | None = None) -> None:
+    entity = _validate_entity(entity, "qc.passed")
     await event_bus.publish(Event(
         event_type="qc.passed",
         entity=entity,
@@ -266,6 +373,7 @@ async def qc_passed(entity: str, *, inspection_id: str, findings: str | None = N
 
 
 async def qc_failed(entity: str, *, inspection_id: str, findings: str | None = None) -> None:
+    entity = _validate_entity(entity, "qc.failed")
     await event_bus.publish(Event(
         event_type="qc.failed",
         entity=entity,
@@ -282,6 +390,7 @@ async def qc_failed(entity: str, *, inspection_id: str, findings: str | None = N
 async def material_moved(entity: str, *, sku_name: str, from_location: str,
                          to_location: str, qty_kg: float,
                          movement_id: int | None = None) -> None:
+    entity = _validate_entity(entity, "material.moved")
     await event_bus.publish(Event(
         event_type="material.moved",
         entity=entity,
@@ -298,6 +407,7 @@ async def material_moved(entity: str, *, sku_name: str, from_location: str,
 
 async def dayend_reconciled(entity: str, *, scan_id: int,
                             floor_location: str) -> None:
+    entity = _validate_entity(entity, "dayend.reconciled")
     await event_bus.publish(Event(
         event_type="dayend.reconciled",
         entity=entity,
@@ -310,6 +420,7 @@ async def dayend_discrepancy_found(entity: str, *, discrepancy_type: str,
                                     severity: str,
                                     affected_material: str | None = None,
                                     affected_job_cards: int = 0) -> None:
+    entity = _validate_entity(entity, "dayend.discrepancy_found")
     await event_bus.publish(Event(
         event_type="dayend.discrepancy_found",
         entity=entity,
@@ -327,6 +438,7 @@ async def dayend_discrepancy_found(entity: str, *, discrepancy_type: str,
 async def store_alert_created(entity: str, *, allocation_id: int,
                                decision: str, material: str,
                                approved_qty: float) -> None:
+    entity = _validate_entity(entity, "store_alert.created")
     await event_bus.publish(Event(
         event_type="store_alert.created",
         entity=entity,
