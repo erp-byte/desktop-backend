@@ -521,3 +521,71 @@ ALTER TABLE job_card_output DROP COLUMN IF EXISTS dispatch_qty;
 ALTER TABLE job_card_output DROP COLUMN IF EXISTS extra_give_away_kg;
 ALTER TABLE job_card_output DROP COLUMN IF EXISTS balance_material_kg;
 ALTER TABLE job_card_output DROP COLUMN IF EXISTS wastage_kg;
+
+-- ═══════════════════════════════════════════════════════════════════
+-- Migration: OutputV2 per-line RM consumption + bom_line_id linkage
+-- 2026-05-19
+-- ═══════════════════════════════════════════════════════════════════
+-- Goal: let the JC-detail response carry per-BOM-line consumed_qty so the
+-- Android Output & Accounting screen can round-trip each row, and let
+-- balance_material rows reference the BOM line they came from.
+
+ALTER TABLE job_card_rm_indent        ADD COLUMN IF NOT EXISTS bom_line_id  INT;
+ALTER TABLE job_card_rm_indent        ADD COLUMN IF NOT EXISTS consumed_qty NUMERIC(15,3);
+
+ALTER TABLE job_card_pm_indent        ADD COLUMN IF NOT EXISTS bom_line_id  INT;
+ALTER TABLE job_card_pm_indent        ADD COLUMN IF NOT EXISTS consumed_qty NUMERIC(15,3);
+
+ALTER TABLE job_card_balance_material ADD COLUMN IF NOT EXISTS bom_line_id INT;
+
+CREATE INDEX IF NOT EXISTS idx_rm_indent_bom_line     ON job_card_rm_indent(bom_line_id);
+CREATE INDEX IF NOT EXISTS idx_pm_indent_bom_line     ON job_card_pm_indent(bom_line_id);
+CREATE INDEX IF NOT EXISTS idx_balance_mat_bom_line   ON job_card_balance_material(bom_line_id);
+
+-- Backfill: link existing indent rows to their bom_line by
+-- (job_card.bom_id, material_sku_name, item_type). For BOMs that list the
+-- same material on multiple lines, we resolve to the lowest line_number —
+-- correct in the common case; rare edge cases may need manual cleanup.
+WITH rm_resolved AS (
+    SELECT
+        ri.rm_indent_id,
+        (
+            SELECT bl.bom_line_id
+            FROM bom_line bl
+            WHERE bl.bom_id = jc.bom_id
+              AND bl.material_sku_name = ri.material_sku_name
+              AND bl.item_type = 'rm'
+            ORDER BY bl.line_number ASC
+            LIMIT 1
+        ) AS resolved_id
+    FROM job_card_rm_indent ri
+    JOIN job_card jc ON jc.job_card_id = ri.job_card_id
+    WHERE ri.bom_line_id IS NULL
+)
+UPDATE job_card_rm_indent ri
+SET bom_line_id = rm_resolved.resolved_id
+FROM rm_resolved
+WHERE ri.rm_indent_id = rm_resolved.rm_indent_id
+  AND rm_resolved.resolved_id IS NOT NULL;
+
+WITH pm_resolved AS (
+    SELECT
+        pi.pm_indent_id,
+        (
+            SELECT bl.bom_line_id
+            FROM bom_line bl
+            WHERE bl.bom_id = jc.bom_id
+              AND bl.material_sku_name = pi.material_sku_name
+              AND bl.item_type = 'pm'
+            ORDER BY bl.line_number ASC
+            LIMIT 1
+        ) AS resolved_id
+    FROM job_card_pm_indent pi
+    JOIN job_card jc ON jc.job_card_id = pi.job_card_id
+    WHERE pi.bom_line_id IS NULL
+)
+UPDATE job_card_pm_indent pi
+SET bom_line_id = pm_resolved.resolved_id
+FROM pm_resolved
+WHERE pi.pm_indent_id = pm_resolved.pm_indent_id
+  AND pm_resolved.resolved_id IS NOT NULL;

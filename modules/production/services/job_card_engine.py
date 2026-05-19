@@ -169,11 +169,11 @@ async def create_job_cards(conn, prod_order_id: int) -> dict:
                 await conn.execute(
                     """
                     INSERT INTO job_card_rm_indent (
-                        job_card_id, material_sku_name, uom, reqd_qty, loss_pct,
-                        gross_qty, godown, status
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
+                        job_card_id, bom_line_id, material_sku_name, uom, reqd_qty,
+                        loss_pct, gross_qty, godown, status
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
                     """,
-                    job_card_id, bl['material_sku_name'], bl['uom'],
+                    job_card_id, bl['bom_line_id'], bl['material_sku_name'], bl['uom'],
                     round(reqd, 3), loss, round(gross, 3), bl['godown'],
                 )
                 rm_count += 1
@@ -188,11 +188,11 @@ async def create_job_cards(conn, prod_order_id: int) -> dict:
                 await conn.execute(
                     """
                     INSERT INTO job_card_pm_indent (
-                        job_card_id, material_sku_name, uom, reqd_qty, loss_pct,
-                        gross_qty, godown, status
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
+                        job_card_id, bom_line_id, material_sku_name, uom, reqd_qty,
+                        loss_pct, gross_qty, godown, status
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
                     """,
-                    job_card_id, bl['material_sku_name'], bl['uom'],
+                    job_card_id, bl['bom_line_id'], bl['material_sku_name'], bl['uom'],
                     round(reqd, 3), loss, round(gross, 3), bl['godown'],
                 )
                 pm_count += 1
@@ -493,16 +493,24 @@ async def record_output_v2(conn, job_card_id: int, data: dict) -> dict:
     balance_materials = data.get('balance_materials') or []
     qc = data.get('qc') or {}
 
-    # Validate any supplied bom_line_id belongs to this JC's BOM.
+    # Validate any supplied bom_line_id belongs to one of this JC's indent rows.
+    # Stricter than checking bom_line — if the JC has no indent row for the line,
+    # the UPDATE below would silently no-op, so reject early instead.
     submitted_bom_line_ids = {
         int(r['bom_line_id']) for r in rm_consumed_lines if r.get('bom_line_id') is not None
     } | {
         int(b['bom_line_id']) for b in balance_materials if b.get('bom_line_id') is not None
     }
-    if submitted_bom_line_ids and jc['bom_id']:
+    if submitted_bom_line_ids:
         valid_rows = await conn.fetch(
-            "SELECT bom_line_id FROM bom_line WHERE bom_id = $1 AND bom_line_id = ANY($2::int[])",
-            jc['bom_id'], list(submitted_bom_line_ids),
+            """
+            SELECT bom_line_id FROM job_card_rm_indent
+              WHERE job_card_id = $1 AND bom_line_id IS NOT NULL
+            UNION
+            SELECT bom_line_id FROM job_card_pm_indent
+              WHERE job_card_id = $1 AND bom_line_id IS NOT NULL
+            """,
+            job_card_id,
         )
         valid_ids = {r['bom_line_id'] for r in valid_rows}
         invalid_ids = submitted_bom_line_ids - valid_ids
@@ -562,17 +570,32 @@ async def record_output_v2(conn, job_card_id: int, data: dict) -> dict:
             bm['balance_type'], float(bm.get('qty_kg', 0)), bm.get('remarks'),
         )
 
-    # 3b. Replace per-BOM-line RM consumption rows
-    await conn.execute("DELETE FROM job_card_rm_consumption WHERE job_card_id = $1", job_card_id)
+    # 3b. Stamp per-BOM-line consumed_qty onto the matching indent row so the
+    # JC-detail GET can round-trip per-line values to the client without an
+    # extra fetch. Reset everyone first to clear stale values from earlier
+    # saves, then apply only the lines submitted in this request.
+    await conn.execute(
+        "UPDATE job_card_rm_indent SET consumed_qty = NULL WHERE job_card_id = $1",
+        job_card_id,
+    )
+    await conn.execute(
+        "UPDATE job_card_pm_indent SET consumed_qty = NULL WHERE job_card_id = $1",
+        job_card_id,
+    )
     for rc in rm_consumed_lines:
+        bid = rc.get('bom_line_id')
+        if bid is None:
+            continue
+        qty = float(rc.get('consumed_qty_kg', 0))
+        # bom_line_id is unique across both indent tables (each indent row
+        # mirrors exactly one bom_line). Run both UPDATEs; only one matches.
         await conn.execute(
-            """
-            INSERT INTO job_card_rm_consumption
-                (job_card_id, bom_line_id, material_sku_name, consumed_qty_kg, uom, remarks)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            """,
-            job_card_id, rc.get('bom_line_id'), rc['material_sku_name'],
-            float(rc.get('consumed_qty_kg', 0)), rc.get('uom', 'kg'), rc.get('remarks'),
+            "UPDATE job_card_rm_indent SET consumed_qty = $3 WHERE job_card_id = $1 AND bom_line_id = $2",
+            job_card_id, bid, qty,
+        )
+        await conn.execute(
+            "UPDATE job_card_pm_indent SET consumed_qty = $3 WHERE job_card_id = $1 AND bom_line_id = $2",
+            job_card_id, bid, qty,
         )
 
     # 4. Auto-compute and upsert loss recon rows
@@ -920,26 +943,15 @@ async def get_job_card_detail(conn, job_card_id: int) -> dict | None:
         "sales_order_ref": jc.get('sales_order_ref'),
     }
 
-    # Section 2A — RM Indent (enriched with FIFO batches + saved consumption)
+    # Section 2A — RM Indent (enriched with FIFO batches)
+    # consumed_qty is now a native column on job_card_rm_indent (stamped by
+    # record_output_v2), so dict(r) surfaces it automatically — no join needed.
     rm_rows = await conn.fetch(
         "SELECT * FROM job_card_rm_indent WHERE job_card_id = $1 ORDER BY rm_indent_id", job_card_id,
     )
-    # Build {material_sku_name → consumed_qty_kg} map so the Output & Accounting tab
-    # can prefill the consumed-qty input on refresh. Source of truth is
-    # job_card_rm_consumption (per-BOM-line); join is on the SKU name since the
-    # indent table has no bom_line_id column.
-    rm_consumed_rows = await conn.fetch(
-        "SELECT material_sku_name, consumed_qty_kg FROM job_card_rm_consumption WHERE job_card_id = $1",
-        job_card_id,
-    )
-    rm_consumed_map = {
-        r['material_sku_name'].lower(): float(r['consumed_qty_kg'] or 0)
-        for r in rm_consumed_rows
-    }
     section_2a = []
     for r in rm_rows:
         row = dict(r)
-        row['consumed_qty'] = rm_consumed_map.get((r['material_sku_name'] or '').lower(), 0)
         # Fetch FIFO batches for this material
         batches = await conn.fetch("""
             SELECT batch_id, lot_number, inward_date, expiry_date,

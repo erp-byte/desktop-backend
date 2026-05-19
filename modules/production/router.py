@@ -3565,7 +3565,8 @@ class JobCardOutputV2Request(BaseModel):
     fg_actual_units: int | None = None
     fg_expected_kg: float | None = None
     fg_expected_units: int | None = None
-    rm_consumed: list[RmConsumptionLineV2] = []   # per-BOM-line consumption
+    rm_consumed: list[RmConsumptionLineV2] = []   # per-BOM-line consumption (preferred)
+    rm_consumed_kg: float | None = None           # legacy scalar — engine falls back to this when rm_consumed is empty
     process_loss_kg: float = 0.0
     byproducts: list[ByproductLineV2] = []
     balance_materials: list[BalanceMaterialV2] = []
@@ -3613,8 +3614,9 @@ async def get_output_v2(request: Request, job_card_id: int):
             "SELECT bom_line_id, material_id, material_name, balance_type, qty_kg, remarks FROM job_card_balance_material WHERE job_card_id = $1",
             job_card_id,
         )
+        # Per-line consumed_qty lives on the indent rows now — surface from there.
         rm_consumed = await conn.fetch(
-            "SELECT bom_line_id, material_sku_name, consumed_qty_kg, uom, remarks FROM job_card_rm_consumption WHERE job_card_id = $1 ORDER BY consumption_id",
+            "SELECT bom_line_id, material_sku_name, consumed_qty AS consumed_qty_kg, uom FROM job_card_rm_indent WHERE job_card_id = $1 AND consumed_qty IS NOT NULL ORDER BY rm_indent_id",
             job_card_id,
         )
         loss_recon = await conn.fetch(
