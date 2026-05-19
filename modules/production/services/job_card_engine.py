@@ -920,13 +920,26 @@ async def get_job_card_detail(conn, job_card_id: int) -> dict | None:
         "sales_order_ref": jc.get('sales_order_ref'),
     }
 
-    # Section 2A — RM Indent (enriched with FIFO batches)
+    # Section 2A — RM Indent (enriched with FIFO batches + saved consumption)
     rm_rows = await conn.fetch(
         "SELECT * FROM job_card_rm_indent WHERE job_card_id = $1 ORDER BY rm_indent_id", job_card_id,
     )
+    # Build {material_sku_name → consumed_qty_kg} map so the Output & Accounting tab
+    # can prefill the consumed-qty input on refresh. Source of truth is
+    # job_card_rm_consumption (per-BOM-line); join is on the SKU name since the
+    # indent table has no bom_line_id column.
+    rm_consumed_rows = await conn.fetch(
+        "SELECT material_sku_name, consumed_qty_kg FROM job_card_rm_consumption WHERE job_card_id = $1",
+        job_card_id,
+    )
+    rm_consumed_map = {
+        r['material_sku_name'].lower(): float(r['consumed_qty_kg'] or 0)
+        for r in rm_consumed_rows
+    }
     section_2a = []
     for r in rm_rows:
         row = dict(r)
+        row['consumed_qty'] = rm_consumed_map.get((r['material_sku_name'] or '').lower(), 0)
         # Fetch FIFO batches for this material
         batches = await conn.fetch("""
             SELECT batch_id, lot_number, inward_date, expiry_date,
