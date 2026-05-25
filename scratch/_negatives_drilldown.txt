@@ -1,0 +1,466 @@
+==============================================================================================================
+  NEGATIVE-STOCK DRILL-DOWN (v5, Inf-In rolled back to Savla/Rishi only)
+  Window: 2026-04-01 → 2026-05-18  ·  21 negative (unit, group) cells
+==============================================================================================================
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  UNIT=A-185   GROUP=dates   CLOSING = -245,463 kg
+    Opening      9,535  + Inward     11,208  + Xfr-In        426  − Xfr-Out      1,684
+    + CN             0  − Outward   264,642  + Adj-In      1,022  − Adj-Out      1,326
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  TOP 10 OUTWARD invoices (article-group = dates):
+       123,990 kg  CDPL/25-26/1430        2026-04-03  AL BARAKAH FARD
+        28,000 kg  CDPL/25-26/1430        2026-04-03  AL BARAKAH BARHI
+        25,000 kg  CDPL/25-26/1430        2026-04-03  Sufri Wet Dates
+         6,250 kg  CDPL/26-27/40          2026-04-27  AL Barakah Date Paste
+         6,000 kg  CDPL/26-27/27          2026-04-17  AL Barakah Date Paste
+         6,000 kg  CDPL/26-27/74          2026-05-14  AL BARAKAH FARD
+         5,000 kg  CDPL/26-27/26          2026-04-17  AL Barakah Date Paste
+         5,000 kg  CDPL/26-27/43          2026-04-27  AL Barakah Date Paste
+         5,000 kg  CDPL/26-27/44          2026-04-27  AL BARAKAH DATE PASTE 12.5KG
+         5,000 kg  CDPL/26-27/55          2026-05-02  Al Barakah Date Powder 5%
+  TOP 10 ADJ-OUT (BOM-RM deductions, FG sales pulling dates):
+           280 kg  CDPL/26-27/68          2026-05-11  FG: Fresho Kimia Dates 500 Gm  → RM: Wet Dates (Mazafati)
+           280 kg  CDPL/26-27/69          2026-05-11  FG: Fresho Kimia Dates 500 Gm  → RM: Wet Dates (Mazafati)
+           168 kg  CDPL/26-27/65          2026-05-07  FG: Fresho Kimia Dates 500 Gm  → RM: Wet Dates (Mazafati)
+           144 kg  CND/26-27/684          2026-05-07  FG: King Solomon Oriental Dates 250g  → RM: Deri Dates
+           144 kg  CND/26-27/684          2026-05-07  FG: King Solomon Oriental Dates 250g  → RM: Wet Dates (Deri)
+           100 kg  CDPL/26-27/23          2026-04-14  FG: Seedless Fard Dates 500g  → RM: Al Barakah Fard Dates Seedless
+            49 kg  CDPL/26-27/20          2026-04-13  FG: King Solomon Medjoul Dates 500 Gms  → RM: WET DATES MEDJOUL BULK LARGE (
+            48 kg  CDPL/26-27/20          2026-04-13  FG: King Solomon Medjoul Dates 500 Gms  → RM: Medjoul Dates Large
+            48 kg  CDPL/26-27/32          2026-04-22  FG: AL BARAKAH DATES SYRUP 400G  → RM: Al Barakah Date Syrup
+            33 kg  CDPL/26-27/35          2026-04-24  FG: King Solomon Medjoul Dates 500 Gms  → RM: WET DATES MEDJOUL BULK LARGE (
+  TOP 10 TRANSFERS OUT (group = dates):
+            14 kg  TRANS202604301422      2026-04-30  A185           → W202           Received   AL BARAKAH DATE SYRUP(1.15KG X 12)
+            14 kg  TRANS202604301422      2026-04-30  A185           → W202           Received   AL BARAKAH DATE SYRUP(1.15KG X 12)
+            14 kg  TRANS202604301422      2026-04-30  A185           → W202           Received   AL BARAKAH DATE SYRUP(1.15KG X 12)
+            14 kg  TRANS202604301422      2026-04-30  A185           → W202           Received   AL BARAKAH DATE SYRUP(1.15KG X 12)
+            14 kg  TRANS202604301422      2026-04-30  A185           → W202           Received   AL BARAKAH DATE SYRUP(1.15KG X 12)
+            10 kg  TRANS202605091242      2026-05-09  A185           → W202           Received   WET DATES SEEDLESS KHALAS
+            10 kg  TRANS202605091242      2026-05-09  A185           → W202           Received   WET DATES SEEDLESS KHALAS
+            10 kg  TRANS202605091242      2026-05-09  A185           → W202           Received   WET DATES SEEDLESS KHALAS
+            10 kg  TRANS202605091242      2026-05-09  A185           → W202           Received   WET DATES SEEDLESS KHALAS
+            10 kg  TRANS202605091242      2026-05-09  A185           → W202           Received   WET DATES SEEDLESS KHALAS
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  UNIT=W-202   GROUP=dates   CLOSING = -38,599 kg
+    Opening     48,895  + Inward     76,174  + Xfr-In     54,004  − Xfr-Out     26,415
+    + CN        32,942  − Outward   205,653  + Adj-In     90,916  − Adj-Out    109,825
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  TOP 10 OUTWARD invoices (article-group = dates):
+        15,000 kg  CND/25-26/10782        2026-04-03  AL BARAKAH
+         8,895 kg  CND/26-27/274          2026-04-14  GOOD LIFE ARABIAN DATES 500 g
+         8,000 kg  CND/25-26/10782        2026-04-03  AL Barakah Date Paste
+         5,000 kg  CND/26-27/13           2026-04-02  AL BARAKAH FARD DATES PREMIUM - 10KG
+         5,000 kg  CND/26-27/145          2026-04-09  AL BARAKAH FARD DATES PREMIUM - 10KG
+         5,000 kg  CND/26-27/405          2026-04-21  AL BARAKAH FARD DATES PREMIUM - 10KG
+         5,000 kg  CND/26-27/522          2026-04-27  GI- Eatrite Arabian Dates 500gm
+         5,000 kg  CND/26-27/523          2026-04-27  GI- Eatrite Fard Dates 500gm
+         4,000 kg  CND/26-27/263          2026-04-13  AL BARAKAH FARD DATES STANDARD
+         3,990 kg  CND/26-27/423          2026-04-21  GOOD LIFE ARABIAN DATES 500 g
+  TOP 10 ADJ-OUT (BOM-RM deductions, FG sales pulling dates):
+         9,108 kg  CND/26-27/274          2026-04-14  FG: GOOD LIFE ARABIAN DATES 500 g  → RM: Sayer Dates
+         5,000 kg  CND/26-27/522          2026-04-27  FG: GI- Eatrite Arabian Dates 500gm  → RM: Sufri Wet Dates
+         5,000 kg  CND/26-27/523          2026-04-27  FG: GI- Eatrite Fard Dates 500gm  → RM: AL BARAKAH FARD DATES STANDARD
+         4,086 kg  CND/26-27/423          2026-04-21  FG: GOOD LIFE ARABIAN DATES 500 g  → RM: Sayer Dates
+         3,164 kg  CND/26-27/491          2026-04-25  FG: GOOD LIFE FARD DATES 500 g  → RM: AL BARAKAH FARD DATES STANDARD
+         1,797 kg  CND/26-27/786          2026-05-12  FG: GOOD LIFE FARD DATES 500 g  → RM: AL BARAKAH FARD DATES STANDARD
+         1,582 kg  CND/26-27/274          2026-04-14  FG: GOOD LIFE FARD DATES 500 g  → RM: AL BARAKAH FARD DATES STANDARD
+         1,520 kg  CND/26-27/574          2026-04-30  FG: PL CLASSIC DATES 500G  → RM: AL BARAKAH SAYER DATES THERMO(
+         1,496 kg  CND/26-27/411          2026-04-21  FG: PL CLASSIC DATES 500G  → RM: AL BARAKAH SAYER DATES THERMO(
+         1,344 kg  CDPL/26-27/14          2026-04-10  FG: CURATE DATES KIMIA IMP IRAN 500G  → RM: Wet Dates (Mazafati)
+  TOP 10 TRANSFERS OUT (group = dates):
+            15 kg  TRANS202604171645      2026-04-17  W202           → F53            Received   WET DATES SAFAVI
+            15 kg  TRANS202604171645      2026-04-17  W202           → F53            Received   WET DATES SAFAVI
+            15 kg  TRANS202604171645      2026-04-17  W202           → F53            Received   WET DATES SAFAVI
+            15 kg  TRANS202604171645      2026-04-17  W202           → F53            Received   WET DATES SAFAVI
+            15 kg  TRANS202604171645      2026-04-17  W202           → F53            Received   WET DATES SAFAVI
+            15 kg  TRANS202604171645      2026-04-17  W202           → F53            Received   WET DATES SAFAVI
+            15 kg  TRANS202604171645      2026-04-17  W202           → F53            Received   WET DATES SAFAVI
+            15 kg  TRANS202604171645      2026-04-17  W202           → F53            Received   WET DATES SAFAVI
+            15 kg  TRANS202604171645      2026-04-17  W202           → F53            Received   WET DATES SAFAVI
+            15 kg  TRANS202604171645      2026-04-17  W202           → F53            Received   WET DATES SAFAVI
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  UNIT=F-53   GROUP=dates   CLOSING = -29,231 kg
+    Opening      2,276  + Inward          0  + Xfr-In     16,044  − Xfr-Out        217
+    + CN             0  − Outward    33,367  + Adj-In     15,534  − Adj-Out     29,501
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  TOP 10 OUTWARD invoices (article-group = dates):
+         3,200 kg  CF53/2627/00270        2026-05-15  AL BARAKAH FARD DATES PREMIUM - 500g
+         3,000 kg  CF53/2627/00201        2026-04-28  Fardh Dates
+         2,010 kg  CF53/2627/00236        2026-05-07  Medjoul Dates Super Jumbo
+         1,040 kg  CF53/2627/00051        2026-04-03  Medjoul Dates Super Jumbo
+         1,040 kg  CF53/2627/00051        2026-04-03  Medjoul Dates Large
+           990 kg  CF53/2627/00083        2026-04-09  Ameri Dates
+           970 kg  CF53/2627/00153        2026-04-24  Deri Dates
+           680 kg  CF53/2627/00267        2026-05-15  King Solomon Medjoul Dates 500 Gms
+           595 kg  CF53/2627/00248        2026-05-11  Mazafati Dates
+           520 kg  CF53/2627/00281        2026-05-18  AL BARAKAH FARD
+  TOP 10 ADJ-OUT (BOM-RM deductions, FG sales pulling dates):
+           494 kg  CF53/2627/00070        2026-04-08  FG: King Solomon Medjoul Dates 500 Gms  → RM: WET DATES MEDJOUL BULK LARGE (
+           494 kg  CF53/2627/00223        2026-05-05  FG: King Solomon Medjoul Dates 500 Gms  → RM: WET DATES MEDJOUL BULK LARGE (
+           480 kg  CF53/2627/00070        2026-04-08  FG: King Solomon Medjoul Dates 500 Gms  → RM: Medjoul Dates Large
+           480 kg  CF53/2627/00223        2026-05-05  FG: King Solomon Medjoul Dates 500 Gms  → RM: Medjoul Dates Large
+           412 kg  CF53/2627/00107        2026-04-15  FG: King Solomon Medjoul Dates 500 Gms  → RM: WET DATES MEDJOUL BULK LARGE (
+           412 kg  CF53/2627/00139        2026-04-22  FG: King Solomon Medjoul Dates 500 Gms  → RM: WET DATES MEDJOUL BULK LARGE (
+           412 kg  CF53/2627/00187        2026-04-28  FG: King Solomon Medjoul Dates 500 Gms  → RM: WET DATES MEDJOUL BULK LARGE (
+           412 kg  CF53/2627/00244        2026-05-09  FG: King Solomon Medjoul Dates 500 Gms  → RM: WET DATES MEDJOUL BULK LARGE (
+           400 kg  CF53/2627/00107        2026-04-15  FG: King Solomon Medjoul Dates 500 Gms  → RM: Medjoul Dates Large
+           400 kg  CF53/2627/00139        2026-04-22  FG: King Solomon Medjoul Dates 500 Gms  → RM: Medjoul Dates Large
+  TOP 10 TRANSFERS OUT (group = dates):
+            12 kg  TRANS202604071714      2026-04-07  F53            → W202           Received   AL BARAKAH DATE SYRUP(1.15KG X 12)
+            12 kg  TRANS202604071714      2026-04-07  F53            → W202           Received   AL BARAKAH DATE SYRUP(1.15KG X 12)
+            10 kg  TRANS202604151454      2026-04-15  F53            → W202           Received   WET DATES SEEDLESS KHALAS
+            10 kg  TRANS202605131648      2026-05-13  F53            → W202           Received   AL BARAKAH FARD DATES D 10KG
+            10 kg  TRANS202605131648      2026-05-13  F53            → W202           Received   AL BARAKAH FARD DATES D 10KG
+            10 kg  TRANS202605131648      2026-05-13  F53            → W202           Received   AL BARAKAH FARD DATES D 10KG
+            10 kg  TRANS202605131648      2026-05-13  F53            → W202           Received   AL BARAKAH FARD DATES D 10KG
+            10 kg  TRANS202605131648      2026-05-13  F53            → W202           Received   AL BARAKAH FARD DATES D 10KG
+            10 kg  TRANS202605131703      2026-05-13  F53            → W202           Received   AL BARAKAH FARD DATES D 10KG
+            10 kg  TRANS202605131703      2026-05-13  F53            → W202           Received   AL BARAKAH FARD DATES D 10KG
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  UNIT=A-185   GROUP=_UNMAPPED   CLOSING = -25,000 kg
+    Opening          0  + Inward          0  + Xfr-In          0  − Xfr-Out          0
+    + CN             0  − Outward    25,000  + Adj-In          0  − Adj-Out          0
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  TOP 1 OUTWARD invoices (article-group = _UNMAPPED):
+        25,000 kg  CDPL/25-26/1430        2026-04-03  Wet Date Sayer ( Unpitted
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  UNIT=A-185   GROUP=trail mix   CLOSING = -7,136 kg
+    Opening        488  + Inward          0  + Xfr-In          0  − Xfr-Out          0
+    + CN           602  − Outward    47,214  + Adj-In     39,289  − Adj-Out          0
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  TOP 10 OUTWARD invoices (article-group = trail mix):
+         1,250 kg  CND/26-27/154          2026-04-09  Healthy Choice 5 in 1 Seeds Mix 200gm
+         1,000 kg  CND/26-27/636          2026-05-04  Healthy Choice 5 in 1 Seeds Mix 200gm
+         1,000 kg  CND/26-27/677          2026-05-06  Healthy Choice 5 in 1 Seeds Mix 200gm
+         1,000 kg  CND/26-27/814          2026-05-13  Healthy Choice 5 in 1 Seeds Mix 200gm
+         1,000 kg  CND/26-27/882          2026-05-16  Healthy Choice 5 in 1 Seeds Mix 200gm
+           800 kg  CND/26-27/610          2026-04-30  Healthy Choice 5 in 1 Seeds Mix 200gm
+           700 kg  CND/26-27/658          2026-05-05  Healthy Choice 5 in 1 Seeds Mix 200gm
+           600 kg  CND/26-27/317          2026-04-16  Healthy Choice 5 in 1 Seeds Mix 200gm
+           600 kg  CND/26-27/419          2026-04-21  Healthy Choice 5 in 1 Seeds Mix 200gm
+           600 kg  CND/26-27/473          2026-04-24  Healthy Choice 5 in 1 Seeds Mix 200gm
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  UNIT=W-202   GROUP=pista   CLOSING = -4,859 kg
+    Opening      6,698  + Inward     37,399  + Xfr-In      3,302  − Xfr-Out      4,392
+    + CN         6,219  − Outward    53,540  + Adj-In     41,764  − Adj-Out     42,309
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  TOP 10 OUTWARD invoices (article-group = pista):
+         7,670 kg  CND/26-27/751          2026-05-09  California Pista Inshell
+         3,500 kg  CND/26-27/176          2026-04-10  California Pista Inshell Roasted and Salted
+         3,000 kg  CND/26-27/553          2026-04-28  California Pista Inshell Roasted and Salted
+         3,000 kg  CND/26-27/606          2026-04-30  California Pista Inshell Roasted and Salted
+         3,000 kg  CND/26-27/694          2026-05-07  California Pista Inshell Roasted and Salted
+         2,500 kg  CND/26-27/395          2026-04-20  California Pista Inshell Roasted and Salted
+         2,500 kg  CND/26-27/850          2026-05-15  California Pista Inshell
+         2,000 kg  CND/26-27/18           2026-04-03  California Pista Inshell Roasted and Salted
+         2,000 kg  CND/26-27/358          2026-04-18  California Pista Inshell Roasted and Salted
+         2,000 kg  CND/26-27/431          2026-04-22  California Pista Inshell Roasted and Salted
+  TOP 10 ADJ-OUT (BOM-RM deductions, FG sales pulling pista):
+         3,535 kg  CND/26-27/176          2026-04-10  FG: California Pista Inshell Roasted an  → RM: California Pista Inshell
+         3,030 kg  CND/26-27/553          2026-04-28  FG: California Pista Inshell Roasted an  → RM: California Pista Inshell
+         3,030 kg  CND/26-27/606          2026-04-30  FG: California Pista Inshell Roasted an  → RM: California Pista Inshell
+         3,030 kg  CND/26-27/694          2026-05-07  FG: California Pista Inshell Roasted an  → RM: California Pista Inshell
+         2,525 kg  CND/26-27/395          2026-04-20  FG: California Pista Inshell Roasted an  → RM: California Pista Inshell
+         2,020 kg  CND/26-27/18           2026-04-03  FG: California Pista Inshell Roasted an  → RM: California Pista Inshell
+         2,020 kg  CND/26-27/358          2026-04-18  FG: California Pista Inshell Roasted an  → RM: California Pista Inshell
+         2,020 kg  CND/26-27/431          2026-04-22  FG: California Pista Inshell Roasted an  → RM: California Pista Inshell
+         1,626 kg  CND/26-27/353          2026-04-18  FG: California Pista Inshell Roasted an  → RM: California Pista Inshell
+         1,515 kg  CND/26-27/140          2026-04-09  FG: Pista Irani 101 Inshell Roasted and  → RM: Pista Irani 101 Inshell
+  TOP 10 TRANSFERS OUT (group = pista):
+            50 kg  TRANS202605051418      2026-05-05  W202           → A185           Received   PISTA IRANI 101 INSHELL
+            50 kg  TRANS202605051418      2026-05-05  W202           → A185           Received   PISTA IRANI 101 INSHELL
+            50 kg  TRANS202605051418      2026-05-05  W202           → A185           Received   PISTA IRANI 101 INSHELL
+            50 kg  TRANS202605051418      2026-05-05  W202           → A185           Received   PISTA IRANI 101 INSHELL
+            50 kg  TRANS202605051418      2026-05-05  W202           → A185           Received   PISTA IRANI 101 INSHELL
+            50 kg  TRANS202605051418      2026-05-05  W202           → A185           Received   PISTA IRANI 101 INSHELL
+            50 kg  TRANS202605051418      2026-05-05  W202           → A185           Received   PISTA IRANI 101 INSHELL
+            50 kg  TRANS202605051418      2026-05-05  W202           → A185           Received   PISTA IRANI 101 INSHELL
+            50 kg  TRANS202605051418      2026-05-05  W202           → A185           Received   PISTA IRANI 101 INSHELL
+            50 kg  TRANS202605051418      2026-05-05  W202           → A185           Received   PISTA IRANI 101 INSHELL
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  UNIT=F-53   GROUP=pista   CLOSING = -4,286 kg
+    Opening        184  + Inward          0  + Xfr-In        258  − Xfr-Out        170
+    + CN             0  − Outward     4,558  + Adj-In          0  − Adj-Out          0
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  TOP 10 OUTWARD invoices (article-group = pista):
+         1,191 kg  CF53/2627/00241        2026-05-08  California Pista Inshell
+           624 kg  CF53/2627/00094        2026-04-11  California Pista Inshell
+           567 kg  CF53/2627/00222        2026-05-05  California Pista Inshell
+           374 kg  CF53/2627/00275        2026-05-16  California Pista Inshell
+           340 kg  CF53/2627/00251        2026-05-12  California Pista Inshell
+           284 kg  CF53/2627/00096        2026-04-13  California Pista Inshell
+           272 kg  CF53/2627/00263        2026-05-14  California Pista
+           145 kg  CF53/2627/00248        2026-05-11  California Pista Inshell
+           113 kg  CF53/2627/00076        2026-04-08  California Pista Inshell
+           113 kg  CF53/2627/00088        2026-04-10  California Pista Inshell
+  TOP 10 TRANSFERS OUT (group = pista):
+            15 kg  TRANS202604021250      2026-04-02  F53            → W202           Received   CARNIVAL ROASTED & SALTED PISTACHIO 250G
+            15 kg  TRANS202604021250      2026-04-02  F53            → W202           Received   CARNIVAL ROASTED & SALTED PISTACHIO 250G
+            15 kg  TRANS202604021250      2026-04-02  F53            → W202           Received   CARNIVAL ROASTED & SALTED PISTACHIO 250G
+            15 kg  TRANS202604021250      2026-04-02  F53            → W202           Received   CARNIVAL ROASTED & SALTED PISTACHIO 250G
+            15 kg  TRANS202604021250      2026-04-02  F53            → W202           Received   CARNIVAL ROASTED & SALTED PISTACHIO 250G
+            15 kg  TRANS202604021250      2026-04-02  F53            → W202           Received   CARNIVAL ROASTED & SALTED PISTACHIO 250G
+            15 kg  TRANS202604021250      2026-04-02  F53            → W202           Received   CARNIVAL ROASTED & SALTED PISTACHIO 250G
+            15 kg  TRANS202604021250      2026-04-02  F53            → W202           Received   CARNIVAL ROASTED & SALTED PISTACHIO 250G
+            15 kg  TRANS202604021250      2026-04-02  F53            → W202           Received   CARNIVAL ROASTED & SALTED PISTACHIO 250G
+            12 kg  TRANS202604241457      2026-04-29  F53            → W202           Received   PISTA KERNEL
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  UNIT=F-53   GROUP=seeds   CLOSING = -2,759 kg
+    Opening        423  + Inward          0  + Xfr-In        783  − Xfr-Out          0
+    + CN             0  − Outward     3,965  + Adj-In         15  − Adj-Out         15
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  TOP 10 OUTWARD invoices (article-group = seeds):
+         1,300 kg  CF53/2627/00054        2026-04-04  Water Melon Seed
+           600 kg  CF53/2627/00219        2026-05-04  Water Melon Seed
+           250 kg  CF53/2627/00202        2026-04-28  Pumpkin Seed ( 5% )
+           240 kg  CF53/2627/00221        2026-05-04  Pumpkin Seed ( 5% )
+           200 kg  CF53/2627/00120        2026-04-17  Pumpkin Seed ( 5% )
+           200 kg  CF53/2627/00161        2026-04-27  Pumpkin Seed ( 5% )
+           100 kg  CF53/2627/00163        2026-04-27  Black Chia Seeds
+            60 kg  CF53/2627/00221        2026-05-04  Sunflower Seeds
+            30 kg  CF53/2627/00159        2026-04-25  Sunflower Seeds
+            30 kg  CF53/2627/00171        2026-04-27  Black Chia Seeds
+  TOP 1 ADJ-OUT (BOM-RM deductions, FG sales pulling seeds):
+            15 kg  CF53/2627/00129        2026-04-20  FG: Pumpkin Seeds Roasted and Salted  → RM: Pumpkin Seed ( 5% )
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  UNIT=W-202   GROUP=peanuts   CLOSING = -1,997 kg
+    Opening          6  + Inward        276  + Xfr-In         94  − Xfr-Out          0
+    + CN            60  − Outward     4,143  + Adj-In      3,943  − Adj-Out      2,233
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  TOP 10 OUTWARD invoices (article-group = peanuts):
+           600 kg  CND/26-27/260          2026-04-13  Greendot Coated Peanuts
+           500 kg  CND/26-27/791          2026-05-12  Greendot Coated Peanuts
+           389 kg  CND/26-27/455          2026-04-23  Smokey BBQ Coated Peanuts 200g
+           370 kg  CND/26-27/455          2026-04-23  Chipotle Honey Coated Peanuts 200g
+           323 kg  CND/26-27/363          2026-04-18  Alpino Peanut Crackers Smokey BBQ 60g
+           317 kg  CND/26-27/363          2026-04-18  Alpino Peanut Crackers Chipotle Honey 60g
+           300 kg  CND/26-27/562          2026-04-29  Greendot Coated Peanuts
+           258 kg  CND/26-27/627          2026-05-04  Alpino Peanut Crackers Chipotle Honey 60g
+           245 kg  CND/26-27/627          2026-05-04  Alpino Peanut Crackers Smokey BBQ 60g
+           170 kg  CND/26-27/399          2026-04-21  Kracknut Coated Peanuts-Pudhina Patakha 1kg
+  TOP 10 ADJ-OUT (BOM-RM deductions, FG sales pulling peanuts):
+           312 kg  CND/26-27/260          2026-04-13  FG: Greendot Coated Peanuts  → RM: Peanuts
+           260 kg  CND/26-27/791          2026-05-12  FG: Greendot Coated Peanuts  → RM: Peanuts
+           207 kg  CND/26-27/455          2026-04-23  FG: Chipotle Honey Coated Peanuts 200g  → RM: Peanuts
+           185 kg  CND/26-27/455          2026-04-23  FG: Smokey BBQ Coated Peanuts 200g  → RM: Peanuts
+           174 kg  CND/26-27/363          2026-04-18  FG: Alpino Peanut Crackers Chipotle Hon  → RM: Peanuts
+           156 kg  CND/26-27/562          2026-04-29  FG: Greendot Coated Peanuts  → RM: Peanuts
+           145 kg  CND/26-27/363          2026-04-18  FG: Alpino Peanut Crackers Smokey BBQ 6  → RM: Peanuts
+           142 kg  CND/26-27/627          2026-05-04  FG: Alpino Peanut Crackers Chipotle Hon  → RM: Peanuts
+           110 kg  CND/26-27/627          2026-05-04  FG: Alpino Peanut Crackers Smokey BBQ 6  → RM: Peanuts
+            80 kg  CND/26-27/399          2026-04-21  FG: Kracknut Coated Peanuts-Pudhina Pat  → RM: Peanuts
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  UNIT=W-202   GROUP=trail mix   CLOSING = -1,850 kg
+    Opening        661  + Inward          0  + Xfr-In          0  − Xfr-Out          0
+    + CN           463  − Outward    17,116  + Adj-In     14,613  − Adj-Out          8
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  TOP 10 OUTWARD invoices (article-group = trail mix):
+         1,092 kg  CND/26-27/259          2026-04-13  Dark Chocolate Coated Almond Stuffed Khalas Single
+         1,000 kg  CND/26-27/598          2026-04-30  Dark Chocolate Coated Almond Stuffed Khalas Single
+         1,000 kg  CND/26-27/598          2026-04-30  Dark Chocolate Coated Cashew Stuffed Khalas Single
+           975 kg  CND/26-27/259          2026-04-13  Dark Chocolate Coated Cashew Stuffed Khalas Single
+           875 kg  CND/26-27/790          2026-05-12  Dark Chocolate Coated Almond Stuffed Khalas Single
+           575 kg  CND/26-27/308          2026-04-16  Dark Chocolate Coated Almond Stuffed Khalas Single
+           575 kg  CND/26-27/308          2026-04-16  Dark Chocolate Coated Cashew Stuffed Khalas Single
+           500 kg  CND/26-27/178          2026-04-11  Daily Mewa Healthy Mix
+           500 kg  CND/26-27/550          2026-04-28  Daily Mewa Healthy Mix
+           500 kg  CND/26-27/649          2026-05-05  Dark Chocolate Coated Almond Stuffed Khalas Single
+  TOP 5 ADJ-OUT (BOM-RM deductions, FG sales pulling trail mix):
+             3 kg  CND/26-27/31           2026-04-04  FG: NB MILLENNIUM NUT MIX LOOSE  → RM: Millennium Nut Mix
+             2 kg  CND/26-27/401          2026-04-21  FG: NB MILLENNIUM NUT MIX LOOSE  → RM: Millennium Nut Mix
+             1 kg  CND/26-27/167          2026-04-10  FG: NB MILLENNIUM NUT MIX LOOSE  → RM: Millennium Nut Mix
+             1 kg  CND/26-27/662          2026-05-05  FG: NB MILLENNIUM NUT MIX LOOSE  → RM: Millennium Nut Mix
+             1 kg  CND/26-27/724          2026-05-08  FG: NB MILLENNIUM NUT MIX LOOSE  → RM: Millennium Nut Mix
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  UNIT=F-53   GROUP=premium nuts   CLOSING = -278 kg
+    Opening        214  + Inward          0  + Xfr-In         26  − Xfr-Out         44
+    + CN             0  − Outward       475  + Adj-In          6  − Adj-Out          6
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  TOP 10 OUTWARD invoices (article-group = premium nuts):
+           100 kg  CF53/2627/00118        2026-04-17  Hazelnut Blanched
+           100 kg  CF53/2627/00229        2026-05-06  Hazelnut Blanched
+            80 kg  CF53/2627/00268        2026-05-15  Hazelnut Kernal
+            70 kg  CF53/2627/00269        2026-05-15  Macadamia Vanilla
+            11 kg  CF53/2627/00071        2026-04-08  Macadamia Roasted - Size 0
+            10 kg  CF53/2627/00058        2026-04-04  Macadamia Vanilla Whole - 320* Cut
+            10 kg  CF53/2627/00060        2026-04-06  Macadamia Vanilla Whole - 320* Cut
+            10 kg  CF53/2627/00078        2026-04-09  Macadamia Vanilla Whole - 320* Cut
+            10 kg  CF53/2627/00099        2026-04-13  Pecans Nuts Inshell
+            10 kg  CF53/2627/00126        2026-04-18  Macadamia Vanilla Whole - 320* Cut
+  TOP 1 ADJ-OUT (BOM-RM deductions, FG sales pulling premium nuts):
+             6 kg  CF53/2627/00137        2026-04-21  FG: Carnival Premium Brazil Nuts, 250 G  → RM: Brazil Nuts
+  TOP 5 TRANSFERS OUT (group = premium nuts):
+            14 kg  TRANS202604111645      2026-04-11  F53            → W202           Received   PECAN NUTS KERNEL SPLIT
+            10 kg  TRANS202604241453      2026-04-24  F53            → W202           Received   MACADAMIA VANILLA WHOLE - 320* CUT
+             9 kg  TRANS202604111645      2026-04-11  F53            → W202           Received   PECAN NUTS
+             6 kg  TRANS202604111645      2026-04-11  F53            → W202           Received   MACADAMIA INSHELL
+             5 kg  TRANS202604111645      2026-04-11  F53            → W202           Received   MACADAMIA INSHELL
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  UNIT=F-53   GROUP=cranberry   CLOSING = -120 kg
+    Opening         43  + Inward          0  + Xfr-In          0  − Xfr-Out          0
+    + CN             0  − Outward       163  + Adj-In          0  − Adj-Out          0
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  TOP 5 OUTWARD invoices (article-group = cranberry):
+            57 kg  CF53/2627/00072        2026-04-08  Dried Cranberry Whole
+            57 kg  CF53/2627/00072        2026-04-08  Dried Cranberry Sliced
+            34 kg  CF53/2627/00215        2026-05-02  Dried Cranberry Sliced
+            11 kg  CF53/2627/00266        2026-05-14  Dried Cranberry
+             5 kg  CF53/2627/00134        2026-04-20  Dried Cranberry Whole
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  UNIT=W-202   GROUP=_UNMAPPED   CLOSING = -67 kg
+    Opening          0  + Inward          0  + Xfr-In          0  − Xfr-Out          0
+    + CN             0  − Outward        67  + Adj-In          0  − Adj-Out          0
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  TOP 10 OUTWARD invoices (article-group = _UNMAPPED):
+            24 kg  CND/26-27/807          2026-05-13  Ha Hazulnut 250g ( 1340531)
+            12 kg  CND/26-27/807          2026-05-13  Ha Pinenut 100g ( 1340543)
+            10 kg  CND/26-27/825          2026-05-14  Vedaka Premium Whole Cranberries 200g ( B07GR2G678)
+             5 kg  CND/26-27/825          2026-05-14  Vedaka Dried Sweetened Blueberries 100gm ( B07GR24VMZ)
+             3 kg  CND/26-27/879          2026-05-16  NB GOJI BERRY DRIED
+             2 kg  CND/26-27/878          2026-05-16  NB BLACK PEPPER
+             2 kg  CND/26-27/878          2026-05-16  NB DEHYDRATED KIWI
+             2 kg  CND/26-27/878          2026-05-16  NB DEHYDRATED
+             2 kg  CND/26-27/879          2026-05-16  NB DEHYDRATED
+             2 kg  CND/26-27/879          2026-05-16  NB MILLENNIUM NUT MIX
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  UNIT=W-202   GROUP=festive hampers   CLOSING = -60 kg
+    Opening          0  + Inward          0  + Xfr-In          0  − Xfr-Out          0
+    + CN             0  − Outward        75  + Adj-In         15  − Adj-Out          0
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  TOP 4 OUTWARD invoices (article-group = festive hampers):
+            36 kg  CND/26-27/874          2026-05-16  Amazon Brand - Vedaka Premium Dry Fruits Combo 400 gm G
+            24 kg  CND/26-27/874          2026-05-16  Vedaka Premium Dry Fruits Combo 1000 gm Gift Box ( B0BB
+            11 kg  CND/26-27/311          2026-04-16  Vedaka Premium Flavored Dry Fruits 500 gm Gift Box (B0C
+             4 kg  CND/26-27/310          2026-04-16  Amazon Brand - Vedaka Premium Dry Fruits Combo 400 gm G
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  UNIT=W-202   GROUP=tajir   CLOSING = -52 kg
+    Opening          6  + Inward        150  + Xfr-In          0  − Xfr-Out          0
+    + CN             0  − Outward         0  + Adj-In          0  − Adj-Out        208
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  TOP 10 ADJ-OUT (BOM-RM deductions, FG sales pulling tajir):
+            42 kg  CND/26-27/260          2026-04-13  FG: Greendot Coated Peanuts  → RM: Maize Starch
+            35 kg  CND/26-27/791          2026-05-12  FG: Greendot Coated Peanuts  → RM: Maize Starch
+            21 kg  CND/26-27/562          2026-04-29  FG: Greendot Coated Peanuts  → RM: Maize Starch
+            18 kg  CND/26-27/455          2026-04-23  FG: Chipotle Honey Coated Peanuts 200g  → RM: Maize Starch
+            17 kg  CND/26-27/455          2026-04-23  FG: Smokey BBQ Coated Peanuts 200g  → RM: Maize Starch
+            15 kg  CND/26-27/363          2026-04-18  FG: Alpino Peanut Crackers Chipotle Hon  → RM: Maize Starch
+            14 kg  CND/26-27/363          2026-04-18  FG: Alpino Peanut Crackers Smokey BBQ 6  → RM: Maize Starch
+            12 kg  CND/26-27/627          2026-05-04  FG: Alpino Peanut Crackers Chipotle Hon  → RM: Maize Starch
+            10 kg  CND/26-27/627          2026-05-04  FG: Alpino Peanut Crackers Smokey BBQ 6  → RM: Maize Starch
+             7 kg  CND/26-27/399          2026-04-21  FG: Kracknut Coated Peanuts-Pudhina Pat  → RM: Maize Starch
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  UNIT=F-53   GROUP=seasoning   CLOSING = -30 kg
+    Opening          0  + Inward          0  + Xfr-In          0  − Xfr-Out          0
+    + CN             0  − Outward        30  + Adj-In          0  − Adj-Out          0
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  TOP 2 OUTWARD invoices (article-group = seasoning):
+            20 kg  CF53/2627/00135        2026-04-21  Jav
+            10 kg  CF53/2627/00135        2026-04-21  Sesame Seeds (White Til)
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  UNIT=F-53   GROUP=blueberry   CLOSING = -24 kg
+    Opening         14  + Inward          0  + Xfr-In         30  − Xfr-Out          0
+    + CN             0  − Outward        66  + Adj-In         30  − Adj-Out         31
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  TOP 5 OUTWARD invoices (article-group = blueberry):
+            30 kg  CF53/2627/00137        2026-04-21  Carnival Dried Blueberry 250g - Tub
+            23 kg  CF53/2627/00072        2026-04-08  Dried Blueberry
+             5 kg  CF53/2627/00077        2026-04-08  Dried Blueberry
+             5 kg  CF53/2627/00205        2026-04-29  Dried Blueberry
+             5 kg  CF53/2627/00228        2026-05-06  Dried Blueberry
+  TOP 1 ADJ-OUT (BOM-RM deductions, FG sales pulling blueberry):
+            31 kg  CF53/2627/00137        2026-04-21  FG: Carnival Dried Blueberry 250g - Tub  → RM: Dried Blueberry
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  UNIT=F-53   GROUP=miscellaneous - rm   CLOSING = -20 kg
+    Opening          0  + Inward          0  + Xfr-In          0  − Xfr-Out          0
+    + CN             0  − Outward        20  + Adj-In          0  − Adj-Out          0
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  TOP 1 OUTWARD invoices (article-group = miscellaneous - rm):
+            20 kg  CF53/2627/00135        2026-04-21  Dried Coconut - Copra
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  UNIT=W-202   GROUP=blackcurrant   CLOSING = -19 kg
+    Opening         85  + Inward          0  + Xfr-In          0  − Xfr-Out         18
+    + CN             0  − Outward        39  + Adj-In         37  − Adj-Out         83
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  TOP 10 OUTWARD invoices (article-group = blackcurrant):
+             7 kg  CND/26-27/8            2026-04-02  BBroyal Black Current 100g
+             7 kg  CND/26-27/9            2026-04-02  BBroyal Black Current 100g
+             5 kg  CND/26-27/182          2026-04-11  BBroyal Black Current 100g
+             4 kg  CND/26-27/183          2026-04-11  BBroyal Black Current 100g
+             3 kg  CND/26-27/25           2026-04-04  BBroyal Black Current 100g
+             3 kg  CND/26-27/167          2026-04-10  NB BLACKCURRANT DRIED LOOSE
+             2 kg  CND/26-27/184          2026-04-11  BBroyal Black Current 100g
+             2 kg  CND/26-27/725          2026-05-08  NB BLACKCURRANT DRIED LOOSE
+             2 kg  CND/26-27/879          2026-05-16  NB BLACKCURRANT
+             1 kg  CND/26-27/26           2026-04-04  BBroyal Black Current 100g
+  TOP 10 ADJ-OUT (BOM-RM deductions, FG sales pulling blackcurrant):
+            16 kg  CND/26-27/525          2026-04-27  FG: Booster Berries 33gm  → RM: GREEK DARK SEEDLESS RAISINS (B
+            12 kg  CND/26-27/525          2026-04-27  FG: Antioxidant Mix 33gm  → RM: Dried Black Currant
+             7 kg  CND/26-27/8            2026-04-02  FG: BBroyal Black Current 100g  → RM: GREEK DARK SEEDLESS RAISINS (B
+             7 kg  CND/26-27/9            2026-04-02  FG: BBroyal Black Current 100g  → RM: GREEK DARK SEEDLESS RAISINS (B
+             5 kg  CND/26-27/182          2026-04-11  FG: BBroyal Black Current 100g  → RM: GREEK DARK SEEDLESS RAISINS (B
+             4 kg  CND/26-27/183          2026-04-11  FG: BBroyal Black Current 100g  → RM: GREEK DARK SEEDLESS RAISINS (B
+             3 kg  CND/26-27/25           2026-04-04  FG: BBroyal Black Current 100g  → RM: GREEK DARK SEEDLESS RAISINS (B
+             3 kg  CND/26-27/167          2026-04-10  FG: NB BLACKCURRANT DRIED LOOSE  → RM: GREEK DARK SEEDLESS RAISINS (B
+             2 kg  CND/26-27/184          2026-04-11  FG: BBroyal Black Current 100g  → RM: GREEK DARK SEEDLESS RAISINS (B
+             2 kg  CND/26-27/725          2026-05-08  FG: NB BLACKCURRANT DRIED LOOSE  → RM: GREEK DARK SEEDLESS RAISINS (B
+  TOP 2 TRANSFERS OUT (group = blackcurrant):
+            12 kg  TRANS202605181634      2026-05-18  W202           → A185           Dispatch   DRIED BLACK CURRANT
+             6 kg  TRANS202604211510      2026-04-21  W202           → F53            Received   HA BLACK CURRENT 250G (1340541)
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  UNIT=F-53   GROUP=makhana   CLOSING = -6 kg
+    Opening          0  + Inward          0  + Xfr-In          0  − Xfr-Out          0
+    + CN             0  − Outward         6  + Adj-In          0  − Adj-Out          0
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  TOP 1 OUTWARD invoices (article-group = makhana):
+             6 kg  CF53/2627/00087        2026-04-10  Makhana
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  UNIT=F-53   GROUP=_UNMAPPED   CLOSING = -6 kg
+    Opening          0  + Inward          0  + Xfr-In          0  − Xfr-Out          0
+    + CN             0  − Outward         6  + Adj-In          0  − Adj-Out          0
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  TOP 1 OUTWARD invoices (article-group = _UNMAPPED):
+             6 kg  CF53/2627/00137        2026-04-21  Carnival Black Currant 250 Gm
+
+==============================================================================================================
+  _UNMAPPED articles (not classifiable into any group)
+==============================================================================================================
+
+Sales register / PDF invoices — articles falling to _UNMAPPED:
+      25,000 kg  Wet Date Sayer ( Unpitted
+          24 kg  Ha Hazulnut 250g ( 1340531)
+          12 kg  Ha Pinenut 100g ( 1340543)
+          10 kg  Vedaka Premium Whole Cranberries 200g ( B07GR2G678)
+           6 kg  Carnival Black Currant 250 Gm
+           5 kg  Vedaka Dried Sweetened Blueberries 100gm ( B07GR24VMZ)
+           3 kg  NB GOJI BERRY DRIED
+           2 kg  NB BLACK PEPPER
+           2 kg  NB DEHYDRATED KIWI
+           2 kg  NB DEHYDRATED
+           2 kg  NB DEHYDRATED
+           2 kg  NB MILLENNIUM NUT MIX
+           1 kg  NB DEHYDRATED MANGO
+           1 kg  NB DEHYDRATED KIWI
+           1 kg  NB DEHYDRATED MANGO
+
+Inward boxes — articles NOT in all_sku (after vendor-fallback):

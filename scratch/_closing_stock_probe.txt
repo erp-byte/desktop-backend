@@ -1,0 +1,1061 @@
+# Closing-stock probe — window 2026-04-01 → 2026-05-18
+
+## Existence check
+- Found: 58 / 58
+- Missing: []
+
+## Related tables discovered (not in candidate list)
+(68 extras)
+  - audit_policy
+  - bom_components
+  - cdpl_complaint_articles
+  - cdpl_complaint_history
+  - cdpl_complaint_proofs
+  - cdplrtv_items
+  - cdplrtv_master
+  - cfpl_complaint_articles
+  - cfpl_complaint_history
+  - cfpl_complaint_proofs
+  - cfplrtv_items
+  - cfplrtv_master
+  - discrepancy_report
+  - doc_incident_report
+  - doc_inward_rm_check
+  - doc_traceability_report
+  - doc_waste_disposal
+  - fulfillment_bom_override
+  - internal_issue_note
+  - internal_job_card
+  - interunit_transfer_boxes
+  - interunit_transfer_request_lines
+  - interunit_transfer_requests
+  - jb_work_inward_lines
+  - jb_work_inward_receipt
+  - job_card
+  - job_card_balance_material
+  - job_card_environment
+  - job_card_loss_reconciliation
+  - job_card_material_accounting
+  - job_card_metal_detection
+  - job_card_partial_dispatch
+  - job_card_process_step
+  - job_card_remarks
+  - job_card_sign_off
+  - job_card_weight_check
+  - jobwork_inward_receipts
+  - landed_cost_component
+  - legacy_import_log
+  - mfg_job_cards
+  - mis_sales_refers
+  - mst_component
+  - ni_reports
+  - offgrade_consumption
+  - outward_approvals
+  - po_event_log
+  - po_section
+  - prd_jc_sign
+  - prd_jc_step
+  - prd_jc_team
+  - production_indent
+  - purchase_indent
+  - qc_report_document
+  - receipt_idempotency_key
+  - rtv_disposition
+  - rtv_permissions
+  - sales_permissions
+  - sales_upload_template
+  - so_fulfillment
+  - transfer_authority
+  - transfers_approval_authorities
+  - transporters
+  - v_billed_articles
+  - v_billed_details
+  - v_mfg_dq_unlinked_components
+  - v_mfg_job_card_summary
+  - vis_appointment
+  - webhook_endpoint
+
+## Per-table inspection
+
+### public.audit_policy
+  rows: 44
+  cols (9): policy_id:text, entity_table:text, capture_insert:boolean, capture_update:boolean, capture_delete:boolean, snapshot_freq:text, revertable:text, revert_roles:text, requires_dual_approval:boolean
+  date_cols: (none)
+  sample: {policy_id=eada6a0d73e2, entity_table=iam_security_event, capture_insert=True, capture_update=False, capture_delete=False, snapshot_freq=none, revertable=no, revert_roles=None, requires_dual_approval=False}
+
+### public.billed_articles
+  rows: 0
+  cols (20): id:character varying, billed_details_id:character varying, article_index:integer, article:text, boxes:integer, net_wt_kg:numeric, gr_wt_kg:numeric, taxable_amount:numeric, hsn_code:text, rate_per_unit:numeric, created_at:timestamp with time zone, updated_at:timestamp with time zone, deleted_at:timestamp with time zone, matched_sku_id:bigint, matched_item_type:text, matched_item_group:text, matched_sub_group:text, matched_uom:numeric, matched_gst:numeric, matched_sale_group:text
+  (empty)
+
+### public.billed_details
+  rows: 0
+  cols (28): id:character varying, route:text, invoice_no:text, invoice_date:date, invoice_type:text, customer:text, location:text, pin_code:text, customer_gstin:text, po_no:text, transporter:text, lr_no:text, warehouse:text, e_way_bill_no:text, payment_terms:text, approx_distance_km:integer, irn:text, total_taxable:numeric, total_gross:numeric, freight_charge:numeric, transport_per_kg:numeric, dispatch_unit:text, source_pdf:text, sheet_start_row:integer, sheet_end_row:integer, created_at:timestamp with time zone, updated_at:timestamp with time zone, deleted_at:timestamp with time zone
+  (empty)
+
+### public.bom_components
+  rows: 0
+  cols (16): id:integer, bom_id:character varying, sku_id:character varying, material_type:character varying, qty_required:numeric, uom:character varying, sequence_order:integer, process_loss_pct:numeric, extra_giveaway_pct:numeric, handling_loss_pct:numeric, shrinkage_pct:numeric, total_loss_pct:numeric, qty_with_loss:numeric, is_active:boolean, created_at:timestamp with time zone, updated_at:timestamp with time zone
+  (empty)
+
+### public.cdpl_articles_v2
+  rows: 40
+  cols (22): id:integer, transaction_no:character varying, sku_id:integer, item_description:character varying, item_category:character varying, sub_category:character varying, material_type:character varying, quality_grade:character varying, uom:character varying, po_quantity:numeric, units:character varying, quantity_units:numeric, net_weight:numeric, total_weight:numeric, lot_number:character varying, manufacturing_date:character varying, expiry_date:character varying, unit_rate:numeric, total_amount:numeric, carton_weight:numeric, created_at:timestamp without time zone, po_weight:numeric
+  date_col[expiry_date character varying]: min=2026-12-01 max=2027-10-08 window_rows=None
+  date_col[sub_category character varying]: min=diced max=syrup window_rows=None
+  date_col[manufacturing_date character varying]: min=2025-08-01 max=2026-04-09 window_rows=None
+  date_col[transaction_no character varying]: min=TR-20260225133247 max=TR-20260515181428 window_rows=None
+  date_col[material_type character varying]: min=fg max=RM window_rows=None
+  date_col[item_category character varying]: min=anjeer max=DATES window_rows=None
+  date_col[created_at timestamp without time zone]: min=2026-02-25 08:02:46.359362 max=2026-05-15 12:44:28.898175 window_rows=16
+  sample: {id=51, transaction_no=TR-20260515181428, sku_id=1220, item_description=al barakah date paste, item_category=dates, sub_category=paste, material_type=rm, quality_grade=None, uom=1, po_quantity=4500.000, units=None, quantity_units=360.000, net_weight=None, total_weight=None, lot_number=6362, manufacturing_date=None, expiry_date=None, unit_rate=93.00, total_amount=418500.00, carton_weight=0.500, created_at=2026-05-15 12:44:28.898175, po_weight=None}
+
+### public.cdpl_boxes_v2
+  rows: 14850
+  cols (10): id:integer, transaction_no:character varying, article_description:character varying, box_number:integer, net_weight:numeric, gross_weight:numeric, lot_number:character varying, count:integer, created_at:timestamp without time zone, box_id:character varying
+  date_col[created_at timestamp without time zone]: min=2026-02-25 08:02:46.359362 max=2026-05-15 12:44:28.898175 window_rows=7765
+  date_col[transaction_no character varying]: min=TR-20260225133247 max=TR-20260515181428 window_rows=None
+  sample: {id=24510, transaction_no=TR-20260515181428, article_description=al barakah date paste, box_number=360, net_weight=12.500, gross_weight=13.000, lot_number=6362, count=360, created_at=2026-05-15 12:44:28.898175, box_id=49068986-1260}
+
+### public.cdpl_complaint_articles
+  rows: 3
+  cols (8): id:integer, complaint_id:integer, item_category:character varying, item_subcategory:character varying, item_description:text, quantity:integer, uom:character varying, created_at:timestamp without time zone
+  date_col[item_subcategory character varying]: min=Emirates max=Emirates window_rows=None
+  date_col[created_at timestamp without time zone]: min=2025-12-04 07:59:32.657820 max=2025-12-18 07:35:54.705848 window_rows=0
+  date_col[item_category character varying]: min=DATES max=DATES window_rows=None
+  sample: {id=3, complaint_id=3, item_category=DATES, item_subcategory=Emirates, item_description=Al Barakah Emirates Dates 500 Gm, quantity=1, uom=pieces, created_at=2025-12-18 07:35:54.705848}
+
+### public.cdpl_complaint_history
+  rows: 0
+  cols (6): id:integer, complaint_id:integer, action:character varying, changed_by:character varying, changed_at:timestamp without time zone, changes:jsonb
+  (empty)
+
+### public.cdpl_complaint_proofs
+  rows: 0
+  cols (10): id:integer, complaint_id:integer, file_name:character varying, file_type:character varying, file_size:bigint, s3_bucket:character varying, s3_key:character varying, s3_url:text, uploaded_at:timestamp without time zone, uploaded_by:character varying
+  (empty)
+
+### public.cdpl_complaints
+  rows: 3
+  cols (22): id:integer, complaint_id:character varying, customer_id:integer, customer_name:character varying, received_date:date, manufacturing_date:date, item_category:character varying, item_subcategory:character varying, item_description:text, batch_code:character varying, quantity_rejected:integer, quantity_approved:integer, uom:character varying, complaint_nature:text, other_complaint_nature:text, qa_assessment:character varying, justified_status:character varying, remarks:text, created_by:character varying, created_at:timestamp without time zone, updated_at:timestamp without time zone, measures_to_resolve:character varying
+  date_col[batch_code character varying]: min= max= window_rows=None
+  date_col[manufacturing_date date]: min=2025-12-04 max=2025-12-17 window_rows=0
+  date_col[justified_status character varying]: min=Under Review max=Under Review window_rows=None
+  date_col[item_category character varying]: min=DATES max=DATES window_rows=None
+  date_col[complaint_nature text]: min=Food Safety max=Food Safety window_rows=None
+  date_col[item_subcategory character varying]: min=Emirates max=Emirates window_rows=None
+  date_col[created_at timestamp without time zone]: min=2025-12-04 07:59:32.657820 max=2025-12-18 07:35:54.705848 window_rows=0
+  date_col[updated_at timestamp without time zone]: min=2025-12-04 07:59:32.657820 max=2025-12-18 07:35:54.705848 window_rows=0
+  date_col[other_complaint_nature text]: min=physical_hazard max=physical_hazard window_rows=None
+  date_col[created_by character varying]: min=qa_user_1 max=qa_user_1 window_rows=None
+  date_col[received_date date]: min=2025-12-04 max=2025-12-17 window_rows=0
+  sample: {id=3, complaint_id=CCFS-2025-12-003, customer_id=None, customer_name=reliance_retail_limited, received_date=2025-12-17, manufacturing_date=2025-12-17, item_category=DATES, item_subcategory=Emirates, item_description=Al Barakah Emirates Dates 500 Gm, batch_code=, quantity_rejected=0, quantity_approved=0, uom=pieces, complaint_nature=Food Safety, other_complaint_nature=physical_hazard, qa_assessment=Pending, justified_status=Under Review, remarks=The customer purchased Classic Emirates Dates from the Re..., created_by=qa_user_1, created_at=2025-12-18 07:35:54.705848, updated_at=2025-12-18 07:35:54.705848, measures_to_resolve=replacement}
+
+### public.cdpl_outward
+  rows: 0
+  cols (37): id:integer, company_name:character varying, consignment_no:character varying, invoice_no:character varying, customer_name:character varying, location:character varying, po_no:character varying, boxes:integer, gross_weight:character varying, net_weight:character varying, appt_date:date, appt_time:time without time zone, sitecode:character varying, asn_id:bigint, transporter_name:character varying, vehicle_no:character varying, lr_no:bigint, dispatch_date:date, estimated_delivery_date:date, actual_delivery_date:date, delivery_status:character varying, invoice_amount:numeric, invoice_gst_amount:numeric, total_invoice_amount:numeric, freight_amount:numeric, freight_gst_amount:numeric, total_freight_amount:numeric, billing_address:text, shipping_address:text, pincode:integer, created_at:timestamp without time zone, updated_at:timestamp without time zone, business_head:character varying, business_head_name:character varying, business_head_email:character varying, invoice_files:ARRAY, pod_files:ARRAY
+  (empty)
+
+### public.cdpl_rtv_boxes
+  rows: 301
+  cols (14): id:integer, header_id:integer, rtv_line_id:integer, box_number:integer, box_id:character varying, article_description:character varying, lot_number:character varying, net_weight:numeric, gross_weight:numeric, count:integer, created_at:timestamp without time zone, updated_at:timestamp without time zone, conversion:character varying, uom:character varying
+  date_col[updated_at timestamp without time zone]: min=2026-03-21 12:42:16.725506 max=2026-05-07 11:05:27.697907 window_rows=40
+  date_col[created_at timestamp without time zone]: min=2026-03-21 12:41:15.345457 max=2026-05-12 10:29:00.162504 window_rows=252
+  sample: {id=301, header_id=16, rtv_line_id=None, box_number=1, box_id=None, article_description=10kg al barakah date powder v1, lot_number=None, net_weight=10.000, gross_weight=10.600, count=1, created_at=2026-05-12 10:29:00.162504, updated_at=None, conversion=1, uom=1.000}
+
+### public.cdpl_rtv_header
+  rows: 16
+  cols (22): id:integer, rtv_id:character varying, rtv_date:timestamp without time zone, factory_unit:character varying, customer:character varying, invoice_number:character varying, challan_no:character varying, dn_no:character varying, conversion:numeric, sales_poc:character varying, remark:character varying, status:character varying, created_by:character varying, created_ts:timestamp without time zone, updated_at:timestamp without time zone, approved_by:character varying, approved_at:timestamp without time zone, vehicle_number:character varying, transporter_name:character varying, driver_name:character varying, inward_manager:character varying, business_head:character varying
+  date_col[status character varying]: min=Approved max=Approved window_rows=None
+  date_col[created_ts timestamp without time zone]: min=2026-03-21 12:41:15.297009 max=2026-05-12 10:28:58.657226 window_rows=12
+  date_col[transporter_name character varying]: min=None max=None window_rows=None
+  date_col[rtv_date timestamp without time zone]: min=2026-03-21 12:41:15.297009 max=2026-05-12 10:28:58.657226 window_rows=12
+  date_col[updated_at timestamp without time zone]: min=2026-03-21 12:42:16.725506 max=2026-05-12 10:29:00.162504 window_rows=12
+  date_col[created_by character varying]: min=vaibhav.kumkar@candorfoods.in max=vaibhav.kumkar@candorfoods.in window_rows=None
+  date_col[approved_at timestamp without time zone]: min=2026-03-21 12:42:16 max=2026-05-12 10:29:00 window_rows=12
+  sample: {id=16, rtv_id=RTV-20260512102858, rtv_date=2026-05-12 10:28:58.657226, factory_unit=W202, customer=Functional & Innovative Foods, invoice_number=CDPL/26-27/52, challan_no=None, dn_no=DN/38/26-27, conversion=0.00, sales_poc=Ajay Sir , remark=None, status=Approved, created_by=vaibhav.kumkar@candorfoods.in, created_ts=2026-05-12 10:28:58.657226, updated_at=2026-05-12 10:29:00.162504, approved_by=vaibhav.kumkar@candorfoods.in, approved_at=2026-05-12 10:29:00, vehicle_number=None, transporter_name=None, driver_name=None, inward_manager=None, business_head=None}
+
+### public.cdpl_rtv_lines
+  rows: 16
+  cols (14): id:integer, header_id:integer, material_type:character varying, item_category:character varying, sub_category:character varying, item_description:character varying, uom:character varying, qty:integer, rate:numeric, value:numeric, net_weight:numeric, created_at:timestamp without time zone, updated_at:timestamp without time zone, carton_weight:numeric
+  date_col[sub_category character varying]: min=Barhi max=Safavi window_rows=None
+  date_col[material_type character varying]: min=fg max=rm window_rows=None
+  date_col[item_category character varying]: min=dates max=DATES window_rows=None
+  date_col[created_at timestamp without time zone]: min=2026-03-21 12:41:15.297009 max=2026-05-12 10:28:58.657226 window_rows=12
+  date_col[updated_at timestamp without time zone]: min=2026-03-21 12:42:16.725506 max=2026-05-12 10:29:00.162504 window_rows=12
+  sample: {id=16, header_id=16, material_type=rm, item_category=dates, sub_category=powder, item_description=10kg al barakah date powder v1, uom=1.000, qty=10, rate=382.00, value=3820.00, net_weight=10.000, created_at=2026-05-12 10:28:58.657226, updated_at=2026-05-12 10:29:00.162504, carton_weight=0.600}
+
+### public.cdpl_transactions_v2
+  rows: 37
+  cols (34): transaction_no:character varying, entry_date:timestamp without time zone, vehicle_number:character varying, transporter_name:character varying, lr_number:character varying, vendor_supplier_name:character varying, customer_party_name:character varying, source_location:character varying, destination_location:character varying, challan_number:character varying, invoice_number:character varying, po_number:character varying, grn_number:character varying, grn_quantity:numeric, system_grn_date:timestamp without time zone, purchased_by:character varying, service_invoice_number:character varying, dn_number:character varying, approval_authority:character varying, total_amount:numeric, tax_amount:numeric, discount_amount:numeric, po_quantity:numeric, remark:character varying, currency:character varying, created_at:timestamp without time zone, status:character varying, approved_by:character varying, approved_at:timestamp without time zone, service:boolean, rtv:boolean, warehouse:character varying, item_mark:character varying, spl_remarks:text
+  date_col[transaction_no character varying]: min=TR-20260225133247 max=TR-20260515181428 window_rows=None
+  date_col[destination_location character varying]: min=Pawane  max=W202 window_rows=None
+  date_col[system_grn_date timestamp without time zone]: min=2026-04-17 00:00:00 max=2026-04-17 00:00:00 window_rows=1
+  date_col[transporter_name character varying]: min=ABC Transport  max=TANISHKA TRANSPORT window_rows=None
+  date_col[status character varying]: min=approved max=pending window_rows=None
+  date_col[created_at timestamp without time zone]: min=2026-02-25 08:02:46.359362 max=2026-05-15 12:44:28.898175 window_rows=13
+  date_col[entry_date timestamp without time zone]: min=2026-02-25 00:00:00 max=2026-05-15 00:00:00 window_rows=13
+  date_col[approved_at timestamp without time zone]: min=2026-03-09 05:42:39 max=2026-04-30 09:14:08 window_rows=9
+  date_col[source_location character varying]: min=Delhi  max=W202 window_rows=None
+  sample: {transaction_no=TR-20260515181428, entry_date=2026-05-15 00:00:00, vehicle_number=MH46DC7270, transporter_name=FUTURE IMPEX, lr_number=None, vendor_supplier_name=AL BARAKAH DATES FACTORY LLC, customer_party_name=CDPL, source_location=SAIH SHUAIB 2, DUBAI INDUSTRIAL CITY,DUBAI,UAE, destination_location=Savla D-39, challan_number=None, invoice_number= ABDF/04/17463/2026, po_number=CDPL/25-26/PO/00110, grn_number=None, grn_quantity=None, system_grn_date=None, purchased_by=AJAY SIR, service_invoice_number=None, dn_number=None, approval_authority=HRITHIK, total_amount=None, tax_amount=None, discount_amount=None, po_quantity=21500.000, remark=chopped, paste, syrup - direct dispatch; powder, crushed ..., currency=INR, created_at=2026-05-15 12:44:28.898175, status=pending, approved_by=None, approved_at=None, service=False, rtv=False, warehouse=None, item_mark=None, spl_remarks=None}
+
+### public.cdplrtv_items
+  rows: 1
+  cols (11): item_id:integer, rtv_number:character varying, transaction_no:character varying, box_number:integer, sub_category:character varying, item_description:character varying, net_weight:numeric, gross_weight:numeric, price:numeric, reason:text, qr_data:jsonb
+  date_col[sub_category character varying]: min=ALMOND - BROKEN max=ALMOND - BROKEN window_rows=None
+  date_col[transaction_no character varying]: min=CONS-202510141157 max=CONS-202510141157 window_rows=None
+  sample: {item_id=3, rtv_number=RTV202510252255, transaction_no=CONS-202510141157, box_number=1, sub_category=ALMOND - BROKEN, item_description=ALMOND BLANCHED SLICED, net_weight=6250.00, gross_weight=6251.00, price=122.98, reason=, qr_data={"aa": "HRITHIK", "ad": "2025-10-16", "an": "ALMOND BLANC...}
+
+### public.cdplrtv_master
+  rows: 1
+  cols (16): rtv_number:character varying, customer_code:character varying, customer_name:character varying, rtv_type:character varying, other_reason:text, rtv_date:character varying, invoice_number:character varying, dc_number:character varying, notes:text, created_by:character varying, total_value:numeric, total_boxes:integer, status:character varying, company_code:character varying, created_at:timestamp without time zone, updated_at:timestamp without time zone
+  date_col[status character varying]: min=pending max=pending window_rows=None
+  date_col[created_at timestamp without time zone]: min=2025-10-25 17:25:42.404280 max=2025-10-25 17:25:42.404280 window_rows=0
+  date_col[rtv_date character varying]: min=2025-10-25 max=2025-10-25 window_rows=None
+  date_col[updated_at timestamp without time zone]: min=2025-10-25 17:25:42.404280 max=2025-10-25 17:25:42.404280 window_rows=0
+  date_col[created_by character varying]: min=Current User max=Current User window_rows=None
+  sample: {rtv_number=RTV202510252255, customer_code=AHLAN LUXURY GOURMET LLP, customer_name=AHLAN LUXURY GOURMET LLP, rtv_type=excess_quantity, other_reason=None, rtv_date=2025-10-25, invoice_number=112345678, dc_number=, notes=hsfdkhshfsjkd, created_by=Current User, total_value=122.98, total_boxes=1, status=pending, company_code=CDPL, created_at=2025-10-25 17:25:42.404280, updated_at=2025-10-25 17:25:42.404280}
+
+### public.cfpl_articles_v2
+  rows: 723
+  cols (22): id:integer, transaction_no:character varying, sku_id:integer, item_description:character varying, item_category:character varying, sub_category:character varying, material_type:character varying, quality_grade:character varying, uom:character varying, po_quantity:numeric, units:character varying, quantity_units:numeric, net_weight:numeric, total_weight:numeric, lot_number:character varying, manufacturing_date:character varying, expiry_date:character varying, unit_rate:numeric, total_amount:numeric, carton_weight:numeric, created_at:timestamp without time zone, po_weight:numeric
+  date_col[expiry_date character varying]: min=2026-05-13 max=2029-02-22 window_rows=None
+  date_col[sub_category character varying]: min=almond - broken max=Whole Spices window_rows=None
+  date_col[manufacturing_date character varying]: min=2024-10-01 max=2026-05-15 window_rows=None
+  date_col[transaction_no character varying]: min=TR-20260224173440 max=TR-20260518115505 window_rows=None
+  date_col[material_type character varying]: min=fg max=RM window_rows=None
+  date_col[item_category character varying]: min=almond max=WALNUT window_rows=None
+  date_col[created_at timestamp without time zone]: min=2026-02-24 12:04:40.943074 max=2026-05-18 06:25:06.058222 window_rows=390
+  sample: {id=892, transaction_no=TR-20260518115505, sku_id=2616, item_description=pm24-3 ply carton black berry/cranberry 100 gm (d mart) u..., item_category=packaging, sub_category=carton, material_type=pm, quality_grade=None, uom=CARTON, po_quantity=None, units=None, quantity_units=None, net_weight=None, total_weight=None, lot_number=None, manufacturing_date=None, expiry_date=None, unit_rate=None, total_amount=None, carton_weight=None, created_at=2026-05-18 06:25:06.058222, po_weight=1605.000}
+
+### public.cfpl_boxes_v2
+  rows: 66278
+  cols (10): id:integer, transaction_no:character varying, article_description:character varying, box_number:integer, net_weight:numeric, gross_weight:numeric, lot_number:character varying, count:integer, created_at:timestamp without time zone, box_id:character varying
+  date_col[created_at timestamp without time zone]: min=2026-02-24 12:04:40.943074 max=2026-05-18 06:36:52.376262 window_rows=40900
+  date_col[transaction_no character varying]: min=TR-20260224173440 max=TR-20260518115505 window_rows=None
+  sample: {id=74536, transaction_no=TR-20260518115505, article_description=pm24-5 ply carton good life other seeds 3 kg, box_number=117, net_weight=None, gross_weight=None, lot_number=RE16/01, count=None, created_at=2026-05-18 06:36:52.376262, box_id=None}
+
+### public.cfpl_complaint_articles
+  rows: 23
+  cols (8): id:integer, complaint_id:integer, item_category:character varying, item_subcategory:character varying, item_description:text, quantity:integer, uom:character varying, created_at:timestamp without time zone
+  date_col[item_subcategory character varying]: min=ALMOND - KERNELS max=Sunflower window_rows=None
+  date_col[created_at timestamp without time zone]: min=2026-01-12 09:28:35.831420 max=2026-05-15 08:15:56.179115 window_rows=3
+  date_col[item_category character varying]: min=ALMOND max=SEEDS window_rows=None
+  sample: {id=119, complaint_id=52, item_category=DATES, item_subcategory=Fard, item_description=GOOD LIFE FARD DATES 500 g, quantity=1, uom=pieces, created_at=2026-05-15 08:15:56.179115}
+
+### public.cfpl_complaint_history
+  rows: 0
+  cols (6): id:integer, complaint_id:integer, action:character varying, changed_by:character varying, changed_at:timestamp without time zone, changes:jsonb
+  (empty)
+
+### public.cfpl_complaint_proofs
+  rows: 18
+  cols (10): id:integer, complaint_id:integer, file_name:character varying, file_type:character varying, file_size:bigint, s3_bucket:character varying, s3_key:character varying, s3_url:text, uploaded_at:timestamp without time zone, uploaded_by:character varying
+  date_col[uploaded_at timestamp without time zone]: min=2026-01-14 05:13:54.316722 max=2026-04-18 05:43:24.889789 window_rows=1
+  sample: {id=90, complaint_id=50, file_name=image (11)_20260418_054129.png, file_type=image/*, file_size=None, s3_bucket=None, s3_key=https://complaint-module-images.s3.ap-south-1.amazonaws.c..., s3_url=https://complaint-module-images.s3.ap-south-1.amazonaws.c..., uploaded_at=2026-04-18 05:43:24.889789, uploaded_by=qa_user_1}
+
+### public.cfpl_complaints
+  rows: 23
+  cols (22): id:integer, complaint_id:character varying, customer_id:integer, customer_name:character varying, received_date:date, manufacturing_date:date, item_category:character varying, item_subcategory:character varying, item_description:text, batch_code:character varying, quantity_rejected:integer, quantity_approved:integer, uom:character varying, complaint_nature:text, other_complaint_nature:text, qa_assessment:character varying, justified_status:character varying, remarks:text, created_by:character varying, created_at:timestamp without time zone, updated_at:timestamp without time zone, measures_to_resolve:character varying
+  date_col[batch_code character varying]: min= max= window_rows=None
+  date_col[manufacturing_date date]: min=2026-01-07 max=2026-05-13 window_rows=3
+  date_col[justified_status character varying]: min=Under Review max=UNDER REVIEW window_rows=None
+  date_col[item_category character varying]: min=ALMOND max=SEEDS window_rows=None
+  date_col[complaint_nature text]: min=food_safety max=Non Food Safety window_rows=None
+  date_col[item_subcategory character varying]: min=ALMOND - KERNELS max=Sunflower window_rows=None
+  date_col[created_at timestamp without time zone]: min=2026-01-12 09:28:35.831420 max=2026-05-15 08:15:56.179115 window_rows=3
+  date_col[updated_at timestamp without time zone]: min=2026-01-12 09:28:35.831420 max=2026-05-15 08:15:56.179115 window_rows=3
+  date_col[other_complaint_nature text]: min=biological_hazard max=taste_smell_texture window_rows=None
+  date_col[created_by character varying]: min=qa_user_1 max=qa_user_1 window_rows=None
+  date_col[received_date date]: min=2026-01-07 max=2026-05-13 window_rows=3
+  sample: {id=52, complaint_id=CCNFS-2026-05-002, customer_id=None, customer_name=reliance_retail_limited, received_date=2026-05-13, manufacturing_date=2026-05-13, item_category=DATES, item_subcategory=Fard, item_description=GOOD LIFE FARD DATES 500 g, batch_code=, quantity_rejected=0, quantity_approved=0, uom=pieces, complaint_nature=Non Food Safety, other_complaint_nature=taste_smell_texture, qa_assessment=Pending, justified_status=Under Review, remarks=, created_by=qa_user_1, created_at=2026-05-15 08:15:56.179115, updated_at=2026-05-15 08:15:56.179115, measures_to_resolve=rca_capa}
+
+### public.cfpl_outward
+  rows: 1
+  cols (37): id:integer, company_name:character varying, consignment_no:character varying, invoice_no:character varying, customer_name:character varying, location:character varying, po_no:character varying, boxes:integer, gross_weight:character varying, net_weight:character varying, appt_date:date, appt_time:time without time zone, sitecode:character varying, asn_id:bigint, transporter_name:character varying, vehicle_no:character varying, lr_no:bigint, dispatch_date:date, estimated_delivery_date:date, actual_delivery_date:date, delivery_status:character varying, invoice_amount:numeric, invoice_gst_amount:numeric, total_invoice_amount:numeric, freight_amount:numeric, freight_gst_amount:numeric, total_freight_amount:numeric, billing_address:text, shipping_address:text, pincode:integer, created_at:timestamp without time zone, updated_at:timestamp without time zone, business_head:character varying, business_head_name:character varying, business_head_email:character varying, invoice_files:ARRAY, pod_files:ARRAY
+  date_col[actual_delivery_date date]: min=None max=None window_rows=0
+  date_col[delivery_status character varying]: min=PENDING max=PENDING window_rows=None
+  date_col[transporter_name character varying]: min=NOT SPECIFIED max=NOT SPECIFIED window_rows=None
+  date_col[estimated_delivery_date date]: min=2025-10-14 max=2025-10-14 window_rows=0
+  date_col[created_at timestamp without time zone]: min=2025-10-14 06:27:23.577789 max=2025-10-14 06:27:23.577789 window_rows=0
+  date_col[appt_date date]: min=2025-10-14 max=2025-10-14 window_rows=0
+  date_col[updated_at timestamp without time zone]: min=2025-10-16 11:40:57.066073 max=2025-10-16 11:40:57.066073 window_rows=0
+  date_col[dispatch_date date]: min=2025-08-31 max=2025-08-31 window_rows=0
+  date_col[location character varying]: min=NOT SPECIFIED max=NOT SPECIFIED window_rows=None
+  sample: {id=17, company_name=CFPL, consignment_no=CONS-202510141157, invoice_no=CND/25-26/4981, customer_name=RELIANCE RETAIL LIMITED, location=NOT SPECIFIED, po_no=5110917314, boxes=5, gross_weight=312550.000 gm, net_weight=156250.000 gm, appt_date=2025-10-14, appt_time=00:00:00, sitecode=NOT SPECIFIED, asn_id=0, transporter_name=NOT SPECIFIED, vehicle_no=NOT SPECIFIED, lr_no=None, dispatch_date=2025-08-31, estimated_delivery_date=2025-10-14, actual_delivery_date=None, delivery_status=PENDING, invoice_amount=93558.64, invoice_gst_amount=11227.04, total_invoice_amount=104785.68, freight_amount=0.00, freight_gst_amount=0.00, total_freight_amount=0.00, billing_address=NO. 62/2, RIL BUILDING, RICHMOND ROAD, BANGALORE 560025, ..., shipping_address=SY NO 14/2 15/4, ADAKAMARANAHALLI VILLAGE, BANGALORE, KAR..., pincode=562123, created_at=2025-10-14 06:27:23.577789, updated_at=2025-10-16 11:40:57.066073, business_head=None, business_head_name=None, business_head_email=None, invoice_files=None, pod_files=None}
+
+### public.cfpl_rtv_boxes
+  rows: 536
+  cols (14): id:integer, header_id:integer, rtv_line_id:integer, box_number:integer, box_id:character varying, article_description:character varying, lot_number:character varying, net_weight:numeric, gross_weight:numeric, count:integer, created_at:timestamp without time zone, updated_at:timestamp without time zone, conversion:character varying, uom:character varying
+  date_col[updated_at timestamp without time zone]: min=2026-03-02 13:02:38.127610 max=2026-05-15 13:45:43.407299 window_rows=378
+  date_col[created_at timestamp without time zone]: min=2026-03-02 12:28:32.653162 max=2026-05-15 13:45:37.761913 window_rows=530
+  sample: {id=539, header_id=40, rtv_line_id=42, box_number=1, box_id=52737764-1, article_description=california pista inshell roasted and salted, lot_number=None, net_weight=5.000, gross_weight=5.600, count=1, created_at=2026-05-15 13:45:37.761913, updated_at=2026-05-15 13:45:43.407299, conversion=1, uom=1.000}
+
+### public.cfpl_rtv_header
+  rows: 38
+  cols (22): id:integer, rtv_id:character varying, rtv_date:timestamp without time zone, factory_unit:character varying, customer:character varying, invoice_number:character varying, challan_no:character varying, dn_no:character varying, conversion:numeric, sales_poc:character varying, remark:character varying, status:character varying, created_by:character varying, created_ts:timestamp without time zone, updated_at:timestamp without time zone, approved_by:character varying, approved_at:timestamp without time zone, vehicle_number:character varying, transporter_name:character varying, driver_name:character varying, inward_manager:character varying, business_head:character varying
+  date_col[status character varying]: min=Approved max=Approved window_rows=None
+  date_col[created_ts timestamp without time zone]: min=2026-03-02 09:31:57.055892 max=2026-05-15 13:45:36.495985 window_rows=33
+  date_col[transporter_name character varying]: min=None max=None window_rows=None
+  date_col[rtv_date timestamp without time zone]: min=2026-03-02 09:31:57.055892 max=2026-05-15 13:45:36.495985 window_rows=33
+  date_col[updated_at timestamp without time zone]: min=2026-03-02 13:02:38.127610 max=2026-05-15 13:45:43.407299 window_rows=33
+  date_col[created_by character varying]: min=samal.kumar@candorfoods.in max=yash@candorfoods.in window_rows=None
+  date_col[approved_at timestamp without time zone]: min=2026-03-02 13:02:38 max=2026-05-15 13:45:43 window_rows=33
+  sample: {id=40, rtv_id=RTV-20260515134536, rtv_date=2026-05-15 13:45:36.495985, factory_unit=A185, customer=ALIGN RETAIL LTD, invoice_number=CND/26-27/553, challan_no=None, dn_no=559/1822/2026, conversion=0.00, sales_poc=None, remark=None, status=Approved, created_by=stores-a185@candorfoods.in, created_ts=2026-05-15 13:45:36.495985, updated_at=2026-05-15 13:45:43.407299, approved_by=stores-a185@candorfoods.in, approved_at=2026-05-15 13:45:43, vehicle_number=None, transporter_name=None, driver_name=None, inward_manager=None, business_head=None}
+
+### public.cfpl_rtv_lines
+  rows: 40
+  cols (14): id:integer, header_id:integer, material_type:character varying, item_category:character varying, sub_category:character varying, item_description:character varying, uom:character varying, qty:integer, rate:numeric, value:numeric, net_weight:numeric, created_at:timestamp without time zone, updated_at:timestamp without time zone, carton_weight:numeric
+  date_col[sub_category character varying]: min=almond - kernels max=Sayer window_rows=None
+  date_col[material_type character varying]: min=fg max=RM window_rows=None
+  date_col[item_category character varying]: min=almond max=PRUNES window_rows=None
+  date_col[created_at timestamp without time zone]: min=2026-03-02 09:31:57.055892 max=2026-05-15 13:45:36.495985 window_rows=35
+  date_col[updated_at timestamp without time zone]: min=2026-03-02 13:02:38.127610 max=2026-05-15 13:45:43.407299 window_rows=35
+  sample: {id=42, header_id=40, material_type=fg, item_category=pista, sub_category=pista - inshell, item_description=california pista inshell roasted and salted, uom=1.000, qty=5, rate=1069.20, value=5346.00, net_weight=5.000, created_at=2026-05-15 13:45:36.495985, updated_at=2026-05-15 13:45:43.407299, carton_weight=0.600}
+
+### public.cfpl_transactions_v2
+  rows: 638
+  cols (34): transaction_no:character varying, entry_date:timestamp without time zone, vehicle_number:character varying, transporter_name:character varying, lr_number:character varying, vendor_supplier_name:character varying, customer_party_name:character varying, source_location:character varying, destination_location:character varying, challan_number:character varying, invoice_number:character varying, po_number:character varying, grn_number:character varying, grn_quantity:numeric, system_grn_date:timestamp without time zone, purchased_by:character varying, service_invoice_number:character varying, dn_number:character varying, approval_authority:character varying, total_amount:numeric, tax_amount:numeric, discount_amount:numeric, po_quantity:numeric, remark:character varying, currency:character varying, created_at:timestamp without time zone, status:character varying, approved_by:character varying, approved_at:timestamp without time zone, service:boolean, rtv:boolean, warehouse:character varying, item_mark:character varying, spl_remarks:text
+  date_col[transaction_no character varying]: min=TR-20260224173440 max=TR-20260518115505 window_rows=None
+  date_col[destination_location character varying]: min=185 max=WADA window_rows=None
+  date_col[system_grn_date timestamp without time zone]: min=2026-02-26 00:00:00 max=2026-05-28 00:00:00 window_rows=100
+  date_col[transporter_name character varying]: min=AAT Container max=YUVRAJ window_rows=None
+  date_col[status character varying]: min=approved max=pending window_rows=None
+  date_col[created_at timestamp without time zone]: min=2026-02-24 12:04:40.943074 max=2026-05-18 06:25:06.058222 window_rows=346
+  date_col[entry_date timestamp without time zone]: min=2026-02-24 00:00:00 max=2026-05-18 00:00:00 window_rows=346
+  date_col[approved_at timestamp without time zone]: min=2026-02-25 06:45:29 max=2026-05-18 06:36:52 window_rows=324
+  date_col[source_location character varying]: min=0, Gala No BRM 5,, Devi dayal Compound, Mazgoan, Darukhana,Mazgoan, Mumbai, Maharashtra, 400010 max=W-202A,TTC INDUSTRIAL AREAKHAIRNE, NAVI MUMBAI window_rows=None
+  sample: {transaction_no=TR-20260518115505, entry_date=2026-05-18 00:00:00, vehicle_number=MH43CA3408, transporter_name=RAHISE, lr_number=None, vendor_supplier_name=RAHIS ENTERPRISES (NEW), customer_party_name=RELIANCE, source_location=H.NO.0996/003, Behind Sunita Bar, Sector-22D.R. Patil Bun..., destination_location=TURBHE, challan_number=585, invoice_number=None, po_number=None, grn_number=None, grn_quantity=None, system_grn_date=None, purchased_by=RAKESH SIR, service_invoice_number=None, dn_number=None, approval_authority=Vaishali Dhuri, total_amount=None, tax_amount=None, discount_amount=None, po_quantity=None, remark=None, currency=INR, created_at=2026-05-18 06:25:06.058222, status=approved, approved_by=Vaishali Dhuri, approved_at=2026-05-18 06:36:52, service=False, rtv=False, warehouse=A68, item_mark=None, spl_remarks=None}
+
+### public.cfplrtv_items
+  rows: 0
+  cols (11): item_id:integer, rtv_number:character varying, transaction_no:character varying, box_number:integer, sub_category:character varying, item_description:character varying, net_weight:numeric, gross_weight:numeric, price:numeric, reason:text, qr_data:jsonb
+  (empty)
+
+### public.cfplrtv_master
+  rows: 0
+  cols (16): rtv_number:character varying, customer_code:character varying, customer_name:character varying, rtv_type:character varying, other_reason:text, rtv_date:character varying, invoice_number:character varying, dc_number:character varying, notes:text, created_by:character varying, total_value:numeric, total_boxes:integer, status:character varying, company_code:character varying, created_at:timestamp without time zone, updated_at:timestamp without time zone
+  (empty)
+
+### public.cst_transferout
+  rows: 4
+  cols (12): id:integer, company:character varying, source_warehouse:character varying, destination_warehouse:character varying, transfer_date:date, transfer_number:character varying, vehicle_number:character varying, status:character varying, created_by:character varying, created_at:timestamp without time zone, updated_at:timestamp without time zone, new_lotnumber:character varying
+  date_col[transfer_date date]: min=2026-02-19 max=2026-02-22 window_rows=0
+  date_col[transfer_number character varying]: min=CST202602191759 max=CST202602212305 window_rows=None
+  date_col[status character varying]: min=pending max=pending window_rows=None
+  date_col[created_at timestamp without time zone]: min=2026-02-19 12:30:41.232367 max=2026-02-21 17:38:13.714940 window_rows=0
+  date_col[destination_warehouse character varying]: min=A185 max=Savla D-39 window_rows=None
+  date_col[updated_at timestamp without time zone]: min=2026-02-19 12:30:41.232367 max=2026-02-21 17:38:13.714940 window_rows=0
+  date_col[created_by character varying]: min=user@candorfoods.com max=user@candorfoods.com window_rows=None
+  sample: {id=18, company=CFPL, source_warehouse=Rishi, destination_warehouse=A185, transfer_date=2026-02-22, transfer_number=CST202602212305, vehicle_number=MH23SW1234, status=pending, created_by=user@candorfoods.com, created_at=2026-02-21 17:38:13.714940, updated_at=2026-02-21 17:38:13.714940, new_lotnumber=None}
+
+### public.cst_transferout_items
+  rows: 5
+  cols (13): id:integer, transfer_id:integer, item_category:character varying, item_description:character varying, sku_id:integer, quantity:numeric, uom:character varying, lot_number:character varying, num_boxes:integer, created_at:timestamp without time zone, new_lotnumber:character varying, weight_kg:numeric, total_inventory_kg:numeric
+  date_col[created_at timestamp without time zone]: min=2026-02-19 12:30:41.232367 max=2026-02-21 17:38:13.714940 window_rows=0
+  date_col[item_category character varying]: min=Date Powder max=Organic Dates window_rows=None
+  sample: {id=6, transfer_id=18, item_category=Date Syrup, item_description=25KG AL BARAKAH DATE SYRUP V1, sku_id=None, quantity=31.000, uom=BOX, lot_number=176393, num_boxes=31, created_at=2026-02-21 17:38:13.714940, new_lotnumber=None, weight_kg=25.000, total_inventory_kg=775.00}
+
+### public.daily_sales
+  rows: 1
+  cols (7): id:uuid, attendance_id:uuid, promoter_id:uuid, ean:character varying, qty_sold:integer, sold_at:timestamp without time zone, created_at:timestamp without time zone
+  date_col[created_at timestamp without time zone]: min=2026-02-19 12:33:54.159908 max=2026-02-19 12:33:54.159908 window_rows=0
+  date_col[sold_at timestamp without time zone]: min=2026-02-19 18:03:14.974470 max=2026-02-19 18:03:14.974470 window_rows=0
+  sample: {id=b62df0f5-90ff-4619-b20c-d8a85fdcbf72, attendance_id=d775fc84-20d8-4b12-8269-70faf277ae66, promoter_id=bf3b794d-3aed-4ddb-877b-e81ea2c108de, ean=8903363008848, qty_sold=2, sold_at=2026-02-19 18:03:14.974470, created_at=2026-02-19 12:33:54.159908}
+
+### public.discrepancy_report
+  rows: 0
+  cols (19): discrepancy_id:integer, discrepancy_type:text, severity:text, affected_material:text, affected_machine_id:integer, affected_job_card_ids:ARRAY, affected_plan_line_ids:ARRAY, details:text, total_affected_qty_kg:numeric, customer_impact:text, resolution_type:text, resolution_details:text, reported_by:text, reported_at:timestamp with time zone, resolved_by:text, resolved_at:timestamp with time zone, status:text, entity:text, created_at:timestamp with time zone
+  (empty)
+
+### public.doc_incident_report
+  rows: 1
+  cols (5): id:integer, rows:jsonb, created_at:timestamp with time zone, created_by:character varying, warehouse:character varying
+  date_col[created_at timestamp with time zone]: min=2026-04-13 06:06:21.404150+00:00 max=2026-04-13 06:06:21.404150+00:00 window_rows=1
+  date_col[created_by character varying]: min=admin max=admin window_rows=None
+  sample: {id=1, rows=[{"cause": "Loose valve on oil line", "nature": "Minor oi..., created_at=2026-04-13 06:06:21.404150+00:00, created_by=admin, warehouse=A185}
+
+### public.doc_inward_rm_check
+  rows: 1
+  cols (7): id:integer, month:character varying, area:character varying, entries:jsonb, created_at:timestamp with time zone, created_by:character varying, warehouse:character varying
+  date_col[created_at timestamp with time zone]: min=2026-04-13 06:06:21.404150+00:00 max=2026-04-13 06:06:21.404150+00:00 window_rows=1
+  date_col[created_by character varying]: min=admin max=admin window_rows=None
+  sample: {id=1, month=2026-04, area=Raw Material Store, entries=[{"fat": 46.1, "remarks": "Accepted", "sensory": [{"resul..., created_at=2026-04-13 06:06:21.404150+00:00, created_by=admin, warehouse=W202}
+
+### public.doc_traceability_report
+  rows: 1
+  cols (23): id:integer, report_date:date, start_time:time without time zone, product_name:character varying, batch_number:character varying, work_order_no:character varying, packing_date:date, expiry_date:date, size_packing:character varying, qty_produced:numeric, rm_quantity:numeric, total_fg_produced:numeric, rejection_qty:numeric, stock_balance:numeric, overall_conclusion:text, prepared_by:character varying, reviewed_by:character varying, ingredients:jsonb, packing_materials:jsonb, documents_review:jsonb, warehouse:character varying, created_at:timestamp with time zone, created_by:character varying
+  date_col[expiry_date date]: min=2026-10-13 max=2026-10-13 window_rows=0
+  date_col[report_date date]: min=2026-04-13 max=2026-04-13 window_rows=1
+  date_col[batch_number character varying]: min=B2026-0413-01 max=B2026-0413-01 window_rows=None
+  date_col[created_at timestamp with time zone]: min=2026-04-13 06:22:43.212959+00:00 max=2026-04-13 06:22:43.212959+00:00 window_rows=1
+  date_col[packing_date date]: min=2026-04-13 max=2026-04-13 window_rows=1
+  date_col[created_by character varying]: min=admin max=admin window_rows=None
+  sample: {id=1, report_date=2026-04-13, start_time=08:00:00, product_name=Roasted Cashews 200g, batch_number=B2026-0413-01, work_order_no=WO-2026-0450, packing_date=2026-04-13, expiry_date=2026-10-13, size_packing=200g pouch, qty_produced=1500.000, rm_quantity=320.000, total_fg_produced=300.000, rejection_qty=2.500, stock_balance=17.500, overall_conclusion=Batch traceable end-to-end. No deviations found., prepared_by=Ravi K, reviewed_by=Nikita P, ingredients=[{"po_no": "PO-4520", "lot_no": "KC-2026-1840", "supplier..., packing_materials=[{"po_no": "PO-4490", "lot_no": "PKG-2026-310", "material..., documents_review=[{"checked": true, "document": "Batch Manufacturing Recor..., warehouse=A185, created_at=2026-04-13 06:22:43.212959+00:00, created_by=admin}
+
+### public.doc_waste_disposal
+  rows: 1
+  cols (10): id:integer, month:character varying, area:character varying, checked_by:character varying, verified_by:character varying, remarks:text, grid:jsonb, warehouse:character varying, created_at:timestamp with time zone, created_by:character varying
+  date_col[created_at timestamp with time zone]: min=2026-04-13 06:22:43.212959+00:00 max=2026-04-13 06:22:43.212959+00:00 window_rows=1
+  date_col[created_by character varying]: min=admin max=admin window_rows=None
+  sample: {id=1, month=2026-04, area=Production Floor, checked_by=Amit R, verified_by=Priya M, remarks=Disposal on schedule, grid=[{"day1": "✓", "day2": "✓", "day3": "✓", "day4": "✓", "da..., warehouse=W202, created_at=2026-04-13 06:22:43.212959+00:00, created_by=admin}
+
+### public.fulfillment_bom_override
+  rows: 0
+  cols (13): override_id:integer, fulfillment_id:integer, bom_line_id:integer, material_sku_name:text, quantity_per_unit:numeric, loss_pct:numeric, uom:text, godown:text, is_removed:boolean, override_reason:text, overridden_by:text, created_at:timestamp with time zone, updated_at:timestamp with time zone
+  (empty)
+
+### public.fulfillment_floor_stock
+  rows: 0
+  cols (11): floor_stock_id:integer, fulfillment_id:integer, material_sku_name:text, item_type:text, quantity_kg:numeric, floor_location:text, added_by:text, notes:text, created_at:timestamp with time zone, updated_at:timestamp with time zone, unit:text
+  (empty)
+
+### public.grn
+  rows: 0
+  cols (35): grn_no:text, transaction_no:text, grn_date:date, total_net_kg:numeric, total_gross_kg:numeric, total_boxes:integer, posted_by:text, posted_at:timestamp with time zone, erp_ref:text, grn_type:text, is_final_grn:boolean, vehicle_no:text, lr_no:text, grn_status:text, tally_status:text, tally_voucher_no:text, tally_pushed_at:timestamp with time zone, tally_error:text, tally_retry_count:integer, cancelled_by:text, cancelled_at:timestamp with time zone, cancel_reason:text, reversed_by:text, reverse_dual_by:text, reversed_at:timestamp with time zone, reverse_reason:text, reverse_stock_txn_ids:jsonb, po_number:text, supplier_id:text, invoice_no:text, invoice_date:date, invoice_value:numeric, remarks:text, tally_last_attempt_at:timestamp with time zone, warehouse_id:text
+  (empty)
+
+### public.grn_line
+  rows: 0
+  cols (17): grn_line_id:bigint, grn_no:text, line_number:integer, po_line_number:integer, sku_id:integer, received_qty:numeric, accepted_qty:numeric, rejected_qty:numeric, rate:numeric, line_value:numeric, lot_number:text, mfg_date:date, expiry_date:date, inventory_lot_id:bigint, box_count:integer, remarks:text, created_at:timestamp with time zone
+  (empty)
+
+### public.inner_cold_transfer
+  rows: 17
+  cols (17): id:integer, challan_no:character varying, transfer_date:character varying, from_warehouse:character varying, reason_code:character varying, remark:text, stock_record_id:integer, item_category:character varying, item_description:character varying, net_weight_kg:numeric, quantity:integer, old_lot_number:character varying, new_lot_number:character varying, transfer_type:character varying, status:character varying, created_at:timestamp without time zone, new_storage_location:character varying
+  date_col[transfer_date character varying]: min=22-04-2026 max=22-04-2026 window_rows=None
+  date_col[item_category character varying]: min=DATES max=DATES window_rows=None
+  date_col[transfer_type character varying]: min=INNER_COLD max=INNER_COLD window_rows=None
+  date_col[status character varying]: min=COMPLETED max=COMPLETED window_rows=None
+  date_col[created_at timestamp without time zone]: min=2026-04-22 05:48:58.110136 max=2026-04-22 09:22:11.547101 window_rows=17
+  date_col[new_storage_location character varying]: min=Savla D-514 cold max=Savla D-514 cold window_rows=None
+  sample: {id=37, challan_no=ICT202604221043, transfer_date=22-04-2026, from_warehouse=Savla Bond, reason_code=Inventory Balancing, remark=Space for new container, stock_record_id=269733, item_category=DATES, item_description=Medjoul Dates Super Jumbo, net_weight_kg=1050.000, quantity=210, old_lot_number=12440, new_lot_number=15702, transfer_type=INNER_COLD, status=COMPLETED, created_at=2026-04-22 09:22:11.547101, new_storage_location=Savla D-514 cold}
+
+### public.inter_entity_transfer
+  rows: 0
+  cols (14): id:integer, transfer_id:text, from_entity:text, to_entity:text, transfer_date:date, status:text, dispatched_by:text, dispatched_at:timestamp with time zone, received_by:text, received_at:timestamp with time zone, mat_doc_dispatch:text, mat_doc_receipt:text, notes:text, created_at:timestamp with time zone
+  (empty)
+
+### public.inter_entity_transfer_line
+  rows: 0
+  cols (8): id:integer, transfer_id:text, batch_id:text, sku_name:text, quantity_kg:numeric, lot_number:text, dispatched_qty_kg:numeric, received_qty_kg:numeric
+  (empty)
+
+### public.internal_issue_note
+  rows: 0
+  cols (17): note_id:integer, note_number:text, sku_name:text, batch_id:text, quantity_kg:numeric, source_warehouse:text, source_floor:text, destination_floor:text, purpose:text, requested_by:text, approved_by:text, approved_at:timestamp with time zone, status:text, entity:text, created_at:timestamp with time zone, is_space_constrained:boolean, reject_reason:text
+  (empty)
+
+### public.internal_job_card
+  rows: 0
+  cols (11): id:integer, internal_jc_id:text, internal_order_id:text, parent_job_card_id:text, parent_so_ref:text, fg_sku_name:text, status:text, bom_data:jsonb, entity:text, created_at:timestamp with time zone, completed_at:timestamp with time zone
+  (empty)
+
+### public.interunit_transfer_boxes
+  rows: 7644
+  cols (15): id:integer, transfer_line_id:integer, header_id:integer, box_number:integer, article:character varying, lot_number:character varying, net_weight:numeric, gross_weight:numeric, created_at:timestamp without time zone, updated_at:timestamp without time zone, batch_number:character varying, transaction_no:character varying, box_id:character varying, qr_data:jsonb, storage_location:character varying
+  date_col[transaction_no character varying]: min=BE-20260311115245 max=TR-20260508000004 window_rows=None
+  date_col[storage_location character varying]: min=None max=None window_rows=None
+  date_col[batch_number character varying]: min=N/A max=N/A window_rows=None
+  date_col[created_at timestamp without time zone]: min=2026-04-11 11:58:21.489096 max=2026-05-18 05:13:18.863839 window_rows=7644
+  date_col[updated_at timestamp without time zone]: min=2026-04-11 11:58:21.489096 max=2026-05-18 05:13:18.863839 window_rows=7644
+  sample: {id=9319, transfer_line_id=30999, header_id=684, box_number=24, article=AL BARAKAH FARD DATES STANDARD C 10KG, lot_number=125863, net_weight=10.00, gross_weight=10.00, created_at=2026-05-18 05:13:18.863839, updated_at=2026-05-18 05:13:18.863839, batch_number=N/A, transaction_no=TR-20260314174755, box_id=90675000-1001, qr_data=None, storage_location=None}
+
+### public.interunit_transfer_in_boxes
+  rows: 18002
+  cols (16): id:integer, header_id:integer, transfer_out_box_id:integer, box_id:character varying, article:character varying, batch_number:character varying, lot_number:character varying, transaction_no:character varying, net_weight:numeric, gross_weight:numeric, scanned_at:timestamp without time zone, is_matched:boolean, created_at:timestamp without time zone, updated_at:timestamp without time zone, issue:jsonb, line_index:integer
+  date_col[transaction_no character varying]: min=TR-202602121146 max=TR-20260508000004 window_rows=None
+  date_col[scanned_at timestamp without time zone]: min=2026-03-06 12:10:39.043460 max=2026-05-18 06:40:21.140842 window_rows=15213
+  date_col[batch_number character varying]: min=N/A max=N/A window_rows=None
+  date_col[created_at timestamp without time zone]: min=2026-03-06 12:10:39.043460 max=2026-05-18 06:40:11.821992 window_rows=15213
+  date_col[updated_at timestamp without time zone]: min=2026-03-06 12:10:39.043460 max=2026-05-18 06:40:21.140842 window_rows=15213
+  sample: {id=29851, header_id=334, transfer_out_box_id=None, box_id=ART-39, article=AL BARAKAH FARD DATES STANDARD A 10KG, batch_number=None, lot_number=CF/IQ16, transaction_no=None, net_weight=10.00, gross_weight=10.70, scanned_at=2026-05-18 06:40:21.140842, is_matched=True, created_at=2026-05-18 06:40:11.821992, updated_at=2026-05-18 06:40:21.140842, issue=None, line_index=38}
+
+### public.interunit_transfer_in_cold_storage
+  rows: 2
+  cols (18): id:integer, header_id:integer, item_description:character varying, inward_dt:character varying, unit:character varying, vakkal:character varying, lot_no:character varying, item_mark:character varying, no_of_cartons:numeric, weight_kg:numeric, group_name:character varying, item_subgroup:character varying, storage_location:character varying, exporter:character varying, rate:numeric, value:numeric, spl_remarks:text, created_at:timestamp without time zone
+  date_col[created_at timestamp without time zone]: min=2026-03-30 07:57:33.906638 max=2026-03-30 08:01:53.974528 window_rows=0
+  date_col[storage_location character varying]: min=None max=None window_rows=None
+  sample: {id=2, header_id=82, item_description=KING SOLOMON MEDJOUL DATES LARGE 5 KG, inward_dt=2026-03-26, unit=BOX, vakkal=None, lot_no=None, item_mark=None, no_of_cartons=144.000, weight_kg=720.000, group_name=DATES, item_subgroup=MEDJOUL-LARGE, storage_location=None, exporter=None, rate=None, value=None, spl_remarks=None, created_at=2026-03-30 08:01:53.974528}
+
+### public.interunit_transfer_in_header
+  rows: 292
+  cols (13): id:integer, transfer_out_id:integer, transfer_out_no:character varying, grn_number:character varying, grn_date:timestamp without time zone, receiving_warehouse:character varying, received_by:character varying, received_at:timestamp without time zone, box_condition:character varying, condition_remarks:text, status:character varying, created_at:timestamp without time zone, updated_at:timestamp without time zone
+  date_col[received_at timestamp without time zone]: min=2026-03-06 12:10:39.043460 max=2026-05-18 06:40:21.243266 window_rows=232
+  date_col[received_by character varying]: min=B.HRITHIK max=YASH window_rows=None
+  date_col[transfer_out_no character varying]: min=TRANS202603021610 max=TRANS202605161706 window_rows=None
+  date_col[status character varying]: min=Pending max=Received window_rows=None
+  date_col[created_at timestamp without time zone]: min=2026-03-06 12:10:39.043460 max=2026-05-18 06:39:43.294352 window_rows=232
+  date_col[grn_date timestamp without time zone]: min=2026-03-06 12:10:39.043460 max=2026-05-18 06:39:43.294352 window_rows=232
+  date_col[updated_at timestamp without time zone]: min=2026-03-06 12:10:39.043460 max=2026-05-18 06:40:21.243266 window_rows=236
+  sample: {id=334, transfer_out_id=673, transfer_out_no=TRANS202605161129, grn_number=GRN-20260516201322, grn_date=2026-05-18 06:39:43.294352, receiving_warehouse=F53, received_by=NARESH JADHAV, received_at=2026-05-18 06:40:21.243266, box_condition=Good, condition_remarks=None, status=Received, created_at=2026-05-18 06:39:43.294352, updated_at=2026-05-18 06:40:21.243266}
+
+### public.interunit_transfer_request_lines
+  rows: 14
+  cols (18): id:integer, request_id:integer, rm_pm_fg_type:character varying, item_category:character varying, sub_category:character varying, item_desc_raw:character varying, item_id:integer, hsn_code:character varying, pack_size:numeric, qty:integer, uom:character varying, net_weight:numeric, total_weight:numeric, lot_number:character varying, created_at:timestamp without time zone, updated_at:timestamp without time zone, unit_pack_size:numeric, item_description:character varying
+  date_col[updated_at timestamp without time zone]: min=2026-03-05 12:01:17.448838 max=2026-04-29 06:39:07.447597 window_rows=2
+  date_col[created_at timestamp without time zone]: min=2026-03-05 12:01:17.448838 max=2026-04-29 06:39:07.447597 window_rows=2
+  date_col[item_category character varying]: min=ALMOND max=SEEDS window_rows=None
+  date_col[sub_category character varying]: min=ALMOND - KERNELS max=WATERMELON window_rows=None
+  sample: {id=175, request_id=115, rm_pm_fg_type=RM, item_category=DATES, sub_category=EGYPTIAN, item_desc_raw=EGYPTIAN WET DATES 10KG, item_id=None, hsn_code=None, pack_size=10.000, qty=50, uom=BOX, net_weight=500.000, total_weight=500.000, lot_number=124679, created_at=2026-04-29 06:39:07.447597, updated_at=2026-04-29 06:39:07.447597, unit_pack_size=0.000, item_description=None}
+
+### public.interunit_transfer_requests
+  rows: 12
+  cols (14): id:integer, request_no:character varying, request_date:date, from_site:character varying, to_site:character varying, reason_code:character varying, remarks:text, status:character varying, reject_reason:text, created_by:character varying, created_ts:timestamp without time zone, rejected_ts:timestamp without time zone, updated_at:timestamp without time zone, reason_description:text
+  date_col[request_date date]: min=2026-03-05 max=2026-04-29 window_rows=2
+  date_col[status character varying]: min=Pending max=Transferred window_rows=None
+  date_col[created_ts timestamp without time zone]: min=2026-03-05 17:31:18.683404 max=2026-04-29 06:39:07.445044 window_rows=2
+  date_col[rejected_ts timestamp without time zone]: min=None max=None window_rows=0
+  date_col[updated_at timestamp without time zone]: min=2026-03-05 12:28:48.598943 max=2026-04-29 06:39:07.447597 window_rows=2
+  date_col[created_by character varying]: min=mayuresh@candorfoods.in max=yash@candorfoods.in window_rows=None
+  sample: {id=115, request_no=REQ20260429120855, request_date=2026-04-29, from_site=A101, to_site=Rishi, reason_code=HOH PRODUCTION, remarks=HOH PRODUCTION, status=Pending, reject_reason=None, created_by=mayuresh@candorfoods.in, created_ts=2026-04-29 06:39:07.445044, rejected_ts=None, updated_at=2026-04-29 06:39:07.447597, reason_description=None}
+
+### public.interunit_transfers_header
+  rows: 327
+  cols (17): id:integer, challan_no:character varying, stock_trf_date:date, from_site:character varying, to_site:character varying, vehicle_no:character varying, remark:text, reason_code:character varying, status:character varying, request_id:integer, created_by:character varying, created_ts:timestamp without time zone, approved_by:character varying, approved_ts:timestamp without time zone, updated_ts:timestamp without time zone, has_variance:boolean, driver_name:character varying
+  date_col[status character varying]: min=Dispatch max=Received window_rows=None
+  date_col[created_ts timestamp without time zone]: min=2026-03-02 12:50:30.642607 max=2026-05-18 05:13:18.861191 window_rows=249
+  date_col[updated_ts timestamp without time zone]: min=2026-03-02 13:00:25.669027 max=2026-05-18 06:40:21.243266 window_rows=260
+  date_col[approved_ts timestamp without time zone]: min=None max=None window_rows=0
+  date_col[stock_trf_date date]: min=2026-03-02 max=2026-05-18 window_rows=249
+  date_col[created_by character varying]: min=B.Hrithik max=Yash window_rows=None
+  sample: {id=684, challan_no=TRANS202605181041, stock_trf_date=2026-05-18, from_site=Cold Storage, to_site=W202, vehicle_no=MH43BX1881, remark=FARD C, reason_code=Material Movement, status=Dispatch, request_id=None, created_by=B.Hrithik, created_ts=2026-05-18 05:13:18.861191, approved_by=Hrithik, approved_ts=None, updated_ts=2026-05-18 05:13:18.863839, has_variance=False, driver_name=Sachin (8692885298)}
+
+### public.interunit_transfers_lines
+  rows: 25469
+  cols (19): id:integer, header_id:integer, rm_pm_fg_type:character varying, item_category:character varying, sub_category:character varying, item_desc_raw:character varying, item_id:integer, hsn_code:character varying, pack_size:numeric, unit_pack_size:numeric, qty:integer, uom:character varying, net_weight:numeric, total_weight:numeric, batch_number:character varying, lot_number:character varying, created_at:timestamp without time zone, updated_at:timestamp without time zone, storage_location:character varying
+  date_col[sub_category character varying]: min= max=ZAHIDI window_rows=None
+  date_col[storage_location character varying]: min=None max=None window_rows=None
+  date_col[item_category character varying]: min= max=WALNUT window_rows=None
+  date_col[batch_number character varying]: min= max= window_rows=None
+  date_col[created_at timestamp without time zone]: min=2026-03-02 12:50:30.649207 max=2026-05-18 05:13:18.863839 window_rows=21904
+  date_col[updated_at timestamp without time zone]: min=2026-03-02 12:50:30.649207 max=2026-05-18 05:13:18.863839 window_rows=21904
+  sample: {id=30999, header_id=684, rm_pm_fg_type=, item_category=DATES, sub_category=, item_desc_raw=AL BARAKAH FARD DATES STANDARD C 10KG, item_id=None, hsn_code=None, pack_size=0.000, unit_pack_size=0.000, qty=1, uom=BOX, net_weight=10.000, total_weight=10.000, batch_number=, lot_number=125863, created_at=2026-05-18 05:13:18.863839, updated_at=2026-05-18 05:13:18.863839, storage_location=None}
+
+### public.inventory_batch
+  rows: 146
+  cols (24): batch_id:text, sku_name:text, item_type:text, transaction_no:text, lot_number:text, source:text, inward_date:date, manufacturing_date:date, expiry_date:date, original_qty_kg:numeric, current_qty_kg:numeric, warehouse_id:text, floor_id:text, status:text, blocked_for_so_id:integer, blocked_by:text, blocked_at:timestamp with time zone, block_reason:text, flag_reason:text, flag_detail:text, ownership:text, entity:text, created_at:timestamp with time zone, updated_at:timestamp with time zone
+  date_col[expiry_date date]: min=2025-09-10 max=2026-10-08 window_rows=4
+  date_col[manufacturing_date date]: min=2025-02-10 max=2025-04-08 window_rows=0
+  date_col[transaction_no text]: min=TR-20250402100000 max=TR-20260322231819 window_rows=None
+  date_col[inward_date date]: min=2025-04-01 max=2026-03-19 window_rows=0
+  date_col[batch_id text]: min=42294472-1 max=LEGACY-SDT-20250401-001 window_rows=None
+  date_col[status text]: min=AVAILABLE max=QC_HOLD window_rows=None
+  date_col[created_at timestamp with time zone]: min=2026-04-04 11:42:54.566100+00:00 max=2026-04-05 06:22:59.282387+00:00 window_rows=146
+  date_col[blocked_at timestamp with time zone]: min=None max=None window_rows=0
+  date_col[updated_at timestamp with time zone]: min=2026-04-04 11:42:54.566100+00:00 max=2026-04-05 06:22:59.282387+00:00 window_rows=146
+  sample: {batch_id=LEGACY-SDT-20250401-001, sku_name=Sayer Dates, item_type=rm, transaction_no=None, lot_number=LEGACY, source=STOCK_TAKE, inward_date=2025-04-01, manufacturing_date=None, expiry_date=None, original_qty_kg=50.000, current_qty_kg=50.000, warehouse_id=W202, floor_id=rm_store, status=AVAILABLE, blocked_for_so_id=None, blocked_by=None, blocked_at=None, block_reason=None, flag_reason=None, flag_detail=None, ownership=STORES, entity=cfpl, created_at=2026-04-05 03:57:59.275066+00:00, updated_at=2026-04-05 03:57:59.275066+00:00}
+
+### public.issue_note
+  rows: 0
+  cols (14): id:integer, issue_note_id:text, job_card_id:text, so_id:text, customer_name:text, bom_line_id:text, issued_by:text, issued_at:timestamp with time zone, status:text, reservation_expires_at:timestamp with time zone, total_weight_kg:numeric, entity:text, created_at:timestamp with time zone, movement_type:text
+  (empty)
+
+### public.issue_note_line
+  rows: 0
+  cols (15): id:integer, issue_note_id:text, bom_line_id:text, sku:text, material_type:text, lot_number:text, lot_id:text, tr_number:text, warehouse:text, net_wt_issued:numeric, qty_cartons:integer, box_id:text, fifo_skipped:boolean, skip_reason:text, movement_type:text
+  (empty)
+
+### public.jb_inward_boxes
+  rows: 345
+  cols (19): id:integer, inward_receipt_id:integer, transaction_no:character varying, box_id:character varying, box_number:integer, item_description:character varying, item_group:character varying, sub_group:character varying, net_weight:numeric, gross_weight:numeric, inward_warehouse:character varying, created_at:timestamp without time zone, vakkal:character varying, lot_no:character varying, item_mark:character varying, storage_location:character varying, exporter:character varying, rate:numeric, spl_remarks:text
+  date_col[storage_location character varying]: min= max= window_rows=None
+  date_col[created_at timestamp without time zone]: min=2026-05-05 09:59:36.664864 max=2026-05-05 09:59:36.664864 window_rows=345
+  date_col[transaction_no character varying]: min=TR-20260505152445 max=TR-20260505152644 window_rows=None
+  sample: {id=373, inward_receipt_id=15, transaction_no=TR-20260505152644, box_id=75004769-51, box_number=51, item_description=AMERICAN ALMONDS KERNEL 20-22 COUNT, item_group=ALMOND, sub_group=ALMOND - KERNELS, net_weight=30.000, gross_weight=30.100, inward_warehouse=W202, created_at=2026-05-05 09:59:36.664864, vakkal=, lot_no=, item_mark=, storage_location=, exporter=, rate=0.00, spl_remarks=}
+
+### public.jb_work_inward_lines
+  rows: 1
+  cols (19): id:integer, inward_receipt_id:integer, sl_no:integer, item_description:character varying, sent_kgs:numeric, sent_boxes:integer, finished_goods_kgs:numeric, finished_goods_boxes:integer, waste_kgs:numeric, waste_type:character varying, rejection_kgs:numeric, rejection_boxes:integer, line_remarks:text, entry_date:timestamp without time zone, process_type:character varying, min_loss_pct:numeric, max_loss_pct:numeric, waste_with_partial:boolean, single_shot:boolean
+  date_col[entry_date timestamp without time zone]: min=2026-05-05 09:59:36.664864 max=2026-05-05 09:59:36.664864 window_rows=1
+  sample: {id=15, inward_receipt_id=15, sl_no=1, item_description=CALIFORNIA INSHELL ALMONDS, sent_kgs=20502.000, sent_boxes=900, finished_goods_kgs=10350.600, finished_goods_boxes=0, waste_kgs=0.000, waste_type=, rejection_kgs=0.000, rejection_boxes=0, line_remarks=, entry_date=2026-05-05 09:59:36.664864, process_type=Cracking, min_loss_pct=0.00, max_loss_pct=0.00, waste_with_partial=True, single_shot=False}
+
+### public.jb_work_inward_receipt
+  rows: 1
+  cols (12): id:integer, ir_number:character varying, header_id:integer, receipt_date:character varying, receipt_type:character varying, vehicle_no:character varying, driver_name:character varying, remarks:text, created_by:character varying, created_at:timestamp without time zone, challan_no:character varying, inward_warehouse:character varying
+  date_col[receipt_date character varying]: min=2026-05-05 max=2026-05-05 window_rows=None
+  date_col[created_at timestamp without time zone]: min=2026-05-05 09:59:36.664864 max=2026-05-05 09:59:36.664864 window_rows=1
+  date_col[created_by character varying]: min=vaibhav.kumkar@candorfoods.in max=vaibhav.kumkar@candorfoods.in window_rows=None
+  sample: {id=15, ir_number=IR-JB202604271906-01, header_id=25, receipt_date=2026-05-05, receipt_type=partial, vehicle_no=MH43BX1881, driver_name=Sachin , remarks=Savla Cold & A185 & APMC F53 ( 600 Gm Sample Yash Sir ) , created_by=vaibhav.kumkar@candorfoods.in, created_at=2026-05-05 09:59:36.664864, challan_no=UGUP/JB/26-27/6 To 9, inward_warehouse=W202}
+
+### public.job_card
+  rows: 50
+  cols (48): job_card_id:integer, job_card_number:text, prod_order_id:integer, bom_id:integer, step_number:integer, process_name:text, stage:text, fg_sku_name:text, customer_name:text, batch_number:text, batch_size_kg:numeric, machine_id:integer, assigned_to_team_leader:text, team_members:ARRAY, is_locked:boolean, locked_reason:text, force_unlocked:boolean, force_unlock_by:text, force_unlock_reason:text, force_unlock_at:timestamp with time zone, status:text, start_time:timestamp with time zone, end_time:timestamp with time zone, total_time_min:numeric, factory:text, floor:text, entity:text, created_at:timestamp with time zone, sales_order_ref:text, article_code:text, mrp:numeric, ean:text, bu:text, fumigation:boolean, metal_detector_used:boolean, roasting_pasteurization:boolean, control_sample_gm:numeric, magnets_used:boolean, store_allocation_status:text, next_job_card_id:integer, prev_job_card_id:integer, carried_qty_kg:numeric, dispatched_to_next_kg:numeric, updated_at:timestamp with time zone, updated_by:text, deleted_at:timestamp with time zone, deleted_by:text, cancellation_reason:text
+  date_col[start_time timestamp with time zone]: min=2026-04-07 11:38:15.125883+00:00 max=2026-05-18 05:43:12.050695+00:00 window_rows=15
+  date_col[end_time timestamp with time zone]: min=2026-04-08 09:34:42.913729+00:00 max=2026-05-18 05:58:30.802653+00:00 window_rows=10
+  date_col[cancellation_reason text]: min=None max=None window_rows=None
+  date_col[store_allocation_status text]: min=approved max=pending window_rows=None
+  date_col[deleted_at timestamp with time zone]: min=None max=None window_rows=0
+  date_col[batch_number text]: min=B2026-0001 max=JD27 window_rows=None
+  date_col[status text]: min=completed max=unlocked window_rows=None
+  date_col[created_at timestamp with time zone]: min=2026-04-07 09:49:54.864555+00:00 max=2026-05-16 07:43:09.391461+00:00 window_rows=50
+  date_col[updated_by text]: min=None max=None window_rows=None
+  date_col[updated_at timestamp with time zone]: min=None max=None window_rows=0
+  date_col[force_unlock_at timestamp with time zone]: min=2026-04-09 11:40:40.492013+00:00 max=2026-05-15 09:51:14.374503+00:00 window_rows=2
+  sample: {job_card_id=113, job_card_number=PRD-2026-0025/1, prod_order_id=53, bom_id=816, step_number=1, process_name=Flavouring (Bulk Packaging, stage=flavouring_(bulk_packaging, fg_sku_name=Pista Irani 101 Inshell Roasted and Salted, customer_name=ALIGN RETAIL TRADES PVT LTD, batch_number=B2026-0025, batch_size_kg=1600.000, machine_id=None, assigned_to_team_leader=Maduri, team_members=['sunil', 'vaishwani', 'maya', 'sujata.'], is_locked=False, locked_reason=None, force_unlocked=False, force_unlock_by=None, force_unlock_reason=None, force_unlock_at=None, status=in_progress, start_time=2026-05-16 09:23:24.047479+00:00, end_time=None, total_time_min=None, factory=W202, floor=Lower Basement, entity=cfpl, created_at=2026-05-16 07:43:09.391461+00:00, sales_order_ref=None, article_code=CFC-323, mrp=None, ean=None, bu=RPC, fumigation=False, metal_detector_used=False, roasting_pasteurization=False, control_sample_gm=None, magnets_used=False, store_allocation_status=pending, next_job_card_id=None, prev_job_card_id=None, carried_qty_kg=0.000, dispatched_to_next_kg=0.000, updated_at=None, updated_by=None, deleted_at=None, deleted_by=None, cancellation_reason=None}
+
+### public.job_card_balance_material
+  rows: 5
+  cols (8): balance_id:integer, job_card_id:integer, material_id:integer, material_name:text, balance_type:text, qty_kg:numeric, remarks:text, created_at:timestamp with time zone
+  date_col[created_at timestamp with time zone]: min=2026-04-23 06:31:10.032054+00:00 max=2026-05-18 05:58:19.412334+00:00 window_rows=5
+  date_col[material_name text]: min=GI- Eatrite Fard Dates 500gm max=QC Sample window_rows=None
+  sample: {balance_id=6, job_card_id=110, material_id=None, material_name=GI- Eatrite Fard Dates 500gm, balance_type=extra_given, qty_kg=5.100, remarks=None, created_at=2026-05-18 05:58:19.412334+00:00}
+
+### public.job_card_byproduct
+  rows: 8
+  cols (7): byproduct_id:integer, job_card_id:integer, category:text, quantity_kg:numeric, remarks:text, created_at:timestamp with time zone, uom:text
+  date_col[category text]: min=control_sample max=tukda window_rows=None
+  date_col[created_at timestamp with time zone]: min=2026-04-23 06:31:10.032054+00:00 max=2026-05-16 08:35:59.850928+00:00 window_rows=8
+  sample: {byproduct_id=24, job_card_id=109, category=other, quantity_kg=38.550, remarks=None, created_at=2026-05-16 08:35:59.850928+00:00, uom=kg}
+
+### public.job_card_environment
+  rows: 3
+  cols (9): env_id:integer, job_card_id:integer, parameter_name:text, value:text, recorded_at:timestamp with time zone, updated_at:timestamp with time zone, updated_by:text, deleted_at:timestamp with time zone, deleted_by:text
+  date_col[recorded_at timestamp with time zone]: min=2026-04-23 06:31:10.032054+00:00 max=2026-04-23 06:31:10.032054+00:00 window_rows=3
+  date_col[updated_at timestamp with time zone]: min=None max=None window_rows=0
+  date_col[updated_by text]: min=None max=None window_rows=None
+  date_col[deleted_at timestamp with time zone]: min=None max=None window_rows=0
+  sample: {env_id=3, job_card_id=104, parameter_name=magnet_obs, value=No, recorded_at=2026-04-23 06:31:10.032054+00:00, updated_at=None, updated_by=None, deleted_at=None, deleted_by=None}
+
+### public.job_card_loss_reconciliation
+  rows: 26
+  cols (13): recon_id:integer, job_card_id:integer, loss_category:text, budgeted_loss_pct:numeric, budgeted_loss_kg:numeric, actual_loss_kg:numeric, variance_kg:numeric, remarks:text, created_at:timestamp with time zone, updated_at:timestamp with time zone, updated_by:text, deleted_at:timestamp with time zone, deleted_by:text
+  date_col[updated_at timestamp with time zone]: min=None max=None window_rows=0
+  date_col[created_at timestamp with time zone]: min=2026-04-10 08:20:55.645786+00:00 max=2026-05-18 05:58:19.412334+00:00 window_rows=26
+  date_col[updated_by text]: min=None max=None window_rows=None
+  date_col[deleted_at timestamp with time zone]: min=None max=None window_rows=0
+  date_col[loss_category text]: min=byproduct_offgrade max=wastage window_rows=None
+  sample: {recon_id=51, job_card_id=110, loss_category=total_loss, budgeted_loss_pct=None, budgeted_loss_kg=None, actual_loss_kg=9.600, variance_kg=9.600, remarks=None, created_at=2026-05-18 05:58:19.412334+00:00, updated_at=None, updated_by=None, deleted_at=None, deleted_by=None}
+
+### public.job_card_material_accounting
+  rows: 0
+  cols (20): accounting_id:integer, job_card_id:integer, total_material_issued_kg:numeric, fg_output_kg:numeric, process_loss_kg:numeric, process_loss_sub_categories:jsonb, extra_give_away_kg:numeric, balance_material_kg:numeric, offgrade_total_kg:numeric, rejection_kg:numeric, wastage_kg:numeric, process_loss_pct:numeric, other_loss_pct:numeric, total_loss_pct:numeric, balance_difference_kg:numeric, is_balanced:boolean, balanced_by:text, balanced_at:timestamp with time zone, created_at:timestamp with time zone, control_sample_kg:numeric
+  (empty)
+
+### public.job_card_material_consumption
+  rows: 1
+  cols (13): consumption_id:integer, job_card_id:integer, rm_indent_id:integer, material_sku_name:text, item_type:text, uom:text, bom_reqd_qty:numeric, issued_qty:numeric, actual_consumed_qty:numeric, return_qty:numeric, variance_qty:numeric, remarks:text, created_at:timestamp with time zone
+  date_col[created_at timestamp with time zone]: min=2026-04-07 12:50:23.375579+00:00 max=2026-04-07 12:50:23.375579+00:00 window_rows=1
+  date_col[material_sku_name text]: min=Turkey Apricot No 3 max=Turkey Apricot No 3 window_rows=None
+  sample: {consumption_id=3, job_card_id=64, rm_indent_id=85, material_sku_name=Turkey Apricot No 3, item_type=rm, uom=Kg, bom_reqd_qty=1.616, issued_qty=1.632, actual_consumed_qty=8.000, return_qty=0.000, variance_qty=6.384, remarks=None, created_at=2026-04-07 12:50:23.375579+00:00}
+
+### public.job_card_metal_detection
+  rows: 4
+  cols (20): detection_id:integer, job_card_id:integer, check_type:text, fe_pass:boolean, nfe_pass:boolean, ss_pass:boolean, failed_units:integer, remarks:text, recorded_at:timestamp with time zone, seal_check:boolean, seal_failed_units:integer, wt_check:boolean, wt_failed_units:integer, dough_temp_c:numeric, oven_temp_c:numeric, baking_temp_c:numeric, updated_at:timestamp with time zone, updated_by:text, deleted_at:timestamp with time zone, deleted_by:text
+  date_col[recorded_at timestamp with time zone]: min=2026-04-14 10:48:02.128703+00:00 max=2026-05-15 06:53:16.792407+00:00 window_rows=4
+  date_col[updated_at timestamp with time zone]: min=None max=None window_rows=0
+  date_col[updated_by text]: min=None max=None window_rows=None
+  date_col[deleted_at timestamp with time zone]: min=None max=None window_rows=0
+  sample: {detection_id=5, job_card_id=99, check_type=pre_packaging, fe_pass=True, nfe_pass=True, ss_pass=True, failed_units=56, remarks=None, recorded_at=2026-05-15 06:53:16.792407+00:00, seal_check=True, seal_failed_units=0, wt_check=True, wt_failed_units=0, dough_temp_c=None, oven_temp_c=None, baking_temp_c=None, updated_at=None, updated_by=None, deleted_at=None, deleted_by=None}
+
+### public.job_card_output
+  rows: 8
+  cols (14): output_id:integer, job_card_id:integer, fg_expected_units:integer, fg_actual_units:integer, fg_expected_kg:numeric, fg_actual_kg:numeric, rm_consumed_kg:numeric, process_loss_kg:numeric, created_at:timestamp with time zone, net_output_kg:numeric, yield_pct:numeric, extra_give_away_kg:numeric, balance_material_kg:numeric, wastage_kg:numeric
+  date_col[created_at timestamp with time zone]: min=2026-04-07 12:47:47.883840+00:00 max=2026-05-16 12:43:07.711718+00:00 window_rows=8
+  sample: {output_id=22, job_card_id=110, fg_expected_units=10000, fg_actual_units=5000, fg_expected_kg=5000.000, fg_actual_kg=2500.000, rm_consumed_kg=2509.600, process_loss_kg=0.000, created_at=2026-05-16 12:43:07.711718+00:00, net_output_kg=2500.000, yield_pct=99.617, extra_give_away_kg=0.000, balance_material_kg=0.000, wastage_kg=0.000}
+
+### public.job_card_partial_dispatch
+  rows: 0
+  cols (6): dispatch_id:integer, from_job_card_id:integer, to_job_card_id:integer, qty_kg:numeric, dispatched_at:timestamp with time zone, dispatched_by:text
+  (empty)
+
+### public.job_card_pm_indent
+  rows: 43
+  cols (22): pm_indent_id:integer, job_card_id:integer, material_sku_name:text, uom:text, reqd_qty:numeric, loss_pct:numeric, gross_qty:numeric, issued_qty:numeric, batch_no:text, godown:text, scanned_box_ids:ARRAY, variance:numeric, status:text, created_at:timestamp with time zone, store_decision:text, store_approved_qty:numeric, store_decided_by:text, store_decided_at:timestamp with time zone, source_location:text, quality_grade:text, manual_ack_by:text, manual_ack_at:timestamp with time zone
+  date_col[batch_no text]: min=A-JD22 max=A-JD22 window_rows=None
+  date_col[manual_ack_at timestamp with time zone]: min=2026-04-07 11:35:03.040210+00:00 max=2026-04-10 07:38:35.672025+00:00 window_rows=7
+  date_col[status text]: min=floor_available max=store_allocated window_rows=None
+  date_col[created_at timestamp with time zone]: min=2026-04-07 09:49:54.864555+00:00 max=2026-05-16 07:43:09.391461+00:00 window_rows=43
+  date_col[material_sku_name text]: min=PM24-3 Ply Carton CF21 Walnut Carton (445X310X305MM)-Unprinted max=PM24-Zahidi Dates Pouch (Reliance-unbranded) 500 gm window_rows=None
+  date_col[store_decided_at timestamp with time zone]: min=2026-04-14 11:12:38.387151+00:00 max=2026-04-14 11:20:31.182667+00:00 window_rows=5
+  date_col[source_location text]: min=None max=None window_rows=None
+  sample: {pm_indent_id=97, job_card_id=113, material_sku_name=PM24-3 Ply Carton CF24 10 Kg (390x290x220mm) 10000 gm -Un..., uom=Pcs, reqd_qty=160.000, loss_pct=1.000, gross_qty=161.616, issued_qty=0.000, batch_no=None, godown=Factory, scanned_box_ids=None, variance=None, status=floor_available, created_at=2026-05-16 07:43:09.391461+00:00, store_decision=pending, store_approved_qty=0.000, store_decided_by=None, store_decided_at=None, source_location=None, quality_grade=None, manual_ack_by=None, manual_ack_at=None}
+
+### public.job_card_process_step
+  rows: 50
+  cols (14): step_id:integer, job_card_id:integer, step_number:integer, process_name:text, machine_name:text, std_time_min:numeric, qc_check:text, loss_pct:numeric, operator_name:text, operator_sign_at:timestamp with time zone, qc_sign_at:timestamp with time zone, time_done:timestamp with time zone, status:text, created_at:timestamp with time zone
+  date_col[time_done timestamp with time zone]: min=None max=None window_rows=0
+  date_col[status text]: min=completed max=pending window_rows=None
+  date_col[operator_name text]: min=None max=None window_rows=None
+  date_col[created_at timestamp with time zone]: min=2026-04-07 09:49:54.864555+00:00 max=2026-05-16 07:43:09.391461+00:00 window_rows=50
+  date_col[operator_sign_at timestamp with time zone]: min=None max=None window_rows=0
+  date_col[qc_sign_at timestamp with time zone]: min=None max=None window_rows=0
+  sample: {step_id=105, job_card_id=113, step_number=1, process_name=Flavouring (Bulk Packaging, machine_name=None, std_time_min=None, qc_check=None, loss_pct=0.000, operator_name=None, operator_sign_at=None, qc_sign_at=None, time_done=None, status=pending, created_at=2026-05-16 07:43:09.391461+00:00}
+
+### public.job_card_remarks
+  rows: 0
+  cols (10): remark_id:integer, job_card_id:integer, remark_type:text, content:text, recorded_by:text, recorded_at:timestamp with time zone, updated_at:timestamp with time zone, updated_by:text, deleted_at:timestamp with time zone, deleted_by:text
+  (empty)
+
+### public.job_card_rm_indent
+  rows: 24
+  cols (22): rm_indent_id:integer, job_card_id:integer, material_sku_name:text, uom:text, reqd_qty:numeric, loss_pct:numeric, gross_qty:numeric, issued_qty:numeric, batch_no:text, godown:text, scanned_box_ids:ARRAY, variance:numeric, status:text, created_at:timestamp with time zone, store_decision:text, store_approved_qty:numeric, store_decided_by:text, store_decided_at:timestamp with time zone, source_location:text, quality_grade:text, manual_ack_by:text, manual_ack_at:timestamp with time zone
+  date_col[batch_no text]: min=125226 max=183833 window_rows=None
+  date_col[manual_ack_at timestamp with time zone]: min=2026-04-07 11:35:03.040210+00:00 max=2026-05-04 12:27:23.322418+00:00 window_rows=6
+  date_col[status text]: min=floor_available max=pending window_rows=None
+  date_col[created_at timestamp with time zone]: min=2026-04-07 09:49:54.864555+00:00 max=2026-05-16 07:43:09.391461+00:00 window_rows=24
+  date_col[material_sku_name text]: min=AL BARAKAH FARD DATES STANDARD max=Zahidi Dates window_rows=None
+  date_col[store_decided_at timestamp with time zone]: min=None max=None window_rows=0
+  date_col[source_location text]: min=None max=None window_rows=None
+  sample: {rm_indent_id=109, job_card_id=113, material_sku_name=Pista Irani 101 Inshell, uom=Kg, reqd_qty=1616.000, loss_pct=2.000, gross_qty=1648.980, issued_qty=0.000, batch_no=None, godown=Factory, scanned_box_ids=None, variance=None, status=pending, created_at=2026-05-16 07:43:09.391461+00:00, store_decision=pending, store_approved_qty=0.000, store_decided_by=None, store_decided_at=None, source_location=None, quality_grade=None, manual_ack_by=None, manual_ack_at=None}
+
+### public.job_card_sign_off
+  rows: 7
+  cols (5): sign_off_id:integer, job_card_id:integer, sign_off_type:text, name:text, signed_at:timestamp with time zone
+  date_col[signed_at timestamp with time zone]: min=2026-04-07 12:48:30.722444+00:00 max=2026-05-07 11:38:22.396925+00:00 window_rows=7
+  sample: {sign_off_id=15, job_card_id=103, sign_off_type=production_incharge, name=Admin, signed_at=2026-05-07 11:38:22.396925+00:00}
+
+### public.job_card_weight_check
+  rows: 41
+  cols (15): check_id:integer, job_card_id:integer, sample_number:integer, net_weight:numeric, gross_weight:numeric, leak_test_pass:boolean, recorded_at:timestamp with time zone, target_wt_g:numeric, tolerance_g:numeric, accept_range_min:numeric, accept_range_max:numeric, updated_at:timestamp with time zone, updated_by:text, deleted_at:timestamp with time zone, deleted_by:text
+  date_col[recorded_at timestamp with time zone]: min=2026-04-23 06:31:10.032054+00:00 max=2026-05-15 06:53:41.395074+00:00 window_rows=41
+  date_col[updated_at timestamp with time zone]: min=None max=None window_rows=0
+  date_col[updated_by text]: min=None max=None window_rows=None
+  date_col[deleted_at timestamp with time zone]: min=None max=None window_rows=0
+  sample: {check_id=43, job_card_id=99, sample_number=1, net_weight=15.000, gross_weight=15.600, leak_test_pass=False, recorded_at=2026-05-15 06:53:41.395074+00:00, target_wt_g=None, tolerance_g=None, accept_range_min=None, accept_range_max=None, updated_at=None, updated_by=None, deleted_at=None, deleted_by=None}
+
+### public.jobwork_inward_receipts
+  rows: 0
+  cols (12): id:integer, jwo_order_id:integer, ir_number:character varying, ir_date:date, receipt_type:character varying, fg_qty_received:double precision, waste_qty_received:double precision, rejection_qty:double precision, actual_loss_pct:double precision, loss_status:character varying, remarks:text, created_at:timestamp without time zone
+  (empty)
+
+### public.landed_cost_component
+  rows: 0
+  cols (10): component_id:bigint, lot_id:bigint, grn_no:text, component_type:text, amount:numeric, allocation_basis:text, allocated_per_unit:numeric, source_doc_ref:text, gl_account:text, created_at:timestamp with time zone
+  (empty)
+
+### public.legacy_import_log
+  rows: 0
+  cols (7): import_id:integer, batch_id:text, item_code:text, generated_at:timestamp with time zone, imported_by:text, source_file_ref:text, entity:text
+  (empty)
+
+### public.material_document
+  rows: 0
+  cols (13): id:integer, mat_doc_id:text, doc_date:date, posting_date:date, movement_type:text, reference_type:text, reference_id:text, created_by:text, entity:text, reversal_of:text, is_reversal:boolean, notes:text, created_at:timestamp with time zone
+  (empty)
+
+### public.material_document_line
+  rows: 0
+  cols (14): id:integer, mat_doc_id:text, line_number:integer, sku_name:text, batch_id:text, movement_type:text, quantity_kg:numeric, uom:text, from_location:text, to_location:text, from_status:text, to_status:text, lot_number:text, box_id:text
+  (empty)
+
+### public.mfg_job_cards
+  rows: 0
+  cols (76): id:character varying, fg_item_id:integer, bom_variant:character varying, party_code:character varying, production_order_no:character varying, sales_order_no:character varying, production_date:date, batch_no:character varying, batch_size_kg:numeric, expected_units:integer, mrp:numeric, best_before:date, ean:character varying, article_code:character varying, team_leader:character varying, team_members:text, nitro_cylinder_no:character varying, start_time:time without time zone, end_time:time without time zone, fumigation:boolean, metal_detector_used:boolean, roasting_pasteurization:boolean, control_sample_given:boolean, control_sample_gm:numeric, magnets_used:boolean, nitrogen_flushing:boolean, actual_fg_units:integer, actual_fg_kg:numeric, rejection_kg:numeric, process_loss_kg:numeric, process_loss_pct:numeric, material_return_kg:numeric, balance_kg:numeric, materials_issued:jsonb, md_pre_fe:boolean, md_pre_nfe:boolean, md_pre_ss:boolean, md_pre_failed_units:integer, seal_check:boolean, seal_check_failed:integer, weight_check_pass:boolean, weight_check_failed:integer, md_post_fe:boolean, md_post_nfe:boolean, md_post_ss:boolean, md_post_failed_units:integer, dough_temp_c:numeric, oven_temp_c:numeric, baking_temp_c:numeric, weight_checks:jsonb, target_weight_g:numeric, weight_tolerance_g:numeric, brine_salinity_pct:numeric, temp_t1:numeric, temp_t2:numeric, humidity_pct:numeric, fan1_pct:numeric, fan2_pct:numeric, rpm:numeric, room_temp_c:numeric, gas_start:character varying, gas_end:character varying, magnet_obs:boolean, clean_room:boolean, loss_reconciliation:jsonb, observations:text, corrective_action:text, signed_production:character varying, signed_production_at:timestamp with time zone, signed_qa:character varying, signed_qa_at:timestamp with time zone, signed_warehouse:character varying, signed_warehouse_at:timestamp with time zone, status:USER-DEFINED, created_at:timestamp with time zone, updated_at:timestamp with time zone
+  (empty)
+
+### public.mis_sales
+  rows: 8
+  cols (18): id:character varying, group_name:character varying, subgroup:character varying, sales_value:text, avg_monthly:text, percentage_of_group:numeric, is_encrypted:boolean, encryption_key_id:character varying, created_at:timestamp without time zone, updated_at:timestamp without time zone, upload_date:date, period_start:date, period_end:date, total_months:integer, is_active:boolean, created_by:character varying, updated_by:character varying, batch_id:character varying
+  date_col[period_end date]: min=2024-10-31 max=2024-10-31 window_rows=0
+  date_col[period_start date]: min=2024-04-01 max=2024-04-01 window_rows=0
+  date_col[batch_id character varying]: min=SALES_2025_12_001 max=SALES_2025_12_001 window_rows=None
+  date_col[upload_date date]: min=2025-12-13 max=2025-12-13 window_rows=0
+  date_col[created_at timestamp without time zone]: min=2025-12-13 10:31:20.559277 max=2025-12-13 10:31:20.559277 window_rows=0
+  date_col[updated_by character varying]: min=None max=None window_rows=None
+  date_col[updated_at timestamp without time zone]: min=2025-12-13 10:31:20.559277 max=2025-12-13 10:31:20.559277 window_rows=0
+  date_col[created_by character varying]: min=None max=None window_rows=None
+  sample: {id=SALES_2025_12_001_008, group_name=special, subgroup=sr, sales_value=AQICAHhZ87t7YWOG/SFxiTaBQcm97jkkAxCDI74csZYw4ZetPgEBuEaqb..., avg_monthly=AQICAHhZ87t7YWOG/SFxiTaBQcm97jkkAxCDI74csZYw4ZetPgEPC/2MW..., percentage_of_group=100.00, is_encrypted=True, encryption_key_id=arn:aws:kms:ap-south-1:548830423226:key/4669bf7e-028f-44a..., created_at=2025-12-13 10:31:20.559277, updated_at=2025-12-13 10:31:20.559277, upload_date=2025-12-13, period_start=2024-04-01, period_end=2024-10-31, total_months=7, is_active=True, created_by=None, updated_by=None, batch_id=SALES_2025_12_001}
+
+### public.mis_sales_refers
+  rows: 1
+  cols (13): sr_no:integer, id:character varying, filename:character varying, date:timestamp with time zone, created_by:character varying, total_records:integer, file_size_bytes:bigint, processing_status:character varying, period_start:timestamp without time zone, period_end:timestamp without time zone, total_months:integer, created_at:timestamp with time zone, updated_at:timestamp with time zone
+  date_col[period_end timestamp without time zone]: min=2024-10-31 00:00:00 max=2024-10-31 00:00:00 window_rows=0
+  date_col[processing_status character varying]: min=completed max=completed window_rows=None
+  date_col[date timestamp with time zone]: min=2025-12-13 10:31:23.791113+00:00 max=2025-12-13 10:31:23.791113+00:00 window_rows=0
+  date_col[updated_at timestamp with time zone]: min=2025-12-13 10:31:20.559277+00:00 max=2025-12-13 10:31:20.559277+00:00 window_rows=0
+  date_col[created_at timestamp with time zone]: min=2025-12-13 10:31:20.559277+00:00 max=2025-12-13 10:31:20.559277+00:00 window_rows=0
+  date_col[period_start timestamp without time zone]: min=2024-04-01 00:00:00 max=2024-04-01 00:00:00 window_rows=0
+  date_col[created_by character varying]: min=ai2@candorfoods.in max=ai2@candorfoods.in window_rows=None
+  sample: {sr_no=5, id=SALES_2025_12_001, filename=test sales data.xlsx, date=2025-12-13 10:31:23.791113+00:00, created_by=ai2@candorfoods.in, total_records=8, file_size_bytes=1079938, processing_status=completed, period_start=2024-04-01 00:00:00, period_end=2024-10-31 00:00:00, total_months=7, created_at=2025-12-13 10:31:20.559277+00:00, updated_at=2025-12-13 10:31:20.559277+00:00}
+
+### public.mst_component
+  rows: 0
+  cols (12): component_id:integer, component_code:character varying, component_name:character varying, material_type:USER-DEFINED, uom:character varying, godown:character varying, unit_rate_inr:numeric, rate_source:USER-DEFINED, rate_updated_at:timestamp with time zone, is_active:boolean, created_at:timestamp with time zone, updated_at:timestamp with time zone
+  (empty)
+
+### public.ni_reports
+  rows: 1
+  cols (14): id:integer, report_no:character varying, report_date:date, product_name:character varying, serving_size_g:numeric, ingredients:jsonb, calculated_per_100g:jsonb, calculated_per_serving:jsonb, rda_percentages:jsonb, warehouse:character varying, created_by:character varying, created_at:timestamp with time zone, updated_at:timestamp with time zone, ni_table:jsonb
+  date_col[report_date date]: min=2026-04-17 max=2026-04-17 window_rows=1
+  date_col[created_at timestamp with time zone]: min=2026-04-17 07:05:43.097902+00:00 max=2026-04-17 07:05:43.097902+00:00 window_rows=1
+  date_col[updated_at timestamp with time zone]: min=2026-04-17 07:05:43.097902+00:00 max=2026-04-17 07:05:43.097902+00:00 window_rows=1
+  date_col[created_by character varying]: min=None max=None window_rows=None
+  sample: {id=2, report_no=NI-2026-00001, report_date=2026-04-17, product_name=Nut MIx, serving_size_g=28.0, ingredients=[{"percentage": 32.94, "ingred_name": "Plain Almond", "ni..., calculated_per_100g={"iron_mg": 0.0, "protein_g": 23.56, "sodium_mg": 458.79,..., calculated_per_serving={"iron_mg": 0.0, "protein_g": 6.6, "sodium_mg": 128.46, "..., rda_percentages={"iron_mg": 0.0, "protein_g": 13.2, "sodium_mg": 6.42, "c..., warehouse=None, created_by=None, created_at=2026-04-17 07:05:43.097902+00:00, updated_at=2026-04-17 07:05:43.097902+00:00, ni_table={"iron_mg": {"per_100g": 0.0, "per_serving": 0.0, "rda_pe...}
+
+### public.offgrade_consumption
+  rows: 0
+  cols (5): consumption_id:integer, offgrade_id:integer, job_card_id:integer, qty_used_kg:numeric, consumed_at:timestamp with time zone
+  (empty)
+
+### public.outward_approvals
+  rows: 1
+  cols (9): id:integer, outward_id:integer, company_name:character varying, approval_status:character varying, approval_authority:character varying, approval_date:date, remarks:text, created_at:timestamp without time zone, updated_at:timestamp without time zone
+  date_col[approval_date date]: min=2025-10-16 max=2025-10-16 window_rows=0
+  date_col[created_at timestamp without time zone]: min=2025-10-16 11:40:57.066073 max=2025-10-16 11:40:57.066073 window_rows=0
+  date_col[approval_status character varying]: min=APPROVED max=APPROVED window_rows=None
+  date_col[updated_at timestamp without time zone]: min=2025-10-16 11:40:57.066073 max=2025-10-16 11:40:57.066073 window_rows=0
+  sample: {id=4, outward_id=17, company_name=CFPL, approval_status=APPROVED, approval_authority=HRITHIK, approval_date=2025-10-16, remarks=, created_at=2025-10-16 11:40:57.066073, updated_at=2025-10-16 11:40:57.066073}
+
+### public.outward_articles
+  rows: 1
+  cols (18): id:integer, outward_id:integer, company_name:character varying, material_type:character varying, item_category:character varying, sub_category:character varying, item_description:character varying, sku_id:character varying, quantity_units:numeric, uom:character varying, pack_size_gm:numeric, no_of_packets:integer, net_weight_gm:numeric, gross_weight_gm:numeric, batch_number:character varying, unit_rate:numeric, created_at:timestamp without time zone, updated_at:timestamp without time zone
+  date_col[sub_category character varying]: min=ALMOND - BROKEN max=ALMOND - BROKEN window_rows=None
+  date_col[material_type character varying]: min= max= window_rows=None
+  date_col[item_category character varying]: min=ALMOND max=ALMOND window_rows=None
+  date_col[batch_number character varying]: min=BT-20251016170301 max=BT-20251016170301 window_rows=None
+  date_col[created_at timestamp without time zone]: min=2025-10-16 11:40:57.066073 max=2025-10-16 11:40:57.066073 window_rows=0
+  date_col[updated_at timestamp without time zone]: min=2025-10-16 11:40:57.066073 max=2025-10-16 11:40:57.066073 window_rows=0
+  sample: {id=7, outward_id=17, company_name=CFPL, material_type=, item_category=ALMOND, sub_category=ALMOND - BROKEN, item_description=ALMOND BLANCHED SLICED, sku_id=None, quantity_units=5.00, uom=BOX, pack_size_gm=250.000, no_of_packets=25, net_weight_gm=31250.000, gross_weight_gm=62510.000, batch_number=BT-20251016170301, unit_rate=0.00, created_at=2025-10-16 11:40:57.066073, updated_at=2025-10-16 11:40:57.066073}
+
+### public.outward_boxes
+  rows: 5
+  cols (13): id:integer, article_id:integer, outward_id:integer, company_name:character varying, box_number:integer, article_name:character varying, lot_number:character varying, net_weight_gm:numeric, gross_weight_gm:numeric, qr_code_generated:boolean, qr_code_data:text, created_at:timestamp without time zone, updated_at:timestamp without time zone
+  date_col[updated_at timestamp without time zone]: min=2025-10-16 11:40:57.066073 max=2025-10-16 11:40:57.066073 window_rows=0
+  date_col[qr_code_data text]: min=None max=None window_rows=None
+  date_col[created_at timestamp without time zone]: min=2025-10-16 11:40:57.066073 max=2025-10-16 11:40:57.066073 window_rows=0
+  sample: {id=8, article_id=7, outward_id=17, company_name=CFPL, box_number=5, article_name=ALMOND BLANCHED SLICED, lot_number=, net_weight_gm=6250.000, gross_weight_gm=6251.000, qr_code_generated=False, qr_code_data=None, created_at=2025-10-16 11:40:57.066073, updated_at=2025-10-16 11:40:57.066073}
+
+### public.po_box
+  rows: 90
+  cols (18): box_id:text, transaction_no:text, line_number:integer, box_number:integer, net_weight:numeric, gross_weight:numeric, lot_number:text, count:integer, created_at:timestamp with time zone, section_number:integer, weighed_by:text, weighed_at:timestamp with time zone, is_final:boolean, qc_inspection_id:text, grn_no:text, grn_line_number:integer, stage2_approved:boolean, stage2_approval_id:text
+  date_col[weighed_at timestamp with time zone]: min=None max=None window_rows=0
+  date_col[created_at timestamp with time zone]: min=2026-04-28 09:51:40.509453+00:00 max=2026-04-28 09:57:44.799909+00:00 window_rows=90
+  date_col[transaction_no text]: min=TXNST2-0a140759 max=TXNST2-f2bc7ab5B window_rows=None
+  sample: {box_id=BOX-f2bc7ab5-C, transaction_no=TXNST2-f2bc7ab5, line_number=1, box_number=3, net_weight=8.000, gross_weight=8.400, lot_number=LOT-f2bc7ab5, count=100, created_at=2026-04-28 09:54:47.009535+00:00, section_number=1, weighed_by=None, weighed_at=None, is_final=False, qc_inspection_id=None, grn_no=None, grn_line_number=None, stage2_approved=False, stage2_approval_id=None}
+
+### public.po_event_log
+  rows: 516
+  cols (9): event_id:bigint, transaction_no:text, po_number:text, entity:text, event_type:text, payload_diff:jsonb, actor_user_id:uuid, request_id:uuid, occurred_at:timestamp with time zone
+  date_col[occurred_at timestamp with time zone]: min=2026-04-29 06:34:24.740367+00:00 max=2026-04-29 06:37:59.681043+00:00 window_rows=516
+  date_col[transaction_no text]: min=TR-20260429120401-084D max=TR-20260429121629-ACEB window_rows=None
+  sample: {event_id=516, transaction_no=TR-20260429121629-ACEB, po_number=CF/PO/2025-26/04007, entity=cfpl, event_type=po_created, payload_diff={"lines": [{"uom": "1.0", "rate": 491, "amount": 2434230...., actor_user_id=b397f0f7-3b24-4c10-a359-a22b6ef4fe99, request_id=1e99e1cf-e408-47b4-8cad-c95e548d15e8, occurred_at=2026-04-29 06:37:59.681043+00:00}
+
+### public.po_header
+  rows: 551
+  cols (47): transaction_no:text, entity:text, po_date:date, voucher_type:text, po_number:text, order_reference_no:text, narration:text, vendor_supplier_name:text, gross_total:numeric, total_amount:numeric, sgst_amount:numeric, cgst_amount:numeric, igst_amount:numeric, round_off:numeric, freight_transport_local:numeric, apmc_tax:numeric, packing_charges:numeric, freight_transport_charges:numeric, loading_unloading_charges:numeric, other_charges_non_gst:numeric, customer_party_name:text, vehicle_number:text, transporter_name:text, lr_number:text, source_location:text, challan_number:text, invoice_number:text, grn_number:text, system_grn_date:timestamp with time zone, purchased_by:text, inward_authority:text, warehouse:text, status:text, approved_by:text, approved_at:timestamp with time zone, created_at:timestamp with time zone, supplier_id:text, delivery_terms:text, expected_arrival:timestamp with time zone, vehicle_lr_no:text, invoice_ref:text, current_stage:text, created_by:text, is_deleted:boolean, deleted_at:timestamp with time zone, deleted_by:uuid, delete_reason:text
+  date_col[po_date date]: min=2026-01-02 max=2026-03-19 window_rows=0
+  date_col[transaction_no text]: min=SOP-TEST-1084ea10 max=TXNST2-f2bc7ab5B window_rows=None
+  date_col[expected_arrival timestamp with time zone]: min=None max=None window_rows=0
+  date_col[system_grn_date timestamp with time zone]: min=None max=None window_rows=0
+  date_col[transporter_name text]: min=None max=None window_rows=None
+  date_col[status text]: min=pending max=pending window_rows=None
+  date_col[narration text]: min=added more as per Rakesh Ji max=STAR BAZAR window_rows=None
+  date_col[created_at timestamp with time zone]: min=2026-04-28 09:51:40.384078+00:00 max=2026-04-29 06:37:59.681043+00:00 window_rows=551
+  date_col[deleted_at timestamp with time zone]: min=None max=None window_rows=0
+  date_col[created_by text]: min=None max=None window_rows=None
+  date_col[approved_at timestamp with time zone]: min=None max=None window_rows=0
+  date_col[source_location text]: min=None max=None window_rows=None
+  sample: {transaction_no=TXNST2-f2bc7ab5B, entity=cfpl, po_date=None, voucher_type=None, po_number=None, order_reference_no=None, narration=None, vendor_supplier_name=None, gross_total=None, total_amount=None, sgst_amount=None, cgst_amount=None, igst_amount=None, round_off=None, freight_transport_local=None, apmc_tax=None, packing_charges=None, freight_transport_charges=None, loading_unloading_charges=None, other_charges_non_gst=None, customer_party_name=None, vehicle_number=None, transporter_name=None, lr_number=None, source_location=None, challan_number=None, invoice_number=None, grn_number=None, system_grn_date=None, purchased_by=None, inward_authority=None, warehouse=None, status=pending, approved_by=None, approved_at=None, created_at=2026-04-28 09:54:47.119480+00:00, supplier_id=None, delivery_terms=None, expected_arrival=None, vehicle_lr_no=None, invoice_ref=None, current_stage=None, created_by=None, is_deleted=False, deleted_at=None, deleted_by=None, delete_reason=None}
+
+### public.po_item_boxes
+  rows: 26901
+  cols (9): id:bigint, po_item_id:bigint, box_no:text, qty_units:numeric, net_weight_kg:numeric, gross_weight_kg:numeric, remarks:text, created_at:timestamp with time zone, legacy_box_id:integer
+  date_col[created_at timestamp with time zone]: min=2026-02-06 06:24:56.654683+00:00 max=2026-02-06 06:24:56.654683+00:00 window_rows=0
+  sample: {id=26902, po_item_id=443, box_no=100, qty_units=None, net_weight_kg=10.000, gross_weight_kg=10.500, remarks=None, created_at=2026-02-06 06:24:56.654683+00:00, legacy_box_id=1823}
+
+### public.po_items
+  rows: 445
+  cols (15): id:bigint, purchase_order_id:bigint, sr_no:integer, material_type:text, item_category:text, sub_category:text, item_description:text, hsn_code:text, net_weight_kg:numeric, price_per_kg:numeric, taxable_value:numeric, gst_percentage:numeric, created_at:timestamp with time zone, updated_at:timestamp with time zone, legacy_article_id:integer
+  date_col[sub_category text]: min=Ajwa max=Whole Spices window_rows=None
+  date_col[material_type text]: min=ALMOND max=WALNUT window_rows=None
+  date_col[item_category text]: min=ALMOND max=WALNUT window_rows=None
+  date_col[created_at timestamp with time zone]: min=2026-02-06 06:24:56.654683+00:00 max=2026-02-06 06:24:56.654683+00:00 window_rows=0
+  date_col[updated_at timestamp with time zone]: min=2026-02-06 06:24:56.654683+00:00 max=2026-02-06 06:24:56.654683+00:00 window_rows=0
+  sample: {id=446, purchase_order_id=412, sr_no=2, material_type=DATES, item_category=DATES, sub_category=Safavi, item_description=Wet Dates Safavi, hsn_code=None, net_weight_kg=500.000, price_per_kg=0.00, taxable_value=0.00, gst_percentage=0.00, created_at=2026-02-06 06:24:56.654683+00:00, updated_at=2026-02-06 06:24:56.654683+00:00, legacy_article_id=6}
+
+### public.po_line
+  rows: 846
+  cols (33): transaction_no:text, line_number:integer, sku_name:text, uom:text, pack_count:integer, po_weight:numeric, rate:numeric, amount:numeric, particulars:text, item_category:text, sub_category:text, item_type:text, sales_group:text, gst_rate:numeric, match_score:numeric, match_source:text, carton_weight:numeric, status:text, created_at:timestamp with time zone, gr_tolerance_pct:numeric, received_qty_kg:numeric, customer_id:text, correction_round_no:integer, current_ncr_id:text, sku_id:integer, received_qty_cumulative:numeric, pending_qty:numeric, line_status:text, closure_reason:text, quantity:numeric, alt_unit_qty:numeric, line_value:numeric, gst_rate_pct:numeric
+  date_col[sub_category text]: min=ajwa max=whole spices window_rows=None
+  date_col[transaction_no text]: min=SOP-TEST-1084ea10 max=TXNST2-f2bc7ab5B window_rows=None
+  date_col[item_category text]: min=almond max=walnut window_rows=None
+  date_col[status text]: min=draft max=pending window_rows=None
+  date_col[created_at timestamp with time zone]: min=2026-04-28 09:51:40.454163+00:00 max=2026-04-29 06:37:59.681043+00:00 window_rows=846
+  date_col[match_source text]: min=all_sku max=all_sku window_rows=None
+  date_col[line_status text]: min=open max=open window_rows=None
+  sample: {transaction_no=TXNST2-f2bc7ab5B, line_number=1, sku_name=TestSKU, uom=None, pack_count=None, po_weight=None, rate=None, amount=None, particulars=None, item_category=None, sub_category=None, item_type=None, sales_group=None, gst_rate=None, match_score=None, match_source=None, carton_weight=None, status=pending, created_at=2026-04-28 09:54:47.139049+00:00, gr_tolerance_pct=5.00, received_qty_kg=0.000, customer_id=None, correction_round_no=0, current_ncr_id=None, sku_id=None, received_qty_cumulative=0.0000, pending_qty=0.0000, line_status=open, closure_reason=None, quantity=None, alt_unit_qty=None, line_value=None, gst_rate_pct=None}
+
+### public.po_section
+  rows: 0
+  cols (8): transaction_no:text, line_number:integer, section_number:integer, lot_number:text, box_count:integer, manufacturing_date:text, expiry_date:text, created_at:timestamp with time zone
+  (empty)
+
+### public.prd_jc_pm
+  rows: 0
+  cols (11): jc_pm_id:integer, jc_id:integer, line_number:integer, component_id:integer, reqd_qty:numeric, budgeted_loss_pct:numeric, gross_qty:numeric, issued_qty:numeric, batch_qty:numeric, batch_no:character varying, variance_qty:numeric
+  (empty)
+
+### public.prd_jc_rm
+  rows: 0
+  cols (12): jc_rm_id:integer, jc_id:integer, line_number:integer, component_id:integer, reqd_qty:numeric, budgeted_loss_pct:numeric, gross_qty:numeric, issued_qty:numeric, batch_qty:numeric, batch_no:character varying, variance_qty:numeric, is_overflow:boolean
+  (empty)
+
+### public.prd_jc_sign
+  rows: 0
+  cols (7): signoff_id:integer, jc_id:integer, role:USER-DEFINED, page:USER-DEFINED, signoff_name:character varying, signoff_date:date, signoff_time:time without time zone
+  (empty)
+
+### public.prd_jc_step
+  rows: 0
+  cols (12): jc_step_id:integer, jc_id:integer, step_number:integer, process_name:character varying, machine_id:integer, machine_placeholder:character varying, std_time_min:integer, qc_check:text, budgeted_loss_pct:numeric, operator_sign:character varying, qc_sign:character varying, time_done:timestamp with time zone
+  (empty)
+
+### public.prd_jc_team
+  rows: 0
+  cols (14): jc_team_id:integer, jc_id:integer, team_leader:character varying, team_members:text, nitro_cyl_no:character varying, start_time:timestamp with time zone, end_time:timestamp with time zone, total_time_min:integer, checklist_fumigation:boolean, checklist_metal_detector:boolean, checklist_roasting:boolean, checklist_control_sample_g:numeric, checklist_magnets:boolean, checklist_nitrogen:boolean
+  (empty)
+
+### public.production_consumption
+  rows: 0
+  cols (16): consumption_id:bigint, job_card_id:text, parent_sku_id:integer, input_sku_id:integer, input_lot_id:bigint, planned_qty:numeric, actual_qty:numeric, variance_qty:numeric, rate_at_issue:numeric, consumption_value:numeric, allocation_basis:text, allocated_to_output_value:numeric, consumed_at:timestamp with time zone, external_module_ref:text, sync_status:text, synced_at:timestamp with time zone
+  (empty)
+
+### public.production_indent
+  rows: 0
+  cols (26): id:integer, prod_indent_id:text, item_description:text, item_category:text, sub_category:text, material_type:text, uom:text, required_qty:numeric, available_qty:numeric, shortfall_qty:numeric, triggered_by_job_card:text, triggered_by_so:text, customer_name:text, maker_user:text, checker_user:text, checker_comment:text, status:text, linked_internal_order:text, linked_internal_jc:text, entity:text, created_at:timestamp with time zone, approved_at:timestamp with time zone, fulfilled_at:timestamp with time zone, cancel_reason:text, indent_value:numeric, approval_level:text
+  (empty)
+
+### public.purchase_indent
+  rows: 124
+  cols (29): indent_id:integer, indent_number:text, material_sku_name:text, required_qty_kg:numeric, required_by_date:date, priority:integer, plan_line_id:integer, po_reference:text, status:text, acknowledged_by:text, acknowledged_at:timestamp with time zone, entity:text, created_at:timestamp with time zone, store_allocation_id:integer, job_card_id:integer, indent_source:text, customer_name:text, so_reference:text, triggered_by_batch:text, shortfall_qty_kg:numeric, cascade_from_indent_id:integer, cascade_reason:text, cancelled_at:timestamp with time zone, cancelled_reason:text, cascade_event_id:integer, allocated_qty_kg:numeric, allocated_by:text, allocated_at:timestamp with time zone, insufficient_reason:text
+  date_col[acknowledged_at timestamp with time zone]: min=2026-04-07 10:34:57.380002+00:00 max=2026-04-07 12:35:38.552951+00:00 window_rows=11
+  date_col[allocated_at timestamp with time zone]: min=2026-04-07 10:34:57.380002+00:00 max=2026-04-07 12:35:38.552951+00:00 window_rows=11
+  date_col[status text]: min=acknowledged max=raised window_rows=None
+  date_col[required_by_date date]: min=2026-04-01 max=2026-05-23 window_rows=92
+  date_col[created_at timestamp with time zone]: min=2026-04-07 10:29:02.827808+00:00 max=2026-05-16 07:43:09.391461+00:00 window_rows=124
+  date_col[material_sku_name text]: min=AL BARAKAH FARD DATES STANDARD max=Zahidi Dates window_rows=None
+  date_col[cancelled_at timestamp with time zone]: min=None max=None window_rows=0
+  date_col[triggered_by_batch text]: min=None max=None window_rows=None
+  date_col[allocated_by text]: min=Admin max=Admin window_rows=None
+  sample: {indent_id=1765, indent_number=IND-20260516-011, material_sku_name=Pista Irani 101 Inshell, required_qty_kg=1648.980, required_by_date=None, priority=5, plan_line_id=None, po_reference=None, status=raised, acknowledged_by=None, acknowledged_at=None, entity=cfpl, created_at=2026-05-16 07:43:09.391461+00:00, store_allocation_id=None, job_card_id=113, indent_source=floor_shortage, customer_name=None, so_reference=None, triggered_by_batch=None, shortfall_qty_kg=None, cascade_from_indent_id=None, cascade_reason=Floor stock insufficient for JC PRD-2026-0025/1, cancelled_at=None, cancelled_reason=None, cascade_event_id=None, allocated_qty_kg=None, allocated_by=None, allocated_at=None, insufficient_reason=None}
+
+### public.qc_report_document
+  rows: 0
+  cols (20): report_id:text, report_type:text, inspection_id:text, transaction_no:text, po_number:text, sku_id:integer, sku_name:text, supplier_id:text, supplier_name:text, lot_number:text, accepted_qty:numeric, rejected_qty:numeric, verdict:text, verdict_at:timestamp with time zone, ncr_no:text, failed_parameters:jsonb, s3_key:text, generated_by:uuid, generated_at:timestamp with time zone, created_at:timestamp with time zone
+  (empty)
+
+### public.receipt_idempotency_key
+  rows: 2
+  cols (5): key:text, request_hash:text, response_blob:jsonb, created_at:timestamp with time zone, expires_at:timestamp with time zone
+  date_col[created_at timestamp with time zone]: min=2026-05-13 10:49:52.283700+00:00 max=2026-05-13 11:47:07.776833+00:00 window_rows=2
+  date_col[expires_at timestamp with time zone]: min=2026-05-14 10:49:52.283700+00:00 max=2026-05-14 11:47:07.776833+00:00 window_rows=2
+  sample: {key=start-f02f6cfb-d675-4e99-ab98-f50eccdd9315, request_hash=2bc7da4da463bf4cd74c74e4006c4dc8ab808600d2d7dbbb702d08257..., response_blob={"entity": "cfpl", "sku_id": 2148, "status": "in_progress..., created_at=2026-05-13 11:47:07.776833+00:00, expires_at=2026-05-14 11:47:07.776833+00:00}
+
+### public.rtv_disposition
+  rows: 0
+  cols (16): id:integer, disposition_id:text, rtv_id:text, item_description:text, qty:numeric, net_weight:numeric, source_type:text, disposition_type:text, decided_by:text, decided_at:timestamp with time zone, qc_remarks:text, linked_internal_order:text, linked_offgrade_lot:text, discard_approved:boolean, entity:text, created_at:timestamp with time zone
+  (empty)
+
+### public.rtv_permissions
+  rows: 0
+  cols (9): id:bigint, user_id:bigint, can_create:boolean, can_edit:boolean, can_approve:boolean, can_delete:boolean, can_view:boolean, created_at:timestamp with time zone, updated_at:timestamp with time zone
+  (empty)
+
+### public.sales_data
+  rows: 0
+  cols (9): id:integer, group_name:character varying, sales:double precision, fg_rm:double precision, packaging:double precision, debtors:double precision, creditors:double precision, created_at:timestamp with time zone, updated_at:timestamp with time zone
+  (empty)
+
+### public.sales_order_items
+  rows: 22
+  cols (11): id:integer, sales_order_id:integer, item_number:integer, description:text, quantity:numeric, qty_in_kg:numeric, rate:numeric, amount:numeric, hsn_code:character varying, gst_rate:numeric, created_at:timestamp without time zone
+  date_col[created_at timestamp without time zone]: min=2026-02-16 12:55:29.182777 max=2026-02-16 12:55:42.456201 window_rows=0
+  sample: {id=44, sales_order_id=7, item_number=14, description=Premia Prunes 100gm, quantity=1000.00, qty_in_kg=100.000, rate=65.11, amount=64458.90, hsn_code=08132000, gst_rate=5.00, created_at=2026-02-16 12:55:42.456201}
+
+### public.sales_orders
+  rows: 3
+  cols (11): id:integer, so_number:character varying, po_number:character varying, company:character varying, customer_name:character varying, location:character varying, so_date:date, order_date:date, remarks:text, created_at:timestamp without time zone, updated_at:timestamp without time zone
+  date_col[order_date date]: min=2026-02-16 max=2026-02-16 window_rows=0
+  date_col[so_date date]: min=2026-01-30 max=2026-02-04 window_rows=0
+  date_col[created_at timestamp without time zone]: min=2026-02-16 12:55:29.182777 max=2026-02-16 12:55:42.456201 window_rows=0
+  date_col[updated_at timestamp without time zone]: min=2026-02-16 12:55:29.182777 max=2026-02-16 12:55:42.456201 window_rows=0
+  date_col[location character varying]: min=Bangalore max=Navi Mumbai window_rows=None
+  sample: {id=7, so_number=CF-SO/02180, po_number=CF-SO/02180, company=CFPL, customer_name=Avenue Supermarts Limited, location=Bangalore, so_date=2026-02-04, order_date=2026-02-16, remarks=, created_at=2026-02-16 12:55:42.456201, updated_at=2026-02-16 12:55:42.456201}
+
+### public.sales_outward
+  rows: 0
+  cols (16): outward_id:bigint, invoice_no:text, invoice_date:date, customer_id:integer, sku_id:integer, lot_id:bigint, qty_sold:numeric, sale_rate:numeric, sale_value:numeric, cogs_rate:numeric, cogs_value:numeric, gross_margin:numeric, gross_margin_pct:numeric, gl_sales_account:text, gl_cogs_account:text, dispatched_at:timestamp with time zone
+  (empty)
+
+### public.sales_permissions
+  rows: 0
+  cols (9): id:bigint, user_id:bigint, can_create:boolean, can_edit:boolean, can_approve:boolean, can_delete:boolean, can_view:boolean, created_at:timestamp with time zone, updated_at:timestamp with time zone
+  (empty)
+
+### public.sales_upload_template
+  rows: 79493
+  cols (13): id:integer, upload_batch_id:character varying, item_name:text, item_value:numeric, sale_group:text, main_group:text, fg_rm_pm:text, matching_confidence:double precision, group_percentage:numeric, main_group_total:numeric, upload_date:date, created_at:timestamp without time zone, is_processed:boolean
+  date_col[upload_date date]: min=2025-12-04 max=2025-12-04 window_rows=0
+  date_col[created_at timestamp without time zone]: min=2025-12-04 07:08:46.933606 max=2025-12-04 07:47:56.138382 window_rows=0
+  date_col[upload_batch_id character varying]: min=BATCH_20251204_123837 max=BATCH_20251204_131621 window_rows=None
+  sample: {id=79493, upload_batch_id=BATCH_20251204_131621, item_name=al barakah khalas dates, item_value=-1111528.60, sale_group=other, main_group=sr, fg_rm_pm=None, matching_confidence=1.0, group_percentage=14.73, main_group_total=254652372.33, upload_date=2025-12-04, created_at=2025-12-04 07:47:56.138382, is_processed=True}
+
+### public.so_fulfillment
+  rows: 6550
+  cols (18): fulfillment_id:integer, so_line_id:integer, so_id:integer, financial_year:text, fg_sku_name:text, customer_name:text, original_qty_kg:numeric, revised_qty_kg:numeric, pending_qty_kg:numeric, produced_qty_kg:numeric, dispatched_qty_kg:numeric, order_status:text, delivery_deadline:date, priority:integer, carryforward_from_id:integer, entity:text, created_at:timestamp with time zone, updated_at:timestamp with time zone
+  date_col[delivery_deadline date]: min=2026-04-01 max=2026-05-22 window_rows=6307
+  date_col[created_at timestamp with time zone]: min=2026-04-07 08:32:59.682023+00:00 max=2026-05-16 07:31:43.114747+00:00 window_rows=6550
+  date_col[order_status text]: min=open max=open window_rows=None
+  date_col[updated_at timestamp with time zone]: min=2026-04-07 08:32:59.682023+00:00 max=2026-05-16 07:31:43.114747+00:00 window_rows=6550
+  sample: {fulfillment_id=25710, so_line_id=41537, so_id=8002, financial_year=2026-27, fg_sku_name=Pista Irani 101 Inshell Roasted and salted, customer_name=ALIGN RETAIL TRADES PVT LTD, original_qty_kg=1800.000, revised_qty_kg=None, pending_qty_kg=1800.000, produced_qty_kg=0.000, dispatched_qty_kg=0.000, order_status=open, delivery_deadline=2026-05-22, priority=5, carryforward_from_id=None, entity=cfpl, created_at=2026-05-16 07:31:43.114747+00:00, updated_at=2026-05-16 07:31:43.114747+00:00}
+
+### public.transfer_authority
+  rows: 5
+  cols (8): id:integer, email:character varying, name:character varying, phone:character varying, warehouse:character varying, is_active:boolean, created_at:timestamp without time zone, updated_at:timestamp without time zone
+  date_col[updated_at timestamp without time zone]: min=2025-10-14 09:11:32.628661 max=2025-10-14 09:11:32.628661 window_rows=0
+  date_col[created_at timestamp without time zone]: min=2025-10-14 09:11:32.628661 max=2025-10-14 09:11:32.628661 window_rows=0
+  sample: {id=5, email=sneha@candorfoods.in, name=Sneha Gupta, phone=+91-9876543214, warehouse=SAVLA, is_active=True, created_at=2025-10-14 09:11:32.628661, updated_at=2025-10-14 09:11:32.628661}
+
+### public.transfers_approval_authorities
+  rows: 12
+  cols (8): id:integer, authority:character varying, contact_number:character varying, email:character varying, warehouse:character varying, is_active:boolean, created_at:timestamp without time zone, updated_at:timestamp without time zone
+  date_col[updated_at timestamp without time zone]: min=2025-10-14 08:00:00.423269 max=2025-10-14 08:00:00.423269 window_rows=0
+  date_col[created_at timestamp without time zone]: min=2025-10-14 08:00:00.423269 max=2025-10-14 08:00:00.423269 window_rows=0
+  sample: {id=12, authority=B Hrithik, contact_number=7801000296, email=b.hrithik@candorfoods.in, warehouse=HO, is_active=True, created_at=2025-10-14 08:00:00.423269, updated_at=2025-10-14 08:00:00.423269}
+
+### public.transporters
+  rows: 4
+  cols (7): id:integer, transporter_name:character varying, contact_no:character varying, email:character varying, is_active:boolean, created_at:timestamp without time zone, updated_at:timestamp without time zone
+  date_col[updated_at timestamp without time zone]: min=2025-10-10 07:32:56.274192 max=2025-10-10 07:32:56.274192 window_rows=0
+  date_col[created_at timestamp without time zone]: min=2025-10-10 07:32:56.274192 max=2025-10-10 07:32:56.274192 window_rows=0
+  date_col[transporter_name character varying]: min=BLUE DART max=FEDEX window_rows=None
+  sample: {id=4, transporter_name=FEDEX, contact_no=9876543213, email=fedex@example.com, is_active=True, created_at=2025-10-10 07:32:56.274192, updated_at=2025-10-10 07:32:56.274192}
+
+### public.v_billed_articles
+  rows: 0
+  cols (20): id:character varying, billed_details_id:character varying, article_index:integer, article:text, boxes:integer, net_wt_kg:numeric, gr_wt_kg:numeric, taxable_amount:numeric, hsn_code:text, rate_per_unit:numeric, created_at:timestamp with time zone, updated_at:timestamp with time zone, deleted_at:timestamp with time zone, matched_sku_id:bigint, matched_item_type:text, matched_item_group:text, matched_sub_group:text, matched_uom:numeric, matched_gst:numeric, matched_sale_group:text
+  (empty)
+
+### public.v_billed_details
+  rows: 0
+  cols (28): id:character varying, route:text, invoice_no:text, invoice_date:date, invoice_type:text, customer:text, location:text, pin_code:text, customer_gstin:text, po_no:text, transporter:text, lr_no:text, warehouse:text, e_way_bill_no:text, payment_terms:text, approx_distance_km:integer, irn:text, total_taxable:numeric, total_gross:numeric, freight_charge:numeric, transport_per_kg:numeric, dispatch_unit:text, source_pdf:text, sheet_start_row:integer, sheet_end_row:integer, created_at:timestamp with time zone, updated_at:timestamp with time zone, deleted_at:timestamp with time zone
+  (empty)
+
+### public.v_mfg_dq_unlinked_components
+  rows: 0
+  cols (1): component_name:character varying
+  (empty)
+
+### public.v_mfg_job_card_summary
+  rows: 0
+  cols (23): id:character varying, production_date:date, production_order_no:character varying, sales_order_no:character varying, batch_no:character varying, bom_variant:character varying, product_name:character varying, product_group:character varying, product_sub_group:character varying, factory:character varying, customer_name:character varying, batch_size_kg:numeric, expected_units:integer, actual_fg_units:integer, unit_variance:integer, rejection_kg:numeric, process_loss_kg:numeric, process_loss_pct:numeric, status:USER-DEFINED, team_leader:character varying, start_time:time without time zone, end_time:time without time zone, duration:interval
+  (empty)
+
+### public.vis_appointment
+  rows: 12
+  cols (20): id:bigint, visitor_name:character varying, mobile_number:character varying, email_address:character varying, company:character varying, person_to_meet:character varying, purpose_of_visit:character varying, preferred_time_slot:character varying, carrying_items:text, additional_remarks:text, source:character varying, submitted_at:timestamp with time zone, sheet_name:character varying, row_number:integer, status:character varying, visitor_id:bigint, created_at:timestamp with time zone, updated_at:timestamp with time zone, qr_code:character varying, qr_code_sent:character varying
+  date_col[submitted_at timestamp with time zone]: min=2026-01-07 06:41:16.867626+00:00 max=2026-02-11 11:34:09.957387+00:00 window_rows=0
+  date_col[status character varying]: min=CONFIRMED max=CONFIRMED window_rows=None
+  date_col[created_at timestamp with time zone]: min=2026-01-07 06:41:16.867626+00:00 max=2026-02-11 11:34:09.957387+00:00 window_rows=0
+  date_col[preferred_time_slot character varying]: min=02:00 PM – 03:00 PM max=12:00 PM – 01:00 PM window_rows=None
+  date_col[updated_at timestamp with time zone]: min=2026-01-07 06:41:16.867626+00:00 max=2026-02-11 11:34:14.325892+00:00 window_rows=0
+  sample: {id=12, visitor_name=chaitanya, mobile_number=8856056214, email_address=loharshubham31@gmail.com, company=cdpl, person_to_meet=shubhamlohar, purpose_of_visit=Delivery / Pickup, preferred_time_slot=04:00 PM – 05:00 PM, carrying_items=Tools / Equipment, additional_remarks=, source=google_form, submitted_at=2026-02-11 11:34:09.957387+00:00, sheet_name=None, row_number=None, status=CONFIRMED, visitor_id=20260211113347, created_at=2026-02-11 11:34:09.957387+00:00, updated_at=2026-02-11 11:34:14.325892+00:00, qr_code=APT-20260211113347-22EED2CD, qr_code_sent=YES}
+
+### public.webhook_endpoint
+  rows: 1
+  cols (9): id:integer, entity:text, url:text, secret:text, description:text, is_active:boolean, created_by:text, created_at:timestamp with time zone, updated_at:timestamp with time zone
+  date_col[updated_at timestamp with time zone]: min=2026-04-18 05:22:53.797782+00:00 max=2026-04-18 05:22:53.797782+00:00 window_rows=1
+  date_col[created_at timestamp with time zone]: min=2026-04-18 05:22:53.797782+00:00 max=2026-04-18 05:22:53.797782+00:00 window_rows=1
+  date_col[created_by text]: min=Admin max=Admin window_rows=None
+  sample: {id=1, entity=cfpl, url=https://httpbin.org/post, secret=fd17e984d2195b357af1233193d7a90821e11118b8aa050ff52632017..., description=gsd verify, is_active=True, created_by=Admin, created_at=2026-04-18 05:22:53.797782+00:00, updated_at=2026-04-18 05:22:53.797782+00:00}

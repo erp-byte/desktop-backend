@@ -43,6 +43,13 @@ class UserOut(BaseModel):
     email: str | None = None
     is_admin: bool
     roles: list[RoleOut]
+    # User-level scope (same shape as MeResponse). Surfaced here so the
+    # client can render factory/floor-aware UI without a follow-up /me call.
+    # Empty list = "no restriction at the user level"; intersect with
+    # permission-row scope server-side for the real gate.
+    entities:   list[str] = []
+    warehouses: list[str] = []
+    floors:     list[str] = []
 
 
 class LoginResponse(BaseModel):

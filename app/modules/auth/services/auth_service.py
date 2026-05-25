@@ -304,6 +304,15 @@ async def login(
 
     logger.info("Login: user_id=%s role=%s", user["user_id"], role and role.get("role_name"))
 
+    # Surface user-level scope on the login payload so the renderer can lock
+    # entity/factory/floor dropdowns on first paint without waiting for /me.
+    # Multi-entity comes from allowed_entities; fall back to [entity] for
+    # records created before that column existed.
+    entities   = list(user.get("allowed_entities")
+                      or ([user["entity"]] if user.get("entity") else []))
+    warehouses = list(user.get("allowed_warehouses") or [])
+    floors     = list(user.get("allowed_floors")     or [])
+
     return {
         "access_token": access_jwt,
         "refresh_token": refresh_jwt,
@@ -318,6 +327,9 @@ async def login(
             "email": user.get("email"),
             "is_admin": is_admin,
             "roles": _role_payload(role),
+            "entities":   entities,
+            "warehouses": warehouses,
+            "floors":     floors,
         },
     }
 
@@ -663,9 +675,13 @@ async def me(conn, *, user_id: int) -> dict:
             role["role_id"],
         )
 
-    entities = [user["entity"]] if user.get("entity") else []
+    # Multi-entity assignment lives in allowed_entities (TEXT[]). Fall back
+    # to the legacy single-value `entity` column when the array is unset so
+    # users created before the column existed still see their assignment.
+    entities = list(user.get("allowed_entities")
+                    or ([user["entity"]] if user.get("entity") else []))
     warehouses = list(user.get("allowed_warehouses") or [])
-    floors: list[str] = []  # no user-level floor column yet
+    floors     = list(user.get("allowed_floors")     or [])
 
     return {
         "user_id": str(user["user_id"]),
@@ -845,6 +861,7 @@ async def validate_session(conn, token: str) -> dict | None:
         """
         SELECT u.user_id, u.phone, u.full_name, u.email, u.entity, u.role_id,
                u.is_active, u.status, u.must_change_password,
+               u.allowed_warehouses, u.allowed_floors, u.allowed_entities,
                r.role_name, r.is_admin
           FROM auth_user u
           LEFT JOIN auth_role r ON u.role_id = r.role_id
@@ -866,6 +883,14 @@ async def validate_session(conn, token: str) -> dict | None:
         "role_id": row["role_id"],
         "role_name": row["role_name"],
         "is_admin": row["is_admin"],
+        # User-level scope defaults. Middleware uses these to gate any
+        # request that carries an ?entity= / ?warehouse= / ?floor= query param.
+        # `allowed_entities` falls back to [entity] for users created before
+        # the multi-entity column existed, so legacy single-entity assignments
+        # keep working without backfill.
+        "allowed_entities":   list(row["allowed_entities"] or ([row["entity"]] if row["entity"] else [])),
+        "allowed_warehouses": list(row["allowed_warehouses"] or []),
+        "allowed_floors":     list(row["allowed_floors"]     or []),
         # Legacy callers used `session_id`. Keep the key but fill with the
         # refresh token jti that minted this access — closest equivalent.
         "session_id": payload.get("parent_jti"),
@@ -896,25 +921,37 @@ async def get_user_permissions(conn, role_id: int) -> list[dict]:
 async def create_user(conn, phone: str, password: str, full_name: str,
                       role_id: int, email: str | None = None,
                       entity: str | None = None,
-                      allowed_warehouses: list[str] | None = None) -> dict:
+                      allowed_warehouses: list[str] | None = None,
+                      allowed_floors:     list[str] | None = None,
+                      allowed_entities:   list[str] | None = None) -> dict:
     """Create a user with a bcrypt-hashed password, normalized phone.
 
     HI-06: callers MUST validate `password` via `password_rules.evaluate`
     before invoking — the router does this. This helper does NOT re-validate
     so admin tooling can still seed accounts deliberately, but any new HTTP
     surface that reaches this function should run the rules first.
+
+    If `allowed_entities` is given, the legacy single-value `entity` column
+    is set to the first element so older queries that read it stay happy.
     """
     norm = normalize_phone(phone) or phone
     hashed = password_rules.hash_password(password)
+    # Keep the legacy single-value `entity` in sync with allowed_entities[0]
+    # so reads against the old column still resolve a sensible default.
+    effective_entity = entity
+    if allowed_entities:
+        effective_entity = allowed_entities[0]
     user_id = await conn.fetchval(
         """
         INSERT INTO auth_user
             (phone, password_encrypted, full_name, email, role_id, entity,
-             allowed_warehouses, password_changed_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+             allowed_warehouses, allowed_floors, allowed_entities,
+             password_changed_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
         RETURNING user_id
         """,
-        norm, hashed, full_name, email, role_id, entity, allowed_warehouses,
+        norm, hashed, full_name, email, role_id, effective_entity,
+        allowed_warehouses, allowed_floors, allowed_entities,
     )
     return {"user_id": user_id, "phone": norm, "full_name": full_name, "role_id": role_id}
 

@@ -18,6 +18,7 @@ See AUTH_API_DOC.md for the wire-format contract.
 from __future__ import annotations
 
 import logging
+from typing import Literal
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -185,8 +186,13 @@ class CreateUserRequest(BaseModel):
     full_name: str
     role_id: int
     email: str | None = None
+    # `entity` is the legacy single-entity field, kept for back-compat. New
+    # callers should send `allowed_entities` (array) and leave `entity`
+    # unset — the service derives `entity` from `allowed_entities[0]`.
     entity: str | None = None
+    allowed_entities:   list[str] | None = None
     allowed_warehouses: list[str] | None = None
+    allowed_floors:     list[str] | None = None
 
 
 class EditUserRequest(BaseModel):
@@ -195,7 +201,29 @@ class EditUserRequest(BaseModel):
     role_id: int | None = None
     entity: str | None = None
     is_active: bool | None = None
+    # Admin-controlled soft-ban toggle. The auth_user.status CHECK constraint
+    # allows {'active','disabled','suspended'}; 'disabled' is reserved for the
+    # DELETE /users/{id} hard-disable path, so admins can only flip between
+    # 'active' and 'suspended' here.
+    status: Literal['active', 'suspended'] | None = None
+    allowed_entities:   list[str] | None = None
     allowed_warehouses: list[str] | None = None
+    allowed_floors:     list[str] | None = None
+
+
+class UserScopeRequest(BaseModel):
+    """Atomic replace of a user's entity / warehouse / floor scope.
+
+    Used by the admin user-detail Scope tab. Sending an empty list for a
+    field means "no restriction at the user level"; sending `null` (omit
+    the field) leaves the current value untouched.
+    """
+    # `entities` is plural for symmetry with the frontend, but auth_user
+    # only has a single-value `entity` column. We take the first item (or
+    # None when the list is empty) and write that.
+    entities:   list[str] | None = None
+    warehouses: list[str] | None = None
+    floors:     list[str] | None = None
 
 
 class CreateRoleRequest(BaseModel):
@@ -238,7 +266,8 @@ class CreateModuleRequest(BaseModel):
 # to opt it in explicitly. The SET clause quotes each identifier as a
 # defence-in-depth marker even though the values come from this allowlist.
 _EDITABLE_USER_COLUMNS: frozenset[str] = frozenset({
-    "full_name", "email", "role_id", "entity", "is_active", "allowed_warehouses",
+    "full_name", "email", "role_id", "entity", "is_active", "status",
+    "allowed_entities", "allowed_warehouses", "allowed_floors",
 })
 _EDITABLE_PERMISSION_COLUMNS: frozenset[str] = frozenset({
     "module", "sub_module", "sub_sub_module", "action", "description",
@@ -311,7 +340,9 @@ async def create_user(request: Request, body: CreateUserRequest):
         try:
             return await _create(
                 conn, body.phone, body.password, body.full_name,
-                body.role_id, body.email, body.entity, body.allowed_warehouses,
+                body.role_id, body.email, body.entity,
+                body.allowed_warehouses, body.allowed_floors,
+                body.allowed_entities,
             )
         except asyncpg.UniqueViolationError as e:
             cname = e.constraint_name or ""
@@ -327,7 +358,8 @@ async def list_users(request: Request):
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT u.user_id, u.phone, u.full_name, u.email, u.entity, u.allowed_warehouses,
+            SELECT u.user_id, u.phone, u.full_name, u.email, u.entity,
+                   u.allowed_entities, u.allowed_warehouses, u.allowed_floors,
                    u.is_active, u.status, u.created_at, u.last_login_at,
                    r.role_id, r.role_name, r.is_admin
             FROM auth_user u
@@ -335,7 +367,17 @@ async def list_users(request: Request):
             ORDER BY u.created_at DESC
             """
         )
-    return [dict(r) for r in rows]
+    out = []
+    for r in rows:
+        d = dict(r)
+        # Mirror the keys /me uses so the admin UI can read either name.
+        # Fall back to [entity] when allowed_entities is unset/NULL.
+        d["entities"] = list(d.get("allowed_entities")
+                             or ([d["entity"]] if d.get("entity") else []))
+        d["warehouses"] = list(d.get("allowed_warehouses") or [])
+        d["floors"]     = list(d.get("allowed_floors")     or [])
+        out.append(d)
+    return out
 
 
 @router.put("/users/{user_id}")
@@ -368,6 +410,91 @@ async def edit_user(request: Request, user_id: int, body: EditUserRequest):
             raise HTTPException(status_code=404, detail="User not found")
 
     return {"user_id": user_id, "updated": True}
+
+
+@router.get("/users/{user_id}")
+async def get_user(request: Request, user_id: int):
+    """Admin: fetch a single user with full profile (incl. allowed_floors).
+
+    The frontend admin user-detail page calls this on load; without it the
+    page falls back to a synthetic placeholder and the Scope tab can't show
+    the user's current factory/floor assignment.
+    """
+    await _require_admin(request)
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT u.user_id, u.phone, u.full_name, u.email, u.entity,
+                   u.allowed_entities, u.allowed_warehouses, u.allowed_floors,
+                   u.is_active, u.status, u.created_at, u.last_login_at,
+                   u.must_change_password,
+                   r.role_id, r.role_name, r.is_admin
+            FROM auth_user u
+            LEFT JOIN auth_role r ON u.role_id = r.role_id
+            WHERE u.user_id = $1
+            """,
+            user_id,
+        )
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found")
+    out = dict(row)
+    # Mirror keys the admin UI uses interchangeably with the /me payload.
+    # Fall back to [entity] when allowed_entities is NULL so users created
+    # before the array column existed still have a sensible entities list.
+    out["entities"]   = list(out.get("allowed_entities")
+                             or ([out["entity"]] if out.get("entity") else []))
+    out["warehouses"] = list(out.get("allowed_warehouses") or [])
+    out["floors"]     = list(out.get("allowed_floors")     or [])
+    return out
+
+
+@router.put("/users/{user_id}/scope")
+async def replace_user_scope(request: Request, user_id: int, body: UserScopeRequest):
+    """Admin: atomic replace of a user's entity / warehouse / floor scope.
+
+    Fields omitted from the payload leave the existing value untouched;
+    fields sent as an empty list clear the column to NULL (no restriction at
+    the user level — role-permission scope still applies).
+    """
+    await _require_admin(request)
+
+    updates: list[str] = []
+    params: list = []
+    idx = 1
+    sent = body.model_fields_set
+
+    if "entities" in sent:
+        entities_val = body.entities if body.entities else None
+        # Write the array as the source of truth, and mirror the first
+        # element to the legacy single-column `entity` so existing reads
+        # against that column still return a sensible value. NULL on both
+        # sides when the admin clears the list.
+        first = entities_val[0] if entities_val else None
+        updates.append(f'"allowed_entities" = ${idx}')
+        params.append(entities_val); idx += 1
+        updates.append(f'"entity" = ${idx}')
+        params.append(first); idx += 1
+    if "warehouses" in sent:
+        wh = body.warehouses if body.warehouses else None
+        updates.append(f'"allowed_warehouses" = ${idx}')
+        params.append(wh); idx += 1
+    if "floors" in sent:
+        fl = body.floors if body.floors else None
+        updates.append(f'"allowed_floors" = ${idx}')
+        params.append(fl); idx += 1
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="No scope fields supplied")
+
+    params.append(user_id)
+    sql = f'UPDATE auth_user SET {", ".join(updates)} WHERE user_id = ${idx}'
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        result = await conn.execute(sql, *params)
+        if result == 'UPDATE 0':
+            raise HTTPException(status_code=404, detail="User not found")
+    return {"user_id": user_id, "scope_updated": True}
 
 
 @router.delete("/users/{user_id}")

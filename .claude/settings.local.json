@@ -1,0 +1,39 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find D:\\\\Consumption\\\\New\\\\Backend:*)",
+      "Bash(grep -l \"floor_inventory\\\\|inventory_batch\\\\|bom_header\\\\|bom_line\\\\|machine\\\\|offgrade_inventory\" \"D:/Consumption/New/Backend/app/modules/production/services\"/*.py)",
+      "Bash(grep -E \"\\\\.py$\")",
+      "Bash(grep:*)",
+      "Bash(python -m pytest)",
+      "Bash(ls ~/.config/superpowers/worktrees/Backend/feature/plan-builder-endpoints/test_*)",
+      "Bash(ls D:/Consumption/New/Backend/app/db/*.sql)",
+      "Bash(python -c ':*)",
+      "Bash(python -)",
+      "Bash(ls -d .worktrees)",
+      "Bash(ls -d worktrees)",
+      "Bash(python -c \"import mangum; import boto3; from dotenv import load_dotenv; print\\('OK'\\)\")",
+      "Bash(/d/Consumption/New/Backend/.venv/Scripts/python -m pip install mangum==0.19.0 boto3==1.38.0 python-dotenv==1.1.0)",
+      "Bash(python -m pip install mangum==0.19.0 boto3==1.38.0 python-dotenv==1.1.0 --user)",
+      "Bash(/d/Consumption/New/Backend/.venv/Scripts/pip install:*)",
+      "Bash(\"D:/Consumption/New/Backend/.venv/Scripts/python.exe\" -m ensurepip --upgrade)",
+      "Bash(\"D:/Consumption/New/Backend/.venv/Scripts/python.exe\" -m pip install mangum==0.19.0 boto3==1.38.0 python-dotenv==1.1.0 -q)",
+      "Bash(python -m pytest tests/ -v)",
+      "Bash(\"D:/Consumption/New/Backend/.venv/Scripts/python.exe\" -m pip install pytest -q)",
+      "Bash(\"D:/Consumption/New/Backend/.venv/Scripts/python.exe\" -m pytest \"D:/Consumption/New/Backend/.worktrees/feature/lambda-deploy/tests/\" -v)",
+      "Bash(java -version)",
+      "Bash(where java:*)",
+      "Read(//c/ProgramData/chocolatey/lib/**)",
+      "Read(//c/Users/cando/.local/share/**)",
+      "Bash(python -c \"import plantuml; print\\('ok'\\)\")",
+      "Bash(dot -V)",
+      "Bash(pip install:*)",
+      "Bash(python scripts/generate_db_diagrams_pdf.py)",
+      "Bash(.venv/Scripts/python.exe enrich_symbols.py)",
+      "Bash(python scripts/generate_inventory_report.py)",
+      "Bash(find \"D:\\\\Consumption\\\\New\\\\Backend\" -type f \\\\\\( -name \"*.py\" -o -name \"*.sql\" -o -name \"*.md\" \\\\\\) -exec grep -l \"sign_off_type\\\\|sign.off\" {} \\\\;)",
+      "Bash(python *)",
+      "Bash(git checkout *)"
+    ]
+  }
+}

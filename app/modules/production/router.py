@@ -5,10 +5,11 @@ import logging
 from datetime import date, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from app.webhooks.event_bus import deferred_events
-from app.modules.auth.middleware import AuthUser, require_permission
+from app.modules.auth.middleware import AuthUser, get_current_user, require_permission
 from app.modules.auth.services.permission_service import check_permission
 from app.modules.production.schemas.job_card_edit import (
     JobCardPatchRequest, JobCardCancelRequest,
@@ -43,6 +44,86 @@ class CarryforwardRequest(BaseModel):
     revised_by: str = ""
 
 
+class FulfillmentV2SyncRequest(BaseModel):
+    entity: str | None = None
+
+
+class ReviseV2Request(BaseModel):
+    new_qty: float | None = None
+    new_units: float | None = None
+    new_date: date | None = None
+    reason: str = ""
+    revised_by: str = ""
+
+
+class CarryforwardV2Request(BaseModel):
+    fulfillment_ids: list[int]
+    new_fy: str
+    revised_by: str = ""
+
+
+class CancelV2Request(BaseModel):
+    fulfillment_ids: list[int]
+    reason: str
+    cancelled_by: str = ""
+
+
+class BomOverrideV2Request(BaseModel):
+    overrides: list[dict] = []
+    overridden_by: str = ""
+
+
+class FloorStockV2Request(BaseModel):
+    entries: list[dict] = []
+    added_by: str = ""
+
+
+# ---- Plan v2 request models ----
+class PlanV2Create(BaseModel):
+    entity: str
+    warehouse: str
+    plan_type: str = "daily"
+    plan_date: date
+    date_from: date | None = None
+    date_to: date | None = None
+    lines: list[dict] = []
+
+
+class PlanV2Update(BaseModel):
+    plan_date: date | None = None
+    date_from: date | None = None
+    date_to: date | None = None
+    plan_type: str | None = None
+
+
+class PlanV2Approve(BaseModel):
+    approved_by: str
+
+
+class PlanV2Cancel(BaseModel):
+    reason: str = ""
+
+
+class StepV2Reorder(BaseModel):
+    step_ids: list[int]
+
+
+class StepV2Patch(BaseModel):
+    process_name: str | None = None
+    stage: str | None = None
+    floor: str | None = None
+    std_time_min: float | None = None
+    loss_pct: float | None = None
+    notes: str | None = None
+
+
+class StepV2Add(BaseModel):
+    process_name: str
+    stage: str | None = None
+    floor: str | None = None
+    std_time_min: float | None = None
+    loss_pct: float | None = None
+    notes: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +421,235 @@ async def revise(request: Request, fulfillment_id: int, body: ReviseRequest):
                     reason=body.reason, revised_by=body.revised_by,
                 )
     if "error" in result:
+        raise HTTPException(status_code=404, detail="Fulfillment record not found")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Fulfillment v2 endpoints (manual planning workflow)
+# ---------------------------------------------------------------------------
+
+@router.get("/fulfillment-v2")
+async def list_fulfillment_v2(
+    request: Request,
+    entity: str = Query(None),
+    status: str = Query(None),
+    financial_year: str = Query(None),
+    customer: str = Query(None),
+    so_number: str = Query(None),
+    article: str = Query(None),
+    search: str = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(200, ge=1, le=500),
+):
+    """Paginated v2 fulfillment list — drop-in for v1 GET /fulfillment."""
+    from app.modules.production.services.fulfillment_v2 import list_fulfillment
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await list_fulfillment(
+            conn, entity=entity, status=status, financial_year=financial_year,
+            customer=customer, so_number=so_number, article=article,
+            search=search, page=page, page_size=page_size,
+        )
+
+
+@router.get("/fulfillment-v2/filter-options")
+async def filter_options_v2(
+    request: Request,
+    entity: str = Query(None),
+    financial_year: str = Query(None),
+    customer: str = Query(None),
+    so_number: str = Query(None),
+    article: str = Query(None),
+):
+    """Distinct dropdown values for v2 fulfillment filters."""
+    from app.modules.production.services.fulfillment_v2 import get_filter_options
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await get_filter_options(
+            conn, entity=entity, financial_year=financial_year,
+            customer=customer, so_number=so_number, article=article,
+        )
+
+
+@router.post("/fulfillment-v2/sync")
+async def sync_fulfillment_v2(request: Request, body: FulfillmentV2SyncRequest):
+    """Sync FG SO lines into so_fulfillment_v2. Idempotent."""
+    from app.modules.production.services.fulfillment_v2 import sync_fulfillment as _sync
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with deferred_events():
+            async with conn.transaction():
+                result = await _sync(conn, body.entity)
+    return result
+
+
+@router.get("/fulfillment-v2/demand-summary")
+async def demand_summary_v2(
+    request: Request,
+    entity: str = Query(None),
+    financial_year: str = Query(None),
+):
+    from app.modules.production.services.fulfillment_v2 import get_demand_summary
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await get_demand_summary(conn, entity=entity, financial_year=financial_year)
+
+
+@router.get("/fulfillment-v2/chart-summary")
+async def chart_summary_v2(
+    request: Request,
+    entity: str = Query(None),
+    financial_year: str = Query(None),
+    customer: str = Query(None),
+    so_number: str = Query(None),
+    article: str = Query(None),
+    status: str = Query(None),
+):
+    from app.modules.production.services.fulfillment_v2 import get_chart_summary
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await get_chart_summary(
+            conn, entity=entity, financial_year=financial_year,
+            customer=customer, so_number=so_number, article=article, status=status,
+        )
+
+
+@router.get("/fulfillment-v2/customer-view")
+async def customer_view_v2(
+    request: Request,
+    entity: str = Query(None),
+    financial_year: str = Query(None),
+    customer: str = Query(None),
+):
+    from app.modules.production.services.fulfillment_v2 import get_enriched_fulfillment
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await get_enriched_fulfillment(
+            conn, entity=entity, financial_year=financial_year, customer=customer,
+        )
+
+
+@router.get("/fulfillment-v2/fy-review")
+async def fy_review_v2(
+    request: Request,
+    entity: str = Query(None),
+    financial_year: str = Query(None),
+):
+    from app.modules.production.services.fulfillment_v2 import get_fy_review
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await get_fy_review(conn, entity=entity, financial_year=financial_year)
+
+
+@router.post("/fulfillment-v2/cancel")
+async def cancel_fulfillment_v2(request: Request, body: CancelV2Request):
+    """Cancel selected v2 fulfillment rows with reason."""
+    from app.modules.production.services.fulfillment_v2 import cancel_orders
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            return await cancel_orders(
+                conn, body.fulfillment_ids,
+                reason=body.reason, cancelled_by=body.cancelled_by,
+            )
+
+
+@router.post("/fulfillment-v2/carryforward")
+async def carryforward_v2(request: Request, body: CarryforwardV2Request):
+    """Bulk carry forward selected v2 fulfillment rows to a new FY."""
+    from app.modules.production.services.fulfillment_v2 import carryforward_orders
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            return await carryforward_orders(
+                conn, body.fulfillment_ids, body.new_fy, body.revised_by,
+            )
+
+
+@router.put("/fulfillment-v2/{so_fulfillment_id}/revise")
+async def revise_v2(request: Request, so_fulfillment_id: int, body: ReviseV2Request):
+    """Revise qty or deadline on a v2 fulfillment row with audit log."""
+    from app.modules.production.services.fulfillment_v2 import revise_order
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with deferred_events():
+            async with conn.transaction():
+                result = await revise_order(
+                    conn, so_fulfillment_id,
+                    new_qty=body.new_qty, new_units=body.new_units,
+                    new_date=body.new_date,
+                    reason=body.reason, revised_by=body.revised_by,
+                )
+    if result.get("error") == "not_found":
+        raise HTTPException(status_code=404, detail="Fulfillment record not found")
+    if result.get("error") == "no_change":
+        raise HTTPException(status_code=400, detail=result.get("message", "No change provided"))
+    if result.get("error") in ("invalid_qty", "invalid_units"):
+        raise HTTPException(status_code=400, detail=result.get("message", "Invalid value"))
+    return result
+
+
+@router.get("/fulfillment-v2/{so_fulfillment_id}/detail")
+async def detail_v2(request: Request, so_fulfillment_id: int):
+    """Full v2 fulfillment detail (drop-in shape for v1's modal)."""
+    from app.modules.production.services.fulfillment_v2 import get_fulfillment_detail
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        result = await get_fulfillment_detail(conn, so_fulfillment_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Fulfillment record not found")
+    return result
+
+
+@router.get("/fulfillment-v2/{so_fulfillment_id}/bom-override")
+async def get_bom_override_v2(request: Request, so_fulfillment_id: int):
+    from app.modules.production.services.fulfillment_v2 import get_bom_overrides
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        result = await get_bom_overrides(conn, so_fulfillment_id)
+    if result.get("error") == "not_found":
+        raise HTTPException(status_code=404, detail="Fulfillment record not found")
+    return result
+
+
+@router.put("/fulfillment-v2/{so_fulfillment_id}/bom-override")
+async def save_bom_override_v2(request: Request, so_fulfillment_id: int, body: BomOverrideV2Request):
+    from app.modules.production.services.fulfillment_v2 import save_bom_overrides
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await save_bom_overrides(
+                conn, so_fulfillment_id, body.overrides, body.overridden_by,
+            )
+    if result.get("error") == "not_found":
+        raise HTTPException(status_code=404, detail="Fulfillment record not found")
+    if result.get("error") in ("invalid_status", "no_bom"):
+        raise HTTPException(status_code=400, detail=result.get("message", "Invalid"))
+    return result
+
+
+@router.get("/fulfillment-v2/{so_fulfillment_id}/floor-stock")
+async def get_floor_stock_v2(request: Request, so_fulfillment_id: int):
+    from app.modules.production.services.fulfillment_v2 import get_floor_stock
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        result = await get_floor_stock(conn, so_fulfillment_id)
+    if result.get("error") == "not_found":
+        raise HTTPException(status_code=404, detail="Fulfillment record not found")
+    return result
+
+
+@router.put("/fulfillment-v2/{so_fulfillment_id}/floor-stock")
+async def save_floor_stock_v2(request: Request, so_fulfillment_id: int, body: FloorStockV2Request):
+    from app.modules.production.services.fulfillment_v2 import save_floor_stock
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await save_floor_stock(
+                conn, so_fulfillment_id, body.entries, body.added_by,
+            )
+    if result.get("error") == "not_found":
         raise HTTPException(status_code=404, detail="Fulfillment record not found")
     return result
 
@@ -1544,14 +1854,28 @@ async def list_job_cards(
     page_size: int = Query(200, ge=1, le=500),
     size: int = Query(None, ge=1, le=500),
     include_cancelled: bool = Query(False),
+    user=Depends(get_current_user),
 ):
-    """List job cards with filters."""
+    """List job cards. For non-admin users with a floor / warehouse lock,
+    the result is restricted to JCs on those floors / warehouses regardless
+    of the corresponding query params (a request for a floor outside the
+    lock returns 403)."""
     if size is not None:
         page_size = size
     pool = request.app.state.db_pool
     conditions = []
     params = []
     idx = 1
+
+    # ── User-level scope lock ─────────────────────────────────────────────
+    # The middleware-level lock checks ?floor= / ?warehouse= and 403s when
+    # they're out of range. Here we also intersect the IMPLICIT scope (no
+    # query param given) so a floor-locked user defaults to their floors
+    # instead of "all floors". Admin bypasses both.
+    user_floors     = getattr(user, "allowed_floors", []) or []
+    user_warehouses = getattr(user, "allowed_warehouses", []) or []
+    is_admin = getattr(user, "is_admin", False)
+
     if not include_cancelled:
         conditions.append("deleted_at IS NULL")
     if entity:
@@ -1562,10 +1886,25 @@ async def list_job_cards(
         conditions.append(f"status IN ({ph})"); params.extend(statuses); idx += len(statuses)
     if team_leader:
         conditions.append(f"assigned_to_team_leader ILIKE ${idx}"); params.append(f"%{team_leader}%"); idx += 1
+
+    # Floor handling: explicit param wins (after lock check); else apply lock.
     if floor:
+        if not is_admin and user_floors and floor not in user_floors:
+            raise HTTPException(status_code=403,
+                                detail=f"User is not assigned to floor '{floor}'")
         conditions.append(f"floor ILIKE ${idx}"); params.append(f"%{floor}%"); idx += 1
+    elif not is_admin and user_floors:
+        conditions.append(f"floor = ANY(${idx}::text[])")
+        params.append(list(user_floors)); idx += 1
+
     if factory:
+        if not is_admin and user_warehouses and factory not in user_warehouses:
+            raise HTTPException(status_code=403,
+                                detail=f"User is not assigned to factory '{factory}'")
         conditions.append(f"factory ILIKE ${idx}"); params.append(f"%{factory}%"); idx += 1
+    elif not is_admin and user_warehouses:
+        conditions.append(f"factory = ANY(${idx}::text[])")
+        params.append(list(user_warehouses)); idx += 1
     if stage:
         conditions.append(f"stage = ${idx}"); params.append(stage); idx += 1
     if search:
@@ -2094,14 +2433,37 @@ async def sign_off_jc(request: Request, job_card_id: int, body: SignOffRequest):
 
 @router.put("/job-cards/{job_card_id}/close")
 async def close_jc(request: Request, job_card_id: int):
+    """Close a job card and, when every JC on the linked plan has reached a
+    terminal state, auto-transition the plan_v2 row to 'executed'.
+
+    The plan-close hook is fire-and-forget within the same transaction: if
+    the JC close succeeds but the plan auto-close errors, we still surface
+    the JC close success — the plan auto-close runs again on every JC
+    close attempt so eventual consistency is fine.
+    """
     from app.modules.production.services.job_card_engine import close_job_card
+    from app.modules.production.services.job_card_v2 import maybe_close_plan_from_jcs
     pool = request.app.state.db_pool
+    plan_closed = False
     async with pool.acquire() as conn:
-        result = await close_job_card(conn, job_card_id)
+        async with conn.transaction():
+            result = await close_job_card(conn, job_card_id)
+            if "error" not in result:
+                plan_id = await conn.fetchval(
+                    "SELECT plan_id FROM job_card WHERE job_card_id=$1",
+                    job_card_id,
+                )
+                if plan_id is not None:
+                    try:
+                        plan_closed = await maybe_close_plan_from_jcs(conn, plan_id)
+                    except Exception:
+                        logger.exception("maybe_close_plan_from_jcs failed (jc_id=%d) — JC close stands", job_card_id)
     if "error" in result:
         if result["error"] == "missing_sign_offs":
             raise HTTPException(status_code=400, detail=f"Missing sign-offs: {result['missing']}")
         raise HTTPException(status_code=400, detail=result.get("message", result["error"]))
+    if plan_closed:
+        result["plan_auto_closed"] = True
     return result
 
 
@@ -3889,4 +4251,1851 @@ async def delete_remark_endpoint(request: Request, job_card_id: int, remark_id: 
                     )
                 except Exception:
                     logger.exception("job_card_annexure_changed emit buffering failed; swallowing")
-    return {"ok": True, "row": row}
+
+
+# ===========================================================================
+# Plan v2 endpoints (manual planning workflow)
+# ===========================================================================
+
+@router.post("/plans-v2")
+async def create_plan_v2(
+    request: Request,
+    body: PlanV2Create,
+    user=Depends(get_current_user),
+):
+    """Create a plan with header + lines; steps auto-snapshotted from BOM.
+
+    Enforces the user-level factory lock: a non-admin user assigned to a
+    specific list of warehouses cannot create a plan against a warehouse
+    outside that list.
+    """
+    if (not user.is_admin
+            and user.allowed_warehouses
+            and body.warehouse not in user.allowed_warehouses):
+        raise HTTPException(
+            status_code=403,
+            detail=f"User is not assigned to warehouse '{body.warehouse}'",
+        )
+
+    from app.modules.production.services.plan_v2 import create_plan
+    pool = request.app.state.db_pool
+    try:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                result = await create_plan(conn, body.model_dump())
+    except ValueError as exc:
+        # Over-allocation against so_fulfillment_v2 pending_qty bounds.
+        raise HTTPException(status_code=400, detail=str(exc))
+    if result.get("error") in ("no_lines", "no_bom"):
+        raise HTTPException(status_code=400, detail=result.get("message"))
+    return result
+
+
+@router.get("/plans-v2")
+async def list_plans_v2(
+    request: Request,
+    entity: str = Query(None),
+    warehouse: str = Query(None),
+    plan_type: str = Query(None),
+    status: str = Query(None),
+    date_from: date = Query(None),
+    date_to: date = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=500),
+    user=Depends(get_current_user),
+):
+    """List plans. For non-admin users with a warehouse lock, the result set
+    is restricted to their assigned warehouses regardless of the `warehouse`
+    query param (a request for a warehouse outside the lock returns 403)."""
+    user_scope_warehouses: list[str] | None = None
+    if not user.is_admin and user.allowed_warehouses:
+        if warehouse:
+            if warehouse not in user.allowed_warehouses:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"User is not assigned to warehouse '{warehouse}'",
+                )
+        else:
+            # No explicit filter — apply the user's lock list as the implicit
+            # filter. The service layer intersects this with `warehouse`.
+            user_scope_warehouses = list(user.allowed_warehouses)
+
+    from app.modules.production.services.plan_v2 import list_plans
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await list_plans(
+            conn, entity=entity, warehouse=warehouse, plan_type=plan_type,
+            status=status, date_from=date_from, date_to=date_to,
+            page=page, page_size=page_size,
+            user_scope_warehouses=user_scope_warehouses,
+        )
+
+
+@router.get("/plans-v2/{plan_id}")
+async def get_plan_v2(request: Request, plan_id: int):
+    """Full nested plan: header + lines + ordered steps."""
+    from app.modules.production.services.plan_v2 import get_plan
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        result = await get_plan(conn, plan_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Plan not found")
+    return result
+
+
+@router.put("/plans-v2/{plan_id}")
+async def update_plan_v2(request: Request, plan_id: int, body: PlanV2Update):
+    from app.modules.production.services.plan_v2 import update_plan
+    pool = request.app.state.db_pool
+    fields = {k: v for k, v in body.model_dump().items() if v is not None}
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await update_plan(conn, plan_id, fields)
+    if result.get("error") == "not_found":
+        raise HTTPException(status_code=404, detail="Plan not found")
+    if result.get("error") == "no_change":
+        raise HTTPException(status_code=400, detail=result.get("message"))
+    return result
+
+
+@router.post("/plans-v2/{plan_id}/approve")
+async def approve_plan_v2(request: Request, plan_id: int, body: PlanV2Approve):
+    from app.modules.production.services.plan_v2 import approve_plan
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await approve_plan(conn, plan_id, body.approved_by)
+    if result.get("error") == "missing_approver":
+        raise HTTPException(status_code=400, detail=result.get("message"))
+    if result.get("error") == "not_found_or_invalid_status":
+        raise HTTPException(status_code=404, detail="Plan not found or status not approvable")
+    return result
+
+
+@router.post("/plans-v2/{plan_id}/cancel")
+async def cancel_plan_v2(request: Request, plan_id: int, body: PlanV2Cancel):
+    from app.modules.production.services.plan_v2 import cancel_plan
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await cancel_plan(conn, plan_id, body.reason)
+    if result.get("error") == "not_found_or_already_cancelled":
+        raise HTTPException(status_code=404, detail="Plan not found or already cancelled")
+    return result
+
+
+# --- Step-level endpoints ---
+
+@router.put("/plans-v2/lines/{plan_line_id}/steps/reorder")
+async def reorder_steps_v2(request: Request, plan_line_id: int, body: StepV2Reorder):
+    """Bulk reorder: step_ids[0] becomes step_order=1, etc."""
+    from app.modules.production.services.plan_v2 import reorder_steps
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await reorder_steps(conn, plan_line_id, body.step_ids)
+    if result.get("error") == "step_set_mismatch":
+        raise HTTPException(status_code=400, detail=result.get("message"))
+    return result
+
+
+@router.post("/plans-v2/lines/{plan_line_id}/steps")
+async def add_step_v2(
+    request: Request,
+    plan_line_id: int,
+    body: StepV2Add,
+    user=Depends(get_current_user),
+):
+    """Append a step at the end of the line.
+
+    Enforces the user-level floor lock — same rules as update_step_v2.
+    """
+    if (body.floor
+            and not user.is_admin
+            and user.allowed_floors
+            and body.floor not in user.allowed_floors):
+        raise HTTPException(
+            status_code=403,
+            detail=f"User is not assigned to floor '{body.floor}'",
+        )
+
+    from app.modules.production.services.plan_v2 import add_step
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await add_step(conn, plan_line_id, body.model_dump())
+    if result.get("error") == "missing_process_name":
+        raise HTTPException(status_code=400, detail=result.get("message"))
+    return result
+
+
+@router.put("/plans-v2/steps/{step_id}")
+async def update_step_v2(
+    request: Request,
+    step_id: int,
+    body: StepV2Patch,
+    user=Depends(get_current_user),
+):
+    """Patch a step's floor / notes / std_time_min / loss_pct / name / stage.
+
+    Uses `exclude_unset=True` so an explicit `null` from the client (e.g. the
+    user clearing the floor dropdown) is treated as "set this column to NULL"
+    rather than being silently filtered out as a missing field.
+
+    Enforces the user-level floor lock: a non-admin user assigned to a
+    specific list of floors cannot set a step's floor to a value outside
+    that list. Clearing the floor (sending null) is always permitted.
+    """
+    fields = body.model_dump(exclude_unset=True)
+    new_floor = fields.get("floor")
+    if (new_floor
+            and not user.is_admin
+            and user.allowed_floors
+            and new_floor not in user.allowed_floors):
+        raise HTTPException(
+            status_code=403,
+            detail=f"User is not assigned to floor '{new_floor}'",
+        )
+
+    from app.modules.production.services.plan_v2 import update_step
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await update_step(conn, step_id, fields)
+    if result.get("error") == "not_found":
+        raise HTTPException(status_code=404, detail="Step not found")
+    if result.get("error") == "no_change":
+        raise HTTPException(status_code=400, detail=result.get("message"))
+    return result
+
+
+@router.delete("/plans-v2/steps/{step_id}")
+async def delete_step_v2(request: Request, step_id: int):
+    from app.modules.production.services.plan_v2 import delete_step
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await delete_step(conn, step_id)
+    if result.get("error") == "not_found":
+        raise HTTPException(status_code=404, detail="Step not found")
+    return result
+
+
+@router.get("/plans-v2/bom/{bom_id}")
+async def get_bom_summary_v2(request: Request, bom_id: int):
+    """Lightweight BOM summary intended for the Plan Detail BOM hover-card.
+
+    Returns the header, a compact list of materials (truncated at 30 for the
+    tooltip), and the ordered process route. Heavier reads should go through
+    the existing fulfillment-detail endpoint.
+    """
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        header = await conn.fetchrow(
+            """
+            SELECT bom_id, fg_sku_name, customer_name, pack_size_kg, version,
+                   is_active, item_group, entity, effective_from, effective_to,
+                   notes
+            FROM bom_header
+            WHERE bom_id = $1
+            """,
+            bom_id,
+        )
+        if not header:
+            raise HTTPException(status_code=404, detail="BOM not found")
+
+        line_count_row = await conn.fetchrow(
+            """
+            SELECT
+                COUNT(*) FILTER (WHERE item_type = 'rm') AS rm_count,
+                COUNT(*) FILTER (WHERE item_type = 'pm') AS pm_count,
+                COUNT(*)                                  AS total_count
+            FROM bom_line WHERE bom_id = $1
+            """,
+            bom_id,
+        )
+        lines = await conn.fetch(
+            """
+            SELECT bom_line_id, line_number, material_sku_name, item_type,
+                   quantity_per_unit, uom, loss_pct, godown
+            FROM bom_line
+            WHERE bom_id = $1
+            ORDER BY line_number
+            LIMIT 30
+            """,
+            bom_id,
+        )
+        steps = await conn.fetch(
+            """
+            SELECT step_number, process_name, stage, std_time_min, loss_pct,
+                   machine_type
+            FROM bom_process_route
+            WHERE bom_id = $1
+            ORDER BY step_number
+            """,
+            bom_id,
+        )
+
+    def _norm(row):
+        from decimal import Decimal
+        from datetime import date as _d, datetime as _dt
+        out = {}
+        for k, v in dict(row).items():
+            if isinstance(v, Decimal):
+                out[k] = float(v)
+            elif isinstance(v, (_d, _dt)):
+                out[k] = v.isoformat()
+            else:
+                out[k] = v
+        return out
+
+    return {
+        "header": _norm(header),
+        "counts": _norm(line_count_row),
+        "lines": [_norm(r) for r in lines],
+        "steps": [_norm(r) for r in steps],
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  JOB CARD V2 — list/detail + multi-shift time capture
+# ═══════════════════════════════════════════════════════════════════════════
+# Backed by job_card_v2 + related v2 tables (migration 017). Parallel to
+# the legacy /job-cards surface, which continues to serve v1 callers until
+# the frontend migrates. A single v2 job card may run across multiple
+# shifts and multiple days — each active segment is a row in
+# job_card_shift_log_v2; job_card_v2.total_time_min is the running roll-up.
+
+class ShiftStartRequest(BaseModel):
+    """POST /job-cards-v2/{id}/shifts/start"""
+    shift: Literal['A', 'B', 'C', 'general']
+    shift_date: date | None = None   # defaults to today
+    operator_name: str | None = None
+    notes: str | None = None
+
+
+class ShiftStopRequest(BaseModel):
+    """POST /job-cards-v2/shifts/{log_id}/stop"""
+    paused_minutes: int = 0
+    notes: str | None = None
+
+
+@router.get("/job-cards-v2")
+async def list_job_cards_v2(
+    request: Request,
+    entity:   str | None = Query(None),
+    factory:  str | None = Query(None),
+    floor:    str | None = Query(None),
+    status:   str | None = Query(None),
+    plan_id:  int | None = Query(None),
+    customer: str | None = Query(None),
+    search:   str | None = Query(None),
+    page:      int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=500),
+    user=Depends(get_current_user),
+):
+    """Paginated list of v2 job cards. Non-admin users with a factory /
+    floor lock get the result intersected with their assignment when no
+    explicit factory / floor param is given. Explicit out-of-scope params
+    return 403.
+
+    Filter params:
+      entity (cfpl/cdpl), factory (W-202/A-185), floor (canonical floor),
+      status (comma-sep), plan_id, customer (comma-sep), search (ILIKE on
+      job_card_number / fg_sku_name / customer_name / batch_number)."""
+    from app.modules.production.services.job_card_v2 import list_job_cards
+    pool = request.app.state.db_pool
+
+    user_warehouses = getattr(user, "allowed_warehouses", []) or []
+    user_floors     = getattr(user, "allowed_floors",     []) or []
+    is_admin        = getattr(user, "is_admin", False)
+
+    if factory and not is_admin and user_warehouses and factory not in user_warehouses:
+        raise HTTPException(status_code=403,
+                            detail=f"User is not assigned to factory '{factory}'")
+    if floor and not is_admin and user_floors and floor not in user_floors:
+        raise HTTPException(status_code=403,
+                            detail=f"User is not assigned to floor '{floor}'")
+
+    async with pool.acquire() as conn:
+        return await list_job_cards(
+            conn,
+            entity=entity, factory=factory, floor=floor,
+            status=status, plan_id=plan_id,
+            customer=customer, search=search,
+            page=page, page_size=page_size,
+            user_scope_warehouses=None if is_admin or factory else user_warehouses or None,
+            user_scope_floors=None     if is_admin or floor   else user_floors     or None,
+        )
+
+
+@router.get("/job-cards-v2/{job_card_id}")
+async def get_job_card_v2(
+    request: Request,
+    job_card_id: int,
+    user=Depends(get_current_user),
+):
+    """Full v2 job card detail — header + shifts + outputs + indents + sign-offs."""
+    from app.modules.production.services.job_card_v2 import get_job_card
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        result = await get_job_card(conn, job_card_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Job card not found")
+    # Enforce user-level factory/floor lock at read time too. Admin bypasses.
+    if not getattr(user, "is_admin", False):
+        if user.allowed_warehouses and result.get("factory") not in user.allowed_warehouses:
+            raise HTTPException(status_code=403, detail="JC outside your factory scope")
+        if user.allowed_floors and result.get("floor") and result["floor"] not in user.allowed_floors:
+            raise HTTPException(status_code=403, detail="JC outside your floor scope")
+    return result
+
+
+@router.post("/job-cards-v2/{job_card_id}/shifts/start")
+async def start_shift_v2(
+    request: Request,
+    job_card_id: int,
+    body: ShiftStartRequest,
+    user=Depends(get_current_user),
+):
+    """Open a new shift segment on this v2 job card.
+
+    Refuses (400) when another segment is currently open — must stop the
+    prior one first. The first start_shift on a JC also stamps the JC's
+    headline start_time and transitions it to 'in_progress'.
+    """
+    from app.modules.production.services.job_card_v2 import start_shift
+    pool = request.app.state.db_pool
+    shift_date_v = body.shift_date or date.today()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await start_shift(
+                conn,
+                job_card_id=job_card_id,
+                shift=body.shift,
+                shift_date=shift_date_v,
+                operator_name=body.operator_name or user.full_name or user.phone,
+                notes=body.notes,
+            )
+    if result.get("error") == "open_segment_exists":
+        raise HTTPException(status_code=400, detail=result)
+    if result.get("error") == "invalid_shift":
+        raise HTTPException(status_code=400, detail=result.get("message"))
+    return result
+
+
+@router.post("/job-cards-v2/shifts/{log_id}/stop")
+async def stop_shift_v2(
+    request: Request,
+    log_id: int,
+    body: ShiftStopRequest,
+    user=Depends(get_current_user),
+):
+    """Close an open shift segment + recompute the v2 JC's total_time_min."""
+    from app.modules.production.services.job_card_v2 import stop_shift
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await stop_shift(
+                conn,
+                log_id=log_id,
+                paused_minutes=body.paused_minutes,
+                notes=body.notes,
+            )
+    if result.get("error") == "log_not_found":
+        raise HTTPException(status_code=404, detail="Shift log not found")
+    if result.get("error") == "already_closed":
+        raise HTTPException(status_code=400, detail="Shift segment is already closed")
+    if result.get("error") == "negative_pause":
+        raise HTTPException(status_code=400, detail="paused_minutes must be >= 0")
+    return result
+
+
+@router.get("/job-cards-v2/{job_card_id}/shifts")
+async def list_shifts_v2(
+    request: Request,
+    job_card_id: int,
+    user=Depends(get_current_user),
+):
+    """Return all shift segments for the v2 job card, ordered by start_at."""
+    from app.modules.production.services.job_card_v2 import list_shifts
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return {"segments": await list_shifts(conn, job_card_id)}
+
+
+# ─── Team assignment ────────────────────────────────────────────────────────
+
+class AssignTeamV2Request(BaseModel):
+    """PUT /job-cards-v2/{id}/assign"""
+    team_leader: str
+    team_members: list[str] | None = None
+
+
+@router.put("/job-cards-v2/{job_card_id}/assign")
+async def assign_team_v2(
+    request: Request,
+    job_card_id: int,
+    body: AssignTeamV2Request,
+    user=Depends(get_current_user),
+):
+    """Assign a team leader and optional members to a v2 JC.
+
+    - Refuses on a 'locked' JC (downstream stage waiting on RM handoff).
+    - Refuses on terminal 'closed' / 'cancelled' status.
+    - Moves an 'unlocked' JC to 'assigned'; leaves later statuses as-is
+      (re-assignment is fine, just updates names).
+    """
+    from app.modules.production.services.job_card_v2 import assign_team
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await assign_team(
+                conn,
+                job_card_id=job_card_id,
+                team_leader=body.team_leader,
+                team_members=body.team_members,
+            )
+    if result.get("error") == "job_card_not_found":
+        raise HTTPException(status_code=404, detail="Job card not found")
+    if result.get("error") == "missing_team_leader":
+        raise HTTPException(status_code=400, detail=result["message"])
+    if result.get("error") == "terminal_state":
+        raise HTTPException(status_code=400,
+                            detail=f"JC is already {result['current_status']}")
+    if result.get("error") == "locked":
+        raise HTTPException(status_code=400, detail=result["message"])
+    return result
+
+
+# ─── Multi-stage material accounting (migration 018) ──────────────────────
+#
+# Three sub-endpoints under /job-cards-v2/{id}/accounting/* :
+#   GET                    — full view (consumption + byproducts + summary + stage context)
+#   PUT  /consumption      — upsert consumption rows
+#   PUT  /byproducts       — upsert byproduct rows
+#   PUT  /summary          — save the balance summary; backend computes
+#                            is_balanced and the loss percentages
+
+class AccountingConsumptionRow(BaseModel):
+    """One input line on the consumption table. SFG/WIP rows describe
+    material carried from a previous stage; RM rows mirror the indent.
+    Adapter classes for the two kinds aren't needed because the column
+    set is identical — what differs is the `input_kind` discriminator."""
+    material_sku_name:    str
+    input_kind:           Literal['RM', 'SFG', 'WIP', 'PM'] = 'RM'
+    uom:                  str
+    issued_qty:           float = 0
+    actual_consumed_qty:  float = 0
+    return_qty:           float = 0
+    source_rm_indent_id:  int | None = None
+    source_dispatch_id:   int | None = None
+    remarks:              str | None = None
+
+
+class AccountingConsumptionRequest(BaseModel):
+    rows: list[AccountingConsumptionRow]
+
+
+class AccountingByproductRow(BaseModel):
+    category:  Literal[
+        'tukda', 'damaged', 'black_stained', 'without_shell', 'empty_shells',
+        'dust', 'balance_material', 'rejection', 'control_sample', 'other',
+    ]
+    quantity:  float
+    uom:       str = 'KGS'
+    remarks:   str | None = None
+
+
+class AccountingByproductsRequest(BaseModel):
+    rows: list[AccountingByproductRow]
+
+
+class AccountingSummaryRequest(BaseModel):
+    total_input_qty:        float
+    input_uom:              str = 'KGS'
+    output_qty:             float = 0
+    output_uom:             str = 'KGS'
+    output_qty_units:       float | None = None
+    process_loss_qty:       float = 0
+    # 6 sub-categories the UI exposes: moisture_loss, roasting_loss,
+    # floor_waste, dust_loss, machine_waste, sticky_material. Keys are
+    # free-form so future categories don't need a migration.
+    process_loss_breakdown: dict[str, float] | None = None
+    extra_give_away_qty:    float = 0
+    balance_material_qty:   float = 0
+    offgrade_total_qty:     float = 0
+    rejection_qty:          float = 0
+    wastage_qty:            float = 0
+    control_sample_qty:     float = 0
+
+
+@router.get("/job-cards-v2/{job_card_id}/accounting")
+async def get_accounting_v2(
+    request: Request,
+    job_card_id: int,
+    user=Depends(get_current_user),
+):
+    """Full accounting view for a v2 JC. Includes:
+       stage context (step number, position, prev/next IDs, carried qty),
+       consumption rows, byproduct rows, accounting summary."""
+    from app.modules.production.services.jc_accounting_v2 import get_accounting
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        result = await get_accounting(conn, job_card_id)
+    if result.get("error") == "job_card_not_found":
+        raise HTTPException(status_code=404, detail="Job card not found")
+    return result
+
+
+@router.put("/job-cards-v2/{job_card_id}/accounting/consumption")
+async def save_consumption_v2(
+    request: Request,
+    job_card_id: int,
+    body: AccountingConsumptionRequest,
+    user=Depends(get_current_user),
+):
+    """Upsert consumption rows on this JC. The (job_card_id,
+    material_sku_name) unique index makes re-saves an UPDATE."""
+    from app.modules.production.services.jc_accounting_v2 import save_consumption
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await save_consumption(
+                conn, job_card_id=job_card_id,
+                rows=[r.model_dump() for r in body.rows],
+                recorded_by=user.full_name or user.phone,
+            )
+    if result.get("error"):
+        raise HTTPException(status_code=400, detail=result)
+    return result
+
+
+@router.put("/job-cards-v2/{job_card_id}/accounting/byproducts")
+async def save_byproducts_v2(
+    request: Request,
+    job_card_id: int,
+    body: AccountingByproductsRequest,
+    user=Depends(get_current_user),
+):
+    """Upsert byproduct rows. Zero-qty saves let the UI clear a row."""
+    from app.modules.production.services.jc_accounting_v2 import save_byproducts
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await save_byproducts(
+                conn, job_card_id=job_card_id,
+                rows=[r.model_dump() for r in body.rows],
+                recorded_by=user.full_name or user.phone,
+            )
+    if result.get("error"):
+        raise HTTPException(status_code=400, detail=result)
+    return result
+
+
+@router.put("/job-cards-v2/{job_card_id}/accounting/summary")
+async def save_accounting_summary_v2(
+    request: Request,
+    job_card_id: int,
+    body: AccountingSummaryRequest,
+    user=Depends(get_current_user),
+):
+    """Save the summary balance row. Backend computes is_balanced and the
+    loss percentages; returns the saved row + the residual difference."""
+    from app.modules.production.services.jc_accounting_v2 import save_accounting
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await save_accounting(
+                conn, job_card_id=job_card_id,
+                payload=body.model_dump(),
+                saved_by=user.full_name or user.phone,
+            )
+    if result.get("error") == "job_card_not_found":
+        raise HTTPException(status_code=404, detail="Job card not found")
+    if result.get("error"):
+        raise HTTPException(status_code=400, detail=result)
+    return result
+
+
+# ─── Stage handoff (WIP/SFG → next stage) ──────────────────────────────────
+
+class DispatchToNextRequest(BaseModel):
+    """POST /job-cards-v2/{id}/dispatch-to-next
+
+    Pydantic-level `gt=0` mirrors the service-side `invalid_qty` check
+    so a malformed client (qty_kg=0 or negative) is rejected with a
+    422 before the service is even invoked. Service still re-checks
+    defensively because other call paths bypass the router.
+    """
+    qty_kg:    float = Field(gt=0)
+    qty_units: float | None = Field(default=None, ge=0)
+    notes:     str | None = None
+
+
+@router.post("/job-cards-v2/{job_card_id}/dispatch-to-next")
+async def dispatch_to_next_v2(
+    request: Request,
+    job_card_id: int,
+    body: DispatchToNextRequest,
+    user=Depends(get_current_user),
+):
+    """Hand qty from this JC to its next_job_card_id partner. Auto-unlocks
+    the downstream JC when it was waiting on the previous stage."""
+    from app.modules.production.services.job_card_v2 import dispatch_to_next
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await dispatch_to_next(
+                conn,
+                job_card_id=job_card_id,
+                qty_kg=body.qty_kg,
+                qty_units=body.qty_units,
+                dispatched_by=user.full_name or user.phone,
+                notes=body.notes,
+            )
+    if result.get("error") == "job_card_not_found":
+        raise HTTPException(status_code=404, detail="Job card not found")
+    if result.get("error") in ("invalid_qty", "no_next_stage", "chain_broken"):
+        raise HTTPException(status_code=400, detail=result.get("message", result["error"]))
+    return result
+
+
+# ─── Output capture ─────────────────────────────────────────────────────────
+
+class ConsumedLineV2(BaseModel):
+    """Per-BOM-line consumption row. `consumed_qty` is in the row's own
+    UOM (the v2 indent CHECK constraint already pinned the UOM at
+    materialisation time, so we accept the operator's number as-is and
+    stamp it onto the indent row by bom_line_id)."""
+    bom_line_id:       int
+    material_sku_name: str | None = None
+    consumed_qty:      float
+    remarks:           str | None = None
+
+
+class RecordOutputRequest(BaseModel):
+    """POST /job-cards-v2/{id}/outputs"""
+    rm_consumed_kg:   float
+    output_qty_kg:    float
+    output_qty_units: float | None = None
+    output_kind:      Literal['SFG', 'WIP', 'FG'] | None = None
+    uom:              str | None = None
+    notes:            str | None = None
+    # Per-line consumption — operator's record of which articles were
+    # consumed and by how much. Each entry is matched to its indent row
+    # by bom_line_id (cheap O(1) lookup via the FK index added in
+    # migration 023). Splitting RM and PM keeps the kind unambiguous so
+    # we hit the right indent table without secondary lookups.
+    rm_consumed:      list[ConsumedLineV2] = []
+    pm_consumed:      list[ConsumedLineV2] = []
+
+
+@router.post("/job-cards-v2/{job_card_id}/outputs")
+async def record_output_v2(
+    request: Request,
+    job_card_id: int,
+    body: RecordOutputRequest,
+    user=Depends(get_current_user),
+):
+    """Append an output row (RM consumed + output qty + yield) for this JC.
+
+    When the body includes per-BOM-line `rm_consumed` / `pm_consumed`
+    entries, each is written back to the matching indent row's
+    `consumed_qty` column so the JC-detail response round-trips the
+    operator's per-line entry on the next read. Rows whose bom_line_id
+    doesn't belong to this JC are rejected — prevents a stale or
+    malicious payload from updating consumption on a different JC.
+    """
+    from app.modules.production.services.job_card_v2 import (
+        record_output, upsert_consumption_lines,
+    )
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            # ── Per-BOM-line consumption ──────────────────────────────
+            # Validated against the JC's BOM catalog (bom_line for the
+            # JC's bom_id) — every stage can record consumption against
+            # every BOM article, not just the ones materialised into
+            # this stage's indent rows. The packaging (last) stage
+            # commonly records both RM and PM here.
+            submitted_bom_lines = (
+                {int(r.bom_line_id) for r in body.rm_consumed} |
+                {int(p.bom_line_id) for p in body.pm_consumed}
+            )
+            if submitted_bom_lines:
+                valid = await conn.fetch(
+                    """
+                    SELECT bom_line_id
+                    FROM   bom_line bl
+                    JOIN   job_card_v2 jc ON jc.bom_id = bl.bom_id
+                    WHERE  jc.job_card_id = $1
+                    """,
+                    job_card_id,
+                )
+                valid_ids = {r["bom_line_id"] for r in valid}
+                invalid = submitted_bom_lines - valid_ids
+                if invalid:
+                    raise HTTPException(
+                        status_code=400,
+                        detail={
+                            "error": "invalid_bom_line",
+                            "message": (
+                                f"bom_line_id(s) {sorted(invalid)} do not "
+                                "belong to this job card's BOM"
+                            ),
+                        },
+                    )
+
+                # Upsert into job_card_material_consumption_v2 — UNIQUE
+                # (job_card_id, material_sku_name) keeps re-saves
+                # idempotent (single row per article per JC).
+                rec_by = user.full_name or user.phone
+                await upsert_consumption_lines(
+                    conn, job_card_id=job_card_id,
+                    entries=[r.model_dump() for r in body.rm_consumed],
+                    input_kind='RM', recorded_by=rec_by,
+                )
+                await upsert_consumption_lines(
+                    conn, job_card_id=job_card_id,
+                    entries=[p.model_dump() for p in body.pm_consumed],
+                    input_kind='PM', recorded_by=rec_by,
+                )
+
+            result = await record_output(
+                conn,
+                job_card_id=job_card_id,
+                rm_consumed_kg=body.rm_consumed_kg,
+                output_qty_kg=body.output_qty_kg,
+                output_qty_units=body.output_qty_units,
+                output_kind=body.output_kind,
+                uom=body.uom,
+                notes=body.notes,
+                recorded_by=user.full_name or user.phone,
+            )
+    if result.get("error") == "job_card_not_found":
+        raise HTTPException(status_code=404, detail="Job card not found")
+    if result.get("error") == "negative_qty":
+        raise HTTPException(status_code=400, detail="qty values must be >= 0")
+    return result
+
+
+# ─── Sign-off ───────────────────────────────────────────────────────────────
+
+class SignOffRequest(BaseModel):
+    """POST /job-cards-v2/{id}/sign-off
+
+    `signed_by_name` lets the operator at the device record a sign-off
+    on behalf of someone else (e.g. the production head standing
+    nearby). When provided, it overrides the JWT-derived signer for
+    the persisted `signed_by` column. When omitted, the bearer-token
+    user is used — preserving the old behaviour for callers that don't
+    send the field.
+
+    `notes` is a free-form audit trail field, kept separate from
+    `signed_by_name` so the signer's name and any operational notes
+    are recorded in distinct columns.
+    """
+    role:           str
+    notes:          str | None = None
+    signed_by_name: str | None = None
+
+
+@router.post("/job-cards-v2/{job_card_id}/sign-off")
+async def sign_off_v2(
+    request: Request,
+    job_card_id: int,
+    body: SignOffRequest,
+    user=Depends(get_current_user),
+):
+    """Record a per-role sign-off. UNIQUE (job_card_id, role) — re-signing
+    under the same role refreshes the row instead of erroring."""
+    from app.modules.production.services.job_card_v2 import add_sign_off
+    pool = request.app.state.db_pool
+    # Typed name takes precedence over the JWT user so the operator
+    # can sign on someone else's behalf (common pattern: the
+    # production head's name is typed in by whoever's at the device).
+    # Strip + fall back to JWT identity when the typed name is empty
+    # so we never persist a blank signer.
+    typed = (body.signed_by_name or "").strip()
+    signer = typed if typed else (user.full_name or user.phone)
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await add_sign_off(
+                conn,
+                job_card_id=job_card_id,
+                role=body.role,
+                signed_by=signer,
+                notes=body.notes,
+            )
+    if result.get("error"):
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+# ─── Lifecycle: start / complete / force-unlock / patch / cancel ──────────
+
+class ForceUnlockV2Request(BaseModel):
+    """PUT /job-cards-v2/{id}/force-unlock"""
+    authority: str       # operator / supervisor name
+    reason:    str
+
+
+class PatchJobCardV2Request(BaseModel):
+    """PATCH /job-cards-v2/{id}
+
+    Whitelisted fields only — status / lineage / chain pointers can't be
+    patched here; use the dedicated lifecycle endpoints. Sending unknown
+    keys is harmless (silently ignored)."""
+    fg_sku_name:         str | None = None
+    customer_name:       str | None = None
+    batch_number:        str | None = None
+    planned_qty_kg:      float | None = None
+    planned_qty_units:   float | None = None
+    uom:                 str | None = None
+    assigned_to_team_leader: str | None = None
+    team_members:        list[str] | None = None
+    floor:               str | None = None
+    machine_id:          int | None = None
+
+
+class CancelJobCardV2Request(BaseModel):
+    """DELETE /job-cards-v2/{id}"""
+    reason: str
+
+
+@router.put("/job-cards-v2/{job_card_id}/start")
+async def start_jc_v2(
+    request: Request,
+    job_card_id: int,
+    user=Depends(get_current_user),
+):
+    """Move a v2 JC into 'in_progress'."""
+    from app.modules.production.services.job_card_v2 import start_job_card
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await start_job_card(conn, job_card_id=job_card_id)
+    if result.get("error") == "job_card_not_found":
+        raise HTTPException(status_code=404, detail="Job card not found")
+    if result.get("error") in ("locked", "invalid_status"):
+        raise HTTPException(status_code=400, detail=result["message"])
+    return result
+
+
+@router.put("/job-cards-v2/{job_card_id}/complete")
+async def complete_jc_v2(
+    request: Request,
+    job_card_id: int,
+    user=Depends(get_current_user),
+):
+    """Move a v2 JC from 'in_progress' to 'completed'. Refuses when an
+    open shift segment is still running (would skew total_time_min)."""
+    from app.modules.production.services.job_card_v2 import complete_job_card
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await complete_job_card(conn, job_card_id=job_card_id)
+    if result.get("error") == "job_card_not_found":
+        raise HTTPException(status_code=404, detail="Job card not found")
+    if result.get("error") in ("invalid_status", "open_shift"):
+        raise HTTPException(status_code=400, detail=result["message"])
+    return result
+
+
+@router.put("/job-cards-v2/{job_card_id}/force-unlock")
+async def force_unlock_v2(
+    request: Request,
+    job_card_id: int,
+    body: ForceUnlockV2Request,
+    user=Depends(get_current_user),
+):
+    """Admin override: flip a locked JC to 'unlocked' regardless of
+    upstream-handoff state. Stamps force_unlocked + audit fields."""
+    from app.modules.production.services.job_card_v2 import force_unlock
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await force_unlock(
+                conn,
+                job_card_id=job_card_id,
+                authority=body.authority,
+                reason=body.reason,
+            )
+    if result.get("error") == "job_card_not_found":
+        raise HTTPException(status_code=404, detail="Job card not found")
+    if result.get("error") in ("missing_authority", "missing_reason", "not_locked"):
+        raise HTTPException(status_code=400, detail=result["message"])
+    return result
+
+
+@router.patch("/job-cards-v2/{job_card_id}")
+async def patch_jc_v2(
+    request: Request,
+    job_card_id: int,
+    body: PatchJobCardV2Request,
+    user=Depends(get_current_user),
+):
+    """Partial update of header fields. Use lifecycle endpoints for
+    status / start / complete / close / cancel — those aren't patchable
+    through this surface."""
+    from app.modules.production.services.job_card_v2 import patch_job_card
+    pool = request.app.state.db_pool
+    # exclude_unset so omitted fields don't get blanked.
+    fields = body.model_dump(exclude_unset=True)
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await patch_job_card(
+                conn,
+                job_card_id=job_card_id,
+                fields=fields,
+                updated_by=user.full_name or user.phone,
+            )
+    if result.get("error") == "job_card_not_found":
+        raise HTTPException(status_code=404, detail="Job card not found")
+    if result.get("error") == "no_change":
+        raise HTTPException(status_code=400, detail=result["message"])
+    return result
+
+
+@router.delete("/job-cards-v2/{job_card_id}")
+async def cancel_jc_v2(
+    request: Request,
+    job_card_id: int,
+    body: CancelJobCardV2Request,
+    user=Depends(get_current_user),
+):
+    """Soft-cancel a v2 JC. Allowed only before 'in_progress' — past that
+    point, finish via complete/close instead."""
+    from app.modules.production.services.job_card_v2 import cancel_job_card
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await cancel_job_card(
+                conn,
+                job_card_id=job_card_id,
+                reason=body.reason,
+                deleted_by=user.full_name or user.phone,
+            )
+    if result.get("error") == "job_card_not_found":
+        raise HTTPException(status_code=404, detail="Job card not found")
+    if result.get("error") in ("missing_reason", "invalid_status"):
+        raise HTTPException(status_code=400, detail=result["message"])
+    return result
+
+
+# ─── Close (with plan auto-close) ──────────────────────────────────────────
+
+class CloseJobCardV2Request(BaseModel):
+    """PUT /job-cards-v2/{id}/close"""
+    allow_partial: bool = False     # admin override of sign-off check
+
+
+@router.post("/job-cards-v2/{job_card_id}/backfill-indents")
+async def backfill_indents_v2(
+    request: Request,
+    job_card_id: int,
+    user=Depends(get_current_user),
+):
+    """Retro-materialise RM/PM indent rows for a v2 JC that was created
+    before indent materialisation was wired into ``create_job_cards_from_plan``.
+
+    Idempotent: any side (RM or PM) that already has indent rows is
+    skipped. Stage 1 fills RM rows; the final stage fills PM rows;
+    intermediate stages produce nothing because they consume upstream
+    WIP via dispatch_to_next, not a fresh issuance.
+
+    Returns ``{job_card_id, rm_added, pm_added, rm_skipped, pm_skipped}``
+    or HTTP 404 when the JC doesn't exist.
+    """
+    from app.modules.production.services.job_card_v2 import backfill_indents_for_jc
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await backfill_indents_for_jc(conn, job_card_id)
+    if result.get("error") == "job_card_not_found":
+        raise HTTPException(status_code=404, detail="Job card not found")
+    return result
+
+
+@router.put("/job-cards-v2/{job_card_id}/close")
+async def close_job_card_v2(
+    request: Request,
+    job_card_id: int,
+    body: CloseJobCardV2Request | None = None,
+    user=Depends(get_current_user),
+):
+    """Close a v2 job card. Refuses on missing sign-offs or an open shift
+    segment. After a successful close, if every JC on the linked plan has
+    reached a terminal state, the plan is auto-flipped to 'executed'.
+
+    `allow_partial=true` skips the sign-off check — admin-only.
+    """
+    from app.modules.production.services.job_card_v2 import (
+        close_job_card, maybe_close_plan_from_jcs,
+    )
+    allow_partial = bool(body and body.allow_partial)
+    if allow_partial and not user.is_admin:
+        raise HTTPException(status_code=403, detail="allow_partial requires admin")
+
+    pool = request.app.state.db_pool
+    plan_closed = False
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await close_job_card(
+                conn, job_card_id=job_card_id, allow_partial=allow_partial,
+            )
+            if "error" not in result and result.get("plan_id") is not None:
+                try:
+                    plan_closed = await maybe_close_plan_from_jcs(conn, result["plan_id"])
+                except Exception:
+                    logger.exception("maybe_close_plan_from_jcs failed (jc_id=%d) — JC close stands", job_card_id)
+
+    if result.get("error") == "job_card_not_found":
+        raise HTTPException(status_code=404, detail="Job card not found")
+    if result.get("error") == "terminal_state":
+        raise HTTPException(status_code=400,
+                            detail=f"JC is already {result['current_status']}")
+    if result.get("error") == "open_shift":
+        raise HTTPException(status_code=400, detail=result["message"])
+    if result.get("error") == "missing_sign_offs":
+        raise HTTPException(status_code=400,
+                            detail={"error": "missing_sign_offs", "missing": result["missing"]})
+    if plan_closed:
+        result["plan_auto_closed"] = True
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  v2 QUALITY ANNEXURES — Metal / Weight / Environment / Loss / Remarks
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+async def _assert_jc_writable_by_user(conn, *, job_card_id: int, user):
+    """Floor/factory scope guard applied to every v2 annexure write.
+
+    The list endpoint already filters JCs to the user's allowed scope on
+    READ. WRITES need their own guard because the JC ID can be guessed
+    or typed directly; without this, a floor-locked operator could
+    submit annexure rows against any JC.
+    """
+    if getattr(user, "is_admin", False):
+        return  # admin bypass
+    from app.modules.production.services.jc_annexures_v2 import assert_jc_in_scope
+    result = await assert_jc_in_scope(
+        conn,
+        job_card_id=job_card_id,
+        allowed_warehouses=getattr(user, "allowed_warehouses", []) or None,
+        allowed_floors=getattr(user, "allowed_floors", []) or None,
+    )
+    if result.get("error") == "job_card_not_found":
+        raise HTTPException(status_code=404, detail="Job card not found")
+    if result.get("error") == "out_of_scope":
+        raise HTTPException(
+            status_code=403,
+            detail=f"User not assigned to {result['scope']} '{result['value']}'",
+        )
+#
+# Each annexure exposes POST (add row), PATCH (update row), DELETE (soft-
+# delete with reason). All payload bodies are flat — the service module
+# filters to its allow-list and stamps the audit columns.
+
+# ─── Annexure A — Metal Detection ───────────────────────────────────────
+
+class MetalDetectionAddRequest(BaseModel):
+    check_type:   Literal['pre_packaging', 'post_packaging']
+    fe_pass:      bool | None = None
+    nfe_pass:     bool | None = None
+    ss_pass:      bool | None = None
+    failed_units: int = 0
+    remarks:      str | None = None
+
+
+class MetalDetectionPatchRequest(BaseModel):
+    check_type:   Literal['pre_packaging', 'post_packaging'] | None = None
+    fe_pass:      bool | None = None
+    nfe_pass:     bool | None = None
+    ss_pass:      bool | None = None
+    failed_units: int  | None = None
+    remarks:      str  | None = None
+
+
+class AnnexureDeleteRequest(BaseModel):
+    """Shared body for all annexure DELETE endpoints."""
+    reason: str | None = None
+
+
+@router.post("/job-cards-v2/{job_card_id}/metal-detection")
+async def add_metal_detection_v2(
+    request: Request, job_card_id: int,
+    body: MetalDetectionAddRequest, user=Depends(get_current_user),
+):
+    from app.modules.production.services.jc_annexures_v2 import add_metal_detection
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await _assert_jc_writable_by_user(conn, job_card_id=job_card_id, user=user)
+            r = await add_metal_detection(
+                conn, job_card_id=job_card_id,
+                check_type=body.check_type, fe_pass=body.fe_pass,
+                nfe_pass=body.nfe_pass, ss_pass=body.ss_pass,
+                failed_units=body.failed_units, remarks=body.remarks,
+                recorded_by=user.full_name or user.phone,
+            )
+    if r.get("error"): raise HTTPException(status_code=400, detail=r)
+    return r
+
+
+@router.patch("/job-cards-v2/{job_card_id}/metal-detection/{detection_id}")
+async def patch_metal_detection_v2(
+    request: Request, job_card_id: int, detection_id: int,
+    body: MetalDetectionPatchRequest, user=Depends(get_current_user),
+):
+    from app.modules.production.services.jc_annexures_v2 import patch_metal_detection
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await _assert_jc_writable_by_user(conn, job_card_id=job_card_id, user=user)
+            r = await patch_metal_detection(
+                conn, detection_id=detection_id, job_card_id=job_card_id,
+                fields=body.model_dump(exclude_unset=True),
+                updated_by=user.full_name or user.phone,
+            )
+    if r.get("error") == "not_found": raise HTTPException(status_code=404, detail="Row not found")
+    if r.get("error"): raise HTTPException(status_code=400, detail=r)
+    return r
+
+
+@router.api_route(
+    "/job-cards-v2/{job_card_id}/metal-detection/{detection_id}",
+    methods=["DELETE"],
+)
+async def delete_metal_detection_v2(
+    request: Request, job_card_id: int, detection_id: int,
+    body: AnnexureDeleteRequest | None = None, user=Depends(get_current_user),
+):
+    from app.modules.production.services.jc_annexures_v2 import delete_metal_detection
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await _assert_jc_writable_by_user(conn, job_card_id=job_card_id, user=user)
+            r = await delete_metal_detection(
+                conn, detection_id=detection_id, job_card_id=job_card_id,
+                deleted_by=user.full_name or user.phone,
+                reason=body.reason if body else None,
+            )
+    if r.get("error") == "not_found_or_already_deleted":
+        raise HTTPException(status_code=404, detail="Row not found or already deleted")
+    return r
+
+
+# ─── Annexure B — Weight Checks ─────────────────────────────────────────
+
+class WeightCheckAddRequest(BaseModel):
+    sample_number:   int
+    net_weight:      float | None = None
+    gross_weight:    float | None = None
+    leak_test_pass:  bool  | None = None
+    remarks:         str   | None = None
+
+
+class WeightCheckPatchRequest(BaseModel):
+    sample_number:   int   | None = None
+    net_weight:      float | None = None
+    gross_weight:    float | None = None
+    leak_test_pass:  bool  | None = None
+    remarks:         str   | None = None
+
+
+@router.post("/job-cards-v2/{job_card_id}/weight-checks")
+async def add_weight_check_v2(
+    request: Request, job_card_id: int,
+    body: WeightCheckAddRequest, user=Depends(get_current_user),
+):
+    from app.modules.production.services.jc_annexures_v2 import add_weight_check
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await _assert_jc_writable_by_user(conn, job_card_id=job_card_id, user=user)
+            r = await add_weight_check(
+                conn, job_card_id=job_card_id, **body.model_dump(),
+                recorded_by=user.full_name or user.phone,
+            )
+    if r.get("error"): raise HTTPException(status_code=400, detail=r)
+    return r
+
+
+@router.patch("/job-cards-v2/{job_card_id}/weight-checks/{check_id}")
+async def patch_weight_check_v2(
+    request: Request, job_card_id: int, check_id: int,
+    body: WeightCheckPatchRequest, user=Depends(get_current_user),
+):
+    from app.modules.production.services.jc_annexures_v2 import patch_weight_check
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await _assert_jc_writable_by_user(conn, job_card_id=job_card_id, user=user)
+            r = await patch_weight_check(
+                conn, check_id=check_id, job_card_id=job_card_id,
+                fields=body.model_dump(exclude_unset=True),
+                updated_by=user.full_name or user.phone,
+            )
+    if r.get("error") == "not_found": raise HTTPException(status_code=404, detail="Row not found")
+    if r.get("error"): raise HTTPException(status_code=400, detail=r)
+    return r
+
+
+@router.api_route(
+    "/job-cards-v2/{job_card_id}/weight-checks/{check_id}", methods=["DELETE"],
+)
+async def delete_weight_check_v2(
+    request: Request, job_card_id: int, check_id: int,
+    body: AnnexureDeleteRequest | None = None, user=Depends(get_current_user),
+):
+    from app.modules.production.services.jc_annexures_v2 import delete_weight_check
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await _assert_jc_writable_by_user(conn, job_card_id=job_card_id, user=user)
+            r = await delete_weight_check(
+                conn, check_id=check_id, job_card_id=job_card_id,
+                deleted_by=user.full_name or user.phone,
+                reason=body.reason if body else None,
+            )
+    if r.get("error") == "not_found_or_already_deleted":
+        raise HTTPException(status_code=404, detail="Row not found or already deleted")
+    return r
+
+
+# ─── Annexure C — Environment ────────────────────────────────────────────
+
+class EnvironmentAddRequest(BaseModel):
+    parameter_name: str
+    value:          str | None = None
+    unit:           str | None = None
+    remarks:        str | None = None
+
+
+class EnvironmentPatchRequest(BaseModel):
+    parameter_name: str | None = None
+    value:          str | None = None
+    unit:           str | None = None
+    remarks:        str | None = None
+
+
+@router.post("/job-cards-v2/{job_card_id}/environment")
+async def add_environment_v2(
+    request: Request, job_card_id: int,
+    body: EnvironmentAddRequest, user=Depends(get_current_user),
+):
+    from app.modules.production.services.jc_annexures_v2 import add_environment
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await _assert_jc_writable_by_user(conn, job_card_id=job_card_id, user=user)
+            r = await add_environment(
+                conn, job_card_id=job_card_id, **body.model_dump(),
+                recorded_by=user.full_name or user.phone,
+            )
+    if r.get("error"): raise HTTPException(status_code=400, detail=r)
+    return r
+
+
+@router.patch("/job-cards-v2/{job_card_id}/environment/{env_id}")
+async def patch_environment_v2(
+    request: Request, job_card_id: int, env_id: int,
+    body: EnvironmentPatchRequest, user=Depends(get_current_user),
+):
+    from app.modules.production.services.jc_annexures_v2 import patch_environment
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await _assert_jc_writable_by_user(conn, job_card_id=job_card_id, user=user)
+            r = await patch_environment(
+                conn, env_id=env_id, job_card_id=job_card_id,
+                fields=body.model_dump(exclude_unset=True),
+                updated_by=user.full_name or user.phone,
+            )
+    if r.get("error") == "not_found": raise HTTPException(status_code=404, detail="Row not found")
+    if r.get("error"): raise HTTPException(status_code=400, detail=r)
+    return r
+
+
+@router.api_route(
+    "/job-cards-v2/{job_card_id}/environment/{env_id}", methods=["DELETE"],
+)
+async def delete_environment_v2(
+    request: Request, job_card_id: int, env_id: int,
+    body: AnnexureDeleteRequest | None = None, user=Depends(get_current_user),
+):
+    from app.modules.production.services.jc_annexures_v2 import delete_environment
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await _assert_jc_writable_by_user(conn, job_card_id=job_card_id, user=user)
+            r = await delete_environment(
+                conn, env_id=env_id, job_card_id=job_card_id,
+                deleted_by=user.full_name or user.phone,
+                reason=body.reason if body else None,
+            )
+    if r.get("error") == "not_found_or_already_deleted":
+        raise HTTPException(status_code=404, detail="Row not found or already deleted")
+    return r
+
+
+# ─── Annexure D — Loss Reconciliation ────────────────────────────────────
+
+class LossReconAddRequest(BaseModel):
+    loss_category:     Literal[
+        'sorting_rejection', 'roasting_loss', 'packaging_rejection',
+        'metal_detector', 'spillage', 'qc_sample', 'other']
+    budgeted_loss_pct: float | None = None
+    budgeted_loss_qty: float | None = None
+    actual_loss_qty:   float | None = None
+    uom:               str   | None = 'KGS'
+    remarks:           str   | None = None
+
+
+class LossReconPatchRequest(BaseModel):
+    loss_category:     Literal[
+        'sorting_rejection', 'roasting_loss', 'packaging_rejection',
+        'metal_detector', 'spillage', 'qc_sample', 'other'] | None = None
+    budgeted_loss_pct: float | None = None
+    budgeted_loss_qty: float | None = None
+    actual_loss_qty:   float | None = None
+    uom:               str   | None = None
+    remarks:           str   | None = None
+
+
+@router.post("/job-cards-v2/{job_card_id}/loss-reconciliation")
+async def add_loss_recon_v2(
+    request: Request, job_card_id: int,
+    body: LossReconAddRequest, user=Depends(get_current_user),
+):
+    from app.modules.production.services.jc_annexures_v2 import add_loss_reconciliation
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await _assert_jc_writable_by_user(conn, job_card_id=job_card_id, user=user)
+            r = await add_loss_reconciliation(
+                conn, job_card_id=job_card_id, **body.model_dump(),
+                recorded_by=user.full_name or user.phone,
+            )
+    if r.get("error"): raise HTTPException(status_code=400, detail=r)
+    return r
+
+
+@router.patch("/job-cards-v2/{job_card_id}/loss-reconciliation/{recon_id}")
+async def patch_loss_recon_v2(
+    request: Request, job_card_id: int, recon_id: int,
+    body: LossReconPatchRequest, user=Depends(get_current_user),
+):
+    from app.modules.production.services.jc_annexures_v2 import patch_loss_reconciliation
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await _assert_jc_writable_by_user(conn, job_card_id=job_card_id, user=user)
+            r = await patch_loss_reconciliation(
+                conn, recon_id=recon_id, job_card_id=job_card_id,
+                fields=body.model_dump(exclude_unset=True),
+                updated_by=user.full_name or user.phone,
+            )
+    if r.get("error") == "not_found": raise HTTPException(status_code=404, detail="Row not found")
+    if r.get("error"): raise HTTPException(status_code=400, detail=r)
+    return r
+
+
+@router.api_route(
+    "/job-cards-v2/{job_card_id}/loss-reconciliation/{recon_id}", methods=["DELETE"],
+)
+async def delete_loss_recon_v2(
+    request: Request, job_card_id: int, recon_id: int,
+    body: AnnexureDeleteRequest | None = None, user=Depends(get_current_user),
+):
+    from app.modules.production.services.jc_annexures_v2 import delete_loss_reconciliation
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await _assert_jc_writable_by_user(conn, job_card_id=job_card_id, user=user)
+            r = await delete_loss_reconciliation(
+                conn, recon_id=recon_id, job_card_id=job_card_id,
+                deleted_by=user.full_name or user.phone,
+                reason=body.reason if body else None,
+            )
+    if r.get("error") == "not_found_or_already_deleted":
+        raise HTTPException(status_code=404, detail="Row not found or already deleted")
+    return r
+
+
+# ─── Annexure E — Remarks ────────────────────────────────────────────────
+
+class RemarkAddRequest(BaseModel):
+    remark_type: Literal['observation', 'deviation', 'corrective_action']
+    content:     str
+
+
+class RemarkPatchRequest(BaseModel):
+    remark_type: Literal['observation', 'deviation', 'corrective_action'] | None = None
+    content:     str | None = None
+
+
+@router.post("/job-cards-v2/{job_card_id}/remarks")
+async def add_remark_v2(
+    request: Request, job_card_id: int,
+    body: RemarkAddRequest, user=Depends(get_current_user),
+):
+    from app.modules.production.services.jc_annexures_v2 import add_remark
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await _assert_jc_writable_by_user(conn, job_card_id=job_card_id, user=user)
+            r = await add_remark(
+                conn, job_card_id=job_card_id,
+                remark_type=body.remark_type, content=body.content,
+                recorded_by=user.full_name or user.phone,
+            )
+    if r.get("error"): raise HTTPException(status_code=400, detail=r)
+    return r
+
+
+@router.patch("/job-cards-v2/{job_card_id}/remarks/{remark_id}")
+async def patch_remark_v2(
+    request: Request, job_card_id: int, remark_id: int,
+    body: RemarkPatchRequest, user=Depends(get_current_user),
+):
+    from app.modules.production.services.jc_annexures_v2 import patch_remark
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await _assert_jc_writable_by_user(conn, job_card_id=job_card_id, user=user)
+            r = await patch_remark(
+                conn, remark_id=remark_id, job_card_id=job_card_id,
+                fields=body.model_dump(exclude_unset=True),
+                updated_by=user.full_name or user.phone,
+            )
+    if r.get("error") == "not_found": raise HTTPException(status_code=404, detail="Row not found")
+    if r.get("error"): raise HTTPException(status_code=400, detail=r)
+    return r
+
+
+@router.api_route(
+    "/job-cards-v2/{job_card_id}/remarks/{remark_id}", methods=["DELETE"],
+)
+async def delete_remark_v2(
+    request: Request, job_card_id: int, remark_id: int,
+    body: AnnexureDeleteRequest | None = None, user=Depends(get_current_user),
+):
+    from app.modules.production.services.jc_annexures_v2 import delete_remark
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await _assert_jc_writable_by_user(conn, job_card_id=job_card_id, user=user)
+            r = await delete_remark(
+                conn, remark_id=remark_id, job_card_id=job_card_id,
+                deleted_by=user.full_name or user.phone,
+                reason=body.reason if body else None,
+            )
+    if r.get("error") == "not_found_or_already_deleted":
+        raise HTTPException(status_code=404, detail="Row not found or already deleted")
+    return r
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  v2 PDF + read endpoints + material receipt
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.get("/job-cards-v2/{job_card_id}/pdf")
+async def job_card_pdf_v2(
+    request: Request,
+    job_card_id: int,
+    mode: Literal['bom', 'full'] = Query('full'),
+    user=Depends(get_current_user),
+):
+    """Render a v2 job card to PDF using the same fpdf renderer as v1.
+    The renderer reads `section_1_product` / `section_3_team` / etc. from
+    the JC dict — get_job_card (v2) already populates those legacy keys
+    so the renderer works without code changes."""
+    from app.modules.production.services.job_card_v2 import get_job_card
+    from app.modules.production.services.job_card_pdf import generate_job_card_pdf
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        jc_data = await get_job_card(conn, job_card_id)
+    if jc_data is None:
+        raise HTTPException(status_code=404, detail="Job card not found")
+    pdf_bytes = generate_job_card_pdf(jc_data, mode=mode)
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="JC-{job_card_id}-{mode}.pdf"'},
+    )
+
+
+@router.get("/job-cards/{job_card_id}/pdf")
+async def job_card_pdf_v1(
+    request: Request,
+    job_card_id: int,
+    mode: Literal['bom', 'full'] = Query('full'),
+    user=Depends(get_current_user),
+):
+    """v1 PDF for legacy job_card rows. Auth-required — when the row
+    isn't in v1 (because it's a v2 JC and the caller hit this URL by
+    mistake), falls back to the v2 detail so the PDF still renders."""
+    from app.modules.production.services.job_card_engine import get_job_card_detail
+    from app.modules.production.services.job_card_v2 import get_job_card as get_jc_v2
+    from app.modules.production.services.job_card_pdf import generate_job_card_pdf
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        try:
+            jc_data = await get_job_card_detail(conn, job_card_id)
+        except Exception:
+            jc_data = None
+        if not jc_data:
+            jc_data = await get_jc_v2(conn, job_card_id)
+    if jc_data is None:
+        raise HTTPException(status_code=404, detail="Job card not found")
+    pdf_bytes = generate_job_card_pdf(jc_data, mode=mode)
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="JC-{job_card_id}-{mode}.pdf"'},
+    )
+
+
+@router.get("/job-cards-v2/{job_card_id}/allocations")
+async def get_allocations_v2(
+    request: Request, job_card_id: int, user=Depends(get_current_user),
+):
+    """Store allocations recorded against this v2 JC's batch. Reads the
+    shared store_allocation table by joining on batch_number."""
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        jc = await conn.fetchrow(
+            "SELECT batch_number FROM job_card_v2 WHERE job_card_id = $1 AND deleted_at IS NULL",
+            job_card_id,
+        )
+        if not jc:
+            raise HTTPException(status_code=404, detail="Job card not found")
+        rows = await conn.fetch(
+            "SELECT * FROM store_allocation WHERE batch_number = $1 ORDER BY allocated_at DESC",
+            jc["batch_number"],
+        )
+
+    def _norm(row):
+        from decimal import Decimal
+        from datetime import datetime as _dt, date as _d
+        out = {}
+        for k, v in dict(row).items():
+            if isinstance(v, Decimal):     out[k] = float(v)
+            elif isinstance(v, (_d, _dt)): out[k] = v.isoformat()
+            else:                          out[k] = v
+        return out
+    return {"job_card_id": job_card_id, "allocations": [_norm(r) for r in rows]}
+
+
+@router.get("/job-cards-v2/{job_card_id}/floor-stock-status")
+async def get_floor_stock_status_v2(
+    request: Request, job_card_id: int, user=Depends(get_current_user),
+):
+    """Live floor-stock for this JC's batch. Excludes terminal statuses
+    so the consumer sees what's still actionable on the floor."""
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        jc = await conn.fetchrow(
+            "SELECT batch_number, floor FROM job_card_v2 WHERE job_card_id = $1 AND deleted_at IS NULL",
+            job_card_id,
+        )
+        if not jc:
+            raise HTTPException(status_code=404, detail="Job card not found")
+        rows = await conn.fetch(
+            """
+            SELECT * FROM floor_stock
+            WHERE  batch_number = $1
+              AND  (status IS NULL OR status NOT IN ('consumed','expired'))
+            ORDER  BY received_at DESC
+            """,
+            jc["batch_number"],
+        )
+
+    def _norm(row):
+        from decimal import Decimal
+        from datetime import datetime as _dt, date as _d
+        out = {}
+        for k, v in dict(row).items():
+            if isinstance(v, Decimal):     out[k] = float(v)
+            elif isinstance(v, (_d, _dt)): out[k] = v.isoformat()
+            else:                          out[k] = v
+        return out
+    return {
+        "job_card_id":  job_card_id,
+        "batch_number": jc["batch_number"],
+        "floor":        jc["floor"],
+        "floor_stock":  [_norm(r) for r in rows],
+    }
+
+
+# ─── Material receipt + acknowledgement (QR / manual) ──────────────────────
+
+class ReceiveMaterialV2Request(BaseModel):
+    """POST /job-cards-v2/{id}/receive-material"""
+    box_ids: list[str]
+
+
+class AcknowledgeMaterialV2Request(BaseModel):
+    """POST /job-cards-v2/{id}/acknowledge-material"""
+    indent_id:    int | None = None
+    acknowledged: bool = True
+    notes:        str | None = None
+
+
+@router.post("/job-cards-v2/{job_card_id}/receive-material")
+async def receive_material_v2(
+    request: Request, job_card_id: int,
+    body: ReceiveMaterialV2Request, user=Depends(get_current_user),
+):
+    """Attach QR-scanned boxes to this v2 JC's RM indent. Looks each
+    box up in po_box, matches material_sku_name to the indent row,
+    appends to scanned_box_ids and increments issued_qty. Flips JC to
+    'material_received' if any box actually attached."""
+    if not body.box_ids:
+        raise HTTPException(status_code=400, detail="No box_ids supplied")
+
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            jc = await conn.fetchrow(
+                "SELECT status FROM job_card_v2 WHERE job_card_id = $1 AND deleted_at IS NULL",
+                job_card_id,
+            )
+            if not jc:
+                raise HTTPException(status_code=404, detail="Job card not found")
+
+            # Per-box atomicity: wrap each box's lookup+update in a
+            # savepoint so a hard failure on box N (network blip,
+            # constraint violation, etc.) doesn't roll back the boxes
+            # that already attached successfully. Each box's outcome is
+            # reported in the response regardless.
+            attached: list[dict] = []
+            for box_id in body.box_ids:
+                try:
+                    async with conn.transaction():   # SAVEPOINT
+                        box = await conn.fetchrow(
+                            "SELECT box_id, material_sku_name, qty_kg FROM po_box WHERE box_id = $1",
+                            box_id,
+                        )
+                        if not box:
+                            attached.append({"box_id": box_id, "error": "box_not_found"})
+                            continue
+                        # FOR UPDATE on the indent row so two concurrent
+                        # receive-material calls can't both observe the
+                        # same scanned_box_ids snapshot and double-issue.
+                        indent = await conn.fetchrow(
+                            """
+                            SELECT rm_indent_id, scanned_box_ids
+                            FROM   job_card_rm_indent_v2
+                            WHERE  job_card_id = $1
+                              AND  material_sku_name ILIKE $2
+                            FOR UPDATE
+                            """,
+                            job_card_id, box["material_sku_name"],
+                        )
+                        if not indent:
+                            attached.append({"box_id": box_id, "error": "no_matching_indent",
+                                             "material_sku_name": box["material_sku_name"]})
+                            continue
+                        existing = list(indent["scanned_box_ids"] or [])
+                        if box_id in existing:
+                            attached.append({"box_id": box_id, "status": "already_scanned"})
+                            continue
+                        existing.append(box_id)
+                        await conn.execute(
+                            """
+                            UPDATE job_card_rm_indent_v2
+                               SET scanned_box_ids = $1,
+                                   issued_qty      = COALESCE(issued_qty, 0) + $2,
+                                   status          = CASE
+                                                        WHEN issued_qty + $2 >= gross_qty THEN 'fulfilled'
+                                                        WHEN issued_qty + $2 > 0          THEN 'partial'
+                                                        ELSE status
+                                                      END
+                             WHERE rm_indent_id = $3
+                            """,
+                            existing, float(box["qty_kg"] or 0), indent["rm_indent_id"],
+                        )
+                        attached.append({"box_id": box_id, "status": "attached",
+                                         "rm_indent_id": indent["rm_indent_id"]})
+                except Exception as exc:
+                    # Savepoint rolled back automatically by the `async
+                    # with conn.transaction()` exit; report the failure
+                    # for this box and continue with the next.
+                    logger.exception("receive-material: box %s failed (jc_id=%d)", box_id, job_card_id)
+                    attached.append({"box_id": box_id, "error": "save_failed",
+                                     "message": str(exc)})
+
+            if any(a.get("status") == "attached" for a in attached) and \
+               jc["status"] in ('unlocked', 'assigned'):
+                await conn.execute(
+                    "UPDATE job_card_v2 SET status = 'material_received' WHERE job_card_id = $1",
+                    job_card_id,
+                )
+    return {"received": True, "attached": attached}
+
+
+@router.post("/job-cards-v2/{job_card_id}/acknowledge-material")
+async def acknowledge_material_v2(
+    request: Request, job_card_id: int,
+    body: AcknowledgeMaterialV2Request, user=Depends(get_current_user),
+):
+    """Mark RM indent rows on this JC as fulfilled. With `indent_id`,
+    acknowledges just that row; otherwise acknowledges every row on the
+    JC. Moves JC to 'material_received' when applicable."""
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            jc = await conn.fetchrow(
+                "SELECT status FROM job_card_v2 WHERE job_card_id = $1 AND deleted_at IS NULL",
+                job_card_id,
+            )
+            if not jc:
+                raise HTTPException(status_code=404, detail="Job card not found")
+
+            if body.indent_id is not None:
+                r = await conn.execute(
+                    "UPDATE job_card_rm_indent_v2 SET status = 'fulfilled' "
+                    "WHERE rm_indent_id = $1 AND job_card_id = $2",
+                    body.indent_id, job_card_id,
+                )
+                if r == 'UPDATE 0':
+                    raise HTTPException(status_code=404, detail="Indent not found on this JC")
+            else:
+                await conn.execute(
+                    "UPDATE job_card_rm_indent_v2 SET status = 'fulfilled' "
+                    "WHERE job_card_id = $1",
+                    job_card_id,
+                )
+
+            if jc["status"] in ('unlocked', 'assigned'):
+                await conn.execute(
+                    "UPDATE job_card_v2 SET status = 'material_received' WHERE job_card_id = $1",
+                    job_card_id,
+                )
+
+            # Persist the operator's note (if any) as a v2 remark so it
+            # lands in the audit trail. Previously this field was
+            # accepted by the Pydantic model but silently dropped by
+            # the handler — the audit caught it.
+            if body.notes and body.notes.strip():
+                from app.modules.production.services.jc_annexures_v2 import add_remark
+                content = "Ack: " + body.notes.strip()
+                if body.indent_id is not None:
+                    content += f" (indent {body.indent_id})"
+                try:
+                    await add_remark(
+                        conn, job_card_id=job_card_id,
+                        remark_type='observation', content=content,
+                        recorded_by=user.full_name or user.phone,
+                    )
+                except Exception:
+                    # Don't let an annexure write break the ack — the
+                    # ack itself is the operator's primary action.
+                    logger.exception("ack-material: failed to persist notes as remark (jc_id=%d)", job_card_id)
+    return {"acknowledged": True, "job_card_id": job_card_id}

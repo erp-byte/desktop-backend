@@ -48,6 +48,9 @@ class AuthUser:
         role_name: str,
         is_admin: bool,
         refresh_jti: str | None = None,
+        allowed_entities:   list[str] | None = None,
+        allowed_warehouses: list[str] | None = None,
+        allowed_floors:     list[str] | None = None,
     ):
         self.user_id = user_id
         self.phone = phone
@@ -57,6 +60,12 @@ class AuthUser:
         self.role_id = role_id
         self.role_name = role_name
         self.is_admin = is_admin
+        # User-level scope. Empty list means "no restriction at the user
+        # level"; non-empty means the user is locked to those values
+        # regardless of what their role-permission row allows.
+        self.allowed_entities   = list(allowed_entities   or [])
+        self.allowed_warehouses = list(allowed_warehouses or [])
+        self.allowed_floors     = list(allowed_floors     or [])
         # `refresh_jti` is the parent_jti claim from the access token — the
         # refresh token row that minted it. Used by /password/change to keep
         # the current session alive when revoking siblings.
@@ -74,6 +83,9 @@ def _authuser_from_session(session: dict) -> AuthUser:
         role_name=session.get("role_name", ""),
         is_admin=bool(session.get("is_admin")),
         refresh_jti=session.get("session_id"),
+        allowed_entities=session.get("allowed_entities"),
+        allowed_warehouses=session.get("allowed_warehouses"),
+        allowed_floors=session.get("allowed_floors"),
     )
 
 
@@ -139,8 +151,39 @@ def require_permission(
         if user.is_admin:
             return user
 
-        entity = request.query_params.get("entity") or user.entity or None
-        floor = request.query_params.get("floor") or None
+        entity    = request.query_params.get("entity")    or user.entity or None
+        warehouse = request.query_params.get("warehouse") or None
+        floor     = request.query_params.get("floor")     or None
+
+        # User-level scope lock — applied BEFORE the role-permission check.
+        # If the user is restricted to specific entities/warehouses/floors
+        # and the request targets one outside that list, refuse without
+        # consulting the role rows. This is the "lock" half of the
+        # assignment.
+        if (request.query_params.get("entity")
+                and user.allowed_entities
+                and request.query_params["entity"] not in user.allowed_entities):
+            raise AuthError(
+                "forbidden",
+                f"User is not assigned to entity '{request.query_params['entity']}'",
+                403,
+                details={"entity": request.query_params["entity"],
+                         "allowed_entities": user.allowed_entities},
+            )
+        if warehouse and user.allowed_warehouses and warehouse not in user.allowed_warehouses:
+            raise AuthError(
+                "forbidden",
+                f"User is not assigned to warehouse '{warehouse}'",
+                403,
+                details={"warehouse": warehouse, "allowed_warehouses": user.allowed_warehouses},
+            )
+        if floor and user.allowed_floors and floor not in user.allowed_floors:
+            raise AuthError(
+                "forbidden",
+                f"User is not assigned to floor '{floor}'",
+                403,
+                details={"floor": floor, "allowed_floors": user.allowed_floors},
+            )
 
         pool = request.app.state.db_pool
         from app.modules.auth.services.permission_service import check_permission
@@ -149,7 +192,7 @@ def require_permission(
             allowed = await check_permission(
                 conn, user.role_id, user.is_admin,
                 module, sub_module, sub_sub_module, action,
-                entity=entity, floor=floor,
+                entity=entity, warehouse=warehouse, floor=floor,
             )
 
         if not allowed:

@@ -1,0 +1,159 @@
+@startuml
+title Analytics, Yield and Day-End Reconciliation
+
+skinparam entity {
+  BackgroundColor #F0F4FF
+  BorderColor #3A5A8C
+  HeaderBackgroundColor #3A5A8C
+  FontColor white
+  FontSize 11
+  AttributeFontColor black
+  AttributeFontSize 10
+}
+skinparam ArrowColor #3A5A8C
+skinparam NoteBackgroundColor #FFFDE7
+skinparam NoteBorderColor #E6A817
+skinparam shadowing false
+
+entity "Job Card" as JC {
+  * job_card_id
+  --
+  batch_number
+  product_name
+  stage
+}
+
+entity "Machine" as MACH {
+  * machine_id
+  --
+  machine_name
+}
+
+entity "Production Plan" as PP {
+  * plan_id
+  --
+  plan_date
+}
+
+entity "SO Fulfillment" as SF {
+  * fulfillment_id
+  --
+  product_name
+  pending_qty_kg
+}
+
+entity "Process Loss" as PL {
+  * loss_id
+  --
+  product_name
+  stage
+  loss_kg
+  loss_pct
+  loss_category
+  production_date
+}
+
+entity "Quality Inspection" as QI {
+  * inspection_id
+  --
+  inspection_type
+  checkpoint
+  result
+  inspector_name
+  inspected_at
+}
+
+entity "Yield Summary" as YS {
+  * yield_id
+  --
+  product_name
+  period
+  total_input_kg
+  total_output_kg
+  yield_pct
+  total_loss_kg
+  total_offgrade_kg
+}
+
+entity "AI Recommendation" as AIR {
+  * recommendation_id
+  --
+  recommendation_type
+  AI_model
+  status
+  feedback
+}
+
+entity "Day-End Balance Scan" as DEBS {
+  * scan_id
+  --
+  floor_location
+  scan_date
+  submitted_by
+  total_system_qty
+  total_scanned_qty
+  total_variance
+  status
+}
+
+entity "Day-End Scan Line" as DEBSL {
+  * scan_line_id
+  --
+  product_name
+  system_qty_kg
+  scanned_qty_kg
+  variance_kg
+  scanned_boxes
+  variance_reason
+}
+
+entity "Discrepancy Report" as DR {
+  * discrepancy_id
+  --
+  discrepancy_type
+  severity
+  affected_material
+  details
+  resolution
+  reported_by
+  status
+}
+
+entity "Fulfillment Floor Stock" as FFS {
+  * floor_stock_id
+  --
+  material_name
+  quantity_kg
+  floor_location
+  added_by
+}
+
+JC   ||--o{ PL    : "loss per job card"
+JC   ||--o{ QI    : "QC inspections"
+PP   ||--o{ AIR   : "AI suggestions"
+DEBS ||--o{ DEBSL : "scan lines"
+MACH ||--o{ DR    : "discrepancy"
+SF   ||--o{ FFS   : "floor stock snapshot"
+
+note right of PL
+  Auto-created when job card completes.
+  loss_category: sorting | roasting | packaging | metal detection | spillage
+end note
+
+note right of YS
+  Aggregated weekly and monthly.
+  period: '2026-04' (monthly) or '2026-W14' (weekly)
+end note
+
+note right of DEBS
+  End-of-day physical count vs system qty.
+  Variances are flagged for investigation.
+  status: pending | submitted | variance flagged | reconciled
+end note
+
+note right of DR
+  severity: critical | major | minor
+  status: open | investigating | resolved | closed
+end note
+
+@enduml

@@ -97,7 +97,7 @@ CREATE INDEX IF NOT EXISTS idx_bom_route_bom ON bom_process_route(bom_id);
 -- SO fulfillment tracking (bridges SO module to production)
 CREATE TABLE IF NOT EXISTS so_fulfillment (
     fulfillment_id          SERIAL PRIMARY KEY,
-    so_line_id              INT NOT NULL,                  -- FK to so_line.so_line_id
+    so_line_id              BIGINT NOT NULL,               -- FK to so_line.so_line_id (BIGINT app-supplied)
     so_id                   INT,                           -- FK to so_header.so_id
     financial_year          TEXT NOT NULL,                  -- "2025-26", "2026-27"
     fg_sku_name             TEXT NOT NULL,

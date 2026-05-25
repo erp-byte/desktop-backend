@@ -1,0 +1,83 @@
+@startuml
+title Sales Order Fulfillment Tracking
+
+skinparam entity {
+  BackgroundColor #F0F4FF
+  BorderColor #3A5A8C
+  HeaderBackgroundColor #3A5A8C
+  FontColor white
+  FontSize 11
+  AttributeFontColor black
+  AttributeFontSize 10
+}
+skinparam ArrowColor #3A5A8C
+skinparam NoteBackgroundColor #FFFDE7
+skinparam NoteBorderColor #E6A817
+skinparam shadowing false
+
+entity "Sales Order" as SOH {
+  * so_id
+  --
+  so_number
+  customer_name
+}
+
+entity "SO Line" as SOL {
+  * so_line_id
+  --
+  product_name
+  quantity
+  status
+}
+
+entity "SO Fulfillment" as SF {
+  * fulfillment_id
+  --
+  product_name
+  customer_name
+  original_qty_kg
+  pending_qty_kg
+  produced_qty_kg
+  dispatched_qty_kg
+  delivery_deadline
+  priority
+  order_status
+}
+
+entity "Revision Log" as SRL {
+  * revision_id
+  --
+  change_type
+  old_value
+  new_value
+  reason
+  changed_by
+}
+
+entity "Plan Line (ref)" as PPL {
+  * plan_line_id
+  --
+  product_name
+  planned_qty_kg
+}
+
+SOH ||--o{ SOL : "has lines"
+SOL ||--o{ SF  : "fulfillment record"
+SOH ||--o{ SF  : "parent SO"
+SF  ||--o{ SRL : "change history"
+SF  ||--o{ SF  : "carry-forward to next year"
+PPL }o..o{ SF  : "linked fulfillments"
+
+note right of SF
+  Tracks qty from order through to dispatch.
+  pending = original - produced - dispatched
+  Carries forward unsatisfied qty to next year.
+  status: open | partial | fulfilled | cancelled
+end note
+
+note right of SRL
+  Every quantity or date change is logged.
+  change_type: qty_change | date_change | carryforward | cancel
+end note
+
+@enduml

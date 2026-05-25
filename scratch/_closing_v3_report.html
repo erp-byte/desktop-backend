@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang='en'><head><meta charset='utf-8'>
+<title>Candor Foods — Closing Stock v3 (Apr 1 → May 12, 2026)</title>
+<style>
+  :root { --bg:#f7f7f5; --card:#fff; --border:#d9d9d6; --accent:#16513f; --neg:#b6260d;
+            --tot-bg:#eef3f0; --muted:#666; }
+  body { font-family:-apple-system,"Segoe UI",sans-serif; background:var(--bg); margin:0;
+          padding:24px; color:#222; }
+  h1 { margin:0 0 4px; font-size:22px; color:var(--accent); }
+  .sub { color:var(--muted); margin-bottom:24px; font-size:13px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:8px;
+            padding:18px 22px; margin-bottom:18px; }
+  .summary { display:grid; grid-template-columns:repeat(4,1fr); gap:14px; }
+  .summary .lbl { color:var(--muted); font-size:11px; text-transform:uppercase;
+                    letter-spacing:0.05em; }
+  .summary .val { font-size:24px; font-weight:600; color:var(--accent); }
+  .summary .val.neg { color:var(--neg); }
+  h2 { margin:0 0 12px; font-size:16px; color:var(--accent); }
+  h3 { margin:0 0 10px; font-size:14px; color:var(--accent); }
+  table { border-collapse:collapse; width:100%; font-size:13px; font-variant-numeric:tabular-nums; }
+  th,td { padding:7px 10px; text-align:right; border-bottom:1px solid #f0f0ee; }
+  th { background:#f4f5f1; font-weight:600; color:#444; font-size:11px;
+        text-transform:uppercase; letter-spacing:0.04em; }
+  td.grp, th:first-child { text-align:left; }
+  td.grp { font-weight:500; }
+  td.cl { font-weight:600; color:var(--accent); }
+  td.cl.neg, td.neg { color:var(--neg); }
+  td.num { text-align:right; }
+  tr.tot-row td { background:var(--tot-bg); border-top:2px solid #ccc; font-weight:600; }
+  td.tot { font-weight:600; }
+  table.small { font-size:12px; }
+  table.small td:first-child { text-align:left; }
+  .formula { font-family:ui-monospace,Consolas,monospace; background:#f0f1ed;
+              padding:12px 14px; border-radius:6px; font-size:12.5px; line-height:1.6; }
+  .formula .lbl { color:var(--accent); font-weight:600; }
+  .notes li { margin-bottom:6px; font-size:13px; }
+  footer { color:var(--muted); font-size:11px; margin-top:24px; text-align:center; }
+  .pill { display:inline-block; background:#e2eae5; color:var(--accent);
+            padding:2px 8px; border-radius:10px; font-size:11px; margin-right:4px; }
+  /* Toggle (segmented control) */
+  .toggle { display:inline-flex; background:#eef0eb; border-radius:8px;
+              padding:3px; gap:2px; }
+  .toggle button { background:transparent; border:0; padding:7px 16px;
+                     font-size:12px; color:#666; font-weight:500; cursor:pointer;
+                     border-radius:6px; transition:all 0.15s; font-family:inherit; }
+  .toggle button:hover { color:var(--accent); }
+  .toggle button.active { background:var(--card); color:var(--accent);
+                            box-shadow:0 1px 3px rgba(0,0,0,0.06); }
+  .toggle-row { display:flex; justify-content:space-between; align-items:center;
+                  margin-bottom:12px; gap:14px; flex-wrap:wrap; }
+  .toggle-row .lbl-hint { font-size:11px; color:var(--muted); }
+  .view { display:none; }
+  .view.active { display:block; }
+</style></head><body>
+
+<h1>Candor Foods — Closing Stock Report (v3)</h1>
+<div class='sub'>
+  Window <b>2026-04-01 → 2026-05-12</b> &nbsp;·&nbsp; All quantities in KG &nbsp;·&nbsp;
+  ALL FG sales converted to underlying RM groups via BOM &nbsp;·&nbsp;
+  Toggle below to switch between consolidated and per-entity views
+</div>
+
+<div class='card summary' id='summary'>
+  <div><div class='lbl'>Closing Stock</div><div class='val' id='sum-closing'>752,752 kg</div></div>
+  <div><div class='lbl'>Opening (31-Mar)</div><div class='val' id='sum-opening'>947,895 kg</div></div>
+  <div><div class='lbl'>Inward (Apr 1+)</div><div class='val' id='sum-inward'>682,445 kg</div></div>
+  <div><div class='lbl'>Outward (Apr 1+)</div><div class='val' id='sum-outward'>884,868 kg</div></div>
+</div>
+
+<div class='card'>
+  <h2>Formula</h2>
+  <div class='formula'>
+    <span class='lbl'>Closing[group]</span> &nbsp;=&nbsp; Opening + Inward + CN-as-RM − Outward-as-RM
+    <br><br>
+    <span style='color:#666'>
+      Every FG sale is split into its BOM ingredients and deducted from each
+      ingredient's RM group. Direct RM sales deduct from their own group.
+      In the per-entity view, opening / inward / outward / CN are attributed by
+      the entity tagged on each source row (Company01 in sales register, table
+      prefix in DB tables).
+    </span>
+  </div>
+</div>
+
+<div class='card'>
+  <div class='toggle-row'>
+    <h2 style='margin:0'>Closing Stock per RM Group</h2>
+    <div class='toggle' role='group' aria-label='Entity view'>
+      <button class='active' data-view='total' onclick='switchView("total")'>Consolidated (CFPL + CDPL)</button>
+      <button data-view='cfpl' onclick='switchView("cfpl")'>CFPL only</button>
+      <button data-view='cdpl' onclick='switchView("cdpl")'>CDPL only</button>
+    </div>
+  </div>
+  <div class='lbl-hint' id='view-hint'>Showing CFPL + CDPL combined.</div>
+  <div class='view active' id='view-total'>
+    <table>
+      <thead><tr>
+        <th>Group</th><th>Opening</th><th>+ Inward</th>
+        <th>+ CN (as RM)</th><th>− Outward (as RM)</th><th>= Closing</th>
+      </tr></thead>
+      <tbody><tr><td class='grp'>_UNMAPPED</td><td>0</td><td>39</td><td>0</td><td>0</td><td class='cl'>39</td></tr><tr><td class='grp'>almond</td><td>7,954</td><td>52,070</td><td>101</td><td>56,469</td><td class='cl'>3,656</td></tr><tr><td class='grp'>anjeer</td><td>122</td><td>4,161</td><td>0</td><td>2,218</td><td class='cl'>2,066</td></tr><tr><td class='grp'>apricot</td><td>489</td><td>3,130</td><td>0</td><td>1,682</td><td class='cl'>1,937</td></tr><tr><td class='grp'>bars & cereals</td><td>626</td><td>0</td><td>0</td><td>185</td><td class='cl'>441</td></tr><tr><td class='grp'>blackberry</td><td>0</td><td>10</td><td>0</td><td>2</td><td class='cl'>8</td></tr><tr><td class='grp'>blackcurrant</td><td>397</td><td>0</td><td>0</td><td>89</td><td class='cl'>308</td></tr><tr><td class='grp'>blueberry</td><td>1,395</td><td>3,701</td><td>27</td><td>4,099</td><td class='cl'>1,025</td></tr><tr><td class='grp'>cashew</td><td>17,321</td><td>20,343</td><td>34</td><td>30,785</td><td class='cl'>6,913</td></tr><tr><td class='grp'>cranberry</td><td>43,364</td><td>19,506</td><td>85</td><td>12,287</td><td class='cl'>50,668</td></tr><tr><td class='grp'>dates</td><td>642,726</td><td>101,900</td><td>370</td><td>338,703</td><td class='cl'>406,294</td></tr><tr><td class='grp'>dehydrated fruits</td><td>584</td><td>290</td><td>0</td><td>297</td><td class='cl'>577</td></tr><tr><td class='grp'>makhana</td><td>12</td><td>0</td><td>0</td><td>6</td><td class='cl'>6</td></tr><tr><td class='grp'>miscellaneous - rm</td><td>6,356</td><td>5,703</td><td>81</td><td>28,395</td><td class='cl neg'>-16,256</td></tr><tr><td class='grp'>packaging</td><td>0</td><td>34,086</td><td>0</td><td>0</td><td class='cl'>34,086</td></tr><tr><td class='grp'>peanuts</td><td>3,696</td><td>3,234</td><td>0</td><td>11,399</td><td class='cl neg'>-4,469</td></tr><tr><td class='grp'>pista</td><td>66,079</td><td>64,432</td><td>35</td><td>56,494</td><td class='cl'>74,052</td></tr><tr><td class='grp'>premium nuts</td><td>10,781</td><td>73</td><td>0</td><td>1,536</td><td class='cl'>9,318</td></tr><tr><td class='grp'>prunes</td><td>3,369</td><td>10,776</td><td>375</td><td>6,289</td><td class='cl'>8,231</td></tr><tr><td class='grp'>raisin</td><td>23,880</td><td>40,678</td><td>106</td><td>15,263</td><td class='cl'>49,402</td></tr><tr><td class='grp'>salt</td><td>940</td><td>1,555</td><td>0</td><td>97</td><td class='cl'>2,398</td></tr><tr><td class='grp'>seasoning</td><td>2,263</td><td>600</td><td>0</td><td>3,783</td><td class='cl neg'>-920</td></tr><tr><td class='grp'>seeds</td><td>112,752</td><td>315,650</td><td>5,716</td><td>262,380</td><td class='cl'>171,738</td></tr><tr><td class='grp'>spices</td><td>9</td><td>11</td><td>0</td><td>850</td><td class='cl neg'>-830</td></tr><tr><td class='grp'>tajir</td><td>614</td><td>450</td><td>0</td><td>21,390</td><td class='cl neg'>-20,327</td></tr><tr><td class='grp'>trail mix</td><td>1,028</td><td>0</td><td>350</td><td>25,798</td><td class='cl neg'>-24,420</td></tr><tr><td class='grp'>walnut</td><td>1,136</td><td>45</td><td>0</td><td>4,369</td><td class='cl neg'>-3,188</td></tr><tr class='tot-row'><td class='grp tot'>TOTAL</td><td class='tot'>947,895</td><td class='tot'>682,445</td><td class='tot'>7,280</td><td class='tot'>884,868</td><td class='cl tot'>752,752</td></tr></tbody>
+    </table>
+  </div>
+  <div class='view' id='view-cfpl'>
+    <table>
+      <thead><tr>
+        <th>Group</th><th>Opening</th><th>+ Inward</th>
+        <th>+ CN (as RM)</th><th>− Outward (as RM)</th><th>= Closing</th>
+      </tr></thead>
+      <tbody><tr><td class='grp'>_UNMAPPED</td><td>0</td><td>39</td><td>0</td><td>0</td><td class='cl'>39</td></tr><tr><td class='grp'>almond</td><td>7,954</td><td>52,070</td><td>101</td><td>56,469</td><td class='cl'>3,656</td></tr><tr><td class='grp'>anjeer</td><td>122</td><td>3,121</td><td>0</td><td>2,218</td><td class='cl'>1,025</td></tr><tr><td class='grp'>apricot</td><td>489</td><td>3,130</td><td>0</td><td>1,682</td><td class='cl'>1,937</td></tr><tr><td class='grp'>bars & cereals</td><td>626</td><td>0</td><td>0</td><td>185</td><td class='cl'>441</td></tr><tr><td class='grp'>blackberry</td><td>0</td><td>10</td><td>0</td><td>2</td><td class='cl'>8</td></tr><tr><td class='grp'>blackcurrant</td><td>397</td><td>0</td><td>0</td><td>89</td><td class='cl'>308</td></tr><tr><td class='grp'>blueberry</td><td>1,395</td><td>3,701</td><td>27</td><td>4,099</td><td class='cl'>1,025</td></tr><tr><td class='grp'>cashew</td><td>17,321</td><td>20,343</td><td>34</td><td>30,785</td><td class='cl'>6,913</td></tr><tr><td class='grp'>cranberry</td><td>43,364</td><td>19,506</td><td>85</td><td>12,287</td><td class='cl'>50,668</td></tr><tr><td class='grp'>dates</td><td>209,698</td><td>42,347</td><td>370</td><td>273,490</td><td class='cl neg'>-21,076</td></tr><tr><td class='grp'>dehydrated fruits</td><td>584</td><td>290</td><td>0</td><td>297</td><td class='cl'>577</td></tr><tr><td class='grp'>makhana</td><td>12</td><td>0</td><td>0</td><td>6</td><td class='cl'>6</td></tr><tr><td class='grp'>miscellaneous - rm</td><td>6,356</td><td>5,703</td><td>81</td><td>28,395</td><td class='cl neg'>-16,256</td></tr><tr><td class='grp'>packaging</td><td>0</td><td>34,086</td><td>0</td><td>0</td><td class='cl'>34,086</td></tr><tr><td class='grp'>peanuts</td><td>3,696</td><td>3,234</td><td>0</td><td>11,399</td><td class='cl neg'>-4,469</td></tr><tr><td class='grp'>pista</td><td>66,079</td><td>64,432</td><td>35</td><td>56,494</td><td class='cl'>74,052</td></tr><tr><td class='grp'>premium nuts</td><td>10,781</td><td>73</td><td>0</td><td>1,536</td><td class='cl'>9,318</td></tr><tr><td class='grp'>prunes</td><td>3,369</td><td>10,776</td><td>375</td><td>6,289</td><td class='cl'>8,231</td></tr><tr><td class='grp'>raisin</td><td>23,880</td><td>40,678</td><td>106</td><td>15,263</td><td class='cl'>49,402</td></tr><tr><td class='grp'>salt</td><td>940</td><td>1,555</td><td>0</td><td>97</td><td class='cl'>2,398</td></tr><tr><td class='grp'>seasoning</td><td>2,263</td><td>600</td><td>0</td><td>3,783</td><td class='cl neg'>-920</td></tr><tr><td class='grp'>seeds</td><td>112,752</td><td>315,650</td><td>5,716</td><td>262,380</td><td class='cl'>171,738</td></tr><tr><td class='grp'>spices</td><td>9</td><td>11</td><td>0</td><td>850</td><td class='cl neg'>-830</td></tr><tr><td class='grp'>tajir</td><td>614</td><td>450</td><td>0</td><td>21,390</td><td class='cl neg'>-20,327</td></tr><tr><td class='grp'>trail mix</td><td>1,028</td><td>0</td><td>350</td><td>25,798</td><td class='cl neg'>-24,420</td></tr><tr><td class='grp'>walnut</td><td>1,136</td><td>45</td><td>0</td><td>4,369</td><td class='cl neg'>-3,188</td></tr><tr class='tot-row'><td class='grp tot'>TOTAL</td><td class='tot'>514,867</td><td class='tot'>621,851</td><td class='tot'>7,280</td><td class='tot'>819,655</td><td class='cl tot'>324,343</td></tr></tbody>
+    </table>
+  </div>
+  <div class='view' id='view-cdpl'>
+    <table>
+      <thead><tr>
+        <th>Group</th><th>Opening</th><th>+ Inward</th>
+        <th>+ CN (as RM)</th><th>− Outward (as RM)</th><th>= Closing</th>
+      </tr></thead>
+      <tbody><tr><td class='grp'>anjeer</td><td>0</td><td>1,040</td><td>0</td><td>0</td><td class='cl'>1,040</td></tr><tr><td class='grp'>dates</td><td>433,029</td><td>59,553</td><td>0</td><td>65,213</td><td class='cl'>427,369</td></tr><tr class='tot-row'><td class='grp tot'>TOTAL</td><td class='tot'>433,029</td><td class='tot'>60,594</td><td class='tot'>0</td><td class='tot'>65,213</td><td class='cl tot'>428,409</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+  const summaries = {
+    total:  { closing: "752,752", opening: "947,895",
+                inward:  "682,445", outward: "884,868" },
+    cfpl:   { closing: "324,343", opening: "514,867",
+                inward:  "621,851", outward: "819,655" },
+    cdpl:   { closing: "428,409", opening: "433,029",
+                inward:  "60,594", outward: "65,213" },
+  };
+  const hints = {
+    total: "Showing CFPL + CDPL combined.",
+    cfpl:  "Showing CFPL only — sales filtered by Company01 = CFPL, inward from cfpl_* DB tables.",
+    cdpl:  "Showing CDPL only — sales filtered by Company01 = CDPL, inward from cdpl_* DB tables.",
+  };
+  function switchView(view) {
+    document.querySelectorAll('.toggle button').forEach(b => {
+      b.classList.toggle('active', b.dataset.view === view);
+    });
+    document.querySelectorAll('.view').forEach(v => {
+      v.classList.toggle('active', v.id === 'view-' + view);
+    });
+    const s = summaries[view];
+    document.getElementById('sum-closing').textContent = s.closing + ' kg';
+    document.getElementById('sum-opening').textContent = s.opening + ' kg';
+    document.getElementById('sum-inward').textContent  = s.inward  + ' kg';
+    document.getElementById('sum-outward').textContent = s.outward + ' kg';
+    document.getElementById('view-hint').textContent = hints[view];
+  }
+</script>
+
+<div class='card'>
+  <h2>Sale-line classification</h2>
+  <p class='notes'>
+    <span class='pill'>Direct RM sales: 301</span>
+    <span class='pill'>FG with BOM (converted): 2987</span>
+    <span class='pill'>FG without BOM: 49</span>
+    <span class='pill'>Keyword-inferred: 0</span>
+    <span class='pill'>Unknown (_UNMAPPED): 0</span>
+  </p>
+  <p class='notes'>
+    Sales lines: 3,339 &nbsp;·&nbsp; CN lines from Excel: 21
+    &nbsp;·&nbsp; CN lines from PDFs: 18
+  </p>
+</div>
+
+<section><h3>Top unmapped inward SKUs</h3><table class='small'><thead><tr><th>Article</th><th>Inward KG</th></tr></thead><tbody><tr><td></td><td class='num'>39</td></tr></tbody></table></section>
+
+
+<footer>Generated by <code>_closing_stock_calc_v3_probe.py</code> &nbsp;·&nbsp; Candor Foods &amp; Candor Dates</footer>
+</body></html>

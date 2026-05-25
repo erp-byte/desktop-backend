@@ -1,0 +1,149 @@
+@startuml
+title IMS - Indent and Material Flow
+
+skinparam entity {
+  BackgroundColor #F0F4FF
+  BorderColor #3A5A8C
+  HeaderBackgroundColor #3A5A8C
+  FontColor white
+  FontSize 11
+  AttributeFontColor black
+  AttributeFontSize 10
+}
+skinparam ArrowColor #3A5A8C
+skinparam NoteBackgroundColor #FFFDE7
+skinparam NoteBorderColor #E6A817
+skinparam shadowing false
+
+entity "Production Indent" as PRDI {
+  * id
+  --
+  indent_number
+  item_description
+  material_type
+  required_qty
+  available_qty
+  shortfall_qty
+  triggered_by_job_card
+  triggered_by_SO
+  customer_name
+  status
+}
+
+entity "Internal Order" as IORD {
+  * id
+  --
+  order_number
+  item_description
+  material_type
+  required_qty
+  status
+}
+
+entity "Internal Job Card" as IJC {
+  * id
+  --
+  internal_jc_id
+  parent_job_card
+  parent_SO
+  product_name
+  status
+}
+
+entity "Issue Note" as ISN {
+  * id
+  --
+  issue_note_number
+  job_card_ref
+  SO_ref
+  customer_name
+  total_weight_kg
+  status
+}
+
+entity "Issue Note Line" as ISNL {
+  * id
+  --
+  material_name
+  material_type
+  lot_number
+  warehouse
+  qty_issued_kg
+  box_id
+  FIFO_skipped
+}
+
+entity "Lot Block" as LB {
+  * id
+  --
+  lot_number
+  blocked_for_SO
+  blocked_for_customer
+  is_active
+}
+
+entity "QC Inspection" as QCI {
+  * id
+  --
+  inspection_number
+  product_name
+  checkpoint_type
+  inspector
+  result
+  findings
+}
+
+entity "Offgrade Inventory" as OGGI {
+  * id
+  --
+  item_description
+  source_type
+  disposition
+}
+
+entity "Write-Off Ledger" as WOL {
+  * id
+  --
+  item_description
+  lot_number
+  net_weight
+  reason
+  authorised_by
+}
+
+entity "RTV Disposition" as RTVD {
+  * id
+  --
+  item_description
+  disposition_type
+  decided_by
+}
+
+PRDI ||--o{ IORD  : "generates internal order"
+IORD ||--o{ IJC   : "generates internal job card"
+ISN  ||--o{ ISNL  : "material lines"
+RTVD ..>   IORD   : "may trigger internal order"
+RTVD ..>   OGGI   : "may create offgrade"
+OGGI ..>   WOL    : "may be written off"
+
+note right of PRDI
+  Raised automatically when a job card detects a shortfall.
+  status: draft | submitted | approved | fulfilled | cancelled
+end note
+
+note right of ISN
+  Formal record of material issued to the production floor.
+  status: draft | approved | issued | expired
+end note
+
+note right of LB
+  Reserves a specific lot for a particular SO / customer.
+  Active blocks skip that lot in FIFO allocation.
+end note
+
+note right of RTVD
+  Return-to-vendor disposition.
+  Options: return | reprocess | offgrade | write-off
+end note
+
+@enduml

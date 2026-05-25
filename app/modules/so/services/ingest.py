@@ -3,7 +3,7 @@
 import logging
 from datetime import date, datetime
 
-from app.core.helpers import safe_float
+from app.core.helpers import insert_with_pk_retry, new_short_time_id, safe_float
 from app.modules.so.services.gst_reconciliation import reconcile_line
 from app.modules.so.services.item_matcher import MasterItem, match_sku
 from app.modules.so.services.so_book_parser import parse_so_book
@@ -115,54 +115,58 @@ async def ingest_sales_register(
                         else:
                             total_unmatched += 1
 
-                        line_row = await conn.fetchrow(
-                            """
-                            INSERT INTO so_line (
-                                so_id, line_number, sku_name, item_category, sub_category,
-                                uom, grp_code, quantity, quantity_units, rate_inr,
-                                amount_inr, igst_amount, sgst_amount, cgst_amount,
-                                apmc_amount, packing_amount, freight_amount, processing_amount,
-                                total_amount_inr, rate_type,
-                                item_type, item_description, sales_group,
-                                match_score, match_source, status
+                        async def _insert_so_line():
+                            return await conn.fetchrow(
+                                """
+                                INSERT INTO so_line (
+                                    so_id, line_number, sku_name, item_category, sub_category,
+                                    uom, grp_code, quantity, quantity_units, rate_inr,
+                                    amount_inr, igst_amount, sgst_amount, cgst_amount,
+                                    apmc_amount, packing_amount, freight_amount, processing_amount,
+                                    total_amount_inr, rate_type,
+                                    item_type, item_description, sales_group,
+                                    match_score, match_source, status, so_line_id
+                                )
+                                VALUES (
+                                    $1, $2, $3, $4, $5,
+                                    $6, $7, $8, $9, $10,
+                                    $11, $12, $13, $14,
+                                    $15, $16, $17, $18,
+                                    $19, $20,
+                                    $21, $22, $23,
+                                    $24, $25, 'pending'::e_so_line_status, $26
+                                )
+                                RETURNING so_line_id
+                                """,
+                                so_id,
+                                line_idx,
+                                article,
+                                row.get("item_category"),
+                                row.get("sub_category"),
+                                str(row.get("uom")) if row.get("uom") is not None else None,
+                                row.get("grp_code"),
+                                row.get("quantity"),
+                                quantity_units,
+                                row.get("rate_inr"),
+                                row.get("amount_inr"),
+                                row.get("igst_amount"),
+                                row.get("sgst_amount"),
+                                row.get("cgst_amount"),
+                                row.get("apmc_amount", 0),
+                                row.get("packing_amount", 0),
+                                row.get("freight_amount", 0),
+                                row.get("processing_amount", 0),
+                                row.get("total_amount_inr"),
+                                rate_type,
+                                matched_item.item_type if matched_item else None,
+                                matched_item.particulars if matched_item else None,
+                                matched_item.sale_group if matched_item else None,
+                                score if matched_item else None,
+                                "all_sku" if matched_item else None,
+                                new_short_time_id(),  # regenerated on each retry
                             )
-                            VALUES (
-                                $1, $2, $3, $4, $5,
-                                $6, $7, $8, $9, $10,
-                                $11, $12, $13, $14,
-                                $15, $16, $17, $18,
-                                $19, $20,
-                                $21, $22, $23,
-                                $24, $25, 'pending'::e_so_line_status
-                            )
-                            RETURNING so_line_id
-                            """,
-                            so_id,
-                            line_idx,
-                            article,
-                            row.get("item_category"),
-                            row.get("sub_category"),
-                            str(row.get("uom")) if row.get("uom") is not None else None,
-                            row.get("grp_code"),
-                            row.get("quantity"),
-                            quantity_units,
-                            row.get("rate_inr"),
-                            row.get("amount_inr"),
-                            row.get("igst_amount"),
-                            row.get("sgst_amount"),
-                            row.get("cgst_amount"),
-                            row.get("apmc_amount", 0),
-                            row.get("packing_amount", 0),
-                            row.get("freight_amount", 0),
-                            row.get("processing_amount", 0),
-                            row.get("total_amount_inr"),
-                            rate_type,
-                            matched_item.item_type if matched_item else None,
-                            matched_item.particulars if matched_item else None,
-                            matched_item.sale_group if matched_item else None,
-                            score if matched_item else None,
-                            "all_sku" if matched_item else None,
-                        )
+
+                        line_row = await insert_with_pk_retry(conn, _insert_so_line)
                         so_line_id = line_row["so_line_id"]
                         total_lines += 1
 
@@ -386,54 +390,58 @@ async def ingest_manual_so(
                 else:
                     total_unmatched += 1
 
-                line_row = await conn.fetchrow(
-                    """
-                    INSERT INTO so_line (
-                        so_id, line_number, sku_name, item_category, sub_category,
-                        uom, grp_code, quantity, quantity_units, rate_inr,
-                        amount_inr, igst_amount, sgst_amount, cgst_amount,
-                        apmc_amount, packing_amount, freight_amount, processing_amount,
-                        total_amount_inr, rate_type,
-                        item_type, item_description, sales_group,
-                        match_score, match_source, status
+                async def _insert_so_line():
+                    return await conn.fetchrow(
+                        """
+                        INSERT INTO so_line (
+                            so_id, line_number, sku_name, item_category, sub_category,
+                            uom, grp_code, quantity, quantity_units, rate_inr,
+                            amount_inr, igst_amount, sgst_amount, cgst_amount,
+                            apmc_amount, packing_amount, freight_amount, processing_amount,
+                            total_amount_inr, rate_type,
+                            item_type, item_description, sales_group,
+                            match_score, match_source, status, so_line_id
+                        )
+                        VALUES (
+                            $1, $2, $3, $4, $5,
+                            $6, $7, $8, $9, $10,
+                            $11, $12, $13, $14,
+                            $15, $16, $17, $18,
+                            $19, $20,
+                            $21, $22, $23,
+                            $24, $25, 'pending'::e_so_line_status, $26
+                        )
+                        RETURNING so_line_id
+                        """,
+                        so_id,
+                        line_idx,
+                        article,
+                        row.get("item_category"),
+                        row.get("sub_category"),
+                        str(row.get("uom")) if row.get("uom") is not None else None,
+                        row.get("grp_code"),
+                        row.get("quantity"),
+                        quantity_units,
+                        row.get("rate_inr"),
+                        row.get("amount_inr"),
+                        row.get("igst_amount"),
+                        row.get("sgst_amount"),
+                        row.get("cgst_amount"),
+                        row.get("apmc_amount", 0),
+                        row.get("packing_amount", 0),
+                        row.get("freight_amount", 0),
+                        row.get("processing_amount", 0),
+                        row.get("total_amount_inr"),
+                        rate_type,
+                        matched_item.item_type if matched_item else None,
+                        matched_item.particulars if matched_item else None,
+                        matched_item.sale_group if matched_item else None,
+                        score if matched_item else None,
+                        "all_sku" if matched_item else None,
+                        new_short_time_id(),  # regenerated on each retry
                     )
-                    VALUES (
-                        $1, $2, $3, $4, $5,
-                        $6, $7, $8, $9, $10,
-                        $11, $12, $13, $14,
-                        $15, $16, $17, $18,
-                        $19, $20,
-                        $21, $22, $23,
-                        $24, $25, 'pending'::e_so_line_status
-                    )
-                    RETURNING so_line_id
-                    """,
-                    so_id,
-                    line_idx,
-                    article,
-                    row.get("item_category"),
-                    row.get("sub_category"),
-                    str(row.get("uom")) if row.get("uom") is not None else None,
-                    row.get("grp_code"),
-                    row.get("quantity"),
-                    quantity_units,
-                    row.get("rate_inr"),
-                    row.get("amount_inr"),
-                    row.get("igst_amount"),
-                    row.get("sgst_amount"),
-                    row.get("cgst_amount"),
-                    row.get("apmc_amount", 0),
-                    row.get("packing_amount", 0),
-                    row.get("freight_amount", 0),
-                    row.get("processing_amount", 0),
-                    row.get("total_amount_inr"),
-                    rate_type,
-                    matched_item.item_type if matched_item else None,
-                    matched_item.particulars if matched_item else None,
-                    matched_item.sale_group if matched_item else None,
-                    score if matched_item else None,
-                    "all_sku" if matched_item else None,
-                )
+
+                line_row = await insert_with_pk_retry(conn, _insert_so_line)
                 so_line_id = line_row["so_line_id"]
 
                 recon = reconcile_line(row, matched_item)
@@ -642,55 +650,59 @@ async def ingest_so_book(
                     else:
                         total_unmatched += 1
 
-                    line_row = await conn.fetchrow(
-                        """
-                        INSERT INTO so_line (
-                            so_id, line_number, sku_name, item_category, sub_category,
-                            uom, grp_code, quantity, quantity_units, rate_inr,
-                            amount_inr, igst_amount, sgst_amount, cgst_amount,
-                            apmc_amount, packing_amount, freight_amount, processing_amount,
-                            total_amount_inr, rate_type,
-                            item_type, item_description, sales_group,
-                            match_score, match_source, status
+                    async def _insert_so_line():
+                        return await conn.fetchrow(
+                            """
+                            INSERT INTO so_line (
+                                so_id, line_number, sku_name, item_category, sub_category,
+                                uom, grp_code, quantity, quantity_units, rate_inr,
+                                amount_inr, igst_amount, sgst_amount, cgst_amount,
+                                apmc_amount, packing_amount, freight_amount, processing_amount,
+                                total_amount_inr, rate_type,
+                                item_type, item_description, sales_group,
+                                match_score, match_source, status, so_line_id
+                            )
+                            VALUES (
+                                $1, $2, $3, $4, $5,
+                                $6, $7, $8, $9, $10,
+                                $11, $12, $13, $14,
+                                $15, $16, $17, $18,
+                                $19, $20,
+                                $21, $22, $23,
+                                $24, $25, 'pending'::e_so_line_status, $26
+                            )
+                            RETURNING so_line_id
+                            """,
+                            so_id,
+                            line.get("line_number", 1),
+                            article,
+                            item_cat,
+                            item_subcat,
+                            line.get("uom"),
+                            None,  # grp_code — not in SO Book format
+                            line.get("quantity"),
+                            quantity_units,
+                            line.get("rate_inr"),
+                            line.get("amount_inr"),
+                            line.get("igst_amount", 0),
+                            line.get("sgst_amount", 0),
+                            line.get("cgst_amount", 0),
+                            0,  # apmc — not in SO Book
+                            # Bug 10: packing/freight are now apportioned per line by so_book_parser.
+                            line.get("packing_amount", 0),
+                            line.get("freight_amount", 0),
+                            0,  # processing — not in SO Book
+                            line.get("total_amount_inr"),
+                            rate_type,
+                            matched_item.item_type if matched_item else None,
+                            matched_item.particulars if matched_item else None,
+                            matched_item.sale_group if matched_item else None,
+                            score if matched_item else None,
+                            "all_sku" if matched_item else None,
+                            new_short_time_id(),  # regenerated on each retry
                         )
-                        VALUES (
-                            $1, $2, $3, $4, $5,
-                            $6, $7, $8, $9, $10,
-                            $11, $12, $13, $14,
-                            $15, $16, $17, $18,
-                            $19, $20,
-                            $21, $22, $23,
-                            $24, $25, 'pending'::e_so_line_status
-                        )
-                        RETURNING so_line_id
-                        """,
-                        so_id,
-                        line.get("line_number", 1),
-                        article,
-                        item_cat,
-                        item_subcat,
-                        line.get("uom"),
-                        None,  # grp_code — not in SO Book format
-                        line.get("quantity"),
-                        quantity_units,
-                        line.get("rate_inr"),
-                        line.get("amount_inr"),
-                        line.get("igst_amount", 0),
-                        line.get("sgst_amount", 0),
-                        line.get("cgst_amount", 0),
-                        0,  # apmc — not in SO Book
-                        # Bug 10: packing/freight are now apportioned per line by so_book_parser.
-                        line.get("packing_amount", 0),
-                        line.get("freight_amount", 0),
-                        0,  # processing — not in SO Book
-                        line.get("total_amount_inr"),
-                        rate_type,
-                        matched_item.item_type if matched_item else None,
-                        matched_item.particulars if matched_item else None,
-                        matched_item.sale_group if matched_item else None,
-                        score if matched_item else None,
-                        "all_sku" if matched_item else None,
-                    )
+
+                    line_row = await insert_with_pk_retry(conn, _insert_so_line)
                     so_line_id = line_row["so_line_id"]
                     total_lines += 1
 

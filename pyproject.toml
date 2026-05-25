@@ -20,5 +20,7 @@ dependencies = [
     "requests>=2.33.1",
     "pandas>=3.0.2",
     "PyJWT[crypto]>=2.10.1",
-    "magnum>=22.0.0",
+    "mangum>=0.19.0",
+    "bcrypt>=4.2.0",
+    "fpdf2>=2.8.2",
 ]

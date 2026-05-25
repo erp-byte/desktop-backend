@@ -1,0 +1,49 @@
+Loading opening (Excel, consolidated)...
+Loading Excel sales + CNs...
+Loading PDF-extracted CNs (if available)...
+  Sales lines: 3523 | Excel CNs: 21 | PDF CNs: 18
+  DNS lookup failed ([Errno 11001] getaddrinfo failed); falling back to RDS IP...
+Loading all_sku + BOM master...
+  all_sku rows: 3710 | BOM FGs: 1299
+Loading inward...
+Converting outward sales → RM groups via BOM ...
+Converting CN inward → RM groups via BOM ...
+
+WINDOW: 2026-04-01 → 2026-05-12  (CFPL+CDPL consolidated; all qty in KG)
+================================================================================================
+GROUP                       Opening      +Inward     +CN-RM      -Out-RM      = CLOSING
+------------------------------------------------------------------------------------------------
+_UNMAPPED                         0           39          0            0             39
+almond                        7,954       52,070        101       61,144         -1,019
+anjeer                          122        4,161          0          766          3,518
+apricot                         489        3,130          0        1,625          1,994
+bars & cereals                  626            0          0        2,736         -2,110
+blackberry                        0           10          0            2              8
+blackcurrant                    397            0          0           89            308
+blueberry                     1,395        3,701         27        4,093          1,030
+cashew                       17,321       20,343         34       35,140          2,557
+cranberry                    43,364       19,506         85       17,073         45,882
+dates                       642,726      101,900        370      361,853        383,144
+dehydrated fruits               584          290          0          305            569
+makhana                          12            0          0            6              6
+miscellaneous - rm            6,356        5,703         81       28,403        -16,263
+packaging                         0       34,086          0            0         34,086
+peanuts                       3,696        3,234          0       11,514         -4,584
+pista                        66,079       64,432         35       52,336         78,211
+premium nuts                 10,781           73          0        1,536          9,318
+prunes                        3,369       10,776        375        6,264          8,256
+raisin                       23,880       40,678        106       18,612         46,053
+salt                            940        1,555          0          135          2,360
+seasoning                     2,263          600          0        4,243         -1,380
+seeds                       112,752      315,650      7,019      402,197         33,224
+spices                            9           11          0          850           -830
+tajir                           614          450          0       21,392        -20,328
+trail mix                     1,028            0        650       39,032        -37,354
+walnut                        1,136           45          0        4,350         -3,169
+------------------------------------------------------------------------------------------------
+TOTAL                       947,895      682,445      8,883    1,075,697        563,526
+
+Sale-line classification: {'direct_rm': 309, 'fg_bom': 3057, 'fg_no_bom': 88, 'inferred': 0, 'unknown': 0}
+
+HTML report: D:\Consumption\New\Backend\_closing_v3_report.html
+Text report: D:\Consumption\New\Backend\_closing_v3_report.txt

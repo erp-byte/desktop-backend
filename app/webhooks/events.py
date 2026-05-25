@@ -68,6 +68,7 @@ async def fulfillment_synced(entity: str, *, synced: int, skipped: int, total: i
 
 async def fulfillment_revised(entity: str, *, fulfillment_id: int,
                                new_qty: float | None = None,
+                               new_units: float | None = None,
                                new_date: str | None = None,
                                revised_by: str = "") -> None:
     entity = _validate_entity(entity, "fulfillment.revised")
@@ -75,7 +76,8 @@ async def fulfillment_revised(entity: str, *, fulfillment_id: int,
         event_type="fulfillment.revised",
         entity=entity,
         payload={"fulfillment_id": fulfillment_id, "new_qty": new_qty,
-                 "new_date": new_date, "revised_by": revised_by},
+                 "new_units": new_units, "new_date": new_date,
+                 "revised_by": revised_by},
         target_roles=["planner", "admin"],
     ))
 

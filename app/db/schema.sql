@@ -11,7 +11,9 @@ CREATE TABLE IF NOT EXISTS so_header (
 );
 
 CREATE TABLE IF NOT EXISTS so_line (
-    so_line_id            SERIAL PRIMARY KEY,
+    -- so_line_id is application-supplied via app.core.helpers.new_short_time_id()
+    -- (8-digit time-based short ID). Not auto-incremented.
+    so_line_id            BIGINT PRIMARY KEY,
     so_id                 INT NOT NULL REFERENCES so_header(so_id),
     line_number           INT NOT NULL,
     sku_name              TEXT,
@@ -59,7 +61,7 @@ CREATE INDEX IF NOT EXISTS idx_all_sku_particulars ON all_sku(particulars);
 
 CREATE TABLE IF NOT EXISTS so_gst_reconciliation (
     recon_id              SERIAL PRIMARY KEY,
-    so_line_id            INT NOT NULL REFERENCES so_line(so_line_id),
+    so_line_id            BIGINT NOT NULL REFERENCES so_line(so_line_id),
     so_id                 INT NOT NULL REFERENCES so_header(so_id),
     expected_gst_rate     NUMERIC(15,3),
     actual_gst_rate       NUMERIC(15,3),

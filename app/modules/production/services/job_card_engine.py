@@ -38,9 +38,15 @@ async def create_production_orders(conn, plan_id: int, entity: str) -> dict:
         if not bom:
             continue
 
-        # Generate numbers
-        seq = await conn.fetchval("SELECT COUNT(*) + 1 FROM production_order")
+        # Generate numbers. Use MAX(seq) + 1 scoped to this year — COUNT(*)+1
+        # collides whenever a prior prod_order has been deleted (leaves a gap
+        # below the highest seq, so COUNT+1 reuses an already-issued number).
         year = date.today().year
+        seq = await conn.fetchval(
+            "SELECT COALESCE(MAX(CAST(SUBSTRING(prod_order_number FROM 10) AS INT)), 0) + 1 "
+            "FROM production_order WHERE prod_order_number LIKE $1",
+            f"PRD-{year}-%",
+        )
         prod_order_number = f"PRD-{year}-{seq:04d}"
         batch_number = f"B{year}-{seq:04d}"
 

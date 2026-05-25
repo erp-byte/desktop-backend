@@ -119,7 +119,7 @@ $$;
 -- 7. Create GST reconciliation table
 CREATE TABLE IF NOT EXISTS so_gst_reconciliation (
     recon_id              SERIAL PRIMARY KEY,
-    so_line_id            INT NOT NULL REFERENCES so_line(so_line_id),
+    so_line_id            BIGINT NOT NULL REFERENCES so_line(so_line_id),
     so_id                 INT NOT NULL REFERENCES so_header(so_id),
     expected_gst_rate     NUMERIC,
     actual_gst_rate       NUMERIC,

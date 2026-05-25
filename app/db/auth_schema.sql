@@ -31,6 +31,15 @@ CREATE TABLE IF NOT EXISTS auth_user (
 );
 
 ALTER TABLE auth_user ADD COLUMN IF NOT EXISTS allowed_warehouses TEXT[];
+-- Per-user floor scope. NULL / empty = "no floor restriction" (defers to
+-- role-permission level). Non-empty array locks the user to those floors.
+ALTER TABLE auth_user ADD COLUMN IF NOT EXISTS allowed_floors     TEXT[];
+-- Per-user multi-entity scope. NULL / empty = "no entity restriction".
+-- Non-empty array locks the user to those entities (e.g. ['cfpl','cdpl']
+-- = both, ['cfpl'] = CFPL-only). The legacy single-value `entity` column
+-- is kept in sync (first element) so older queries that read it still
+-- work without changes.
+ALTER TABLE auth_user ADD COLUMN IF NOT EXISTS allowed_entities   TEXT[];
 
 CREATE INDEX IF NOT EXISTS idx_auth_user_phone ON auth_user(phone);
 

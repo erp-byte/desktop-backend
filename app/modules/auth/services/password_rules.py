@@ -46,56 +46,17 @@ def _blocklist() -> frozenset[str]:
 
 
 def evaluate(plain: str, phone: str | None) -> list[str]:
-    """Return the list of rule keys that FAILED. Empty list = strong enough."""
-    failed: list[str] = []
+    """Return the list of rule keys that FAILED. Empty list = strong enough.
 
-    if not plain or len(plain) < MIN_LEN or len(plain) > MAX_LEN:
-        failed.append(RULE_LENGTH)
+    Password complexity rules were removed per ops decision (2026-05).
+    Users may pick any password including the empty string; the
+    function is retained as a no-op so existing call sites stay valid
+    and a future re-introduction of rules is a one-file change.
 
-    has_alpha = any(c.isalpha() for c in plain or "")
-    has_digit = any(c.isdigit() for c in plain or "")
-    if not (has_alpha and has_digit):
-        failed.append(RULE_ALPHA_DIGIT)
-
-    # HI-07: normalise the phone first (E.164) and ALWAYS include the bare
-    # 10-digit form for Indian mobiles. Without this, a user stored as
-    # "+919876543210" could pick a password containing "9876543210" and the
-    # rule would silently pass.
-    if phone:
-        from app.modules.auth.services.phone import normalize as _norm_phone
-
-        norm_phone = _norm_phone(phone) or phone
-        phone_digits = "".join(ch for ch in (norm_phone or "") if ch.isdigit())
-        raw_digits = "".join(ch for ch in phone if ch.isdigit())
-        plain_lower = (plain or "").lower()
-
-        # Candidate substrings we treat as "the user's phone" for the
-        # contains-check. Includes:
-        #   • the full normalised digit string (e.g. "919876543210")
-        #   • the raw input digits (in case normalize stripped something)
-        #   • all suffixes of length 7..len-1 of the normalised string
-        #   • the bare 10-digit Indian mobile (when CC=91, len=12)
-        candidates: set[str] = set()
-        if phone_digits:
-            candidates.add(phone_digits)
-            for n in range(7, len(phone_digits)):
-                candidates.add(phone_digits[-n:])
-            if phone_digits.startswith("91") and len(phone_digits) == 12:
-                candidates.add(phone_digits[2:])  # bare 10-digit mobile
-        if raw_digits and raw_digits != phone_digits:
-            candidates.add(raw_digits)
-
-        if (
-            plain_lower == phone.lower()
-            or plain_lower == (norm_phone or "").lower()
-            or any(c and c in plain_lower for c in candidates)
-        ):
-            failed.append(RULE_NOT_PHONE)
-
-    if (plain or "").lower() in _blocklist():
-        failed.append(RULE_NOT_COMMON)
-
-    return failed
+    The original constants (RULE_LENGTH, RULE_ALPHA_DIGIT, …) are kept
+    in this module so any code that imports them keeps compiling.
+    """
+    return []
 
 
 # ── hashing / verification ────────────────────────────────────────────────

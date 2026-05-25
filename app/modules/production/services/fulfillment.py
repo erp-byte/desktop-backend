@@ -62,7 +62,11 @@ async def sync_fulfillment(conn, entity: str | None = None) -> dict:
 
         fy = _derive_fy(so_date)
         ent = _derive_entity(r['company'])
-        qty_kg = float(r['quantity']) if r['quantity'] else 0
+        # so_line field names are misleading (see docs/FRONTEND_API_GUIDE.md):
+        # - so_line.quantity        = raw Excel "Qty." (= pack count for unit-priced items)
+        # - so_line.quantity_units  = computed `quantity × master_uom` (= total kg)
+        # so original_qty_kg should come from quantity_units, not quantity.
+        qty_kg = float(r['quantity_units']) if r['quantity_units'] else 0
         deadline = so_date + timedelta(days=7)
 
         result = await conn.execute(

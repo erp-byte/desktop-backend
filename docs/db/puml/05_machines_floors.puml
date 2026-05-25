@@ -1,0 +1,80 @@
+@startuml
+title Machines and Floors
+
+skinparam entity {
+  BackgroundColor #F0F4FF
+  BorderColor #3A5A8C
+  HeaderBackgroundColor #3A5A8C
+  FontColor white
+  FontSize 11
+  AttributeFontColor black
+  AttributeFontSize 10
+}
+skinparam ArrowColor #3A5A8C
+skinparam NoteBackgroundColor #FFFDE7
+skinparam NoteBorderColor #E6A817
+skinparam shadowing false
+
+entity "Machine" as MACH {
+  * machine_id
+  --
+  machine_name
+  machine_type
+  category
+  capable_stages
+  floor
+  factory
+  status
+}
+
+entity "Machine Capacity" as MC {
+  * capacity_id
+  --
+  machine_name
+  stage
+  product_group
+  capacity_kg_per_hr
+}
+
+entity "Plan Line (ref)" as PPL {
+  * plan_line_id
+  --
+  product_name
+  planned_qty_kg
+  estimated_hours
+}
+
+entity "Job Card (ref)" as JC {
+  * job_card_id
+  --
+  stage
+  floor
+  status
+}
+
+entity "BOM Process Route (ref)" as BPR {
+  * route_id
+  --
+  stage
+  machine_type
+}
+
+MACH ||--o{ MC   : "capacity by stage"
+PPL  }o--|| MACH : "assigned machine"
+JC   }o--|| MACH : "runs on"
+BPR  ..>   MACH  : "matched by machine type"
+
+note right of MACH
+  status: active | under maintenance | retired
+  machine_type: sorting table | sealer | weighing scale | metal detector
+  category: processing | packaging | quality
+  Floors are labels (e.g. Floor 1, PM Area) - no separate floor table.
+end note
+
+note right of MC
+  Capacity is per machine, per stage, per product group.
+  Planning uses this to estimate run time:
+  estimated_hours = planned_qty / capacity_kg_per_hr
+end note
+
+@enduml
