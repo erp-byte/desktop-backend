@@ -13,6 +13,7 @@ Upload-and-save flow:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -20,7 +21,7 @@ import asyncpg
 
 from app.modules.vendor import storage as vendor_storage
 from app.modules.vendor.schemas import ExtractedDocFields, csv_to_list, list_to_csv
-from app.modules.vendor.services import claude_extractor
+from app.modules.vendor.services import claude_extractor, history_service
 from app.modules.vendor.services.vendor_service import NotNullPatchError
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,8 @@ async def create_document(
     vendor_id: str,
     payload: dict[str, Any],
     actor_user_id: str | None = None,
+    *,
+    source: str = "manual",
 ) -> dict[str, Any]:
     cols = [
         "vendor_id", "doc_type", "doc_number", "s3_urls", "issued_on",
@@ -67,8 +70,21 @@ async def create_document(
         RETURNING {_DOC_COLUMNS}
     """
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(sql, *values)
-    return _row(row)  # type: ignore[return-value]
+        async with conn.transaction():
+            row = await conn.fetchrow(sql, *values)
+            result = _row(row)
+            if result is not None:
+                await history_service.record_history(
+                    conn, "document",
+                    operation="create",
+                    parent_id=str(result["doc_id"]),
+                    vendor_id=str(vendor_id),
+                    previous_state=None,
+                    new_state=result,
+                    actor_user_id=actor_user_id,
+                    source=source,
+                )
+    return result  # type: ignore[return-value]
 
 
 # ── list / get ───────────────────────────────────────────────────────────
@@ -116,6 +132,10 @@ async def update_document(
     pool: asyncpg.Pool,
     doc_id: str,
     patch: dict[str, Any],
+    *,
+    actor_user_id: str | None = None,
+    source: str = "manual",
+    reason: str | None = None,
 ) -> dict[str, Any] | None:
     """Partial update. Null on a nullable field clears it; null on a
     NOT NULL field (currently only `doc_type`) raises NotNullPatchError.
@@ -123,9 +143,11 @@ async def update_document(
     patch.pop("doc_id", None)
     patch.pop("vendor_id", None)
     patch.pop("uploaded_at", None)
+    inline_reason = patch.pop("_reason", None) or patch.pop("reason", None)
+    effective_reason = reason if reason is not None else inline_reason
     if "s3_urls" in patch:
         # Explicit null → store empty CSV (clears the row's file list).
-        patch["s3_urls"] = list_to_csv(csv_to_list(patch["s3_urls"] or ""))
+        patch["s3_urls"] = list_to_csv(patch["s3_urls"] or "")
     if not patch:
         return await get_document(pool, doc_id)
     for col in _DOC_NOT_NULL:
@@ -145,16 +167,66 @@ async def update_document(
         RETURNING {_DOC_COLUMNS}
     """
     async with pool.acquire() as conn:
-        return _row(await conn.fetchrow(sql, *args))
+        async with conn.transaction():
+            prev = await conn.fetchrow(
+                f"SELECT {_DOC_COLUMNS} FROM vendor_document "
+                f"WHERE doc_id = $1 FOR UPDATE",
+                doc_id,
+            )
+            if prev is None:
+                return None
+            updated = await conn.fetchrow(sql, *args)
+            if updated is None:
+                return None
+            new_dict = dict(updated)
+            await history_service.record_history(
+                conn, "document",
+                operation="update",
+                parent_id=str(doc_id),
+                vendor_id=str(prev["vendor_id"]),
+                previous_state=dict(prev),
+                new_state=new_dict,
+                actor_user_id=actor_user_id,
+                source=source,
+                reason=effective_reason,
+            )
+            return new_dict
 
 
-async def delete_document(pool: asyncpg.Pool, doc_id: str) -> bool:
+async def delete_document(
+    pool: asyncpg.Pool,
+    doc_id: str,
+    *,
+    actor_user_id: str | None = None,
+    reason: str | None = None,
+) -> bool:
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "DELETE FROM vendor_document WHERE doc_id = $1 RETURNING doc_id",
-            doc_id,
-        )
-    return row is not None
+        async with conn.transaction():
+            prev = await conn.fetchrow(
+                f"SELECT {_DOC_COLUMNS} FROM vendor_document "
+                f"WHERE doc_id = $1 FOR UPDATE",
+                doc_id,
+            )
+            if prev is None:
+                return False
+            row = await conn.fetchrow(
+                "DELETE FROM vendor_document WHERE doc_id = $1 RETURNING doc_id",
+                doc_id,
+            )
+            if row is None:
+                return False
+            await history_service.record_history(
+                conn, "document",
+                operation="delete",
+                parent_id=str(doc_id),
+                vendor_id=str(prev["vendor_id"]),
+                previous_state=dict(prev),
+                new_state={"doc_id": str(doc_id), "deleted": True},
+                actor_user_id=actor_user_id,
+                source="manual",
+                reason=reason,
+            )
+    return True
 
 
 # ── upload + extract ─────────────────────────────────────────────────────
@@ -169,7 +241,11 @@ async def upload_to_s3(
     mime_type: str,
     original_filename: str | None = None,
 ) -> str:
-    """Push bytes to S3 (or local fallback) and return the stored URL."""
+    """Push bytes to S3 and return the stored URL.
+
+    boto3's `put_object` is synchronous; wrapping in `asyncio.to_thread`
+    keeps the event loop free for the parallel Claude extraction.
+    """
     backend = vendor_storage.get_vendor_storage(settings)
     key = vendor_storage.new_vendor_key(
         supplier_code=supplier_code,
@@ -177,7 +253,7 @@ async def upload_to_s3(
         mime_type=mime_type,
         original_filename=original_filename,
     )
-    return backend.put(key, file_bytes, mime_type)
+    return await asyncio.to_thread(backend.put, key, file_bytes, mime_type)
 
 
 async def extract_only(
@@ -189,8 +265,18 @@ async def extract_only(
     mime_type: str,
     original_filename: str | None = None,
 ) -> tuple[str, ExtractedDocFields]:
-    """Push to S3, run extraction, return (s3_url, extracted) — DOES NOT SAVE."""
-    s3_url = await upload_to_s3(
+    """Push to S3 and run extraction CONCURRENTLY; return (s3_url, extracted).
+
+    Both legs consume the same in-memory bytes — no data dependency
+    between them — so wall-clock drops from `S3 + Claude` (~3s + 12s)
+    to `max(S3, Claude)` (~12s) per document.
+
+    `return_exceptions=True` keeps one path's failure from cancelling
+    the other. S3 failure reraises (caller needs the URL to persist a
+    row); Claude failure is wrapped into a failed ExtractedDocFields
+    so the row can still save with `extraction_status="failed"`.
+    """
+    s3_task = upload_to_s3(
         settings,
         supplier_code=supplier_code,
         doc_type=doc_type,
@@ -198,12 +284,23 @@ async def extract_only(
         mime_type=mime_type,
         original_filename=original_filename,
     )
-    extracted = await claude_extractor.extract_document_fields(
+    extract_task = claude_extractor.extract_document_fields(
         file_bytes=file_bytes,
         mime_type=mime_type,
         doc_type=doc_type,
     )
-    return s3_url, extracted
+    s3_result, extracted = await asyncio.gather(
+        s3_task, extract_task, return_exceptions=True,
+    )
+    if isinstance(s3_result, Exception):
+        raise s3_result
+    if isinstance(extracted, Exception):
+        logger.warning("vendor.extract.unexpected_exc err=%r", extracted)
+        extracted = ExtractedDocFields(
+            extraction_status="failed",
+            extraction_error=repr(extracted),
+        )
+    return s3_result, extracted
 
 
 def _merge_extracted(payload: dict[str, Any], extracted: ExtractedDocFields) -> dict[str, Any]:

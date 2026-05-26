@@ -13,6 +13,7 @@ from typing import Any
 
 import asyncpg
 
+from app.modules.vendor.services import history_service
 from app.modules.vendor.services.vendor_service import NotNullPatchError
 
 #: vendor_banking columns that cannot be cleared via PATCH.
@@ -35,6 +36,9 @@ async def create_banking(
     pool: asyncpg.Pool,
     vendor_id: str,
     payload: dict[str, Any],
+    *,
+    actor_user_id: str | None = None,
+    source: str = "manual",
 ) -> dict[str, Any]:
     data = dict(payload)
     cols = [
@@ -55,7 +59,18 @@ async def create_banking(
             if data.get("is_primary"):
                 await _demote_primary(conn, vendor_id, skip_bank_id=None)
             row = await conn.fetchrow(sql, *values)
-    return dict(row)
+            result = dict(row)
+            await history_service.record_history(
+                conn, "banking",
+                operation="create",
+                parent_id=str(result["bank_id"]),
+                vendor_id=str(vendor_id),
+                previous_state=None,
+                new_state=result,
+                actor_user_id=actor_user_id,
+                source=source,
+            )
+    return result
 
 
 async def _demote_primary(
@@ -113,6 +128,9 @@ async def update_banking(
     patch: dict[str, Any],
     *,
     vendor_id: str | None = None,
+    actor_user_id: str | None = None,
+    source: str = "manual",
+    reason: str | None = None,
 ) -> dict[str, Any] | None:
     """Partial update. Pass `vendor_id` to scope the UPDATE so the row
     can only be touched if it belongs to that vendor — the router uses
@@ -125,6 +143,8 @@ async def update_banking(
     patch.pop("bank_id", None)
     patch.pop("vendor_id", None)
     patch.pop("created_at", None)
+    inline_reason = patch.pop("_reason", None) or patch.pop("reason", None)
+    effective_reason = reason if reason is not None else inline_reason
     if not patch:
         return await get_banking(pool, bank_id)
     for col in _BANK_NOT_NULL:
@@ -150,44 +170,89 @@ async def update_banking(
     """
     async with pool.acquire() as conn:
         async with conn.transaction():
+            prev_row = await conn.fetchrow(
+                f"SELECT {_BANK_COLUMNS} FROM vendor_banking "
+                f"WHERE bank_id = $1 FOR UPDATE",
+                bank_id,
+            )
+            if prev_row is None:
+                return None
             # If the patch flips is_primary on, demote siblings first.
             if patch.get("is_primary") is True:
-                owner = vendor_id
-                if owner is None:
-                    row = await conn.fetchrow(
-                        "SELECT vendor_id FROM vendor_banking WHERE bank_id = $1",
-                        bank_id,
-                    )
-                    owner = row["vendor_id"] if row else None
+                owner = vendor_id or prev_row["vendor_id"]
                 if owner:
                     await _demote_primary(conn, owner, skip_bank_id=bank_id)
             updated = await conn.fetchrow(sql, *args)
-    return dict(updated) if updated else None
+            if updated is None:
+                return None
+            new_dict = dict(updated)
+            await history_service.record_history(
+                conn, "banking",
+                operation="update",
+                parent_id=str(bank_id),
+                vendor_id=str(new_dict["vendor_id"]),
+                previous_state=dict(prev_row),
+                new_state=new_dict,
+                actor_user_id=actor_user_id,
+                source=source,
+                reason=effective_reason,
+            )
+            return new_dict
 
 
-async def delete_banking(pool: asyncpg.Pool, bank_id: str) -> bool:
+async def delete_banking(
+    pool: asyncpg.Pool,
+    bank_id: str,
+    *,
+    actor_user_id: str | None = None,
+    reason: str | None = None,
+) -> bool:
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "DELETE FROM vendor_banking WHERE bank_id = $1 RETURNING bank_id",
-            bank_id,
-        )
-    return row is not None
+        async with conn.transaction():
+            prev_row = await conn.fetchrow(
+                f"SELECT {_BANK_COLUMNS} FROM vendor_banking "
+                f"WHERE bank_id = $1 FOR UPDATE",
+                bank_id,
+            )
+            if prev_row is None:
+                return False
+            row = await conn.fetchrow(
+                "DELETE FROM vendor_banking WHERE bank_id = $1 RETURNING bank_id",
+                bank_id,
+            )
+            if row is None:
+                return False
+            await history_service.record_history(
+                conn, "banking",
+                operation="delete",
+                parent_id=str(bank_id),
+                vendor_id=str(prev_row["vendor_id"]),
+                previous_state=dict(prev_row),
+                new_state={"bank_id": str(bank_id), "deleted": True},
+                actor_user_id=actor_user_id,
+                source="manual",
+                reason=reason,
+            )
+    return True
 
 
 async def set_primary(
     pool: asyncpg.Pool,
     vendor_id: str,
     bank_id: str,
+    *,
+    actor_user_id: str | None = None,
 ) -> dict[str, Any] | None:
     """Atomic primary swap."""
     async with pool.acquire() as conn:
         async with conn.transaction():
-            # Verify ownership.
-            owner = await conn.fetchval(
-                "SELECT vendor_id FROM vendor_banking WHERE bank_id = $1",
+            # Verify ownership + capture prev state in one shot.
+            prev_row = await conn.fetchrow(
+                f"SELECT {_BANK_COLUMNS} FROM vendor_banking "
+                f"WHERE bank_id = $1 FOR UPDATE",
                 bank_id,
             )
-            if owner != vendor_id:
+            if prev_row is None or prev_row["vendor_id"] != vendor_id:
                 return None
             await _demote_primary(conn, vendor_id, skip_bank_id=bank_id)
             row = await conn.fetchrow(
@@ -200,4 +265,16 @@ async def set_primary(
                 """,
                 bank_id,
             )
-    return dict(row) if row else None
+            if row is None:
+                return None
+            new_dict = dict(row)
+            await history_service.record_history(
+                conn, "banking",
+                operation="set_primary",
+                parent_id=str(bank_id),
+                vendor_id=str(vendor_id),
+                previous_state=dict(prev_row),
+                new_state=new_dict,
+                actor_user_id=actor_user_id,
+            )
+            return new_dict

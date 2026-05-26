@@ -24,9 +24,12 @@ from pydantic import ValidationError
 from app.modules.auth.middleware import AuthUser, require_permission
 from app.modules.auth.services.permission_service import check_permission
 
-# Hard cap on files-per-request for /with-documents to bound memory + total
-# extraction wall-clock (each file = S3 PUT + Claude call ~3-10s).
-_MAX_DOCS_PER_REQUEST = 10
+# Hard cap on files-per-request for /with-documents and /extract-bulk to
+# bound memory + total extraction wall-clock. With the parallel
+# S3 + Claude fan-out, total time is roughly max(S3, Claude) across the
+# batch — typically ~15-25s for 20 files — so 20 stays under the 30s
+# soft-ceiling we treat as comfortable for a single HTTP request.
+_MAX_DOCS_PER_REQUEST = 20
 from app.modules.vendor import storage as vendor_storage
 from app.modules.vendor.schemas import (
     BankingCreateRequest,
@@ -43,6 +46,12 @@ from app.modules.vendor.schemas import (
     DocumentUpdate,
     DocumentUploadFailure,
     DocumentUploadResponse,
+    ExtractBulkResponse,
+    HistoryEntry,
+    HistoryListResponse,
+    HistoryRevertRequest,
+    SubmitStagedRequest,
+    SubmitStagedResponse,
     VendorCreateRequest,
     VendorDetailResponse,
     VendorListResponse,
@@ -55,6 +64,8 @@ from app.modules.vendor.services import (
     banking_service,
     contract_service,
     document_service,
+    extraction_service,
+    history_service,
     vendor_service,
 )
 
@@ -410,8 +421,8 @@ async def create_vendor_with_documents(
     #     so >10 in-flight S3 PUTs to the same bucket logged "Connection
     #     pool is full, discarding connection" and silently churned
     #     sockets.
-    # A short sleep between docs lets the rate-limit window refill and
-    # keeps the S3 pool drained. The inner s3+claude gather inside
+    # A short sleep between docs gives the rate-limit window time to
+    # refill and keeps the S3 pool drained. Inner s3+claude gather inside
     # document_service.upload_and_save is unaffected — that's only 2
     # ops at a time, well below either ceiling.
     INTER_DOC_PAUSE_S = 1.5
@@ -451,6 +462,8 @@ async def create_vendor_with_documents(
     results = []
     for idx, (meta, c, m, f) in enumerate(prepared):
         results.append(await _one(meta, c, m, f))
+        # Sleep between docs but not after the last one (no point waiting
+        # before the response goes out).
         if idx < len(prepared) - 1:
             await asyncio.sleep(INTER_DOC_PAUSE_S)
 
@@ -482,6 +495,7 @@ async def create_banking_endpoint(
     await _require_vendor(request, vendor_id)
     row = await banking_service.create_banking(
         request.app.state.db_pool, vendor_id, body.model_dump(exclude_unset=True),
+        actor_user_id=str(user.user_id),
     )
     return BankingResponse.model_validate(row)
 
@@ -517,6 +531,7 @@ async def update_banking_endpoint(
             bank_id,
             body.model_dump(exclude_unset=True),
             vendor_id=vendor_id,
+            actor_user_id=str(user.user_id),
         )
     except vendor_service.NotNullPatchError as e:
         raise _patch_to_400(e) from e
@@ -536,7 +551,7 @@ async def delete_banking_endpoint(
     cur = await banking_service.get_banking(pool, bank_id)
     if not cur or cur.get("vendor_id") != vendor_id:
         raise HTTPException(404, detail={"code": "banking_not_found"})
-    await banking_service.delete_banking(pool, bank_id)
+    await banking_service.delete_banking(pool, bank_id, actor_user_id=str(user.user_id))
 
 
 @router.post(
@@ -554,6 +569,7 @@ async def set_primary_banking(
     # been removed.
     row = await banking_service.set_primary(
         request.app.state.db_pool, vendor_id, bank_id,
+        actor_user_id=str(user.user_id),
     )
     if not row:
         raise HTTPException(404, detail={"code": "banking_not_found_for_vendor"})
@@ -616,6 +632,7 @@ async def update_document_endpoint(
     try:
         row = await document_service.update_document(
             pool, doc_id, body.model_dump(exclude_unset=True),
+            actor_user_id=str(user.user_id),
         )
     except vendor_service.NotNullPatchError as e:
         raise _patch_to_400(e) from e
@@ -633,7 +650,7 @@ async def delete_document_endpoint(
     cur = await document_service.get_document(pool, doc_id)
     if not cur or cur.get("vendor_id") != vendor_id:
         raise HTTPException(404, detail={"code": "document_not_found"})
-    await document_service.delete_document(pool, doc_id)
+    await document_service.delete_document(pool, doc_id, actor_user_id=str(user.user_id))
 
 
 @router.post("/{vendor_id}/documents/extract", response_model=DocExtractResponse)
@@ -795,6 +812,7 @@ async def update_contract_endpoint(
         raise HTTPException(404, detail={"code": "contract_not_found"})
     row = await contract_service.update_contract(
         pool, contract_id, body.model_dump(exclude_unset=True),
+        actor_user_id=str(user.user_id),
     )
     return ContractResponse.model_validate(row)
 
@@ -810,7 +828,7 @@ async def delete_contract_endpoint(
     cur = await contract_service.get_contract(pool, contract_id)
     if not cur or cur.get("vendor_id") != vendor_id:
         raise HTTPException(404, detail={"code": "contract_not_found"})
-    await contract_service.delete_contract(pool, contract_id)
+    await contract_service.delete_contract(pool, contract_id, actor_user_id=str(user.user_id))
 
 
 @router.post("/{vendor_id}/contracts/extract", response_model=ContractExtractResponse)
@@ -903,3 +921,257 @@ async def append_contract_file(
     if not row:
         raise HTTPException(404, detail={"code": "contract_not_found"})
     return ContractResponse.model_validate(row)
+
+
+# ── extract-bulk + submit-staged (new onboarding flow) ───────────────────
+
+
+@router.post("/extract-bulk", response_model=ExtractBulkResponse)
+async def extract_bulk_endpoint(
+    request: Request,
+    docs_meta: str = Form(
+        "[]",
+        description=(
+            "Optional JSON array of per-file `{doc_type}` hints, parallel to "
+            "files[]. Pass [] or omit to let Claude infer the type from "
+            "content."
+        ),
+    ),
+    files: list[UploadFile] = File(default_factory=list),
+    user: AuthUser = Depends(require_permission("vendor", "master", action="create")),
+):
+    """Phase 1 of the new onboarding flow. Uploads files BEFORE a vendor
+    row exists and runs Claude extraction across all of them, returning a
+    consolidated suggestion payload + `staging_id` the caller can hand
+    back via /submit-staged.
+
+    No vendor / banking / document / contract rows are written here.
+    """
+    if not files:
+        raise HTTPException(400, detail={"code": "no_files"})
+    if len(files) > _MAX_DOCS_PER_REQUEST:
+        raise HTTPException(
+            400,
+            detail={
+                "code": "too_many_files",
+                "limit": _MAX_DOCS_PER_REQUEST,
+                "actual": len(files),
+            },
+        )
+
+    try:
+        meta_list = json.loads(docs_meta) if docs_meta else []
+    except json.JSONDecodeError as e:
+        raise HTTPException(
+            400, detail={"code": "invalid_docs_meta_json", "msg": str(e)},
+        ) from e
+    if not isinstance(meta_list, list):
+        raise HTTPException(400, detail={"code": "docs_meta_must_be_array"})
+    if meta_list and len(meta_list) != len(files):
+        raise HTTPException(
+            400,
+            detail={
+                "code": "docs_meta_length_mismatch",
+                "files_count": len(files),
+                "meta_count": len(meta_list),
+            },
+        )
+
+    # Read + sniff every upload up-front so a single bad file fails the
+    # whole batch with a 4xx (rather than partially-staging in S3).
+    prepared: list[tuple[bytes, str, str | None, str | None]] = []
+    for idx, file in enumerate(files):
+        meta = meta_list[idx] if idx < len(meta_list) else {}
+        declared_type = (meta or {}).get("doc_type") if isinstance(meta, dict) else None
+        content, mime, filename = await _sniff_and_read_upload(file)
+        prepared.append((content, mime, filename, declared_type))
+
+    try:
+        result = await extraction_service.extract_bulk(
+            request.app.state.db_pool,
+            request.app.state.settings,
+            files=prepared,
+            actor_user_id=str(user.user_id),
+        )
+    except RuntimeError as e:
+        raise HTTPException(503, detail={"code": "storage_unavailable", "msg": str(e)}) from e
+    except extraction_service.StagingError as e:
+        # `migration_not_applied` is operator-actionable (run 030_vendor_history.sql).
+        # Surface as 503 so the UI can prompt the admin to apply migrations.
+        raise HTTPException(503, detail={"code": e.code, "msg": str(e)}) from e
+    return ExtractBulkResponse.model_validate(result)
+
+
+@router.post("/submit-staged", response_model=SubmitStagedResponse, status_code=201)
+async def submit_staged_endpoint(
+    request: Request,
+    body: SubmitStagedRequest,
+    user: AuthUser = Depends(require_permission("vendor", "master", action="create")),
+):
+    """Phase 2 of the new onboarding flow. Commits the (operator-edited)
+    payload across vendor_master + banking + document + contract in one
+    transaction and marks the staging row consumed.
+    """
+    try:
+        result = await extraction_service.submit_staged(
+            request.app.state.db_pool,
+            request.app.state.settings,
+            staging_id=body.staging_id,
+            vendor=body.vendor.model_dump(exclude_unset=True),
+            banking=[b.model_dump(exclude_unset=True) for b in body.banking],
+            documents=[d.model_dump(exclude_unset=True) for d in body.documents],
+            contracts=[c.model_dump(exclude_unset=True) for c in body.contracts],
+            actor_user_id=str(user.user_id),
+        )
+    except extraction_service.StagingError as e:
+        # 409 — caller's staging state precludes submit; they should re-extract.
+        raise HTTPException(409, detail={"code": e.code, "msg": str(e)}) from e
+    return SubmitStagedResponse.model_validate(result)
+
+
+# ── history endpoints (state management) ─────────────────────────────────
+
+
+@router.get("/{vendor_id}/history", response_model=HistoryListResponse)
+async def list_vendor_history_endpoint(
+    request: Request,
+    vendor_id: str,
+    operation: str | None = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=500),
+    user: AuthUser = Depends(require_permission("vendor", "master", action="view_history")),
+):
+    """Master timeline. Each entry carries `previous_state` + `new_state` +
+    a field-level `diff` so the UI can render a "from / to" view per row.
+    """
+    await _require_vendor(request, vendor_id)
+    entries, total = await history_service.list_history(
+        request.app.state.db_pool, "vendor",
+        vendor_id=vendor_id, operation=operation,
+        page=page, page_size=page_size,
+    )
+    return HistoryListResponse(
+        entries=[HistoryEntry.model_validate(e) for e in entries],
+        total=total, page=page, page_size=page_size,
+    )
+
+
+@router.get("/{vendor_id}/history/{history_id}", response_model=HistoryEntry)
+async def get_vendor_history_entry(
+    request: Request,
+    vendor_id: str,
+    history_id: int,
+    user: AuthUser = Depends(require_permission("vendor", "master", action="view_history")),
+):
+    entry = await history_service.get_history_entry(
+        request.app.state.db_pool, "vendor", history_id, vendor_id=vendor_id,
+    )
+    if entry is None:
+        raise HTTPException(404, detail={"code": "history_not_found"})
+    return HistoryEntry.model_validate(entry)
+
+
+@router.post("/{vendor_id}/history/{history_id}/revert", response_model=VendorResponse)
+async def revert_vendor_history(
+    request: Request,
+    vendor_id: str,
+    history_id: int,
+    body: HistoryRevertRequest,
+    user: AuthUser = Depends(require_permission("vendor", "master", action="revert")),
+):
+    """Apply the `previous_state` of an UPDATE / APPROVE snapshot as a
+    fresh PATCH. The revert is itself recorded in history (operation =
+    'revert'); the original entry is left untouched (append-only).
+    """
+    entry = await history_service.get_history_entry(
+        request.app.state.db_pool, "vendor", history_id, vendor_id=vendor_id,
+    )
+    if entry is None:
+        raise HTTPException(404, detail={"code": "history_not_found"})
+    try:
+        patch = history_service.build_revert_patch(entry)
+    except ValueError as e:
+        raise HTTPException(400, detail={"code": "not_revertable", "msg": str(e)}) from e
+    if not patch:
+        raise HTTPException(
+            400,
+            detail={
+                "code": "nothing_to_revert",
+                "msg": "this entry's diff is empty or only covers protected fields",
+            },
+        )
+    effective_reason = body.reason or f"revert of history {history_id}"
+    try:
+        row = await vendor_service.update_vendor(
+            request.app.state.db_pool, vendor_id, patch,
+            actor_user_id=str(user.user_id),
+            source="revert", reason=effective_reason,
+        )
+    except vendor_service.NotNullPatchError as e:
+        raise _patch_to_400(e) from e
+    if row is None:
+        raise HTTPException(404, detail={"code": "vendor_not_found"})
+    return VendorResponse.model_validate(row)
+
+
+@router.get(
+    "/{vendor_id}/banking/{bank_id}/history",
+    response_model=HistoryListResponse,
+)
+async def list_banking_history_endpoint(
+    request: Request,
+    vendor_id: str,
+    bank_id: str,
+    user: AuthUser = Depends(require_permission("vendor", "master", action="view_history")),
+):
+    await _require_vendor(request, vendor_id)
+    entries, total = await history_service.list_history(
+        request.app.state.db_pool, "banking",
+        vendor_id=vendor_id, parent_id=bank_id,
+    )
+    return HistoryListResponse(
+        entries=[HistoryEntry.model_validate(e) for e in entries],
+        total=total, page=1, page_size=len(entries),
+    )
+
+
+@router.get(
+    "/{vendor_id}/documents/{doc_id}/history",
+    response_model=HistoryListResponse,
+)
+async def list_document_history_endpoint(
+    request: Request,
+    vendor_id: str,
+    doc_id: str,
+    user: AuthUser = Depends(require_permission("vendor", "master", action="view_history")),
+):
+    await _require_vendor(request, vendor_id)
+    entries, total = await history_service.list_history(
+        request.app.state.db_pool, "document",
+        vendor_id=vendor_id, parent_id=doc_id,
+    )
+    return HistoryListResponse(
+        entries=[HistoryEntry.model_validate(e) for e in entries],
+        total=total, page=1, page_size=len(entries),
+    )
+
+
+@router.get(
+    "/{vendor_id}/contracts/{contract_id}/history",
+    response_model=HistoryListResponse,
+)
+async def list_contract_history_endpoint(
+    request: Request,
+    vendor_id: str,
+    contract_id: str,
+    user: AuthUser = Depends(require_permission("vendor", "master", action="view_history")),
+):
+    await _require_vendor(request, vendor_id)
+    entries, total = await history_service.list_history(
+        request.app.state.db_pool, "contract",
+        vendor_id=vendor_id, parent_id=contract_id,
+    )
+    return HistoryListResponse(
+        entries=[HistoryEntry.model_validate(e) for e in entries],
+        total=total, page=1, page_size=len(entries),
+    )

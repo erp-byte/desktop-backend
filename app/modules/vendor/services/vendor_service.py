@@ -19,6 +19,8 @@ from typing import Any
 
 import asyncpg
 
+from app.modules.vendor.services import history_service
+
 logger = logging.getLogger(__name__)
 
 
@@ -74,8 +76,16 @@ async def create_vendor(
     pool: asyncpg.Pool,
     payload: dict[str, Any],
     actor_user_id: str | None = None,
+    *,
+    source: str = "manual",
+    reason: str | None = None,
 ) -> dict[str, Any]:
-    """Insert a new vendor_master row; auto-mint supplier_code if absent."""
+    """Insert a new vendor_master row; auto-mint supplier_code if absent.
+
+    Also writes a `create` row into vendor_master_history in the same txn
+    so the audit trail starts the moment the vendor exists. `source` lets
+    extract-driven creates be tagged ('extraction') vs manual ones.
+    """
     data = dict(payload)
     data.setdefault("status", "active")
     data["created_by"] = actor_user_id
@@ -93,7 +103,19 @@ async def create_vendor(
             try:
                 async with conn.transaction():
                     row = await _insert_vendor(conn, data)
-                    return _row_to_dict(row)  # type: ignore[return-value]
+                    result = _row_to_dict(row)
+                    if result is not None:
+                        await history_service.record_history(
+                            conn, "vendor",
+                            operation="create",
+                            parent_id=str(result["vendor_id"]),
+                            new_state=result,
+                            previous_state=None,
+                            actor_user_id=actor_user_id,
+                            source=source,
+                            reason=reason,
+                        )
+                    return result  # type: ignore[return-value]
             except asyncpg.UniqueViolationError as e:
                 # supplier_code collision — only retry when we auto-minted.
                 if "supplier_code" in str(e) and not payload.get("supplier_code"):
@@ -210,6 +232,9 @@ async def update_vendor(
     vendor_id: str,
     patch: dict[str, Any],
     actor_user_id: str | None = None,
+    *,
+    source: str = "manual",
+    reason: str | None = None,
 ) -> dict[str, Any] | None:
     """Partial update.
 
@@ -218,6 +243,10 @@ async def update_vendor(
         * Field present as None → column set to NULL (clears nullable fields).
         * Field present as a value → column updated.
         * Explicit None on a NOT NULL column → `NotNullPatchError`.
+
+    Writes a `vendor_master_history` row in the same transaction. The
+    `_reason` key (if the router didn't strip it) is consumed here as the
+    history reason and never stored on `vendor_master`.
     """
     # Strip keys we should never let the client touch directly.
     patch.pop("vendor_id", None)
@@ -226,6 +255,13 @@ async def update_vendor(
     patch.pop("approved_by", None)
     patch.pop("approved_at", None)
     patch.pop("is_deleted", None)
+    # Consume client-supplied reason (the UI ships it inside the same
+    # JSON body to avoid a second roundtrip). Accept both the JSON-on-
+    # the-wire key (`_reason`) and the Pydantic field name (`reason`)
+    # since `model_dump()` produces the latter when not using by_alias.
+    inline_reason = patch.pop("_reason", None) or patch.pop("reason", None)
+    effective_reason = reason if reason is not None else inline_reason
+
     if not patch:
         return await get_vendor(pool, vendor_id)
 
@@ -250,27 +286,70 @@ async def update_vendor(
         RETURNING {_VENDOR_COLUMNS}
     """
     async with pool.acquire() as conn:
-        return _row_to_dict(await conn.fetchrow(sql, *args))
+        async with conn.transaction():
+            prev_row = await conn.fetchrow(
+                f"SELECT {_VENDOR_COLUMNS} FROM vendor_master "
+                f"WHERE vendor_id = $1 AND is_deleted = false FOR UPDATE",
+                vendor_id,
+            )
+            if prev_row is None:
+                return None
+            new_row = await conn.fetchrow(sql, *args)
+            new_dict = _row_to_dict(new_row)
+            if new_dict is not None:
+                await history_service.record_history(
+                    conn, "vendor",
+                    operation="update",
+                    parent_id=str(vendor_id),
+                    previous_state=dict(prev_row),
+                    new_state=new_dict,
+                    actor_user_id=actor_user_id,
+                    source=source,
+                    reason=effective_reason,
+                )
+            return new_dict
 
 
 async def soft_delete_vendor(
     pool: asyncpg.Pool,
     vendor_id: str,
     actor_user_id: str | None = None,
+    *,
+    reason: str | None = None,
 ) -> bool:
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            UPDATE vendor_master
-               SET is_deleted = true,
-                   updated_at = now(),
-                   updated_by = $2
-             WHERE vendor_id = $1 AND is_deleted = false
-            RETURNING vendor_id
-            """,
-            vendor_id, actor_user_id,
-        )
-    return row is not None
+        async with conn.transaction():
+            prev_row = await conn.fetchrow(
+                f"SELECT {_VENDOR_COLUMNS} FROM vendor_master "
+                f"WHERE vendor_id = $1 AND is_deleted = false FOR UPDATE",
+                vendor_id,
+            )
+            if prev_row is None:
+                return False
+            row = await conn.fetchrow(
+                f"""
+                UPDATE vendor_master
+                   SET is_deleted = true,
+                       updated_at = now(),
+                       updated_by = $2
+                 WHERE vendor_id = $1 AND is_deleted = false
+                RETURNING {_VENDOR_COLUMNS}
+                """,
+                vendor_id, actor_user_id,
+            )
+            if row is None:
+                return False
+            await history_service.record_history(
+                conn, "vendor",
+                operation="delete",
+                parent_id=str(vendor_id),
+                previous_state=dict(prev_row),
+                new_state=dict(row),
+                actor_user_id=actor_user_id,
+                source="manual",
+                reason=reason,
+            )
+    return True
 
 
 # ── approve ──────────────────────────────────────────────────────────────
@@ -301,14 +380,14 @@ async def approve_vendor(
     """
     async with pool.acquire() as conn:
         async with conn.transaction():
-            vendor = await conn.fetchrow(
-                "SELECT vendor_id, kyc_status_id FROM vendor_master "
-                " WHERE vendor_id = $1 AND is_deleted = false FOR UPDATE",
+            prev_row = await conn.fetchrow(
+                f"SELECT {_VENDOR_COLUMNS} FROM vendor_master "
+                f"WHERE vendor_id = $1 AND is_deleted = false FOR UPDATE",
                 vendor_id,
             )
-            if not vendor:
+            if not prev_row:
                 return None
-            if not vendor["kyc_status_id"]:
+            if not prev_row["kyc_status_id"]:
                 raise ApprovalError("kyc_incomplete", "KYC must be completed before approval.")
             has_primary = await conn.fetchval(
                 """
@@ -335,4 +414,14 @@ async def approve_vendor(
                 """,
                 vendor_id, approver_user_id,
             )
+            if row is not None:
+                await history_service.record_history(
+                    conn, "vendor",
+                    operation="approve",
+                    parent_id=str(vendor_id),
+                    previous_state=dict(prev_row),
+                    new_state=dict(row),
+                    actor_user_id=approver_user_id,
+                    source="approve",
+                )
     return _row_to_dict(row)

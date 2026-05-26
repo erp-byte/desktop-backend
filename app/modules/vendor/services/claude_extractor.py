@@ -124,39 +124,105 @@ _DOC_TYPE_INSTRUCTIONS: dict[str, str] = {
 }
 
 
+# System prompts demand a JSON response shape directly — we no longer use
+# `messages.parse()` because Anthropic's grammar compiler chokes on the
+# ExtractedDocFields schema (10 nullable strings × an enum produces enough
+# state-space combinations that compilation times out server-side). Plain
+# `messages.create()` + Pydantic-side validation is more robust and gives
+# the same end result.
 _SYSTEM_PROMPT = (
-    "You extract structured fields from vendor compliance documents "
-    "uploaded by an Indian food-manufacturing ERP. The user will provide "
-    "ONE document (PDF or image) per call along with its declared "
-    "`doc_type`. You MUST:\n"
-    "  1. Read the document carefully — OCR text, headings, tables, and "
-    "stamps all count.\n"
-    "  2. Return ONLY the fields you can read with high confidence. "
-    "Leave fields null rather than guess.\n"
-    "  3. Dates MUST be ISO 8601 (YYYY-MM-DD). Convert from DD/MM/YYYY, "
-    "DD-MM-YYYY, or Indian short-date forms accordingly.\n"
-    "  4. Strip spaces from identifiers (GSTIN, PAN, FSSAI, etc.) and "
-    "return them upper-cased.\n"
-    "  5. Use the `additional_fields` map for anything useful that "
-    "doesn't fit the typed schema (e.g. trade name, jurisdiction, "
-    "constitution-of-business).\n"
-    "  6. If the supplied document looks unrelated to the declared "
-    "doc_type, populate what you can and add a `mismatch_warning` "
-    "string into `additional_fields`."
+    "You extract structured fields from Indian vendor documents — "
+    "compliance certificates, invoices, MOAs, registrations, bank "
+    "papers, contracts — for a food-manufacturing ERP. The user gives "
+    "you ONE document per call with its declared `doc_type`.\n\n"
+    "Extract EVERY field you can find. A single document commonly "
+    "carries multiple identifiers and unrelated extras — a GST "
+    "certificate shows the PAN inside the GSTIN, an invoice carries "
+    "GSTIN + PAN + CIN + contact + sometimes bank details, a FSSAI "
+    "cert lists 'Kind of Business' which tells us the supplier "
+    "category. Pull each one into its named slot.\n\n"
+    "Rules:\n"
+    "  1. Read carefully — OCR text, headings, tables, stamps, footer "
+    "fine-print all count.\n"
+    "  2. Use null when the field is not present or not legible. Never "
+    "guess.\n"
+    "  3. Identifiers (gstin, pan, cin, fssai, iec, udyam, tin, tan, "
+    "pollution_epr, brc_other): upper-cased, no spaces, exact format.\n"
+    "  4. Dates: ISO 8601 strings (YYYY-MM-DD). Convert from DD/MM/YYYY, "
+    "DD-MM-YYYY, '13-Sep-2018', etc.\n"
+    "  5. Address: put the full free-text address in `address`; ALSO "
+    "split city/state/pin_code into their own fields when the doc "
+    "lists them separately.\n"
+    "  6. doc_number is the PRIMARY identifier for this doc_type — "
+    "set it to the same value you put in the matching typed slot "
+    "(gstin for GST cert, pan for PAN card, fssai for FSSAI license, "
+    "etc).\n"
+    "  7. Supplier metadata: `business_category` is a single human "
+    "label like 'Manufacturer', 'Trader', 'Restaurant', 'Service "
+    "Provider', 'Distributor' — read it from FSSAI's 'Kind of "
+    "Business' / GST's nature-of-business / invoice context. "
+    "`supplier_type` is the same idea but more general (Manufacturer "
+    "/ Trader / Service Provider / Importer). `nature_of_business` "
+    "is a more detailed phrase. `core_business` is a one-line plain-"
+    "English description of what they do.\n"
+    "  8. supplier_reg_year: year of incorporation / registration. "
+    "On a CIN it's the 4 digits at positions 8-11. On registration "
+    "certs it's the 'Registered on' year. Use 4-digit year string "
+    "(e.g. '2015') or 'YYYY-YY' range if the doc shows fiscal year.\n"
+    "  9. Banking fields (bank_name, bank_branch, bank_account_no, "
+    "bank_account_name, bank_ifsc, bank_swift, bank_account_type): "
+    "ONLY populate these if the document is a cancelled cheque, "
+    "passbook page, bank letter, or invoice/letterhead that prints "
+    "the supplier's account details. Leave null on PAN / GST / FSSAI "
+    "/ MSME etc. Account number must be the full number with no "
+    "redaction (`XXXX1234` is not acceptable).\n"
+    "  10. Contract fields (contract_type, contract_value, "
+    "contract_summary): ONLY populate these when the document is "
+    "itself a commercial contract / MSA / NDA / SLA / supply "
+    "agreement. `contract_type` is one of: yearly, one-time, NDA, "
+    "MSA. `contract_value` is the total INR value as a float (drop "
+    "₹ / Rs. / commas). `contract_summary` is <= 200 chars.\n"
+    "  11. If the document doesn't match the declared doc_type, "
+    "populate what you can and start `additional_notes` with a "
+    "one-line warning.\n\n"
+    "Return ONLY a JSON object (no prose, no markdown fence) with "
+    "these keys (omit or null any you can't read):\n"
+    "  doc_number, gstin, pan, cin, fssai, iec, udyam, tin, tan, "
+    "pollution_epr, brc_other, issued_on, valid_from, valid_to, "
+    "issuing_authority, business_name, holder_name, contact_person, "
+    "designation, business_category, supplier_type, nature_of_business, "
+    "core_business, supplier_reg_year, address, city, state, pin_code, "
+    "mobile, phone, email, website, bank_name, bank_branch, "
+    "bank_account_no, bank_account_name, bank_ifsc, bank_swift, "
+    "bank_account_type, contract_type, contract_value, "
+    "contract_summary, category, additional_notes\n\n"
+    "Example response for a GST certificate that also shows the PAN "
+    "and lists Kind of Business as 'Manufacturer':\n"
+    '{"doc_number": "27AAACI1234A1Z5", "gstin": "27AAACI1234A1Z5", '
+    '"pan": "AAACI1234A", "business_name": "Acme Foods Pvt Ltd", '
+    '"business_category": "Manufacturer", "supplier_type": "Manufacturer", '
+    '"nature_of_business": "Manufacturing of packaged food products", '
+    '"address": "12 MG Road, Pune, Maharashtra, 411001", '
+    '"city": "Pune", "state": "Maharashtra", "pin_code": "411001", '
+    '"valid_from": "2017-07-01", "issuing_authority": "GSTN", '
+    '"supplier_reg_year": "2015", "additional_notes": null}'
 )
 
 
 _CONTRACT_SYSTEM_PROMPT = (
     "You extract structured fields from a commercial vendor contract "
     "PDF for an Indian food-manufacturing ERP. Return ONLY the fields "
-    "you can read with high confidence. Dates MUST be ISO 8601 "
+    "you can read with high confidence. Dates MUST be ISO 8601 strings "
     "(YYYY-MM-DD). `value_inr` is the total contract value in Indian "
     "Rupees as a float (drop currency symbol, comma, INR suffix). "
     "`contract_type` MUST be one of: yearly, one-time, NDA, MSA — "
     "pick the closest match. The counterparty is the OTHER party "
     "(not Candor Foods). Put the contract scope / purpose summary into "
-    "`summary` in <=200 chars. Use `additional_fields` for everything "
-    "else relevant (penalty clauses, governing law, notice period…)."
+    "`summary` in <=200 chars.\n\n"
+    "Return ONLY a JSON object (no prose, no markdown fence) with these "
+    "keys (omit a key or set it to null when unknown):\n"
+    "  contract_type, signed_date, effective_from, effective_to, "
+    "value_inr, counterparty, summary, additional_notes"
 )
 
 
@@ -166,11 +232,34 @@ _CONTRACT_SYSTEM_PROMPT = (
 _CLIENT: AsyncAnthropic | None = None
 
 
+def _resolve_api_key() -> str:
+    """Find the Anthropic API key.
+
+    `AsyncAnthropic()` reads `os.environ['ANTHROPIC_API_KEY']` only. But
+    pydantic-settings loads `.env` into a `Settings` instance — it does
+    NOT export to os.environ. So a key set only in `.env` is invisible to
+    the SDK by default. Mirror the same fallback chain that storage.py
+    uses for AWS creds: prefer the shell env, then the .env-backed Settings.
+    """
+    key = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
+    if key:
+        return key
+    try:
+        from app.config import Settings
+        return (Settings().ANTHROPIC_API_KEY or "").strip()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("vendor.extract.settings_load_failed err=%r", e)
+        return ""
+
+
 def _client() -> AsyncAnthropic:
-    """Process-wide async Anthropic client. Reads ANTHROPIC_API_KEY from env."""
+    """Process-wide async Anthropic client."""
     global _CLIENT
     if _CLIENT is None:
-        _CLIENT = AsyncAnthropic()
+        api_key = _resolve_api_key()
+        # Pass api_key= explicitly when we have one; otherwise let the SDK
+        # raise its own auth error on first call (clearer than ours).
+        _CLIENT = AsyncAnthropic(api_key=api_key) if api_key else AsyncAnthropic()
     return _CLIENT
 
 
@@ -211,6 +300,55 @@ def _failed_contract(err: str) -> ExtractedContractFields:
     return ExtractedContractFields(extraction_status="failed", extraction_error=err)
 
 
+import json
+import re
+
+
+# Tolerant JSON extractor — Claude generally returns clean JSON when asked,
+# but occasionally wraps it in a ```json fence or prepends a one-line lead.
+# We strip the common wrappers + grab the outermost {...} block.
+_FENCE_RE   = re.compile(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", re.IGNORECASE)
+_OBJECT_RE  = re.compile(r"\{[\s\S]*\}")
+
+
+def _coerce_json_object(text: str) -> dict | None:
+    if not text:
+        return None
+    text = text.strip()
+    # Try direct parse first — happy path.
+    try:
+        v = json.loads(text)
+        return v if isinstance(v, dict) else None
+    except (TypeError, ValueError):
+        pass
+    # Fenced block?
+    m = _FENCE_RE.search(text)
+    if m:
+        try:
+            v = json.loads(m.group(1))
+            return v if isinstance(v, dict) else None
+        except (TypeError, ValueError):
+            pass
+    # First {...} block in the response.
+    m = _OBJECT_RE.search(text)
+    if m:
+        try:
+            v = json.loads(m.group(0))
+            return v if isinstance(v, dict) else None
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _response_text(response: Any) -> str:
+    """Concatenate all text blocks in a Messages API response."""
+    parts: list[str] = []
+    for block in getattr(response, "content", []) or []:
+        if getattr(block, "type", None) == "text":
+            parts.append(block.text or "")
+    return "".join(parts)
+
+
 async def extract_document_fields(
     file_bytes: bytes,
     mime_type: str,
@@ -218,6 +356,12 @@ async def extract_document_fields(
     model: str | None = None,
 ) -> ExtractedDocFields:
     """Run Claude over a vendor document; return a typed extraction.
+
+    Uses `messages.create()` with a JSON-mode prompt (not `messages.parse()`)
+    because the structured-output grammar compiler times out on
+    ExtractedDocFields. We parse + validate the response client-side with
+    Pydantic, which is more permissive (missing keys → defaults, extra
+    keys → ignored).
 
     Never raises — failure modes return an ExtractedDocFields whose
     `extraction_status` is "failed" with `extraction_error` populated.
@@ -232,16 +376,18 @@ async def extract_document_fields(
             "text": (
                 f"doc_type: {doc_type}\n\n"
                 f"Per-type instructions: {instr}\n\n"
-                "Extract the fields now."
+                "Extract the fields now and respond with the JSON object only."
             ),
         },
     ]
 
     try:
-        response = await _client().messages.parse(
+        response = await _client().messages.create(
             model=model or _default_model(),
-            max_tokens=4096,
-            # Frozen system prompt → cache-friendly.
+            max_tokens=2048,
+            # Frozen system prompt → cache-friendly per the prompt-caching
+            # invariant (any byte change anywhere in the prefix invalidates
+            # everything after it).
             system=[
                 {
                     "type": "text",
@@ -250,26 +396,24 @@ async def extract_document_fields(
                 }
             ],
             messages=[{"role": "user", "content": user_blocks}],
-            output_format=ExtractedDocFields,
         )
     except Exception as e:  # noqa: BLE001
         logger.warning("vendor.extract.failed doc_type=%s err=%r", doc_type, e)
         return _failed_doc(repr(e))
 
-    parsed = getattr(response, "parsed_output", None)
-    if isinstance(parsed, ExtractedDocFields):
-        # Model returned a payload — mark as ok unless the model itself
-        # signalled an extraction problem (e.g. via additional_fields).
-        if parsed.extraction_status == "ok":
-            pass
-        return parsed
-    if isinstance(parsed, dict):
-        try:
-            return ExtractedDocFields(**parsed)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("vendor.extract.parse_back_failed err=%r", e)
-            return _failed_doc(f"parse_back_failed: {e!r}")
-    return _failed_doc("no_parsed_output")
+    text = _response_text(response)
+    data = _coerce_json_object(text)
+    if data is None:
+        logger.warning(
+            "vendor.extract.no_json doc_type=%s text=%r", doc_type, text[:200],
+        )
+        return _failed_doc(f"no_json_in_response: {text[:200]!r}")
+
+    try:
+        return ExtractedDocFields.model_validate(data)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("vendor.extract.validate_failed doc_type=%s err=%r", doc_type, e)
+        return _failed_doc(f"validate_failed: {e!r}")
 
 
 async def extract_contract_fields(
@@ -279,12 +423,15 @@ async def extract_contract_fields(
 ) -> ExtractedContractFields:
     user_blocks = [
         _content_block_for_file(file_bytes, mime_type),
-        {"type": "text", "text": "Extract the contract fields now."},
+        {
+            "type": "text",
+            "text": "Extract the contract fields now and respond with the JSON object only.",
+        },
     ]
     try:
-        response = await _client().messages.parse(
+        response = await _client().messages.create(
             model=model or _default_model(),
-            max_tokens=4096,
+            max_tokens=2048,
             system=[
                 {
                     "type": "text",
@@ -293,19 +440,19 @@ async def extract_contract_fields(
                 }
             ],
             messages=[{"role": "user", "content": user_blocks}],
-            output_format=ExtractedContractFields,
         )
     except Exception as e:  # noqa: BLE001
         logger.warning("vendor.extract_contract.failed err=%r", e)
         return _failed_contract(repr(e))
 
-    parsed = getattr(response, "parsed_output", None)
-    if isinstance(parsed, ExtractedContractFields):
-        return parsed
-    if isinstance(parsed, dict):
-        try:
-            return ExtractedContractFields(**parsed)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("vendor.extract_contract.parse_back_failed err=%r", e)
-            return _failed_contract(f"parse_back_failed: {e!r}")
-    return _failed_contract("no_parsed_output")
+    text = _response_text(response)
+    data = _coerce_json_object(text)
+    if data is None:
+        logger.warning("vendor.extract_contract.no_json text=%r", text[:200])
+        return _failed_contract(f"no_json_in_response: {text[:200]!r}")
+
+    try:
+        return ExtractedContractFields.model_validate(data)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("vendor.extract_contract.validate_failed err=%r", e)
+        return _failed_contract(f"validate_failed: {e!r}")

@@ -22,6 +22,7 @@ from app.modules.ncr.router import router as ncr_router
 from app.modules.production.router import router as production_router
 from app.modules.amendment_router import router as amendment_router
 from app.modules.vendor.router import router as vendor_router
+from app.modules.lookups_router import router as lookups_router
 from app.modules.so.services.item_matcher import load_master_items
 from app.modules.production.services.master_ingest import run_master_ingest
 
@@ -93,6 +94,7 @@ app.include_router(ncr_router)
 app.include_router(production_router)
 app.include_router(amendment_router)
 app.include_router(vendor_router)
+app.include_router(lookups_router)
 app.include_router(webhook_router)
 app.include_router(ws_router)
 

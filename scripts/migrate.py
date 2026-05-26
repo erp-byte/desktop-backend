@@ -36,6 +36,8 @@ SQL_FILES = [
     DB_DIR / "ims_new_schema.sql",
     DB_DIR / "sap_mm_align.sql",
     DB_DIR / "001_job_card_chain.sql",
+    DB_DIR / "030_vendor_history.sql",
+    DB_DIR / "031_bom_bar_line_process.sql",
     DB_DIR / "seed_test_data.sql",
 ]
 
