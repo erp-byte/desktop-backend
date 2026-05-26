@@ -1067,6 +1067,111 @@ async def record_output(conn, *, job_card_id: int,
 
 
 # ---------------------------------------------------------------------------
+# Balance materials (job_card_balance_material_v2)
+# ---------------------------------------------------------------------------
+
+VALID_BALANCE_TYPES = ('extra_given', 'returned', 'wastage', 'control_sample')
+
+
+async def replace_balance_materials(conn, *, job_card_id: int,
+                                    rows: list[dict],
+                                    recorded_by: str | None = None) -> dict:
+    """Replace this JC's balance material rows wholesale (delete-then-
+    insert). The Android Output form sends one entry per BOM article on
+    every save with `qty_kg = 0` meaning "explicitly no leftover for
+    this article" (not "skip"). Re-saving zero needs to clear a prior
+    non-zero value, so we can't filter zeros server-side — and we can't
+    rely on an UPSERT keyed on bom_line_id either because the
+    `extra_given` row's bom_line_id can be NULL (the operator picks the
+    article via a spinner) and NULL columns don't conflict in PostgreSQL.
+
+    Wholesale replace matches the v1 engine's pattern
+    (job_card_engine.record_output_v2). Returns the inserted rows so the
+    response can echo back what was saved."""
+    saved: list[dict] = []
+    for r in rows:
+        balance_type = r.get("balance_type")
+        if balance_type not in VALID_BALANCE_TYPES:
+            return {"error": "invalid_balance_type", "balance_type": balance_type}
+        qty = float(r.get("qty_kg") or 0)
+        if qty < 0:
+            return {"error": "negative_qty", "balance_type": balance_type}
+        material_name = r.get("material_name") or r.get("material_sku_name")
+        if not material_name:
+            return {"error": "missing_material_name", "balance_type": balance_type}
+
+    await conn.execute(
+        "DELETE FROM job_card_balance_material_v2 WHERE job_card_id = $1",
+        job_card_id,
+    )
+    for r in rows:
+        async def _insert(_r=r):
+            return await conn.fetchrow(
+                """
+                INSERT INTO job_card_balance_material_v2 (
+                    balance_id, job_card_id, bom_line_id, material_id,
+                    material_name, balance_type, qty_kg, remarks, recorded_by
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                RETURNING *
+                """,
+                new_short_time_id(),
+                job_card_id,
+                _r.get("bom_line_id"),
+                _r.get("material_id"),
+                _r.get("material_name") or _r.get("material_sku_name"),
+                _r["balance_type"],
+                float(_r.get("qty_kg") or 0),
+                _r.get("remarks"),
+                recorded_by,
+            )
+        row = await insert_with_pk_retry(conn, _insert)
+        saved.append(_serialize(row))
+    return {"saved": True, "rows": saved}
+
+
+# ---------------------------------------------------------------------------
+# QC summary (job_card_qc_v2)
+# ---------------------------------------------------------------------------
+
+async def upsert_qc(conn, *, job_card_id: int,
+                    passed: bool | None,
+                    findings: str | None = None,
+                    corrective_action: str | None = None,
+                    inspector_user: str | None = None,
+                    recorded_by: str | None = None) -> dict:
+    """Persist a single-row QC summary. `passed` maps to result:
+    True → 'pass', False → 'fail', None → 'pending'. Re-saves UPDATE the
+    same row (UNIQUE on job_card_id); inspection_date is stamped to NOW
+    on every save so the timestamp reflects the latest call."""
+    result = 'pending' if passed is None else ('pass' if passed else 'fail')
+
+    async def _upsert():
+        return await conn.fetchrow(
+            """
+            INSERT INTO job_card_qc_v2 (
+                qc_id, job_card_id, result, findings, corrective_action,
+                inspector_user, inspection_date, recorded_by
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7)
+            ON CONFLICT (job_card_id) DO UPDATE SET
+                result            = EXCLUDED.result,
+                findings          = EXCLUDED.findings,
+                corrective_action = EXCLUDED.corrective_action,
+                inspector_user    = EXCLUDED.inspector_user,
+                inspection_date   = NOW(),
+                recorded_by       = EXCLUDED.recorded_by
+            RETURNING *
+            """,
+            new_short_time_id(),
+            job_card_id, result, findings, corrective_action,
+            inspector_user, recorded_by,
+        )
+    row = await insert_with_pk_retry(conn, _upsert)
+    return {"saved": True, "qc": _serialize(row)}
+
+
+# ---------------------------------------------------------------------------
 # Sign-off
 # ---------------------------------------------------------------------------
 
@@ -1550,6 +1655,28 @@ async def get_job_card(conn, job_card_id: int) -> dict | None:
         """,
         job_card_id,
     )
+    # Balance materials (migration 027). Returned per-row so the Output
+    # form can pre-fill the qty input next to each BOM article.
+    balance_material_rows = await conn.fetch(
+        """
+        SELECT balance_id, bom_line_id, material_id, material_name,
+               balance_type, qty_kg, remarks
+        FROM   job_card_balance_material_v2
+        WHERE  job_card_id = $1
+        ORDER  BY balance_type, material_name
+        """,
+        job_card_id,
+    )
+    # QC summary (migration 027). At most one row per JC.
+    qc_row = await conn.fetchrow(
+        """
+        SELECT qc_id, result, findings, corrective_action, inspector_user,
+               inspection_date
+        FROM   job_card_qc_v2
+        WHERE  job_card_id = $1
+        """,
+        job_card_id,
+    )
 
     # ─── v1 compat: sectioned payload derived from v2 data ───────────────
     section_1_product = {
@@ -1648,6 +1775,8 @@ async def get_job_card(conn, job_card_id: int) -> dict | None:
         "annexure_d_loss_reconciliation": await _annexure_rows(conn, 'loss_reconciliation', job_card_id),
         "annexure_e_remarks":             await _annexure_rows(conn, 'remarks', job_card_id),
         "byproducts":                     [_serialize(r) for r in byproduct_rows],
+        "balance_materials":              [_serialize(r) for r in balance_material_rows],
+        "qc":                             _serialize(qc_row) if qc_row else None,
         "store_allocations":              [],          # see /allocations endpoint (TODO)
         # total_stages for the chain progress bar.
         "total_stages": await conn.fetchval(

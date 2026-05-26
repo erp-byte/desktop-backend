@@ -4998,12 +4998,10 @@ class RecordOutputV2Request(BaseModel):
     fat fields are mapped onto the lean ones by the model validator
     below so downstream code only sees the v2 surface.
 
-    `process_loss_kg` is persisted on the output row (migration 026).
-    Fields the v2 output endpoint does NOT persist
-    (balance_materials / qc / fg_expected_*) are accepted-but-ignored
-    here — they have dedicated v2 endpoints (`/accounting`, `/qc`, ...).
-    Silently accepting them keeps the legacy v1 client happy without
-    scattering writes."""
+    `process_loss_kg` persists on the output row (migration 026).
+    `balance_materials` write to job_card_balance_material_v2 and `qc`
+    writes to job_card_qc_v2 (migration 027). `fg_expected_*` is
+    informational and silently dropped here."""
     # Lean v2 fields (canonical)
     rm_consumed_kg:   float | None = None
     output_qty_kg:    float | None = None
@@ -5023,12 +5021,12 @@ class RecordOutputV2Request(BaseModel):
     # are absent.
     fg_actual_kg:     float | None = None
     fg_actual_units:  float | None = None
-    fg_expected_kg:   float | None = None     # ignored — informational only
-    fg_expected_units: int | None = None      # ignored — informational only
+    fg_expected_kg:   float | None = None     # informational only — not stored
+    fg_expected_units: int | None = None      # informational only — not stored
     process_loss_kg:  float | None = None     # persisted on the output row
     byproducts:       list[ByproductLineV2]    = []
-    balance_materials: list[BalanceMaterialV2] = []  # ignored — captured via /accounting
-    qc:               QCDataV2 | None = None         # ignored — captured via /qc
+    balance_materials: list[BalanceMaterialV2] = []  # job_card_balance_material_v2
+    qc:               QCDataV2 | None = None         # job_card_qc_v2
 
     @field_validator(
         "rm_consumed_kg", "output_qty_kg", "output_qty_units",
@@ -5142,11 +5140,11 @@ async def record_output_v2(
             # output row; persist them into job_card_byproducts_v2 via
             # the shared accounting helper. UOM 'kg' is normalised to
             # 'KGS' so the v2 universal-UOM check passes.
+            rec_by = user.full_name or user.phone
             if body.byproducts and "error" not in result:
                 from app.modules.production.services.jc_accounting_v2 import (
                     save_byproducts,
                 )
-                rec_by = user.full_name or user.phone
                 rows = []
                 for b in body.byproducts:
                     raw_uom = (b.uom or "KGS").strip().upper()
@@ -5164,6 +5162,42 @@ async def record_output_v2(
                 if "error" in bp_result:
                     raise HTTPException(status_code=400, detail=bp_result)
                 result["byproducts"] = bp_result.get("rows", [])
+
+            # ── Balance materials (v2, migration 027) ─────────────────
+            # Per-BOM-line leftover / wastage / control-sample rows.
+            # The Android form posts one entry per filled article; the
+            # service skips zero-qty no-remark rows so we don't write
+            # noise.
+            if body.balance_materials and "error" not in result:
+                from app.modules.production.services.job_card_v2 import (
+                    replace_balance_materials,
+                )
+                bm_result = await replace_balance_materials(
+                    conn, job_card_id=job_card_id,
+                    rows=[m.model_dump() for m in body.balance_materials],
+                    recorded_by=rec_by,
+                )
+                if "error" in bm_result:
+                    raise HTTPException(status_code=400, detail=bm_result)
+                result["balance_materials"] = bm_result.get("rows", [])
+
+            # ── QC summary (v2, migration 027) ───────────────────────
+            # Single-row roll-up. Passing `qc.passed` = None keeps the
+            # row at 'pending' rather than asserting a verdict the
+            # operator didn't make.
+            if body.qc is not None and "error" not in result:
+                from app.modules.production.services.job_card_v2 import (
+                    upsert_qc,
+                )
+                qc_result = await upsert_qc(
+                    conn, job_card_id=job_card_id,
+                    passed=body.qc.passed,
+                    findings=body.qc.remarks,
+                    corrective_action=body.qc.corrective_action,
+                    inspector_user=body.qc.inspector,
+                    recorded_by=rec_by,
+                )
+                result["qc"] = qc_result.get("qc")
     if result.get("error") == "job_card_not_found":
         raise HTTPException(status_code=404, detail="Job card not found")
     if result.get("error") == "negative_qty":
