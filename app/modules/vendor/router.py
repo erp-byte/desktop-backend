@@ -54,8 +54,11 @@ from app.modules.vendor.schemas import (
     SubmitStagedResponse,
     VendorCreateRequest,
     VendorDetailResponse,
+    ApprovalFilter,
     VendorListResponse,
+    VendorListRow,
     VendorResponse,
+    VendorSearchResponse,
     VendorStatus,
     VendorUpdateRequest,
     VendorWithDocumentsResponse,
@@ -169,23 +172,107 @@ async def list_vendors_endpoint(
     ),
     category_code_id: str | None = Query(None),
     search: str | None = Query(None, min_length=2),
+    approval: ApprovalFilter | None = Query(
+        None,
+        description=(
+            "Filter by approval state. 'approved' = approved_at IS NOT NULL; "
+            "'pending' = approved_at IS NULL. Omit to return both. The result "
+            "is sorted approved-first regardless of this filter, so the UI "
+            "can render one mixed list without re-grouping."
+        ),
+    ),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=500),
     user: AuthUser = Depends(require_permission("vendor", "master", action="view")),
 ):
+    """Paginated vendor list, enriched with approval flag + per-vendor
+    sub-row counts. Rows are sorted approved-first, then alphabetically
+    by name."""
     rows, total = await vendor_service.list_vendors(
         request.app.state.db_pool,
         status=status,
         category_code_id=category_code_id,
         search=search,
+        approval=approval,
         page=page,
         page_size=page_size,
     )
     return VendorListResponse(
-        vendors=[VendorResponse.model_validate(r) for r in rows],
+        vendors=[VendorListRow.model_validate(r) for r in rows],
         total=total,
         page=page,
         page_size=page_size,
+    )
+
+
+@router.get("/paged", response_model=VendorListResponse)
+async def list_vendors_paged_endpoint(
+    request: Request,
+    status: VendorStatus | None = Query(None),
+    category_code_id: str | None = Query(None),
+    search: str | None = Query(None, min_length=2),
+    approval: ApprovalFilter | None = Query(None),
+    page: int = Query(1, ge=1),
+    user: AuthUser = Depends(require_permission("vendor", "master", action="view")),
+):
+    """Same shape as the default list endpoint but with `page_size`
+    pinned server-side to 200 — useful for desktop / tablet UIs that
+    want denser tables without round-tripping a page-size param.
+
+    Sort + enrichment match the default endpoint."""
+    PAGED_SIZE = 200
+    rows, total = await vendor_service.list_vendors(
+        request.app.state.db_pool,
+        status=status,
+        category_code_id=category_code_id,
+        search=search,
+        approval=approval,
+        page=page,
+        page_size=PAGED_SIZE,
+    )
+    return VendorListResponse(
+        vendors=[VendorListRow.model_validate(r) for r in rows],
+        total=total,
+        page=page,
+        page_size=PAGED_SIZE,
+    )
+
+
+@router.get("/search", response_model=VendorSearchResponse)
+async def search_vendors_endpoint(
+    request: Request,
+    q: str = Query(
+        ...,
+        min_length=2,
+        description=(
+            "Substring match against vendor.name via the trigram index. "
+            "Required; two-character minimum so we don't broadcast the "
+            "whole catalogue on a single-letter typo."
+        ),
+    ),
+    status: VendorStatus | None = Query(None),
+    category_code_id: str | None = Query(None),
+    approval: ApprovalFilter | None = Query(None),
+    user: AuthUser = Depends(require_permission("vendor", "master", action="view")),
+):
+    """Direct-to-DB search, no pagination. Returns up to 1000 matches in
+    one round-trip. Hits the trigram index on `vendor.name`, applies the
+    same enrichment + sort as the paged endpoints.
+
+    `truncated=true` in the response means the query matched more than
+    1000 vendors — the UI should prompt for a narrower term rather than
+    silently dropping rows."""
+    rows, truncated = await vendor_service.search_vendors_all(
+        request.app.state.db_pool,
+        query=q,
+        status=status,
+        category_code_id=category_code_id,
+        approval=approval,
+    )
+    return VendorSearchResponse(
+        vendors=[VendorListRow.model_validate(r) for r in rows],
+        total_returned=len(rows),
+        truncated=truncated,
     )
 
 

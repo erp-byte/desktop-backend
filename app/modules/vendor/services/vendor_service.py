@@ -170,20 +170,20 @@ async def get_vendor(
         return _row_to_dict(await conn.fetchrow(sql, vendor_id))
 
 
-async def list_vendors(
-    pool: asyncpg.Pool,
+def _build_vendor_where(
     *,
-    status: str | None = None,
-    category_code_id: str | None = None,
-    search: str | None = None,
-    page: int = 1,
-    page_size: int = 50,
-) -> tuple[list[dict[str, Any]], int]:
-    page = max(1, page)
-    page_size = max(1, min(500, page_size))
+    status: str | None,
+    category_code_id: str | None,
+    search: str | None,
+    approval: str | None,
+) -> tuple[str, list[Any]]:
+    """Shared WHERE-builder for list and search.
+
+    `approval` is 'approved' (approved_at IS NOT NULL) or 'pending'
+    (approved_at IS NULL). The trigram `idx_vendor_name_trgm` index
+    makes ILIKE %term% cheap even on no-prefix searches."""
     where = ["is_deleted = false"]
     args: list[Any] = []
-
     if status:
         args.append(status)
         where.append(f"status = ${len(args)}")
@@ -191,25 +191,166 @@ async def list_vendors(
         args.append(category_code_id)
         where.append(f"category_code_id = ${len(args)}")
     if search:
-        # trigram-indexed via idx_vendor_name_trgm; LIKE works against the GIN.
         args.append(f"%{search}%")
         where.append(f"name ILIKE ${len(args)}")
+    if approval == "approved":
+        where.append("approved_at IS NOT NULL")
+    elif approval == "pending":
+        where.append("approved_at IS NULL")
+    return " AND ".join(where), args
 
-    where_sql = " AND ".join(where)
+
+# Enrichment join applied to a page / search result. Aggregates per
+# vendor are computed via LATERAL subqueries scoped to the result set,
+# so the work is bounded by the page size rather than the whole table.
+# `has_primary_banking` mirrors the approval pre-condition (active +
+# primary banking row required) so the UI can flag pending vendors that
+# are blocked on banking setup without re-implementing the check.
+_VENDOR_ENRICH_LATERAL = """
+    LEFT JOIN LATERAL (
+        SELECT count(*)::int AS cnt
+          FROM vendor_document
+         WHERE vendor_id = base.vendor_id
+    ) d ON true
+    LEFT JOIN LATERAL (
+        SELECT count(*)::int AS cnt
+          FROM vendor_contract
+         WHERE vendor_id = base.vendor_id
+    ) c ON true
+    LEFT JOIN LATERAL (
+        SELECT count(*)::int AS cnt,
+               coalesce(bool_or(is_primary AND is_active), false) AS has_primary
+          FROM vendor_banking
+         WHERE vendor_id = base.vendor_id
+    ) b ON true
+"""
+
+
+# Columns the enrichment query emits. Kept as a string so callers can
+# template it into the outer SELECT alongside _VENDOR_COLUMNS.
+_VENDOR_ENRICH_COLUMNS = """
+    (base.approved_at IS NOT NULL) AS is_approved,
+    coalesce(d.cnt, 0) AS documents_count,
+    coalesce(c.cnt, 0) AS contracts_count,
+    coalesce(b.cnt, 0) AS banking_count,
+    coalesce(b.has_primary, false) AS has_primary_banking
+"""
+
+
+# Sort key for list / search. Approved vendors surface first so the UI
+# can render two visual buckets without re-grouping in the client.
+# `lower(name)` keeps the secondary sort case-insensitive so "Acme
+# Foods" and "acme foods" cluster together instead of splitting across
+# the uppercase / lowercase boundary.
+_VENDOR_ENRICH_ORDER = (
+    "ORDER BY (base.approved_at IS NOT NULL) DESC, "
+    "lower(base.name) ASC NULLS LAST, base.vendor_id DESC"
+)
+
+
+def _row_to_enriched(row: asyncpg.Record) -> dict[str, Any]:
+    """Reshape a flat asyncpg row from the enrichment query into the
+    nested `VendorListRow` shape (counts grouped under `counts`)."""
+    d = dict(row)
+    counts = {
+        "documents": d.pop("documents_count", 0) or 0,
+        "contracts": d.pop("contracts_count", 0) or 0,
+        "banking":   d.pop("banking_count", 0) or 0,
+    }
+    d["counts"] = counts
+    return d
+
+
+async def list_vendors(
+    pool: asyncpg.Pool,
+    *,
+    status: str | None = None,
+    category_code_id: str | None = None,
+    search: str | None = None,
+    approval: str | None = None,
+    page: int = 1,
+    page_size: int = 50,
+) -> tuple[list[dict[str, Any]], int]:
+    """Paginated vendor list with per-vendor enrichment.
+
+    Rows include `is_approved`, document/contract/banking counts, and
+    `has_primary_banking`. Sort: approved first, then alphabetical by
+    name, then vendor_id (deterministic tie-break for paging stability).
+    Default page_size is 50; the paged-200 endpoint passes 200.
+    """
+    page = max(1, page)
+    page_size = max(1, min(500, page_size))
+    where_sql, args = _build_vendor_where(
+        status=status, category_code_id=category_code_id,
+        search=search, approval=approval,
+    )
+
     count_sql = f"SELECT count(*) FROM vendor_master WHERE {where_sql}"
-    # M3: include `vendor_id` as the tie-breaker so paging is deterministic
-    # even when multiple rows share the same `created_at`.
+    # Two-step query: page the vendor_master rows first, then enrich
+    # the page. Putting the LIMIT inside the inner SELECT bounds the
+    # LATERAL work to page_size rows instead of the full result set.
     list_sql = (
-        f"SELECT {_VENDOR_COLUMNS} FROM vendor_master "
-        f"WHERE {where_sql} "
-        f"ORDER BY created_at DESC NULLS LAST, vendor_id DESC "
-        f"LIMIT ${len(args) + 1} OFFSET ${len(args) + 2}"
+        f"SELECT base.*, {_VENDOR_ENRICH_COLUMNS} "
+        f"FROM (SELECT {_VENDOR_COLUMNS} FROM vendor_master "
+        f"      WHERE {where_sql} "
+        f"      ORDER BY (approved_at IS NOT NULL) DESC, "
+        f"               lower(name) ASC NULLS LAST, vendor_id DESC "
+        f"      LIMIT ${len(args) + 1} OFFSET ${len(args) + 2}) base "
+        f"{_VENDOR_ENRICH_LATERAL} "
+        f"{_VENDOR_ENRICH_ORDER}"
     )
 
     async with pool.acquire() as conn:
         total = await conn.fetchval(count_sql, *args)
         rows = await conn.fetch(list_sql, *args, page_size, (page - 1) * page_size)
-    return [dict(r) for r in rows], int(total or 0)
+    return [_row_to_enriched(r) for r in rows], int(total or 0)
+
+
+async def search_vendors_all(
+    pool: asyncpg.Pool,
+    *,
+    query: str,
+    status: str | None = None,
+    category_code_id: str | None = None,
+    approval: str | None = None,
+    limit: int = 1000,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Direct-to-DB vendor search with NO pagination.
+
+    Returns up to `limit` matches in a single round-trip. The hard
+    ceiling guards against runaway responses if the operator types a
+    two-letter common prefix; the response carries `truncated=True` when
+    we hit it so the UI can prompt for a narrower query.
+
+    The enrichment + sort match `list_vendors` so a vendor row looks
+    identical regardless of which endpoint surfaced it.
+    """
+    if not query or not query.strip():
+        return [], False
+    limit = max(1, min(2000, limit))
+    where_sql, args = _build_vendor_where(
+        status=status, category_code_id=category_code_id,
+        search=query, approval=approval,
+    )
+
+    # Fetch limit + 1 so we can detect truncation without a separate count.
+    list_sql = (
+        f"SELECT base.*, {_VENDOR_ENRICH_COLUMNS} "
+        f"FROM (SELECT {_VENDOR_COLUMNS} FROM vendor_master "
+        f"      WHERE {where_sql} "
+        f"      ORDER BY (approved_at IS NOT NULL) DESC, "
+        f"               lower(name) ASC NULLS LAST, vendor_id DESC "
+        f"      LIMIT ${len(args) + 1}) base "
+        f"{_VENDOR_ENRICH_LATERAL} "
+        f"{_VENDOR_ENRICH_ORDER}"
+    )
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(list_sql, *args, limit + 1)
+    truncated = len(rows) > limit
+    if truncated:
+        rows = rows[:limit]
+    return [_row_to_enriched(r) for r in rows], truncated
 
 
 # ── update / delete ──────────────────────────────────────────────────────

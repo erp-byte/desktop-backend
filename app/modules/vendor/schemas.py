@@ -274,11 +274,54 @@ class VendorResponse(BaseModel):
     # `extra=allow` carries the rest of the columns through as-is.
 
 
+class VendorCounts(BaseModel):
+    """Per-vendor aggregate of related sub-rows. Returned by list /
+    search endpoints so the UI can render a summary card without firing
+    a separate request per vendor."""
+    documents: int = 0
+    contracts: int = 0
+    banking:   int = 0
+
+
+class VendorListRow(VendorResponse):
+    """Enriched vendor row for list / search endpoints.
+
+    `is_approved` collapses the two approval columns into a single
+    boolean the UI can sort on. `counts` is the per-vendor sub-row
+    aggregate (one row per vendor; no N+1 fetches from the client).
+    `has_primary_banking` mirrors the approval pre-condition the
+    /approve endpoint enforces, so the UI can flag pending vendors
+    that are blocked on banking setup."""
+    is_approved:         bool = False
+    has_primary_banking: bool = False
+    counts:              VendorCounts = Field(default_factory=VendorCounts)
+
+
+# Approval filter used by the enriched list / search endpoints.
+ApprovalFilter = Literal["approved", "pending"]
+
+
 class VendorListResponse(BaseModel):
-    vendors: list[VendorResponse]
-    total: int
-    page: int
+    """Response shape for the paginated list endpoints. Rows are sorted
+    approved-first, then alphabetically by name — the UI can group on
+    `is_approved` for two visual sections, or render the flat list as-is."""
+    vendors:   list[VendorListRow]
+    total:     int
+    page:      int
     page_size: int
+
+
+class VendorSearchResponse(BaseModel):
+    """Response shape for the no-pagination search endpoint.
+
+    `truncated=true` means the result hit the server-side hard cap
+    (default 1000) before exhausting matches — the UI should prompt the
+    user to narrow the query. `total_returned` is the row count in
+    `vendors`; there is no separate `total` since we don't run a
+    pre-count query (the point of this endpoint is one round-trip)."""
+    vendors:        list[VendorListRow]
+    total_returned: int
+    truncated:      bool
 
 
 # ── vendor_banking ───────────────────────────────────────────────────────
