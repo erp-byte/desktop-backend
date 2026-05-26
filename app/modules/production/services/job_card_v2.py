@@ -1034,6 +1034,8 @@ async def record_output(conn, *, job_card_id: int,
     rm_consumed > 0; NULL otherwise. The JC's status is NOT auto-flipped
     here — explicit /complete and /close calls handle that.
     """
+    if output_qty_kg is None or rm_consumed_kg is None:
+        return {"error": "missing_qty"}
     if output_qty_kg < 0 or rm_consumed_kg < 0:
         return {"error": "negative_qty"}
     jc = await conn.fetchrow(

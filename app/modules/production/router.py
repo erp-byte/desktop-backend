@@ -6,7 +6,7 @@ from datetime import date, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.webhooks.event_bus import deferred_events
 from app.modules.auth.middleware import AuthUser, get_current_user, require_permission
@@ -4963,6 +4963,15 @@ async def dispatch_to_next_v2(
 
 # ─── Output capture ─────────────────────────────────────────────────────────
 
+def _coerce_float(v):
+    """Accept int / float / numeric string from the client and store as
+    float. Empty strings collapse to None so DB columns stay NULL rather
+    than 0.0."""
+    if v is None or v == "":
+        return None
+    return float(v)
+
+
 class ConsumedLineV2(BaseModel):
     """Per-BOM-line consumption row. `consumed_qty` is in the row's own
     UOM (the v2 indent CHECK constraint already pinned the UOM at
@@ -4973,8 +4982,13 @@ class ConsumedLineV2(BaseModel):
     consumed_qty:      float
     remarks:           str | None = None
 
+    @field_validator("consumed_qty", mode="before")
+    @classmethod
+    def _to_float(cls, v):
+        return _coerce_float(v)
 
-class RecordOutputRequest(BaseModel):
+
+class RecordOutputV2Request(BaseModel):
     """POST /job-cards-v2/{id}/outputs"""
     rm_consumed_kg:   float
     output_qty_kg:    float
@@ -4990,12 +5004,17 @@ class RecordOutputRequest(BaseModel):
     rm_consumed:      list[ConsumedLineV2] = []
     pm_consumed:      list[ConsumedLineV2] = []
 
+    @field_validator("rm_consumed_kg", "output_qty_kg", "output_qty_units", mode="before")
+    @classmethod
+    def _to_float(cls, v):
+        return _coerce_float(v)
+
 
 @router.post("/job-cards-v2/{job_card_id}/outputs")
 async def record_output_v2(
     request: Request,
     job_card_id: int,
-    body: RecordOutputRequest,
+    body: RecordOutputV2Request,
     user=Depends(get_current_user),
 ):
     """Append an output row (RM consumed + output qty + yield) for this JC.
@@ -5077,6 +5096,8 @@ async def record_output_v2(
         raise HTTPException(status_code=404, detail="Job card not found")
     if result.get("error") == "negative_qty":
         raise HTTPException(status_code=400, detail="qty values must be >= 0")
+    if result.get("error") == "missing_qty":
+        raise HTTPException(status_code=400, detail="rm_consumed_kg and output_qty_kg are required")
     return result
 
 
