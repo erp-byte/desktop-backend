@@ -7,7 +7,7 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.webhooks.event_bus import deferred_events
 from app.modules.auth.middleware import AuthUser, get_current_user, require_permission
@@ -4990,9 +4990,22 @@ class ConsumedLineV2(BaseModel):
 
 
 class RecordOutputV2Request(BaseModel):
-    """POST /job-cards-v2/{id}/outputs"""
-    rm_consumed_kg:   float
-    output_qty_kg:    float
+    """POST /job-cards-v2/{id}/outputs
+
+    Accepts both the lean v2 shape (`output_qty_kg` / `rm_consumed_kg`
+    scalars) AND the legacy fat shape the v1 client still sends
+    (`fg_actual_kg` / `fg_actual_units` + `rm_consumed[]` per-line). The
+    fat fields are mapped onto the lean ones by the model validator
+    below so downstream code only sees the v2 surface.
+
+    Fields the v2 output endpoint does NOT persist
+    (balance_materials / qc / fg_expected_* / process_loss_kg) are
+    accepted-but-ignored here — they have dedicated v2 endpoints
+    (`/accounting`, `/qc`, ...). Silently accepting them keeps the
+    legacy v1 client happy without scattering writes."""
+    # Lean v2 fields (canonical)
+    rm_consumed_kg:   float | None = None
+    output_qty_kg:    float | None = None
     output_qty_units: float | None = None
     output_kind:      Literal['SFG', 'WIP', 'FG'] | None = None
     uom:              str | None = None
@@ -5004,11 +5017,40 @@ class RecordOutputV2Request(BaseModel):
     # we hit the right indent table without secondary lookups.
     rm_consumed:      list[ConsumedLineV2] = []
     pm_consumed:      list[ConsumedLineV2] = []
+    # Legacy v1 aliases — populated by older clients. The model
+    # validator maps these onto the lean fields when the lean fields
+    # are absent.
+    fg_actual_kg:     float | None = None
+    fg_actual_units:  float | None = None
+    fg_expected_kg:   float | None = None     # ignored — informational only
+    fg_expected_units: int | None = None      # ignored — informational only
+    process_loss_kg:  float | None = None     # captured via /accounting
+    byproducts:       list[ByproductLineV2]    = []
+    balance_materials: list[BalanceMaterialV2] = []  # ignored — captured via /accounting
+    qc:               QCDataV2 | None = None         # ignored — captured via /qc
 
-    @field_validator("rm_consumed_kg", "output_qty_kg", "output_qty_units", mode="before")
+    @field_validator(
+        "rm_consumed_kg", "output_qty_kg", "output_qty_units",
+        "fg_actual_kg", "fg_actual_units", "fg_expected_kg", "process_loss_kg",
+        mode="before",
+    )
     @classmethod
     def _to_float(cls, v):
         return _coerce_float(v)
+
+    @model_validator(mode="after")
+    def _bridge_legacy(self):
+        # output_qty_kg ← fg_actual_kg when the lean field isn't set.
+        if self.output_qty_kg is None and self.fg_actual_kg is not None:
+            self.output_qty_kg = self.fg_actual_kg
+        if self.output_qty_units is None and self.fg_actual_units is not None:
+            self.output_qty_units = self.fg_actual_units
+        # rm_consumed_kg ← sum of rm_consumed[].consumed_qty when the
+        # operator didn't send a scalar total. Matches the v1 engine
+        # behaviour at job_card_engine.record_output_v2.
+        if self.rm_consumed_kg is None and self.rm_consumed:
+            self.rm_consumed_kg = float(sum(r.consumed_qty for r in self.rm_consumed))
+        return self
 
 
 @router.post("/job-cards-v2/{job_card_id}/outputs")
@@ -5093,6 +5135,33 @@ async def record_output_v2(
                 notes=body.notes,
                 recorded_by=user.full_name or user.phone,
             )
+            # ── Byproducts (v2) ───────────────────────────────────────
+            # The legacy v1 client posts byproducts alongside the
+            # output row; persist them into job_card_byproducts_v2 via
+            # the shared accounting helper. UOM 'kg' is normalised to
+            # 'KGS' so the v2 universal-UOM check passes.
+            if body.byproducts and "error" not in result:
+                from app.modules.production.services.jc_accounting_v2 import (
+                    save_byproducts,
+                )
+                rec_by = user.full_name or user.phone
+                rows = []
+                for b in body.byproducts:
+                    raw_uom = (b.uom or "KGS").strip().upper()
+                    norm_uom = "KGS" if raw_uom == "KG" else raw_uom
+                    rows.append({
+                        "category": b.category,
+                        "quantity": b.qty_kg,
+                        "uom":      norm_uom,
+                        "remarks":  b.remarks,
+                    })
+                bp_result = await save_byproducts(
+                    conn, job_card_id=job_card_id,
+                    rows=rows, recorded_by=rec_by,
+                )
+                if "error" in bp_result:
+                    raise HTTPException(status_code=400, detail=bp_result)
+                result["byproducts"] = bp_result.get("rows", [])
     if result.get("error") == "job_card_not_found":
         raise HTTPException(status_code=404, detail="Job card not found")
     if result.get("error") == "negative_qty":
