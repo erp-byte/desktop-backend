@@ -1024,6 +1024,7 @@ async def record_output(conn, *, job_card_id: int,
                         output_kind: str | None = None,
                         uom: str | None = None,
                         notes: str | None = None,
+                        process_loss_kg: float | None = None,
                         recorded_by: str | None = None) -> dict:
     """Append an output row for this JC. The output_kind defaults to the
     JC's declared output_kind (SFG / WIP / FG from the stage chain) unless
@@ -1053,13 +1054,13 @@ async def record_output(conn, *, job_card_id: int,
             """
             INSERT INTO job_card_output_v2
                 (output_id, job_card_id, rm_consumed_kg, output_qty_kg, output_qty_units,
-                 output_kind, uom, yield_pct, notes, recorded_by)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                 output_kind, uom, yield_pct, notes, recorded_by, process_loss_kg)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             RETURNING *
             """,
             new_short_time_id(),
             job_card_id, rm_consumed_kg, output_qty_kg, output_qty_units,
-            kind, uom, yield_pct, notes, recorded_by,
+            kind, uom, yield_pct, notes, recorded_by, process_loss_kg or 0,
         )
     inserted = await insert_with_pk_retry(conn, _insert_output)
     return {"recorded": True, "output": _serialize(inserted), "yield_pct": yield_pct}
@@ -1536,6 +1537,20 @@ async def get_job_card(conn, job_card_id: int) -> dict | None:
         job_card_id,
     )
 
+    # Byproducts in the legacy `{byproduct_id, category, qty_kg, remarks}`
+    # shape the Android Output form deserialises (ByproductLine.java).
+    # Column `quantity` is aliased to `qty_kg` so the JSON keys round-trip
+    # without a client-side mapping layer.
+    byproduct_rows = await conn.fetch(
+        """
+        SELECT byproduct_id, category, quantity AS qty_kg, uom, remarks
+        FROM   job_card_byproducts_v2
+        WHERE  job_card_id = $1
+        ORDER  BY category
+        """,
+        job_card_id,
+    )
+
     # ─── v1 compat: sectioned payload derived from v2 data ───────────────
     section_1_product = {
         "customer_name":  h.get("customer_name"),
@@ -1588,6 +1603,7 @@ async def get_job_card(conn, job_card_id: int) -> dict | None:
         "fg_actual_kg":    last_output.get("output_qty_kg") if last_output else None,
         "fg_actual_units": int(last_output["output_qty_units"]) if (last_output and last_output.get("output_qty_units") is not None) else None,
         "rm_consumed_kg":  last_output.get("rm_consumed_kg") if last_output else None,
+        "process_loss_kg": last_output.get("process_loss_kg") if last_output else None,
         "yield_pct":       last_output.get("yield_pct")  if last_output else None,
         "created_at":      last_output.get("recorded_at") if last_output else None,
     }
@@ -1631,7 +1647,7 @@ async def get_job_card(conn, job_card_id: int) -> dict | None:
         "annexure_c_environment":         await _annexure_rows(conn, 'environment', job_card_id),
         "annexure_d_loss_reconciliation": await _annexure_rows(conn, 'loss_reconciliation', job_card_id),
         "annexure_e_remarks":             await _annexure_rows(conn, 'remarks', job_card_id),
-        "byproducts":                     [],          # legacy v1 byproducts; v2 has separate accounting table
+        "byproducts":                     [_serialize(r) for r in byproduct_rows],
         "store_allocations":              [],          # see /allocations endpoint (TODO)
         # total_stages for the chain progress bar.
         "total_stages": await conn.fetchval(

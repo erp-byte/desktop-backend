@@ -4998,11 +4998,12 @@ class RecordOutputV2Request(BaseModel):
     fat fields are mapped onto the lean ones by the model validator
     below so downstream code only sees the v2 surface.
 
+    `process_loss_kg` is persisted on the output row (migration 026).
     Fields the v2 output endpoint does NOT persist
-    (balance_materials / qc / fg_expected_* / process_loss_kg) are
-    accepted-but-ignored here — they have dedicated v2 endpoints
-    (`/accounting`, `/qc`, ...). Silently accepting them keeps the
-    legacy v1 client happy without scattering writes."""
+    (balance_materials / qc / fg_expected_*) are accepted-but-ignored
+    here — they have dedicated v2 endpoints (`/accounting`, `/qc`, ...).
+    Silently accepting them keeps the legacy v1 client happy without
+    scattering writes."""
     # Lean v2 fields (canonical)
     rm_consumed_kg:   float | None = None
     output_qty_kg:    float | None = None
@@ -5024,7 +5025,7 @@ class RecordOutputV2Request(BaseModel):
     fg_actual_units:  float | None = None
     fg_expected_kg:   float | None = None     # ignored — informational only
     fg_expected_units: int | None = None      # ignored — informational only
-    process_loss_kg:  float | None = None     # captured via /accounting
+    process_loss_kg:  float | None = None     # persisted on the output row
     byproducts:       list[ByproductLineV2]    = []
     balance_materials: list[BalanceMaterialV2] = []  # ignored — captured via /accounting
     qc:               QCDataV2 | None = None         # ignored — captured via /qc
@@ -5133,6 +5134,7 @@ async def record_output_v2(
                 output_kind=body.output_kind,
                 uom=body.uom,
                 notes=body.notes,
+                process_loss_kg=body.process_loss_kg,
                 recorded_by=user.full_name or user.phone,
             )
             # ── Byproducts (v2) ───────────────────────────────────────
