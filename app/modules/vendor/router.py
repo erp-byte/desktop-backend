@@ -401,7 +401,21 @@ async def create_vendor_with_documents(
     supplier_code = vendor_row["supplier_code"]
     vendor_id = vendor_row["vendor_id"]
 
-    # ── per-file upload + extract + save (parallel, best-effort) ────────
+    # ── per-file upload + extract + save (sequential, best-effort) ──────
+    # Sequential rather than parallel because running N docs concurrently
+    # was tripping two ceilings:
+    #   * Anthropic 429s — N parallel /messages calls hit the per-minute
+    #     token+request rate limit even at modest N (~5+).
+    #   * urllib3 S3 pool exhaustion — the boto3 default pool size is 10,
+    #     so >10 in-flight S3 PUTs to the same bucket logged "Connection
+    #     pool is full, discarding connection" and silently churned
+    #     sockets.
+    # A short sleep between docs lets the rate-limit window refill and
+    # keeps the S3 pool drained. The inner s3+claude gather inside
+    # document_service.upload_and_save is unaffected — that's only 2
+    # ops at a time, well below either ceiling.
+    INTER_DOC_PAUSE_S = 1.5
+
     async def _one(meta: dict, content: bytes, mime: str, filename: str | None):
         doc_type = meta["doc_type"]
         try:
@@ -434,10 +448,11 @@ async def create_vendor_with_documents(
                 doc_type=doc_type, filename=filename, error=repr(e),
             ))
 
-    results = await asyncio.gather(
-        *[_one(meta, c, m, f) for (meta, c, m, f) in prepared],
-        return_exceptions=False,
-    )
+    results = []
+    for idx, (meta, c, m, f) in enumerate(prepared):
+        results.append(await _one(meta, c, m, f))
+        if idx < len(prepared) - 1:
+            await asyncio.sleep(INTER_DOC_PAUSE_S)
 
     documents: list[DocumentUploadResponse] = []
     failures: list[DocumentUploadFailure] = []
