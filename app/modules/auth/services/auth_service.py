@@ -923,7 +923,8 @@ async def create_user(conn, phone: str, password: str, full_name: str,
                       entity: str | None = None,
                       allowed_warehouses: list[str] | None = None,
                       allowed_floors:     list[str] | None = None,
-                      allowed_entities:   list[str] | None = None) -> dict:
+                      allowed_entities:   list[str] | None = None,
+                      must_change_password: bool = False) -> dict:
     """Create a user with a bcrypt-hashed password, normalized phone.
 
     HI-06: callers MUST validate `password` via `password_rules.evaluate`
@@ -933,6 +934,9 @@ async def create_user(conn, phone: str, password: str, full_name: str,
 
     If `allowed_entities` is given, the legacy single-value `entity` column
     is set to the first element so older queries that read it stay happy.
+
+    `must_change_password=True` flags the new account so the next login
+    redirects to the force-change-password screen (mig 004 column).
     """
     norm = normalize_phone(phone) or phone
     hashed = password_rules.hash_password(password)
@@ -946,14 +950,18 @@ async def create_user(conn, phone: str, password: str, full_name: str,
         INSERT INTO auth_user
             (phone, password_encrypted, full_name, email, role_id, entity,
              allowed_warehouses, allowed_floors, allowed_entities,
-             password_changed_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+             must_change_password, password_changed_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
         RETURNING user_id
         """,
         norm, hashed, full_name, email, role_id, effective_entity,
         allowed_warehouses, allowed_floors, allowed_entities,
+        must_change_password,
     )
-    return {"user_id": user_id, "phone": norm, "full_name": full_name, "role_id": role_id}
+    return {
+        "user_id": user_id, "phone": norm, "full_name": full_name,
+        "role_id": role_id, "must_change_password": must_change_password,
+    }
 
 
 # ── admin reset-password (POST /users/{user_id}/reset-password) ──────────

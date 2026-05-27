@@ -22,7 +22,7 @@ from typing import Literal
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.core.middleware.request_context import AuthError
 from app.modules.auth.middleware import AuthUser, get_current_user
@@ -181,18 +181,50 @@ async def delete_session(
 
 
 class CreateUserRequest(BaseModel):
+    """Admin: create a user.
+
+    Accepts two shapes for back-compat:
+      * Legacy: `role_id` (int FK) + `allowed_{entities,warehouses,floors}`.
+      * Friendly admin UI: `role_codes` (list of role names — first match
+        wins, since auth_user is single-role) + the shorter
+        `entities` / `warehouses` / `floors` aliases.
+
+    The endpoint resolves `role_codes` -> `role_id` via auth_role before
+    handing off to the service. At least one of {role_id, role_codes}
+    must be present; the model_validator below enforces that.
+    """
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
     phone: str
     password: str
     full_name: str
-    role_id: int
     email: str | None = None
+    # Role — either side is fine; the endpoint resolves role_codes first.
+    role_id:    int | None       = None
+    role_codes: list[str] | None = None
     # `entity` is the legacy single-entity field, kept for back-compat. New
     # callers should send `allowed_entities` (array) and leave `entity`
     # unset — the service derives `entity` from `allowed_entities[0]`.
     entity: str | None = None
-    allowed_entities:   list[str] | None = None
-    allowed_warehouses: list[str] | None = None
-    allowed_floors:     list[str] | None = None
+    # `populate_by_name=True` lets callers send either the legacy
+    # `allowed_*` name or the shorter UI alias.
+    allowed_entities:   list[str] | None = Field(default=None, alias="entities")
+    allowed_warehouses: list[str] | None = Field(default=None, alias="warehouses")
+    allowed_floors:     list[str] | None = Field(default=None, alias="floors")
+    # Force the user to change password on first login. The auth_user
+    # column already exists (migration 004); we just plumb it through.
+    must_change_password: bool = False
+    # Accepted but currently no-op — the admin UI sends this flag when
+    # it wants the server to mint a random password instead of taking
+    # body.password. TODO: implement when the admin UX needs it; for
+    # now we honour body.password verbatim.
+    generate_password: bool = False
+
+    @model_validator(mode="after")
+    def _require_role(self):
+        if self.role_id is None and not (self.role_codes or []):
+            raise ValueError("either role_id or role_codes is required")
+        return self
 
 
 class EditUserRequest(BaseModel):
@@ -337,12 +369,52 @@ async def create_user(request: Request, body: CreateUserRequest):
     from app.modules.auth.services.auth_service import create_user as _create
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
+        # Resolve role_codes -> role_id when the friendly shape was sent.
+        # auth_user is single-role, so we take the FIRST matching code
+        # (admin UI sends `["admin"]` for the admin role). Unknown codes
+        # surface as 400 with the offending names so the operator can
+        # see what didn't match.
+        role_id = body.role_id
+        if role_id is None and body.role_codes:
+            wanted = [c.strip().lower() for c in body.role_codes if c and c.strip()]
+            if wanted:
+                rows = await conn.fetch(
+                    "SELECT role_id, lower(role_name) AS role_name "
+                    "FROM auth_role WHERE lower(role_name) = ANY($1::text[])",
+                    wanted,
+                )
+                resolved = {r["role_name"]: r["role_id"] for r in rows}
+                # First wanted that resolves wins — deterministic and
+                # mirrors the order the operator selected in the UI.
+                for code in wanted:
+                    if code in resolved:
+                        role_id = resolved[code]
+                        break
+                if role_id is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail={
+                            "error": "unknown_role_codes",
+                            "message": "none of the supplied role_codes match an existing role",
+                            "role_codes": body.role_codes,
+                        },
+                    )
+        if role_id is None:
+            # Model validator already gates this, but defend in depth in
+            # case the validator is relaxed later.
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "missing_role",
+                        "message": "role_id or role_codes is required"},
+            )
+
         try:
             return await _create(
                 conn, body.phone, body.password, body.full_name,
-                body.role_id, body.email, body.entity,
+                role_id, body.email, body.entity,
                 body.allowed_warehouses, body.allowed_floors,
                 body.allowed_entities,
+                must_change_password=body.must_change_password,
             )
         except asyncpg.UniqueViolationError as e:
             cname = e.constraint_name or ""
