@@ -5204,6 +5204,18 @@ async def record_output_v2(
         raise HTTPException(status_code=400, detail="qty values must be >= 0")
     if result.get("error") == "missing_qty":
         raise HTTPException(status_code=400, detail="rm_consumed_kg and output_qty_kg are required")
+    if result.get("error") == "implausible_yield":
+        # Operator typo: yield outside ±999.999% almost always means a
+        # value was entered in the wrong unit (grams instead of kg, units
+        # vs kg, etc.). Surface the numbers so they can see what tripped.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Yield computes to {result['yield_pct']:.2f}% — check that "
+                f"output_qty_kg ({result['output_qty_kg']}) and "
+                f"rm_consumed_kg ({result['rm_consumed_kg']}) are both in kg."
+            ),
+        )
     return result
 
 

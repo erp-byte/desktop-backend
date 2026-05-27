@@ -1047,7 +1047,22 @@ async def record_output(conn, *, job_card_id: int,
         return {"error": "job_card_not_found"}
 
     kind = output_kind or jc["output_kind"]
-    yield_pct = round((output_qty_kg / rm_consumed_kg) * 100, 3) if rm_consumed_kg > 0 else None
+    # yield_pct lives in a NUMERIC(6,3) column — max absolute value 999.999.
+    # If the computed yield blows that bound, the operator almost certainly
+    # typo'd a value (output entered in grams instead of kg, RM and output
+    # swapped, etc.). Reject loudly with the numbers so they can see what
+    # tripped the check, rather than letting asyncpg raise a 500 the
+    # operator can't act on.
+    yield_pct = None
+    if rm_consumed_kg > 0:
+        yield_pct = round((output_qty_kg / rm_consumed_kg) * 100, 3)
+        if abs(yield_pct) >= 1000:
+            return {
+                "error": "implausible_yield",
+                "yield_pct":      yield_pct,
+                "rm_consumed_kg": rm_consumed_kg,
+                "output_qty_kg":  output_qty_kg,
+            }
 
     async def _insert_output():
         return await conn.fetchrow(
