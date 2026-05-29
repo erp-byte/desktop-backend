@@ -1,18 +1,34 @@
-anthropic==0.86.0
-cryptography==44.0.3
-asyncpg==0.31.0
+# ── HTTP / API stack ──────────────────────────────────────────────────────
 fastapi==0.135.1
-fpdf2==2.8.3
-httpx==0.28.1
-mcp==1.26.0
-openpyxl==3.1.5
+uvicorn[standard]==0.42.0
+python-multipart==0.0.22          # multipart form parser used by file uploads
+httpx==0.28.1                     # outbound HTTP (Anthropic, internal RPC)
+requests==2.33.1                  # legacy sync HTTP — kept for scripts/
+
+# ── Data + validation ────────────────────────────────────────────────────
 pydantic==2.12.5
 pydantic-settings==2.13.1
-python-multipart==0.0.22
-rapidfuzz==3.14.3
-uvicorn[standard]==0.42.0
-mangum==0.19.0
-boto3==1.38.0
-python-dotenv==1.1.0
-PyJWT[crypto]>=2.10.1,<3.0
+asyncpg==0.31.0                   # PostgreSQL driver
+openpyxl==3.1.5                   # .xlsx parse for SO uploads
+pandas==3.0.2                     # tabular ops in scripts/ + reports
+rapidfuzz==3.14.3                 # fuzzy SKU / customer matching
+
+# ── Auth / crypto ────────────────────────────────────────────────────────
+cryptography==44.0.3
 bcrypt==4.2.1
+PyJWT[crypto]>=2.10.1,<3.0
+python-dotenv==1.1.0
+
+# ── PDF / image generation (scripts/, dispatch invoices, JC reports) ─────
+fpdf2==2.8.3                      # used by app/ runtime PDF endpoints
+reportlab==4.4.0                  # used by scripts/gen_auth_flow_pdf,
+                                  # scripts/generate_jc_report_after
+Pillow==12.2.0                    # PIL — scripts/generate_db_diagrams_pdf
+
+# ── AI / agent integrations ──────────────────────────────────────────────
+anthropic==0.86.0
+mcp==1.26.0                       # Model Context Protocol server
+
+# ── AWS / serverless ─────────────────────────────────────────────────────
+boto3==1.38.0                     # S3 + Secrets Manager bindings
+mangum==0.19.0                    # ASGI -> AWS Lambda adapter
