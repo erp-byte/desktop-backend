@@ -781,7 +781,7 @@ async def list_job_cards(
     customer: str | None = None,
     search: str | None = None,
     page: int = 1,
-    page_size: int = 50,
+    page_size: int = 100,
     user_scope_warehouses: list[str] | None = None,
     user_scope_floors:     list[str] | None = None,
 ) -> dict:
@@ -836,21 +836,33 @@ async def list_job_cards(
     offset = (page - 1) * page_size
     rows = await conn.fetch(
         f"""
-        SELECT job_card_id, job_card_number, plan_id, plan_line_id, plan_step_id,
-               step_number, process_name, stage,
-               fg_sku_name, customer_name, batch_number,
-               planned_qty_kg, planned_qty_units, uom,
-               input_kind, output_kind,
-               factory, floor, entity,
-               assigned_to_team_leader, team_members,
-               is_locked, locked_reason, status,
-               start_time, end_time, total_time_min,
-               prev_job_card_id, next_job_card_id,
-               carried_qty_kg, dispatched_to_next_kg,
-               created_at
-        FROM job_card_v2
+        SELECT jc.job_card_id, jc.job_card_number, jc.plan_id, jc.plan_line_id, jc.plan_step_id,
+               jc.step_number, jc.process_name, jc.stage,
+               jc.fg_sku_name, jc.customer_name, jc.batch_number,
+               jc.planned_qty_kg, jc.planned_qty_units, jc.uom,
+               jc.input_kind, jc.output_kind,
+               jc.factory, jc.floor, jc.entity,
+               jc.assigned_to_team_leader, jc.team_members,
+               jc.is_locked, jc.locked_reason, jc.status,
+               jc.start_time, jc.end_time, jc.total_time_min,
+               jc.prev_job_card_id, jc.next_job_card_id,
+               jc.carried_qty_kg, jc.dispatched_to_next_kg,
+               jc.created_at,
+               -- Aggregated SO numbers for this JC's plan line. A plan line
+               -- can fulfil multiple SOs (multi-SO bundling), so this is an
+               -- array. ARRAY_AGG over the joined chain; NULL so_number rows
+               -- are filtered upstream so the array never contains NULL.
+               (SELECT ARRAY_AGG(DISTINCT sh.so_number)
+                  FROM production_plan_line_v2 pl
+                  JOIN so_fulfillment_v2 sf
+                    ON sf.so_fulfillment_id = ANY(pl.linked_so_fulfillment_ids)
+                  JOIN so_line  sl ON sl.so_line_id = sf.so_line_id
+                  JOIN so_header sh ON sh.so_id      = sl.so_id
+                 WHERE pl.plan_line_id = jc.plan_line_id
+                   AND sh.so_number IS NOT NULL) AS so_numbers
+        FROM job_card_v2 jc
         WHERE {where}
-        ORDER BY plan_id DESC, plan_line_id, step_number, job_card_id
+        ORDER BY jc.plan_id DESC, jc.plan_line_id, jc.step_number, jc.job_card_id
         LIMIT ${idx} OFFSET ${idx + 1}
         """,
         *params, page_size, offset,
@@ -864,6 +876,137 @@ async def list_job_cards(
             "total": total or 0,
             "total_pages": ((total or 0) + page_size - 1) // page_size if total else 0,
         },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Free-text search (unpaginated)
+# ---------------------------------------------------------------------------
+#
+# Distinct from list_job_cards in two ways:
+#   1. No page / page_size — the endpoint deliberately drops pagination so
+#      callers can do "find anything matching this string" without juggling
+#      page counts. A hard cap (`SEARCH_HARD_CAP`) prevents pathological
+#      queries from materialising the whole table.
+#   2. Search reach is wider — every user-visible identifier is matched,
+#      including plan_id (cast to text) and the SO number via a join across
+#      production_plan_line_v2 → so_fulfillment_v2 → so_line → so_header.
+#
+# Case-insensitivity is implemented as LOWER(col) LIKE LOWER($needle) on both
+# sides of the comparison, per spec. We deliberately do NOT add a lowercase
+# mirror column to the schema — the cost of LOWER() in a one-off search is
+# acceptable, and it keeps the canonical row identical to what the writer
+# inserted.
+
+SEARCH_HARD_CAP = 1000
+
+
+async def search_job_cards(
+    conn, *,
+    q: str | None = None,
+    status: str | None = None,
+    entity: str | None = None,
+    factory: str | None = None,
+    floor: str | None = None,
+    user_scope_warehouses: list[str] | None = None,
+    user_scope_floors:     list[str] | None = None,
+) -> dict:
+    conditions: list[str] = ["deleted_at IS NULL"]
+    params: list = []
+    idx = 1
+
+    # Same scope-lock semantics as list_job_cards — explicit factory/floor
+    # are validated upstream in the router; the implicit user-scope intersect
+    # applies here when no explicit param was given.
+    if entity:
+        conditions.append(f"entity = ${idx}"); params.append(entity); idx += 1
+    if factory:
+        conditions.append(f"factory = ${idx}"); params.append(factory); idx += 1
+    elif user_scope_warehouses:
+        conditions.append(f"factory = ANY(${idx}::text[])")
+        params.append(list(user_scope_warehouses)); idx += 1
+    if floor:
+        conditions.append(f"floor = ${idx}"); params.append(floor); idx += 1
+    elif user_scope_floors:
+        conditions.append(f"floor = ANY(${idx}::text[])")
+        params.append(list(user_scope_floors)); idx += 1
+    if status:
+        statuses = [s.strip() for s in status.split(',') if s.strip()]
+        if statuses:
+            ph = ', '.join(f'${idx + i}' for i in range(len(statuses)))
+            conditions.append(f"status IN ({ph})")
+            params.extend(statuses); idx += len(statuses)
+
+    if q:
+        # Bind the needle exactly once — the same parameter feeds every OR
+        # branch in the search clause. LOWER() applied to both sides per spec
+        # ("convert both side values to lowercase in the backend before
+        # comparing"); no lowercase-mirror column is kept on the row.
+        needle = f"%{q.lower()}%"
+        text_cols = [
+            "job_card_number", "fg_sku_name", "customer_name",
+            "batch_number", "process_name", "stage",
+            "assigned_to_team_leader", "factory", "floor", "entity",
+        ]
+        clauses = [f"LOWER({c}) LIKE ${idx}" for c in text_cols]
+        # plan_id is BIGINT — cast so users can paste a plan number directly.
+        clauses.append(f"LOWER(CAST(plan_id AS TEXT)) LIKE ${idx}")
+        # job_card_id likewise (sometimes operators only know the short id).
+        clauses.append(f"LOWER(CAST(job_card_id AS TEXT)) LIKE ${idx}")
+        # SO number via the plan→fulfillment→so_line→so_header chain.
+        # Aliased as `jc` in the outer FROM, so this subquery references jc.
+        clauses.append(
+            "EXISTS (SELECT 1 "
+            "FROM production_plan_line_v2 pl "
+            "JOIN so_fulfillment_v2 sf "
+            "  ON sf.so_fulfillment_id = ANY(pl.linked_so_fulfillment_ids) "
+            "JOIN so_line sl ON sl.so_line_id = sf.so_line_id "
+            "JOIN so_header sh ON sh.so_id = sl.so_id "
+            f"WHERE pl.plan_id = jc.plan_id "
+            f"  AND LOWER(sh.so_number) LIKE ${idx})"
+        )
+        conditions.append("(" + " OR ".join(clauses) + ")")
+        params.append(needle); idx += 1
+
+    where = " AND ".join(conditions)
+    rows = await conn.fetch(
+        f"""
+        SELECT jc.job_card_id, jc.job_card_number, jc.plan_id, jc.plan_line_id, jc.plan_step_id,
+               jc.step_number, jc.process_name, jc.stage,
+               jc.fg_sku_name, jc.customer_name, jc.batch_number,
+               jc.planned_qty_kg, jc.planned_qty_units, jc.uom,
+               jc.input_kind, jc.output_kind,
+               jc.factory, jc.floor, jc.entity,
+               jc.assigned_to_team_leader, jc.team_members,
+               jc.is_locked, jc.locked_reason, jc.status,
+               jc.start_time, jc.end_time, jc.total_time_min,
+               jc.prev_job_card_id, jc.next_job_card_id,
+               jc.carried_qty_kg, jc.dispatched_to_next_kg,
+               jc.created_at,
+               (SELECT ARRAY_AGG(DISTINCT sh.so_number)
+                  FROM production_plan_line_v2 pl
+                  JOIN so_fulfillment_v2 sf
+                    ON sf.so_fulfillment_id = ANY(pl.linked_so_fulfillment_ids)
+                  JOIN so_line  sl ON sl.so_line_id = sf.so_line_id
+                  JOIN so_header sh ON sh.so_id      = sl.so_id
+                 WHERE pl.plan_line_id = jc.plan_line_id
+                   AND sh.so_number IS NOT NULL) AS so_numbers
+        FROM job_card_v2 jc
+        WHERE {where}
+        ORDER BY jc.created_at DESC
+        LIMIT {SEARCH_HARD_CAP + 1}
+        """,
+        *params,
+    )
+    # Fetch one extra so we can detect cap hits without a separate COUNT.
+    capped = len(rows) > SEARCH_HARD_CAP
+    if capped:
+        rows = rows[:SEARCH_HARD_CAP]
+    return {
+        "results": [_serialize(r) for r in rows],
+        "total": len(rows),
+        "capped": capped,
+        "hard_cap": SEARCH_HARD_CAP,
     }
 
 

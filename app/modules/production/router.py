@@ -4592,7 +4592,7 @@ async def list_job_cards_v2(
     customer: str | None = Query(None),
     search:   str | None = Query(None),
     page:      int = Query(1, ge=1),
-    page_size: int = Query(50, ge=1, le=500),
+    page_size: int = Query(100, ge=1, le=500),
     user=Depends(get_current_user),
 ):
     """Paginated list of v2 job cards. Non-admin users with a factory /
@@ -4630,6 +4630,54 @@ async def list_job_cards_v2(
         )
 
 
+@router.get("/job-cards-v2/search")
+async def search_job_cards_v2(
+    request: Request,
+    q:       str | None = Query(None, description="Free-text needle; matched case-insensitively across job_card_number, fg_sku_name (article), customer_name, batch_number, process_name, stage, assigned_to_team_leader, factory, floor, entity, plan_id, job_card_id, and the linked SO number."),
+    status:  str | None = Query(None, description="Comma-separated status list."),
+    entity:  str | None = Query(None),
+    factory: str | None = Query(None),
+    floor:   str | None = Query(None),
+    user=Depends(get_current_user),
+):
+    """Free-text search across the v2 job-card surface.
+
+    NOT paginated by design — a search query is "find anything matching" and
+    callers should not have to juggle page indexes for it. The service caps
+    results at SEARCH_HARD_CAP (1000) and sets ``capped: true`` in the response
+    when the cap is hit, so the UI can prompt the user to narrow the query.
+
+    Pagination params (``page``, ``page_size``) are intentionally absent from
+    this endpoint's signature. Any caller that sends them gets the default
+    FastAPI 422 "Unprocessable Entity" — but only if they use the structured
+    form; ``Query(None)`` would silently accept and ignore extras. Either way
+    the response is identical: the unpaginated result set."""
+    from app.modules.production.services.job_card_v2 import search_job_cards
+    pool = request.app.state.db_pool
+
+    user_warehouses = getattr(user, "allowed_warehouses", []) or []
+    user_floors     = getattr(user, "allowed_floors",     []) or []
+    is_admin        = getattr(user, "is_admin", False)
+
+    # Same explicit-out-of-scope guard as list_job_cards_v2. Without this an
+    # operator filtered to a plant outside their assignment would silently
+    # see an empty result instead of a clear 403.
+    if factory and not is_admin and user_warehouses and factory not in user_warehouses:
+        raise HTTPException(status_code=403,
+                            detail=f"User is not assigned to factory '{factory}'")
+    if floor and not is_admin and user_floors and floor not in user_floors:
+        raise HTTPException(status_code=403,
+                            detail=f"User is not assigned to floor '{floor}'")
+
+    async with pool.acquire() as conn:
+        return await search_job_cards(
+            conn,
+            q=q, status=status, entity=entity, factory=factory, floor=floor,
+            user_scope_warehouses=None if is_admin or factory else user_warehouses or None,
+            user_scope_floors=None     if is_admin or floor   else user_floors     or None,
+        )
+
+
 @router.get("/job-cards-v2/{job_card_id}")
 async def get_job_card_v2(
     request: Request,
@@ -4650,6 +4698,75 @@ async def get_job_card_v2(
         if user.allowed_floors and result.get("floor") and result["floor"] not in user.allowed_floors:
             raise HTTPException(status_code=403, detail="JC outside your floor scope")
     return result
+
+
+@router.get("/job-cards-v2/{job_card_id}/chain")
+async def job_card_chain_v2(
+    request: Request,
+    job_card_id: int,
+    user=Depends(get_current_user),
+):
+    """Stage chain for a v2 JC — siblings on the same plan_line ordered by
+    step_number. The current JC is marked with ``is_current: true`` so the
+    UI can highlight it without a separate lookup.
+
+    Empty array on missing JC instead of 404 because the JC may have been
+    soft-cancelled; callers display "no chain" rather than erroring out."""
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        anchor = await conn.fetchrow(
+            "SELECT plan_line_id, factory, floor FROM job_card_v2 WHERE job_card_id=$1",
+            job_card_id,
+        )
+        if not anchor:
+            return []
+        # Same factory/floor lock the detail endpoint applies — don't expose
+        # the chain of a JC the caller couldn't read directly.
+        if not getattr(user, "is_admin", False):
+            if user.allowed_warehouses and anchor["factory"] not in user.allowed_warehouses:
+                raise HTTPException(status_code=403, detail="JC outside your factory scope")
+            if user.allowed_floors and anchor["floor"] and anchor["floor"] not in user.allowed_floors:
+                raise HTTPException(status_code=403, detail="JC outside your floor scope")
+
+        rows = await conn.fetch(
+            """
+            SELECT job_card_id, job_card_number, step_number,
+                   process_name, stage,
+                   factory, floor, status,
+                   input_kind, output_kind,
+                   planned_qty_kg, carried_qty_kg, dispatched_to_next_kg,
+                   prev_job_card_id, next_job_card_id,
+                   start_time, end_time
+            FROM   job_card_v2
+            WHERE  plan_line_id = $1
+              AND  deleted_at IS NULL
+            ORDER  BY step_number
+            """,
+            anchor["plan_line_id"],
+        )
+        return [
+            {
+                "job_card_id":           r["job_card_id"],
+                "job_card_number":       r["job_card_number"],
+                "step_number":           r["step_number"],
+                "process_name":          r["process_name"],
+                "stage":                 r["stage"],
+                "factory":               r["factory"],
+                "floor":                 r["floor"],
+                "status":                r["status"],
+                "input_kind":            r["input_kind"],
+                "output_kind":           r["output_kind"],
+                "planned_qty_kg":        float(r["planned_qty_kg"])         if r["planned_qty_kg"]         is not None else None,
+                "carried_qty_kg":        float(r["carried_qty_kg"])         if r["carried_qty_kg"]         is not None else None,
+                "dispatched_to_next_kg": float(r["dispatched_to_next_kg"])  if r["dispatched_to_next_kg"]  is not None else None,
+                "prev_job_card_id":      r["prev_job_card_id"],
+                "next_job_card_id":      r["next_job_card_id"],
+                "start_time":            r["start_time"].isoformat() if r["start_time"] else None,
+                "end_time":              r["end_time"].isoformat()   if r["end_time"]   else None,
+                "is_current":            r["job_card_id"] == job_card_id,
+            }
+            for r in rows
+        ]
 
 
 @router.post("/job-cards-v2/{job_card_id}/shifts/start")
