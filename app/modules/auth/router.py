@@ -417,7 +417,10 @@ async def create_user(request: Request, body: CreateUserRequest):
                 must_change_password=body.must_change_password,
             )
         except asyncpg.UniqueViolationError as e:
-            cname = e.constraint_name or ""
+            # `constraint_name` is real on PostgresError at runtime but
+            # missing from asyncpg's type stubs — use getattr so Pylance
+            # doesn't flag it.
+            cname = getattr(e, "constraint_name", "") or ""
             if "phone" in cname:
                 raise HTTPException(status_code=409, detail="Phone number already registered")
             raise HTTPException(status_code=409, detail=f"Conflict on constraint {cname}")

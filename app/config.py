@@ -1,5 +1,15 @@
+from pathlib import Path
+
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings
+
+# Resolve .env against the project root, not the process CWD. Without this,
+# pydantic-settings would treat env_file=".env" as relative to wherever
+# `uvicorn` was launched from — so a fallback `Settings()` constructed
+# mid-request (e.g. inside jwt_service._secret) silently fails to read .env
+# and the model validator raises "DATABASE_URL: Field required". The
+# computation runs at import time so the absolute path is baked in.
+_ENV_PATH = str(Path(__file__).resolve().parent.parent / ".env")
 
 
 class Settings(BaseSettings):
@@ -53,7 +63,7 @@ class Settings(BaseSettings):
     AWS_SESSION_TOKEN: str = ""                 # optional, for assumed-role credentials
     AWS_DEFAULT_REGION: str = ""
 
-    model_config = {"env_file": ".env", "extra": "ignore"}
+    model_config = {"env_file": _ENV_PATH, "extra": "ignore"}
 
     @field_validator("APP_ENV")
     @classmethod
