@@ -381,6 +381,35 @@ async def list_plans(conn, *, entity=None, warehouse=None, plan_type=None,
     }
 
 
+async def update_plan_line(conn, plan_line_id: int, fields: dict) -> dict:
+    """Partial update on a single plan line. Mirrors update_plan's shape.
+    Allowed: planned_qty_kg, planned_qty_units, area, deadline_date.
+
+    Zero/negative qty surfaces a ValueError so the router can map it to a
+    clean 400 instead of bubbling the raw asyncpg CHECK violation.
+    """
+    allowed = {'planned_qty_kg', 'planned_qty_units', 'area', 'deadline_date'}
+    sets, params, idx = [], [], 1
+    for k, v in fields.items():
+        if k not in allowed:
+            continue
+        if k in ('planned_qty_kg', 'planned_qty_units') and v is not None and float(v) <= 0:
+            raise ValueError(f"{k} must be > 0")
+        sets.append(f"{k} = ${idx}")
+        params.append(v); idx += 1
+    if not sets:
+        return {"error": "no_change", "message": "No editable fields supplied"}
+    params.append(plan_line_id)
+    result = await conn.fetchrow(
+        f"UPDATE production_plan_line_v2 SET {', '.join(sets)} "
+        f"WHERE plan_line_id = ${idx} RETURNING *",
+        *params,
+    )
+    if not result:
+        return {"error": "not_found"}
+    return {"updated": True, "line": _serialize_row(result)}
+
+
 async def update_plan(conn, plan_id: int, fields: dict) -> dict:
     """Update header fields. Allowed: plan_date, date_from, date_to,
     plan_type. Status changes go through approve/cancel."""
@@ -491,6 +520,78 @@ async def cancel_plan(conn, plan_id: int, reason: str = "") -> dict:
         )
 
     return {"cancelled": True, "plan": _serialize_row(result)}
+
+
+async def delete_plan(conn, plan_id: int, *, reason: str, deleted_by: str) -> dict:
+    """Hard-deactivate an APPROVED plan.
+
+    Differs from cancel_plan in three ways:
+      1. Only valid when the plan is currently `approved` (cancel_plan
+         allows draft and approved both — but the operator-facing UX maps
+         draft→Cancel and approved→Delete so the intent is clearer).
+      2. Tags the audit row with the `deleted_by` operator + reason. We
+         reuse the existing status='cancelled' enum value (no schema
+         change) but record the action in cancellation_reason so the
+         distinction stays in the row's history.
+      3. Caller is expected to fan out a notification email to all admin
+         users — that's the router's job since this service stays pure
+         and the mail helper lives in services/mail_service.
+
+    Returns:
+      {"deleted": True, "plan": {...serialized row...}}
+      on success; otherwise {"error": "not_found_or_invalid_status"}.
+
+    Plan-level approved → deleted is *destructive*: the job cards that
+    were auto-generated at approve-time are NOT cascaded automatically.
+    Callers (web replica) should explicitly warn the operator that this
+    step doesn't void downstream JCs — those still need to be cancelled
+    individually if the plan is being retracted for real.
+    """
+    # Read line allocations BEFORE flipping status so the planned-counter
+    # release runs against pre-delete data inside the same transaction.
+    lines = await conn.fetch(
+        """
+        SELECT planned_qty_kg, planned_qty_units, linked_so_fulfillment_ids
+        FROM production_plan_line_v2
+        WHERE plan_id = $1
+        """,
+        plan_id,
+    )
+
+    result = await conn.fetchrow(
+        """
+        UPDATE production_plan_v2
+        SET status              = 'cancelled',
+            cancellation_reason = $2
+        WHERE plan_id = $1 AND status = 'approved'
+        RETURNING *
+        """,
+        plan_id, f"[deleted by {deleted_by or 'unknown'}] {reason}".strip(),
+    )
+    if not result:
+        return {"error": "not_found_or_invalid_status"}
+
+    # Release planned counters back to so_fulfillment_v2. Same defensive
+    # GREATEST(0, ...) pattern cancel_plan uses.
+    for ln in lines:
+        fids = ln['linked_so_fulfillment_ids'] or []
+        if not fids:
+            continue
+        kg    = float(ln['planned_qty_kg']    or 0)
+        units = float(ln['planned_qty_units'] or 0)
+        if kg <= 0 and units <= 0:
+            continue
+        await conn.execute(
+            """
+            UPDATE so_fulfillment_v2
+               SET planned_qty_kg    = GREATEST(0, planned_qty_kg    - $1),
+                   planned_qty_units = GREATEST(0, planned_qty_units - $2)
+             WHERE so_fulfillment_id = ANY($3)
+            """,
+            kg, units, fids,
+        )
+
+    return {"deleted": True, "plan": _serialize_row(result)}
 
 
 # ---------------------------------------------------------------------------

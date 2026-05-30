@@ -120,6 +120,74 @@ async def send_rtv_disposition_email(
     _send(subject, body, [to_email], cc)
 
 
+async def _lookup_admin_emails(conn) -> list[str]:
+    """Return the email addresses of every active admin user.
+
+    Admin = users.role_id → auth_role with is_admin = TRUE. Inactive users
+    are filtered out. NULL / empty emails are dropped. Order is stable
+    (email-ascending) so the list reads consistently across calls — handy
+    for log review.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT u.email
+        FROM   users u
+        JOIN   auth_role r ON u.role_id = r.role_id
+        WHERE  r.is_admin = TRUE
+          AND  u.is_active = TRUE
+          AND  u.email IS NOT NULL
+          AND  TRIM(u.email) <> ''
+        ORDER BY u.email
+        """,
+    )
+    return [r["email"] for r in rows]
+
+
+async def send_plan_deletion_email(
+    conn,
+    *,
+    plan_id: int,
+    plan_name: str | None,
+    warehouse: str | None,
+    entity: str | None,
+    reason: str,
+    deleted_by: str,
+) -> int:
+    """Fan out a notification to every active admin when an approved plan
+    is deleted. Returns the number of admin recipients the message was
+    sent to (or 0 if no admins are configured / SMTP is off).
+
+    Best-effort — failures here are logged inside `_send` and never raise,
+    so the API call that triggered the delete still returns success even
+    if SMTP is unreachable.
+    """
+    admins = await _lookup_admin_emails(conn)
+    if not admins:
+        logger.warning(
+            "[mail] plan-delete notification skipped — no active admin emails on file (plan_id=%s)",
+            plan_id,
+        )
+        return 0
+    label = plan_name or f"Plan #{plan_id}"
+    subject = f"[Plan] APPROVED plan deleted — {label}"
+    body = (
+        f"An approved production plan has been deleted by an operator.\n\n"
+        f"Plan ID         : {plan_id}\n"
+        f"Plan Name       : {plan_name or '—'}\n"
+        f"Entity          : {entity or '—'}\n"
+        f"Warehouse       : {warehouse or '—'}\n"
+        f"Deleted By      : {deleted_by or '—'}\n"
+        f"Reason          : {reason or '—'}\n\n"
+        f"Note: any per-floor job cards auto-generated when the plan was\n"
+        f"approved are NOT automatically cancelled. Please verify and cancel\n"
+        f"the related job cards individually if appropriate.\n"
+    )
+    # All admins go in `To:` (everyone is a primary recipient for a
+    # destructive admin-audit notification). No CC.
+    _send(subject, body, admins, [])
+    return len(admins)
+
+
 async def send_rtv_discard_email(
     conn,
     *,

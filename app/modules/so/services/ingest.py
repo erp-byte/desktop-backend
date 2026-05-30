@@ -708,6 +708,14 @@ async def ingest_so_book(
 
                     # Bug 10: Include apportioned packing/freight in recon so the
                     # total_with_gst_valid check accounts for those charges.
+                    #
+                    # quantity + quantity_units are passed in so the non-numeric
+                    # UOM fallback can verify the Excel's reported kg total
+                    # against the master's kg-per-unit factor. Note we pass the
+                    # Excel-provided `alt_units` rather than the locally-computed
+                    # `quantity_units` (qty × master.uom) — the latter is
+                    # tautologically equal to qty × master.uom by construction
+                    # and the check would always pass against itself.
                     recon_input = {
                         "amount_inr": line.get("amount_inr"),
                         "igst_amount": line.get("igst_amount", 0),
@@ -719,6 +727,8 @@ async def ingest_so_book(
                         "processing_amount": 0,
                         "total_amount_inr": line.get("total_amount_inr"),
                         "uom": line.get("uom"),
+                        "quantity": line.get("quantity"),
+                        "quantity_units": line.get("alt_units"),
                     }
                     recon = reconcile_line(recon_input, matched_item)
                     recon["match_score"] = score if matched_item else None

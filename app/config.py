@@ -53,6 +53,20 @@ class Settings(BaseSettings):
     VENDOR_S3_BUCKET: str = ""                  # required for vendor doc uploads; falls back to RECEIPT_S3_BUCKET
     VENDOR_DOC_MODEL: str = "claude-sonnet-4-6"  # Claude model used for vendor document extraction
 
+    # ── WhatsApp Cloud API (password-reset OTP delivery) ─────────────────
+    # `otp_service` reads these via os.environ at call time so an ops flip
+    # of WHATSAPP_ENABLED takes effect without a restart. We still declare
+    # them here so pydantic-settings hydrates them from .env into the
+    # process environment + so they surface in any /healthz / admin debug
+    # view. Defaults mirror the working vms_referrence integration on the
+    # same WABA (`visitor_revisit_otp` / `en_US` / Graph v21.0).
+    WHATSAPP_ENABLED: bool = True
+    WHATSAPP_ACCESS_TOKEN: str = ""
+    WHATSAPP_PHONE_NUMBER_ID: str = ""
+    WHATSAPP_OTP_TEMPLATE_NAME: str = "visitor_revisit_otp"
+    WHATSAPP_OTP_LANG: str = "en_US"
+    WHATSAPP_GRAPH_BASE: str = "https://graph.facebook.com/v21.0"
+
     # ── AWS credentials (read from .env when not present in shell env) ────
     # pydantic-settings reads these from `.env` into the Settings instance;
     # boto3 does NOT consult `.env`, only os.environ. We read them here and

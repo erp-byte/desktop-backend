@@ -145,6 +145,44 @@ class AdminResetPasswordResponse(BaseModel):
     temp_password_set: bool
 
 
+# ── /password/reset (OTP-based) ──────────────────────────────────────────
+
+
+class SendResetOtpRequest(BaseModel):
+    """Step 1: ask the server to deliver an OTP to the registered WhatsApp
+    number for `phone`. We intentionally do NOT reveal whether `phone` is
+    registered; the endpoint returns 200 either way and the user only learns
+    the answer if their phone actually pings.
+    """
+    phone: str = Field(min_length=1, max_length=32)
+
+
+class SendResetOtpResponse(BaseModel):
+    # Generic envelope — see the docstring above on why we don't leak
+    # registration status. `expires_in_seconds` is fixed at the configured
+    # TTL so the UI can show a countdown without an extra round-trip.
+    message: str
+    expires_in_seconds: int
+
+
+class VerifyResetOtpRequest(BaseModel):
+    """Step 2: present the OTP + the new password. The server matches by
+    (phone, otp), rotates the password, and erases the OTP row.
+
+    `new_password` carries the value verbatim — no length/strength rules,
+    per the 2026-05-30 product decision. The pydantic constraint here is
+    just a sanity cap so an attacker can't shovel megabytes of garbage.
+    """
+    phone: str = Field(min_length=1, max_length=32)
+    otp: str = Field(min_length=4, max_length=12)
+    new_password: str = Field(min_length=1, max_length=256)
+
+
+class VerifyResetOtpResponse(BaseModel):
+    message: str
+    revoked_count: int
+
+
 # ── /sessions ─────────────────────────────────────────────────────────────
 
 

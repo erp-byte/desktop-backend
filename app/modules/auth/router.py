@@ -38,9 +38,13 @@ from app.modules.auth.schemas import (
     MeResponse,
     RefreshRequest,
     RefreshResponse,
+    SendResetOtpRequest,
+    SendResetOtpResponse,
     SessionsResponse,
+    VerifyResetOtpRequest,
+    VerifyResetOtpResponse,
 )
-from app.modules.auth.services import auth_service, password_rules, rate_limiter
+from app.modules.auth.services import auth_service, otp_service, password_rules, rate_limiter
 from app.modules.auth.services.phone import normalize as normalize_phone
 
 logger = logging.getLogger(__name__)
@@ -143,6 +147,92 @@ async def password_change(
             confirm_password=body.confirm_password,
             current_refresh_jti=user.refresh_jti,
         )
+
+
+# ── OTP-based password reset (unauthenticated; replaces admin path) ──────
+#
+# Two endpoints, both no-auth: the user is by definition locked out when
+# they ask for an OTP. We always return a successful-looking envelope on
+# /send-otp regardless of whether the phone is registered — leaking that
+# would let an attacker enumerate the user table. /verify is constant-time
+# on the not-found / wrong-otp branches for the same reason.
+
+
+@router.post("/password/reset/send-otp", response_model=SendResetOtpResponse)
+async def password_reset_send_otp(request: Request, body: SendResetOtpRequest):
+    pool = request.app.state.db_pool
+    # We always claim "OTP sent if the number is registered" so an attacker
+    # can't probe the user table by timing or response code. The actual
+    # send happens inline (no queue) so a delivery error to a real user
+    # surfaces immediately in the logs.
+    async with pool.acquire() as conn:
+        user = await auth_service.find_user_by_phone_public(conn, body.phone)
+        if user is not None:
+            otp = otp_service.generate_otp()
+            await otp_service.upsert_otp(
+                conn,
+                user_id=user["user_id"],
+                otp_hash=otp_service.hash_otp(otp),
+                expires=otp_service.expires_at(),
+                phone=user.get("phone") or body.phone,
+            )
+            try:
+                # Use the operator-supplied number for delivery — falls back
+                # to the stored one inside the service if normalisation
+                # strips it back to the same E.164.
+                await otp_service.send_otp_via_whatsapp(body.phone, otp)
+            except RuntimeError as e:
+                # WA send failed. Roll the OTP back so the user can retry
+                # without the prior code being held against them.
+                await otp_service.delete_otp(conn, user_id=user["user_id"])
+                logger.error("password reset OTP send failed: %s", e)
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "error": "whatsapp_send_failed",
+                        "message": "Could not deliver OTP. Please try again shortly.",
+                    },
+                )
+    return {
+        "message": "If that phone is registered, an OTP has been sent on WhatsApp.",
+        "expires_in_seconds": otp_service.OTP_TTL_SECONDS,
+    }
+
+
+@router.post("/password/reset/verify", response_model=VerifyResetOtpResponse)
+async def password_reset_verify(request: Request, body: VerifyResetOtpRequest):
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        user = await auth_service.find_user_by_phone_public(conn, body.phone)
+        # Match the constant-time / opacity story of /send-otp — invalid
+        # phone or invalid OTP both surface as the same generic error so
+        # nothing about the user table leaks.
+        invalid = HTTPException(
+            status_code=400,
+            detail={"error": "invalid_otp", "message": "OTP is invalid or has expired."},
+        )
+        if user is None:
+            raise invalid
+        record = await otp_service.fetch_otp(conn, user_id=user["user_id"])
+        if record is None:
+            raise invalid
+
+        from datetime import datetime, timezone
+        exp = record["expires_at"]
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
+        if exp <= datetime.now(timezone.utc):
+            # Erase the dead row so the next /send-otp doesn't see it.
+            await otp_service.delete_otp(conn, user_id=user["user_id"])
+            raise invalid
+
+        if not otp_service.verify_otp(body.otp, record["otp_hash"]):
+            raise invalid
+
+        revoked = await auth_service.reset_password_with_otp(
+            conn, user_id=user["user_id"], new_password=body.new_password,
+        )
+    return {"message": "Password updated. Please sign in.", "revoked_count": revoked}
 
 
 @router.get("/sessions", response_model=SessionsResponse)
@@ -436,6 +526,7 @@ async def list_users(request: Request):
             SELECT u.user_id, u.phone, u.full_name, u.email, u.entity,
                    u.allowed_entities, u.allowed_warehouses, u.allowed_floors,
                    u.is_active, u.status, u.created_at, u.last_login_at,
+                   u.must_change_password, u.password_changed_at,
                    r.role_id, r.role_name, r.is_admin
             FROM auth_user u
             LEFT JOIN auth_role r ON u.role_id = r.role_id
@@ -503,7 +594,7 @@ async def get_user(request: Request, user_id: int):
             SELECT u.user_id, u.phone, u.full_name, u.email, u.entity,
                    u.allowed_entities, u.allowed_warehouses, u.allowed_floors,
                    u.is_active, u.status, u.created_at, u.last_login_at,
-                   u.must_change_password,
+                   u.must_change_password, u.password_changed_at,
                    r.role_id, r.role_name, r.is_admin
             FROM auth_user u
             LEFT JOIN auth_role r ON u.role_id = r.role_id

@@ -105,6 +105,23 @@ class PlanV2Cancel(BaseModel):
     reason: str = ""
 
 
+class PlanV2Delete(BaseModel):
+    # Reason is required — the value is included in the notification email
+    # so the admin distribution list can see why the plan was deleted.
+    reason: str
+    deleted_by: str = ""
+
+
+class PlanLineV2Patch(BaseModel):
+    # All optional — caller sends ONLY the fields they want to update.
+    # planned_qty_* are NUMERIC(12,3) NOT NULL CHECK (> 0) on the column,
+    # so submitting zero or negative will surface a 400 from the service.
+    planned_qty_kg: float | None = None
+    planned_qty_units: float | None = None
+    area: str | None = None
+    deadline_date: date | None = None
+
+
 class StepV2Reorder(BaseModel):
     step_ids: list[int]
 
@@ -4382,6 +4399,92 @@ async def cancel_plan_v2(request: Request, plan_id: int, body: PlanV2Cancel):
             result = await cancel_plan(conn, plan_id, body.reason)
     if result.get("error") == "not_found_or_already_cancelled":
         raise HTTPException(status_code=404, detail="Plan not found or already cancelled")
+    return result
+
+
+@router.post("/plans-v2/{plan_id}/delete")
+async def delete_plan_v2(request: Request, plan_id: int, body: PlanV2Delete):
+    """Delete an APPROVED plan and notify every active admin by email.
+
+    Uses POST (not HTTP DELETE) so a body can carry the reason + actor.
+    Reuses the cancel-plan accounting (planned_qty release) under the hood
+    but only accepts approved plans — draft plans go through /cancel.
+
+    Email is best-effort: a transient SMTP failure is logged and swallowed
+    so the API still confirms the delete. `admin_email_count` in the
+    response tells the caller how many admins were notified (0 means the
+    admin list was empty or SMTP was disabled).
+    """
+    if not body.reason or not body.reason.strip():
+        raise HTTPException(status_code=400, detail="reason is required")
+
+    from app.modules.production.services.plan_v2 import delete_plan
+    from app.modules.production.services.mail_service import send_plan_deletion_email
+
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await delete_plan(
+                conn, plan_id,
+                reason=body.reason.strip(),
+                deleted_by=body.deleted_by,
+            )
+            if result.get("error") == "not_found_or_invalid_status":
+                raise HTTPException(
+                    status_code=404,
+                    detail="Plan not found or not in approved status",
+                )
+            # Fan out the admin notification INSIDE the same transaction so
+            # the email count is recorded before the response goes out.
+            # _send itself opens a separate SMTP socket — failures don't
+            # roll the transaction back (caught in the helper).
+            plan = result.get("plan") or {}
+            try:
+                admin_count = await send_plan_deletion_email(
+                    conn,
+                    plan_id=plan_id,
+                    plan_name=plan.get("plan_name"),
+                    warehouse=plan.get("warehouse"),
+                    entity=plan.get("entity"),
+                    reason=body.reason.strip(),
+                    deleted_by=body.deleted_by,
+                )
+            except Exception:
+                logger.exception("[plan-delete] admin email fan-out failed (plan_id=%s)", plan_id)
+                admin_count = 0
+
+    return {
+        "deleted": True,
+        "plan_id": plan_id,
+        "status": plan.get("status"),
+        "admin_email_count": admin_count,
+    }
+
+
+# --- Plan line-level edits ---
+
+@router.put("/plans-v2/lines/{plan_line_id}")
+async def update_plan_line_v2(request: Request, plan_line_id: int, body: PlanLineV2Patch):
+    """Partial update for a plan line. Mirrors PUT /plans-v2/{plan_id} —
+    server filters None-valued keys and applies only the supplied fields.
+
+    Allowed: planned_qty_kg, planned_qty_units, area, deadline_date. The
+    qty fields are CHECK > 0 at the column level; zero/negative submissions
+    surface as 400 with the column-constraint error.
+    """
+    from app.modules.production.services.plan_v2 import update_plan_line
+    pool = request.app.state.db_pool
+    fields = {k: v for k, v in body.model_dump().items() if v is not None}
+    if not fields:
+        raise HTTPException(status_code=400, detail="No editable fields supplied")
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            try:
+                result = await update_plan_line(conn, plan_line_id, fields)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+    if result.get("error") == "not_found":
+        raise HTTPException(status_code=404, detail="Plan line not found")
     return result
 
 

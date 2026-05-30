@@ -77,22 +77,57 @@ def reconcile_line(
             )
             status = "mismatch"
 
-    # 7. UOM consistency — only compare when Excel UOM is numeric
+    # 7. UOM consistency.
+    #
+    # master_item.uom is a kg-per-unit factor (1.0 → rate per kg, 0.5 → half-kg
+    # pack, etc.). Two cases for the Excel UOM cell:
+    #
+    #   a) Numeric (e.g. "0.5", "1") — compare it directly against the master
+    #      factor.
+    #   b) Alphabetical (e.g. "PCS", "CTN", "BOX") — string equality is
+    #      meaningless against a float, so verify the underlying relationship
+    #      instead: quantity_units (kg) ÷ master.uom (kg-per-unit) should equal
+    #      the pack count (quantity).
+    #
+    # If we can't compute either form (master uom is 0 / missing, qty is 0,
+    # or excel uom blank), uom_match stays None and the row's status is
+    # untouched — neither a pass nor a fail, just absent from the validation
+    # panel.
     uom_match = None
-    if master_item and master_item.uom is not None and excel_uom is not None:
-        try:
-            excel_uom_float = float(excel_uom)
-            uom_match = abs(excel_uom_float - master_item.uom) < 0.001
-            if not uom_match:
-                notes_parts.append(f"UOM mismatch: Excel={excel_uom}, Master={master_item.uom}")
-                if status == "ok":
-                    status = "warning"
-        except (ValueError, TypeError):
-            # Bug 6: Non-numeric UOM string (e.g. "CTN", "PCS") — skip comparison.
-            # uom_match is explicitly set to None so no false mismatch is logged.
-            # Note: numeric-string UOMs like "0.1" DO reach float() successfully
-            # and are compared correctly against master_item.uom.
-            uom_match = None
+    if master_item and master_item.uom is not None:
+        if excel_uom is not None:
+            try:
+                excel_uom_float = float(excel_uom)
+                uom_match = abs(excel_uom_float - master_item.uom) < 0.001
+                if not uom_match:
+                    notes_parts.append(
+                        f"UOM mismatch: Excel={excel_uom}, Master={master_item.uom}"
+                    )
+                    if status == "ok":
+                        status = "warning"
+            except (ValueError, TypeError):
+                # Non-numeric label — fall back to the kg / pack-count check.
+                # quantity is the pack count from the Sales Register; quantity_units
+                # is the kg total. ingest_sales_register/so_book normalises both
+                # into the line_data dict.
+                quantity = line_data.get("quantity") or 0
+                quantity_units = line_data.get("quantity_units") or 0
+                if master_item.uom > 0 and quantity and quantity_units:
+                    expected_units = quantity_units / master_item.uom
+                    # < 0.5 packs of slack covers floating-point + Excel
+                    # rounding without admitting genuine miscounts (pack
+                    # counts are integers in the real world).
+                    uom_match = abs(expected_units - quantity) < 0.5
+                    if not uom_match:
+                        notes_parts.append(
+                            f"UOM check: {quantity_units} kg / {master_item.uom} kg-per-{excel_uom} "
+                            f"= {expected_units:.2f} units (expected {quantity})"
+                        )
+                        if status == "ok":
+                            status = "warning"
+                # If qty is zero/blank or master.uom is 0 (packaging material
+                # with no per-unit weight), we can't derive an expected pack
+                # count — leave uom_match=None so the check is simply absent.
 
     # 8. Item type flag — warn if RM or PM being sold
     item_type_flag = None

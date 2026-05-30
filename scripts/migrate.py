@@ -39,6 +39,14 @@ SQL_FILES = [
     DB_DIR / "030_vendor_history.sql",
     DB_DIR / "031_bom_bar_line_process.sql",
     DB_DIR / "seed_test_data.sql",
+    # 032 backfills uom_match for SO Book uploads that landed before the
+    # reconciliation switched from string-UOM equality to the kg/pack-count
+    # math check. Idempotent — only touches rows where uom_match IS NULL.
+    DB_DIR / "032_so_uom_recon_backfill.sql",
+    # 033 stages OTPs for the WhatsApp-based self-service password reset
+    # that replaced the admin-only reset path. One row per user (PK), 60s
+    # TTL, deleted on successful reset.
+    DB_DIR / "033_password_reset_otp.sql",
 ]
 
 

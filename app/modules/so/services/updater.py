@@ -751,6 +751,9 @@ async def manual_update_so(
                     "processing_amount": nl.get("processing_amount"),
                     "total_amount_inr": nl.get("total_amount_inr"),
                     "uom": nl.get("uom"),
+                    # Feed the non-numeric UOM fallback in reconcile_line.
+                    "quantity": nl.get("quantity"),
+                    "quantity_units": nl.get("quantity_units"),
                 }
                 recon = reconcile_line(recon_input, matched_item)
                 recon["match_score"] = score if matched_item else None

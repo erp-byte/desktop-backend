@@ -1043,3 +1043,60 @@ async def admin_reset_password(
         "revoked_count": revoked_count,
         "temp_password_set": True,
     }
+
+
+# ── OTP-based self-service reset (POST /password/reset/*) ────────────────
+#
+# Replaces the admin-only reset path for end-users who forgot their password.
+# We deliberately do NOT call password_rules.evaluate here — the product
+# decision (2026-05-30) is that anything the user types is accepted, including
+# the previous password. Validation surface is the OTP, not the password.
+
+
+async def reset_password_with_otp(
+    conn, *, user_id: int, new_password: str,
+) -> int:
+    """Set a new password on `user_id`, clear lockout state, and revoke
+    every live refresh token. Returns the revoked-token count. The OTP row
+    deletion is left to the router so a single transaction can wrap both.
+    """
+    new_hash = password_rules.hash_password(new_password)
+    async with conn.transaction():
+        await conn.execute(
+            """
+            UPDATE auth_user
+               SET password_encrypted    = $2,
+                   password_changed_at   = NOW(),
+                   must_change_password  = FALSE,
+                   status                = 'active',
+                   failed_login_count    = 0,
+                   locked_until          = NULL
+             WHERE user_id = $1
+            """,
+            user_id, new_hash,
+        )
+        row = await conn.fetchrow(
+            """
+            WITH revoked AS (
+                UPDATE auth_refresh_token
+                   SET revoked_at = NOW(), revoke_reason = $2
+                 WHERE user_id = $1
+                   AND revoked_at IS NULL
+                   AND rotated_at IS NULL
+                RETURNING jti
+            )
+            SELECT COUNT(*) AS n FROM revoked
+            """,
+            user_id, _REVOKE_PASSWORD_CHANGE,
+        )
+        # Erase the OTP row inside the same transaction so a crash between
+        # password-write and OTP-delete can't leave the just-used OTP usable.
+        await conn.execute("DELETE FROM auth_password_reset_otp WHERE user_id = $1", user_id)
+    return int(row["n"]) if row else 0
+
+
+async def find_user_by_phone_public(conn, raw_phone: str) -> dict | None:
+    """Public wrapper around the private _find_user_by_phone for the OTP
+    router — kept private internally so the public surface stays minimal.
+    """
+    return await _find_user_by_phone(conn, raw_phone)
