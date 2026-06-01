@@ -193,6 +193,12 @@ INSERT INTO auth_permission (module, sub_module, sub_sub_module, action, descrip
     ('purchase',   NULL,          NULL,       'create', 'Upload purchase orders'),
     ('purchase',   'receive',     NULL,       'create', 'Receive PO material'),
     ('purchase',   'boxes',       NULL,       'create', 'Add/update PO boxes'),
+    -- Purchase · PO upload module (/api/v1/po — preview/commit/list/lines/delete).
+    -- NOTE: this router gates on action 'read' (not the legacy 'view').
+    ('purchase',   'po',          NULL,       'read',   'View/list purchase orders (PO upload)'),
+    ('purchase',   'po',          NULL,       'create', 'Upload + preview purchase orders'),
+    ('purchase',   'po',          NULL,       'edit',   'Commit purchase orders'),
+    ('purchase',   'po',          NULL,       'delete', 'Soft-delete purchase orders'),
     -- Auth (admin only)
     ('auth',       'users',       NULL,       'view',   'View users'),
     ('auth',       'users',       NULL,       'create', 'Create users'),
@@ -281,6 +287,10 @@ WHERE r.role_name = 'floor_manager'
 ON CONFLICT DO NOTHING;
 
 -- Purchase manager role
+-- NOTE: the `p.module = 'purchase'` clause below automatically covers the new
+-- purchase.po.{read,create,edit,delete} permissions added above, so
+-- purchase_manager gets the full PO-upload lifecycle on the next migrate run.
+-- (admin's blanket grant likewise covers them; admins also bypass the check.)
 INSERT INTO auth_role_permission (role_id, permission_id)
 SELECT r.role_id, p.permission_id
 FROM auth_role r, auth_permission p
@@ -290,4 +300,13 @@ WHERE r.role_name = 'purchase_manager'
     OR (p.module = 'production' AND p.sub_module IN ('indents', 'alerts') AND p.action IN ('view', 'create'))
     OR (p.module = 'production' AND p.action = 'view')
   )
+ON CONFLICT DO NOTHING;
+
+-- Viewer role also needs read on the PO-upload module: the blanket viewer grant
+-- above only matches action='view', but /api/v1/po gates on action='read'.
+INSERT INTO auth_role_permission (role_id, permission_id)
+SELECT r.role_id, p.permission_id
+FROM auth_role r, auth_permission p
+WHERE r.role_name = 'viewer'
+  AND p.module = 'purchase' AND p.sub_module = 'po' AND p.action = 'read'
 ON CONFLICT DO NOTHING;
