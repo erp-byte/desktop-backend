@@ -595,7 +595,7 @@ erDiagram
 
 ### 11.5 Seeded data (defaults)
 
-- **Roles** (`auth_role`): `admin` *(is_admin=TRUE)*, `planner`, `stores_manager`, `team_leader`, `qc_inspector`, `floor_manager`, `purchase_manager`, `viewer`.
+- **Roles** (`auth_role`): `admin` *(is_admin=TRUE)*, `planner`, `inventory_manager`, `team_leader`, `qc_inspector`, `floor_manager`, `purchase_manager`, `viewer`.
 - **Default admin user** (`auth_user`): phone `9004464207`, password `Candor@123*` *(change immediately in any non-dev environment)*.
 - **Permissions** (`auth_permission`): ~60 rows across `production` (14 sub_modules), `purchase`, `so`, and `auth` (admin-only `users` + `roles`).
 - **Role-permission mappings** (`auth_role_permission`): admin gets every permission; viewer gets every `action='view'` permission; the other roles get curated subsets — see `db/auth_schema.sql` §§207-284 for the exact `SELECT … WHERE …` rules.

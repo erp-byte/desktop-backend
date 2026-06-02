@@ -637,7 +637,7 @@ async def send_indent(indent_id: int) -> str:
                 "INSERT INTO store_alert (alert_type, target_team, message, related_id, related_type, entity) VALUES ('indent_raised','stores',$1,$2,'indent',$3)",
                 f"Indent for {mat} — {qty:.1f} kg", indent_id, indent['entity']
             )
-    await emit_event("indent.sent", indent['entity'], {"indent_id": indent_id, "material": mat, "qty_kg": qty}, target_roles=["store_manager", "purchase", "admin"])
+    await emit_event("indent.sent", indent['entity'], {"indent_id": indent_id, "material": mat, "qty_kg": qty}, target_roles=["inventory_manager", "purchase", "admin"])
     return f"Indent {indent['indent_number']} sent. 2 alerts created."
 
 
@@ -666,7 +666,7 @@ async def send_bulk_indents(indent_ids: list[int]) -> str:
                 last_entity = indent['entity']
                 sent += 1
     if sent:
-        await emit_event("indent.bulk_sent", last_entity, {"indent_ids": indent_ids, "sent": sent}, target_roles=["store_manager", "purchase", "admin"])
+        await emit_event("indent.bulk_sent", last_entity, {"indent_ids": indent_ids, "sent": sent}, target_roles=["inventory_manager", "purchase", "admin"])
     return f"Sent {sent} of {len(indent_ids)} indents."
 
 

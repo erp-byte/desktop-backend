@@ -1108,7 +1108,7 @@ Implement these as integration tests OR a manual checklist. **Do not** ship if a
 |--------------------|----------|----------------------------------------------------------------------------------|
 | `admin`            | TRUE     | Full unrestricted access; bypasses all permission checks                         |
 | `planner`          | FALSE    | Plans (full CRUD), fulfillment, MRP, indents, AI, orders + view-all              |
-| `stores_manager`   | FALSE    | Inventory (full), day-end (full), offgrade + view-all                            |
+| `inventory_manager` | FALSE    | Inventory (full), day-end (full), offgrade + view-all                            |
 | `team_leader`      | FALSE    | Job cards (lifecycle, output, annexures) + view-all                              |
 | `qc_inspector`     | FALSE    | Job-card annexures + sign-offs + view-all                                        |
 | `floor_manager`    | FALSE    | Inventory, day-end, discrepancy + job-card view                                  |

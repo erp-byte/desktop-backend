@@ -2,8 +2,10 @@ import logging
 import math
 from datetime import date
 
-from fastapi import APIRouter, HTTPException, Query, Request, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, UploadFile, File
 
+from app.modules.auth.middleware import get_current_user
+from app.modules.production.services.response_filters import strip_cost_fields
 from app.modules.so.schemas import (
     SOUploadResponse,
     SOCreateRequest,
@@ -485,8 +487,15 @@ async def view_all_sos(
     sales_group: str = Query(None),
     match_source: str = Query(None),
     line_status: str = Query(None),
+    user=Depends(get_current_user),
 ):
-    """View Sales Orders with server-side pagination, filtering, sorting, and search."""
+    """View Sales Orders with server-side pagination, filtering, sorting, and search.
+
+    B13 cost-metric gate: SO lines surface ``rate_inr``, ``amount_inr``, and
+    the tax/charge ``*_amount`` columns. Strip them for deny-listed roles
+    before serialising — the response model is dumped to a dict tree first
+    because ``strip_cost_fields`` operates on dicts/lists in place.
+    """
     pool = request.app.state.db_pool
 
     # --- Filter options (from ALL data in DB, always unfiltered) ---
@@ -618,7 +627,7 @@ async def view_all_sos(
     so_ids = [h["so_id"] for h in paginated_headers]
     all_so_details = await _fetch_so_details(pool, so_ids, paginated_headers)
 
-    return SOViewResponse(
+    payload = SOViewResponse(
         page=page,
         page_size=page_size,
         total=total,
@@ -626,6 +635,11 @@ async def view_all_sos(
         summary=UploadSummary.model_validate(summary),
         filter_options=FilterOptions.model_validate(filter_options),
         sales_orders=[SODetail.model_validate(d) for d in all_so_details],
+    ).model_dump()
+    return strip_cost_fields(
+        payload,
+        getattr(user, "role_name", None),
+        is_admin=getattr(user, "is_admin", False),
     )
 
 
@@ -651,8 +665,14 @@ async def export_sos(
     sales_group: str = Query(None),
     match_source: str = Query(None),
     line_status: str = Query(None),
+    user=Depends(get_current_user),
 ):
-    """Export all filtered Sales Orders (no pagination) for download."""
+    """Export all filtered Sales Orders (no pagination) for download.
+
+    B13 cost-metric gate: same surface as ``view_all_sos`` — strip ₹ columns
+    for deny-listed roles. ``.model_dump()`` before strip because the helper
+    expects a plain dict tree.
+    """
     pool = request.app.state.db_pool
 
     where_clause, params = _build_where_clause(
@@ -684,9 +704,14 @@ async def export_sos(
     so_ids = [h["so_id"] for h in headers]
     all_so_details = await _fetch_so_details(pool, so_ids, headers)
 
-    return SOExportResponse(
+    payload = SOExportResponse(
         total=len(all_so_details),
         sales_orders=[SODetail.model_validate(d) for d in all_so_details],
+    ).model_dump()
+    return strip_cost_fields(
+        payload,
+        getattr(user, "role_name", None),
+        is_admin=getattr(user, "is_admin", False),
     )
 
 
@@ -823,8 +848,12 @@ async def sku_lookup(
 
 
 @router.get("/{so_id}", response_model=SOHeaderOut)
-async def get_so(request: Request, so_id: int):
-    """Get SO header with all line items."""
+async def get_so(request: Request, so_id: int, user=Depends(get_current_user)):
+    """Get SO header with all line items.
+
+    B13 cost-metric gate: the per-SO detail surfaces every ₹ field on each
+    line. Deny-listed roles get them stripped before serialisation.
+    """
     pool = request.app.state.db_pool
 
     header = await pool.fetchrow("SELECT * FROM so_header WHERE so_id = $1", so_id)
@@ -835,7 +864,7 @@ async def get_so(request: Request, so_id: int):
         "SELECT * FROM so_line WHERE so_id = $1 ORDER BY line_number", so_id
     )
 
-    return SOHeaderOut(
+    payload = SOHeaderOut(
         so_id=header["so_id"],
         so_number=header.get("so_number"),
         so_date=str(header["so_date"]) if header.get("so_date") else None,
@@ -875,6 +904,11 @@ async def get_so(request: Request, so_id: int):
             )
             for l in lines
         ],
+    ).model_dump()
+    return strip_cost_fields(
+        payload,
+        getattr(user, "role_name", None),
+        is_admin=getattr(user, "is_admin", False),
     )
 
 

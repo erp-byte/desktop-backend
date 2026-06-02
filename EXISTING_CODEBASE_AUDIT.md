@@ -306,7 +306,7 @@ Plus one top-level POST: `/internal/events` (HMAC `INTERNAL_WEBHOOK_TOKEN`, `app
 | Password storage | Fernet (AES-128 equivalent) symmetric encryption — **not a hash, decryptable with `AUTH_ENCRYPTION_KEY`** | `app/modules/auth/services/auth_service.py:8, 33-45` |
 | User table | `auth_user`: user_id (PK), phone (UNIQUE), password_encrypted (Fernet), full_name, email, role_id, entity, allowed_warehouses[], is_active, created_at, last_login_at | `app/db/auth_schema.sql:19-31` |
 | Seed admin | Phone `9004464207`, password hash provided in seed | `app/db/auth_schema.sql:99-107` |
-| Role model | DB-backed: `auth_role` (8 seed roles: admin, planner, stores_manager, team_leader, qc_inspector, floor_manager, purchase_manager, viewer); `is_admin` bool | `app/db/auth_schema.sql:7-13, 87-96` |
+| Role model | DB-backed: `auth_role` (8 seed roles: admin, planner, inventory_manager, team_leader, qc_inspector, floor_manager, purchase_manager, viewer); `is_admin` bool | `app/db/auth_schema.sql:7-13, 87-96` |
 | Permission model | Hierarchical (module → sub_module → sub_sub_module × action), ~100+ seed permissions, `auth_role_permission` carries `allowed_entities[]`, `allowed_warehouses[]`, `allowed_floors[]` scope | `app/db/auth_schema.sql:41-49, 55-62, 114-195` |
 | Permission eval | Admin (`is_admin=true`) bypass at top; hierarchical fallback exact → broader; **scope mismatch returns False immediately (HIGH-5 safety)** | `app/modules/auth/services/permission_service.py:8-67` |
 | Per-route gate (auth_router) | `_require_auth()` (`auth/router.py:462-476`) and `_require_admin()` (`auth/router.py:479-484`) on all admin endpoints | `app/modules/auth/router.py:144,160,179,207,223,241,254,271,287,316,334,365,384,411,427` |

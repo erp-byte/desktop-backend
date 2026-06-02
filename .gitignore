@@ -9,8 +9,8 @@ wheels/
 # Virtual environments
 .venv
 
-# Environment
-.env
+# Environment (.env and .env.example kept local only — never committed)
+.env*
 
 # Uploaded files
 so_pdfs/

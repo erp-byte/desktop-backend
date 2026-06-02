@@ -771,7 +771,7 @@ The server automatically filters events based on the user's role (from the JWT t
 | Role | Events Received | Typical Screens |
 |------|-----------------|-----------------|
 | `planner` | `plan.*`, `mrp.*`, `fulfillment.*` | Plan dashboard, MRP, fulfillment |
-| `store_manager` | `indent.*`, `material.*`, `store_alert.*` | Store dashboard, inventory, indents |
+| `inventory_manager` | `indent.*`, `material.*`, `store_alert.*` | Store dashboard, inventory, indents |
 | `floor_supervisor` | `job_card.*` (all 11 events), `qc.*`, `dayend.*` | Job card list/detail, QC queue, day-end |
 | `purchase` | `indent.*` (drafted, sent, bulk_sent, raised) | Purchase dashboard, PO tracking |
 | `admin` | **ALL 25 events** | Admin dashboard |

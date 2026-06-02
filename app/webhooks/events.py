@@ -121,7 +121,7 @@ async def mrp_shortage_detected(entity: str, *, plan_id: int,
         entity=entity,
         payload={"plan_id": plan_id, "shortage_count": shortage_count,
                  "total_shortage_kg": total_shortage_kg},
-        target_roles=["planner", "store_manager", "admin"],
+        target_roles=["planner", "inventory_manager", "admin"],
     ))
 
 
@@ -149,7 +149,7 @@ async def indent_sent(entity: str, *, indent_id: int, material: str,
         entity=entity,
         payload={"indent_id": indent_id, "material": material,
                  "qty_kg": qty_kg, "deadline": deadline},
-        target_roles=["store_manager", "purchase", "admin"],
+        target_roles=["inventory_manager", "purchase", "admin"],
     ))
 
 
@@ -160,7 +160,7 @@ async def indent_bulk_sent(entity: str, *, indent_ids: list[int],
         event_type="indent.bulk_sent",
         entity=entity,
         payload={"indent_ids": indent_ids, "sent": sent},
-        target_roles=["store_manager", "purchase", "admin"],
+        target_roles=["inventory_manager", "purchase", "admin"],
     ))
 
 
@@ -228,7 +228,7 @@ async def job_card_material_received(entity: str, *, job_card_id: int,
         entity=entity,
         payload={"job_card_id": job_card_id, "job_card_number": job_card_number,
                  "boxes_scanned": boxes_scanned, "total_kg": total_kg},
-        target_roles=["floor_supervisor", "store_manager", "admin"],
+        target_roles=["floor_supervisor", "inventory_manager", "admin"],
     ))
 
 
@@ -239,7 +239,7 @@ async def job_card_material_acknowledged(entity: str, *, job_card_id: int,
         event_type="job_card.material_acknowledged",
         entity=entity,
         payload={"job_card_id": job_card_id, "job_card_number": job_card_number},
-        target_roles=["floor_supervisor", "store_manager", "admin"],
+        target_roles=["floor_supervisor", "inventory_manager", "admin"],
     ))
 
 
@@ -355,7 +355,7 @@ async def indent_raised(entity: str, *, indent_id: int, material: str,
         payload={"indent_id": indent_id, "material": material,
                  "qty_kg": qty_kg, "source": source,
                  "job_card_id": job_card_id},
-        target_roles=["store_manager", "purchase", "admin"],
+        target_roles=["inventory_manager", "purchase", "admin"],
     ))
 
 
@@ -399,7 +399,7 @@ async def material_moved(entity: str, *, sku_name: str, from_location: str,
         payload={"sku_name": sku_name, "from": from_location,
                  "to": to_location, "qty_kg": qty_kg,
                  "movement_id": movement_id},
-        target_roles=["store_manager", "admin"],
+        target_roles=["inventory_manager", "admin"],
     ))
 
 
@@ -429,7 +429,7 @@ async def dayend_discrepancy_found(entity: str, *, discrepancy_type: str,
         payload={"discrepancy_type": discrepancy_type, "severity": severity,
                  "affected_material": affected_material,
                  "affected_job_cards": affected_job_cards},
-        target_roles=["planner", "store_manager", "admin"],
+        target_roles=["planner", "inventory_manager", "admin"],
     ))
 
 
@@ -446,5 +446,5 @@ async def store_alert_created(entity: str, *, allocation_id: int,
         entity=entity,
         payload={"allocation_id": allocation_id, "decision": decision,
                  "material": material, "approved_qty": approved_qty},
-        target_roles=["store_manager", "admin"],
+        target_roles=["inventory_manager", "admin"],
     ))

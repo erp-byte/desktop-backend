@@ -817,7 +817,7 @@ async def send_indent(indent_id: int) -> str:
             mat = indent['material_sku_name']; qty = float(indent['required_qty_kg']); dl = indent['required_by_date']
             await conn.execute("INSERT INTO store_alert (alert_type, target_team, message, related_id, related_type, entity) VALUES ('material_shortage','purchase',$1,$2,'indent',$3)", f"SHORTAGE: {mat} — Need {qty:.1f} kg by {dl}", indent_id, indent['entity'])
             await conn.execute("INSERT INTO store_alert (alert_type, target_team, message, related_id, related_type, entity) VALUES ('indent_raised','stores',$1,$2,'indent',$3)", f"Indent raised for {mat} — {qty:.1f} kg. Check existing stock.", indent_id, indent['entity'])
-    await emit_event("indent.sent", indent['entity'], {"indent_id": indent_id, "material": mat, "qty_kg": qty}, target_roles=["store_manager", "purchase", "admin"])
+    await emit_event("indent.sent", indent['entity'], {"indent_id": indent_id, "material": mat, "qty_kg": qty}, target_roles=["inventory_manager", "purchase", "admin"])
     return f"Indent {indent['indent_number']} sent (raised). 2 alerts created."
 
 
@@ -839,7 +839,7 @@ async def send_bulk_indents(indent_ids: list[int]) -> str:
                 await conn.execute("INSERT INTO store_alert (alert_type, target_team, message, related_id, related_type, entity) VALUES ('indent_raised','stores',$1,$2,'indent',$3)", f"Indent for {mat} — {qty:.1f} kg", iid, indent['entity'])
                 last_entity = indent['entity']
                 sent += 1
-    await emit_event("indent.bulk_sent", last_entity, {"indent_ids": indent_ids, "sent": sent}, target_roles=["store_manager", "purchase", "admin"])
+    await emit_event("indent.bulk_sent", last_entity, {"indent_ids": indent_ids, "sent": sent}, target_roles=["inventory_manager", "purchase", "admin"])
     return f"Sent {sent} of {len(indent_ids)} indents."
 
 
@@ -1227,7 +1227,7 @@ async def move_material(sku_name: str, from_location: str, to_location: str, qua
             result = await _move(conn, sku_name, from_location, to_location, quantity_kg, entity, reason=reason, moved_by=moved_by)
     if "error" in result:
         return result["message"]
-    await emit_event("material.moved", entity, {"sku_name": sku_name, "from": from_location, "to": to_location, "qty_kg": quantity_kg}, target_roles=["store_manager", "admin"])
+    await emit_event("material.moved", entity, {"sku_name": sku_name, "from": from_location, "to": to_location, "qty_kg": quantity_kg}, target_roles=["inventory_manager", "admin"])
     return _dumps(result)
 
 

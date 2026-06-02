@@ -25,6 +25,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from app.core.helpers import insert_with_pk_retry, new_short_time_id
+from app.modules.production.services.job_card_v2 import assert_not_locked
 
 logger = logging.getLogger(__name__)
 
@@ -191,6 +192,9 @@ async def add_metal_detection(conn, *, job_card_id: int,
                               failed_units: int = 0,
                               remarks: str | None = None,
                               recorded_by: str | None = None) -> dict:
+    lock_err = await assert_not_locked(conn, job_card_id)
+    if lock_err:
+        return lock_err
     if check_type not in ('pre_packaging', 'post_packaging'):
         return {"error": "invalid_check_type", "value": check_type}
 
@@ -279,6 +283,9 @@ async def add_weight_check(conn, *, job_card_id: int,
     are excluded from the conflict target by the partial unique index
     (`uq_jcwc_v2_jc_sample_active`), so delete + re-add still works.
     """
+    lock_err = await assert_not_locked(conn, job_card_id)
+    if lock_err:
+        return lock_err
     if sample_number is None or sample_number <= 0:
         return {"error": "invalid_sample_number"}
 
@@ -363,6 +370,9 @@ async def add_environment(conn, *, job_card_id: int,
                           unit: str | None = None,
                           remarks: str | None = None,
                           recorded_by: str | None = None) -> dict:
+    lock_err = await assert_not_locked(conn, job_card_id)
+    if lock_err:
+        return lock_err
     if not parameter_name or not parameter_name.strip():
         return {"error": "missing_parameter_name"}
 
@@ -441,6 +451,9 @@ async def add_loss_reconciliation(conn, *, job_card_id: int,
                                    uom: str | None = None,
                                    remarks: str | None = None,
                                    recorded_by: str | None = None) -> dict:
+    lock_err = await assert_not_locked(conn, job_card_id)
+    if lock_err:
+        return lock_err
     if loss_category not in VALID_LOSS_CATEGORIES:
         return {"error": "invalid_loss_category", "value": loss_category}
 
@@ -540,6 +553,9 @@ async def add_remark(conn, *, job_card_id: int,
                      remark_type: str,
                      content: str,
                      recorded_by: str | None = None) -> dict:
+    lock_err = await assert_not_locked(conn, job_card_id)
+    if lock_err:
+        return lock_err
     if remark_type not in VALID_REMARK_TYPES:
         return {"error": "invalid_remark_type", "value": remark_type}
     if not content or not content.strip():

@@ -96,7 +96,7 @@ CREATE INDEX IF NOT EXISTS idx_auth_session_user ON auth_session(user_id);
 INSERT INTO auth_role (role_name, description, is_admin) VALUES
     ('admin',           'Full unrestricted access',                          TRUE),
     ('planner',         'Production planner — plans, fulfillment, MRP, AI',  FALSE),
-    ('stores_manager',  'Stores manager — inventory, day-end, indents view', FALSE),
+    ('inventory_manager', 'Inventory manager — inventory, day-end, indents view', FALSE),
     ('team_leader',     'Team leader — job card execution',                  FALSE),
     ('qc_inspector',    'QC inspector — inspections, annexures, sign-offs',  FALSE),
     ('floor_manager',   'Floor manager — floor operations, discrepancy',     FALSE),
@@ -249,11 +249,11 @@ WHERE r.role_name = 'team_leader'
   )
 ON CONFLICT DO NOTHING;
 
--- Stores manager role
+-- Inventory manager role
 INSERT INTO auth_role_permission (role_id, permission_id)
 SELECT r.role_id, p.permission_id
 FROM auth_role r, auth_permission p
-WHERE r.role_name = 'stores_manager'
+WHERE r.role_name = 'inventory_manager'
   AND p.module = 'production'
   AND (
     p.sub_module IN ('inventory', 'day_end', 'offgrade')

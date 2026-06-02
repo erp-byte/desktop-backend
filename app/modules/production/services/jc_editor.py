@@ -27,7 +27,12 @@ WEIGHT_CHECK_EDITABLE_COLS        = frozenset({"sample_number", "net_weight", "g
 LOSS_RECONCILIATION_EDITABLE_COLS = frozenset({"loss_category", "budgeted_loss_pct", "budgeted_loss_kg", "actual_loss_kg", "variance_kg", "remarks"})
 REMARKS_EDITABLE_COLS             = frozenset({"remark_type", "content"})
 
-EDITABLE_STATUSES    = frozenset({"locked", "unlocked", "assigned", "material_received", "in_progress"})
+# R1: Header-edit (machine, team, batch_number, factory, floor, BOM swap)
+# is allowed through `material_received` but BLOCKED once a JC is running.
+# Operational data entry (output, consumption, QC) is the only way to change
+# state from `in_progress` onward. CANCELLABLE_STATUSES already matches the
+# spec - keeping the existing set.
+EDITABLE_STATUSES    = frozenset({"locked", "unlocked", "assigned", "material_received"})
 CANCELLABLE_STATUSES = frozenset({"locked", "unlocked", "assigned"})
 
 

@@ -84,7 +84,7 @@ auth_permission
 | Column | Type | Description |
 |--------|------|-------------|
 | role_id | SERIAL PK | Auto-increment |
-| role_name | TEXT UNIQUE | admin, planner, stores_manager, etc. |
+| role_name | TEXT UNIQUE | admin, planner, inventory_manager, etc. |
 | description | TEXT | Human-readable description |
 | is_admin | BOOLEAN | TRUE = bypasses ALL permission checks |
 | created_at | TIMESTAMPTZ | |
@@ -776,7 +776,7 @@ Each role-permission mapping can have scope restrictions:
 |------|----------|----------------|
 | **admin** | TRUE | Everything — bypasses all permission checks |
 | **planner** | FALSE | Plans (full CRUD), fulfillment, MRP, indents, AI, orders, + view all |
-| **stores_manager** | FALSE | Inventory (full), day-end (full), offgrade, + view all |
+| **inventory_manager** | FALSE | Inventory (full), day-end (full), offgrade, + view all |
 | **team_leader** | FALSE | Job cards (lifecycle, output, annexures), + view all |
 | **qc_inspector** | FALSE | Job card annexures + sign-offs, + view all |
 | **floor_manager** | FALSE | Inventory, day-end, discrepancy, + job card view |

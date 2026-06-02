@@ -630,7 +630,7 @@ Same filters, no pagination. Returns flat array.
       "rejection_reason": "Only 300 kg available"
     }
   ],
-  "decided_by": "store_manager"
+  "decided_by": "inventory_manager"
 }
 ```
 
@@ -651,7 +651,7 @@ Same filters, no pagination. Returns flat array.
   "verifications": [
     {"allocation_id": 45, "verified_qty": 500.0, "condition_notes": ""}
   ],
-  "verified_by": "store_manager"
+  "verified_by": "inventory_manager"
 }
 ```
 
@@ -669,7 +669,7 @@ Same filters, no pagination. Returns flat array.
   "allocation_id": 46,
   "offgrade_id": 12,
   "qty": 200.0,
-  "suggested_by": "store_manager"
+  "suggested_by": "inventory_manager"
 }
 ```
 
@@ -843,7 +843,7 @@ Same filters, no pagination. Returns flat array.
   "indent_lines": [
     {"indent_type": "rm", "indent_id": 5}
   ],
-  "acknowledged_by": "store_manager"
+  "acknowledged_by": "inventory_manager"
 }
 ```
 
@@ -851,7 +851,7 @@ Or acknowledge all (omit `indent_lines`):
 ```json
 {
   "indent_lines": null,
-  "acknowledged_by": "store_manager"
+  "acknowledged_by": "inventory_manager"
 }
 ```
 
@@ -1249,7 +1249,7 @@ V2 consolidated: FG output + byproducts + balance materials + QC in one call.
 
 ### `POST /api/v1/production/inventory/internal-issue/{note_id}/approve`
 
-**Request Body:** `{"approved_by": "store_manager"}`
+**Request Body:** `{"approved_by": "inventory_manager"}`
 
 ---
 
@@ -1259,13 +1259,13 @@ V2 consolidated: FG output + byproducts + balance materials + QC in one call.
 |-------------|------|---------|
 | `space_constrained` | bool | false |
 
-**Request Body:** `{"approved_by": "store_manager"}`
+**Request Body:** `{"approved_by": "inventory_manager"}`
 
 ---
 
 ### `POST /api/v1/production/inventory/internal-issue/{note_id}/reject`
 
-**Request Body:** `{"rejected_by": "store_manager", "reason": "Not in stock"}`
+**Request Body:** `{"rejected_by": "inventory_manager", "reason": "Not in stock"}`
 
 ---
 
@@ -1372,7 +1372,7 @@ V2 consolidated: FG output + byproducts + balance materials + QC in one call.
   "quantity_kg": 250.0,
   "entity": "cfpl",
   "reason": "Production use",
-  "moved_by": "store_manager"
+  "moved_by": "inventory_manager"
 }
 ```
 
@@ -1506,7 +1506,7 @@ V2 consolidated: FG output + byproducts + balance materials + QC in one call.
 {
   "floor_location": "rm_store",
   "entity": "cfpl",
-  "submitted_by": "store_manager",
+  "submitted_by": "inventory_manager",
   "scan_lines": [
     {
       "sku_name": "Sugar",
@@ -1548,7 +1548,7 @@ V2 consolidated: FG output + byproducts + balance materials + QC in one call.
 
 **Request Body:**
 ```json
-{"reviewed_by": "store_manager"}
+{"reviewed_by": "inventory_manager"}
 ```
 
 ---
@@ -1771,7 +1771,7 @@ V2 consolidated: FG output + byproducts + balance materials + QC in one call.
   "job_card_id": "101",
   "so_id": "SO-100",
   "customer_name": "ABC Traders",
-  "issued_by": "store_manager",
+  "issued_by": "inventory_manager",
   "lines": [
     {
       "sku": "Raw Cashew",
@@ -2034,7 +2034,7 @@ WebSocket connection for real-time events.
 | Role | Receives |
 |------|----------|
 | `planner` | `plan.*`, `mrp.*`, `fulfillment.*` |
-| `store_manager` | `indent.*`, `material.*`, `store_alert.*` |
+| `inventory_manager` | `indent.*`, `material.*`, `store_alert.*` |
 | `floor_supervisor` | `job_card.*`, `qc.*`, `dayend.*` |
 | `purchase` | `indent.*` |
 | `admin` | All 25 events |

@@ -32,8 +32,74 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from app.core.helpers import insert_with_pk_retry, new_short_time_id
+from app.modules.production.services.output_calc import compute_output_row
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# R6 lock guard
+#
+# Operational entry (output, accounting, annexures, shifts/start) is refused
+# while a JC is locked unless force_unlocked is set. The router-level
+# dispatcher translates the returned error dict into a 409 / 404 HTTP code -
+# this helper stays HTTP-agnostic so jc_accounting_v2.py and jc_annexures_v2.py
+# can call it without pulling in fastapi.
+#
+# Exempt operations (PATCH/DELETE header edits, force-unlock, sign-off,
+# complete, close, dispatch-to-next, receive-material) deliberately do NOT
+# call this gate - they govern the lock itself or are lifecycle transitions.
+# ---------------------------------------------------------------------------
+
+async def assert_not_locked(conn, job_card_id: int) -> dict | None:
+    """R6 lock guard. Returns None when the JC is unlocked or force-unlocked
+    (caller proceeds). Returns an error dict when the JC is locked, missing,
+    or soft-deleted (caller bails by returning the dict).
+    """
+    row = await conn.fetchrow(
+        "SELECT is_locked, locked_reason, force_unlocked, status "
+        "FROM   job_card_v2 "
+        "WHERE  job_card_id=$1 AND deleted_at IS NULL",
+        job_card_id,
+    )
+    if not row:
+        return {"error": "job_card_not_found"}
+    if row["is_locked"] and not row["force_unlocked"]:
+        return {
+            "error": "locked",
+            "locked_reason": row["locked_reason"],
+            "status": row["status"],
+            "message": "Job card is locked; operational entry refused. "
+                       "Use force-unlock with approval if required.",
+        }
+    return None
+
+
+# ---------------------------------------------------------------------------
+# R11 packing-stage detection
+#
+# EGA (Extra Give Away) is only meaningful at packing stages - that's where
+# the operator over-packs slightly to compensate for label-weight tolerance.
+#
+# B6 C2 fix: instead of exact-string matching against truncated-paren
+# legacy values, normalise the stage and match any string containing
+# 'packaging' or 'packing'. This is resilient to data cleanups (e.g.
+# closing the paren on 'flavouring_(bulk_packaging)') and case drift.
+# ---------------------------------------------------------------------------
+_PACKING_STAGE_TOKENS = ("packaging", "packing")
+
+def is_packing_stage(stage: str | None) -> bool:
+    if not stage:
+        return False
+    s = stage.strip().lower()
+    return any(tok in s for tok in _PACKING_STAGE_TOKENS)
+
+# Legacy alias - some external code may import this. Kept for back-compat.
+PACKING_STAGES = frozenset({
+    "packaging",
+    "flavouring_(bulk_packaging",
+    "roasting_(bulk_packaging",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +192,73 @@ def _canonical_uom(raw: str | None, kind: str) -> str:
     return 'KGS'
 
 
+async def resolve_bom_multiplier(
+    conn,
+    *,
+    fg_sku_name: str | None,
+    qty_kg,
+    qty_units=None,
+) -> tuple[float, str, float | None]:
+    """Return ``(multiplier, basis, sku_uom)`` for BOM math.
+
+    Convention (operator-stated, supersedes earlier 'per kg of FG' docstring):
+
+      • ``all_sku.uom`` is the per-unit kg multiplier of the FG SKU
+        (schema.sql:54, R2 framework single source of truth).
+      • When ``uom != 1.000`` (per-piece FG SKU, e.g. 500 gm pouch with
+        ``uom = 0.5``), BOM ``quantity_per_unit`` is interpreted as
+        'per FG unit'. ``multiplier = qty_units`` (= qty_kg / uom when
+        the caller passed only kg).
+      • When ``uom == 1.000`` (1 piece = 1 kg), units and kg are
+        numerically equal, so either multiplier yields the same answer;
+        we pick kg for back-compat with the prior convention.
+      • When the FG SKU is missing from ``all_sku`` or its uom is NULL,
+        fall back to kg.
+
+    Callers pick which qty to pass — indent generators pass planned qty
+    (no actual exists yet at JC creation); the variance calc passes the
+    actual FG output (falling back to planned when no output is
+    recorded).
+
+    Returns ``(multiplier, basis, sku_uom)`` where ``basis`` is one of
+    ``'units' | 'kg'`` (mostly for tracing / log lines) and ``sku_uom``
+    is the resolved per-unit kg (``None`` when the SKU isn't in the
+    master).
+    """
+    try:
+        kg = float(qty_kg or 0)
+    except (TypeError, ValueError):
+        kg = 0.0
+    if kg <= 0:
+        return (0.0, 'kg', None)
+
+    sku_uom: float | None = None
+    if fg_sku_name:
+        row = await conn.fetchrow(
+            "SELECT uom FROM all_sku WHERE particulars = $1 LIMIT 1",
+            fg_sku_name,
+        )
+        if row and row["uom"] is not None:
+            try:
+                sku_uom = float(row["uom"])
+            except (TypeError, ValueError):
+                sku_uom = None
+
+    # uom missing / zero / exactly 1 → kg-basis (canonical legacy)
+    if sku_uom is None or sku_uom <= 0 or abs(sku_uom - 1.0) < 1e-9:
+        return (kg, 'kg', sku_uom)
+
+    # uom != 1 → units-basis. Prefer the caller-supplied units; else derive.
+    if qty_units is not None:
+        try:
+            units = float(qty_units)
+            if units > 0:
+                return (units, 'units', sku_uom)
+        except (TypeError, ValueError):
+            pass
+    return (kg / sku_uom, 'units', sku_uom)
+
+
 async def _materialise_indents(
     conn,
     *,
@@ -133,6 +266,8 @@ async def _materialise_indents(
     bom_id: int,
     planned_qty_kg,
     is_first_stage: bool,
+    fg_sku_name: str | None = None,
+    planned_qty_units=None,
     include_rm: bool = True,
     include_pm: bool = True,
 ) -> tuple[int, int]:
@@ -156,10 +291,16 @@ async def _materialise_indents(
     other side may already have operator-touched rows that must be
     preserved).
 
-    bom_line.quantity_per_unit is the BOM convention 'per kg of FG'
-    (matches v1's job_card_engine math), so reqd = planned_qty_kg ×
-    quantity_per_unit. gross_qty applies the loss buffer: reqd / (1 -
-    loss_pct/100), the same formula v1 uses.
+    bom_line.quantity_per_unit basis depends on the FG SKU's all_sku.uom
+    (resolved by resolve_bom_multiplier above):
+
+      • all_sku.uom != 1  → per-piece FG SKU; qpu is 'per FG unit';
+        multiplier = planned_qty_units (= planned_qty_kg / uom when
+        the planner only entered kg).
+      • all_sku.uom == 1 or NULL → qpu is 'per kg of FG';
+        multiplier = planned_qty_kg.
+
+    gross_qty applies the loss buffer: reqd / (1 - loss_pct/100).
     """
     if not is_first_stage:
         return (0, 0)
@@ -179,7 +320,21 @@ async def _materialise_indents(
     if not bom_lines:
         return (0, 0)
 
-    batch_kg = float(planned_qty_kg)
+    # Indent runs at JC creation — no actual FG output yet, so we pass
+    # planned qty as the multiplier source. The variance calc later swaps
+    # in the actual FG output.
+    multiplier, basis, sku_uom = await resolve_bom_multiplier(
+        conn,
+        fg_sku_name=fg_sku_name,
+        qty_kg=planned_qty_kg,
+        qty_units=planned_qty_units,
+    )
+    if multiplier <= 0:
+        return (0, 0)
+    logger.debug(
+        "indent: jc=%s fg=%s sku_uom=%s multiplier=%.3f basis=%s",
+        job_card_id, fg_sku_name, sku_uom, multiplier, basis,
+    )
     rm_count = 0
     pm_count = 0
 
@@ -195,7 +350,7 @@ async def _materialise_indents(
         qpu = float(bl["quantity_per_unit"] or 0)
         if qpu <= 0:
             continue
-        reqd  = batch_kg * qpu
+        reqd  = qpu * multiplier
         loss  = float(bl["loss_pct"] or 0)
         gross = reqd / (1 - loss / 100.0) if loss < 100 else reqd
         if reqd <= 0:
@@ -326,6 +481,7 @@ async def backfill_indents_for_jc(conn, job_card_id: int) -> dict:
     jc = await conn.fetchrow(
         """
         SELECT j.job_card_id, j.bom_id, j.plan_line_id, j.planned_qty_kg,
+               j.planned_qty_units, j.fg_sku_name,
                j.step_number,
                (SELECT MAX(step_number) FROM job_card_v2
                  WHERE plan_line_id = j.plan_line_id
@@ -401,6 +557,8 @@ async def backfill_indents_for_jc(conn, job_card_id: int) -> dict:
             conn, job_card_id=job_card_id, bom_id=effective_bom_id,
             planned_qty_kg=effective_qty,
             is_first_stage=True,
+            fg_sku_name=jc["fg_sku_name"],
+            planned_qty_units=jc["planned_qty_units"],
             include_rm=not has_rm,
             include_pm=not has_pm,
         )
@@ -579,6 +737,8 @@ async def create_job_cards_from_plan(conn, plan_id: int) -> dict:
                     bom_id=ln["bom_id"],
                     planned_qty_kg=ln["planned_qty_kg"],
                     is_first_stage=True,
+                    fg_sku_name=ln["fg_sku_name"],
+                    planned_qty_units=ln["planned_qty_units"],
                 )
 
             # Bi-directional chain — set next pointer on the prev row.
@@ -658,6 +818,9 @@ async def start_shift(conn, *, job_card_id: int, shift: str,
     The partial-unique index `uq_jcsl_v2_one_open` in migration 017 enforces
     this at the DB level too, so concurrent open attempts cleanly violate.
     """
+    lock_err = await assert_not_locked(conn, job_card_id)
+    if lock_err:
+        return lock_err
     if shift not in VALID_SHIFTS:
         return {"error": "invalid_shift",
                 "message": f"shift must be one of {VALID_SHIFTS}"}
@@ -771,6 +934,14 @@ async def list_shifts(conn, job_card_id: int) -> list[dict]:
 # JC list (v2)
 # ---------------------------------------------------------------------------
 
+_JC_SORTABLE_COLUMNS = frozenset({
+    "created_at", "start_time", "end_time", "plan_id", "status",
+    "step_number", "job_card_id", "planned_qty_kg",
+})
+_JC_DATE_FIELDS    = frozenset({"created_at", "start_time", "end_time"})
+_JC_PENDENCY_CHIPS = frozenset({"overdue", "due_today", "due_this_week", "future"})
+
+
 async def list_job_cards(
     conn, *,
     entity: str | None = None,
@@ -778,8 +949,16 @@ async def list_job_cards(
     floor: str | None = None,
     status: str | None = None,
     plan_id: int | None = None,
+    so_number: str | None = None,
+    machine_id: int | None = None,
     customer: str | None = None,
     search: str | None = None,
+    date_field: str = "created_at",
+    date_from: str | None = None,
+    date_to:   str | None = None,
+    pendency:  str | None = None,
+    sort_by:   str = "created_at",
+    sort_order: str = "DESC",
     page: int = 1,
     page_size: int = 100,
     user_scope_warehouses: list[str] | None = None,
@@ -788,6 +967,20 @@ async def list_job_cards(
     """Paginated list of v2 job cards with the user-level lock applied
     when no explicit filter is given (admins should pass None for the
     scope kwargs to bypass).
+
+    R3.D extensions:
+      * sort_by + sort_order: pick the ORDER BY column at the call site
+        rather than the hardcoded (plan_id DESC, plan_line_id, step). The
+        sort column is validated against an allow-list to keep the SQL
+        injection surface zero.
+      * date_field + date_from / date_to: choose which date column the
+        range filter applies to (created_at vs start_time vs end_time).
+      * pendency: chip filter (overdue / due_today / due_this_week / future)
+        computed against end_time as the proxy for stage deadline.
+      * so_number, machine_id, plan_id: drill-down filters.
+      * Counter block: top-line counters (total / locked / in_progress /
+        completed / pending_issuance / overdue) returned alongside the
+        page so the UI doesn't need a separate aggregate call.
     """
     conditions: list[str] = ["deleted_at IS NULL"]
     params: list = []
@@ -813,6 +1006,25 @@ async def list_job_cards(
             params.extend(statuses); idx += len(statuses)
     if plan_id is not None:
         conditions.append(f"plan_id = ${idx}"); params.append(plan_id); idx += 1
+    if machine_id is not None:
+        conditions.append(f"machine_id = ${idx}"); params.append(machine_id); idx += 1
+    if so_number:
+        # so_number is held on so_header; join via the plan-line ->
+        # so_fulfillment_v2 -> so_line -> so_header chain that the SELECT
+        # also uses. An EXISTS subquery keeps the outer plan size flat.
+        conditions.append(f"""
+            EXISTS (
+                SELECT 1
+                FROM   production_plan_line_v2 pl
+                JOIN   so_fulfillment_v2 sf
+                  ON   sf.so_fulfillment_id = ANY(pl.linked_so_fulfillment_ids)
+                JOIN   so_line  sl ON sl.so_line_id = sf.so_line_id
+                JOIN   so_header sh ON sh.so_id      = sl.so_id
+                WHERE  pl.plan_line_id = jc.plan_line_id
+                  AND  sh.so_number ILIKE ${idx}
+            )
+        """)
+        params.append(f"%{so_number}%"); idx += 1
     if customer:
         # Multi-value support for parity with v1 (UI sends comma-separated).
         customers = [c.strip() for c in customer.split(',') if c.strip()]
@@ -829,10 +1041,119 @@ async def list_job_cards(
         )
         params.append(f"%{search}%"); idx += 1
 
-    where = " AND ".join(conditions)
+    # Date range against the chosen date column. Allow-list keeps SQL
+    # injection at bay - reject unknown date_field explicitly rather than
+    # silently falling back to created_at (B10 H1 fix).
+    if date_field not in _JC_DATE_FIELDS:
+        return {
+            "error": "invalid_date_field",
+            "date_field": date_field,
+            "allowed": sorted(_JC_DATE_FIELDS),
+            "message": (
+                f"date_field='{date_field}' is not recognised. "
+                f"Allowed: {sorted(_JC_DATE_FIELDS)}."
+            ),
+        }
+    date_col = date_field
+    if date_from:
+        conditions.append(f"{date_col} >= ${idx}::date"); params.append(date_from); idx += 1
+    if date_to:
+        conditions.append(f"{date_col} <= ${idx}::date"); params.append(date_to); idx += 1
+
+    # Pendency chips - computed off production_plan_line_v2.deadline_date
+    # joined via plan_line_id. The previous implementation keyed off
+    # end_time (the JC COMPLETION timestamp), which is NULL while a JC
+    # is open and set in the past once closed - mathematically incapable
+    # of representing "due today" or "future". Migration 014 added the
+    # real deadline column. B10 C1 fix.
+    #
+    # Build the pendency predicate separately so the counter block can
+    # show meaningful chip totals over the non-pendency-filtered set
+    # (B10 C2).
+    pendency_predicate: str | None = None
+    if pendency is not None and pendency not in _JC_PENDENCY_CHIPS:
+        return {
+            "error": "invalid_pendency",
+            "pendency": pendency,
+            "allowed": sorted(_JC_PENDENCY_CHIPS),
+            "message": (
+                f"pendency='{pendency}' is not a valid chip. "
+                f"Allowed: {sorted(_JC_PENDENCY_CHIPS)}."
+            ),
+        }
+    if pendency == "overdue":
+        pendency_predicate = (
+            "(SELECT pl.deadline_date FROM production_plan_line_v2 pl "
+            "  WHERE pl.plan_line_id = jc.plan_line_id) < CURRENT_DATE "
+            "AND jc.status NOT IN ('completed','closed','cancelled')"
+        )
+    elif pendency == "due_today":
+        pendency_predicate = (
+            "(SELECT pl.deadline_date FROM production_plan_line_v2 pl "
+            "  WHERE pl.plan_line_id = jc.plan_line_id) = CURRENT_DATE "
+            "AND jc.status NOT IN ('completed','closed','cancelled')"
+        )
+    elif pendency == "due_this_week":
+        pendency_predicate = (
+            "(SELECT pl.deadline_date FROM production_plan_line_v2 pl "
+            "  WHERE pl.plan_line_id = jc.plan_line_id) "
+            "  BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '7 days' "
+            "AND jc.status NOT IN ('completed','closed','cancelled')"
+        )
+    elif pendency == "future":
+        pendency_predicate = (
+            "(SELECT pl.deadline_date FROM production_plan_line_v2 pl "
+            "  WHERE pl.plan_line_id = jc.plan_line_id) > CURRENT_DATE + INTERVAL '7 days'"
+        )
+
+    where_for_list = " AND ".join(conditions + ([pendency_predicate] if pendency_predicate else []))
+    where_for_counters = " AND ".join(conditions)   # counter chips reflect the page set MINUS pendency / status
+
     total = await conn.fetchval(
-        f"SELECT COUNT(*) FROM job_card_v2 WHERE {where}", *params,
+        f"SELECT COUNT(*) FROM job_card_v2 jc WHERE {where_for_list}", *params,
     )
+
+    # Counter block: the WHERE deliberately OMITS the pendency filter so
+    # chip-bar UIs can show how many JCs would fall into each chip when
+    # the user switches. The status counters likewise reflect every
+    # status in the unfiltered set. B10 C2 fix.
+    counters_row = await conn.fetchrow(
+        f"""
+        SELECT
+            COUNT(*)                                                AS total,
+            COUNT(*) FILTER (WHERE status='locked')                 AS locked,
+            COUNT(*) FILTER (WHERE status='in_progress')            AS in_progress,
+            COUNT(*) FILTER (WHERE status='completed')              AS completed,
+            COUNT(*) FILTER (WHERE status IN ('locked','unlocked')) AS pending_issuance,
+            COUNT(*) FILTER (
+                WHERE
+                    (SELECT pl.deadline_date FROM production_plan_line_v2 pl
+                       WHERE pl.plan_line_id = jc.plan_line_id) < CURRENT_DATE
+                AND status NOT IN ('completed','closed','cancelled')
+            )                                                       AS overdue
+        FROM   job_card_v2 jc
+        WHERE  {where_for_counters}
+        """,
+        *params,
+    )
+    where = where_for_list   # for the rest of this function (results query)
+
+    # ORDER BY with allow-list. B10 H1: reject explicitly instead of
+    # silently coercing to created_at - clients with a typo get an
+    # immediate signal rather than wrong-ordered data.
+    if sort_by not in _JC_SORTABLE_COLUMNS:
+        return {
+            "error": "invalid_sort_by",
+            "sort_by": sort_by,
+            "allowed": sorted(_JC_SORTABLE_COLUMNS),
+            "message": (
+                f"sort_by='{sort_by}' is not recognised. "
+                f"Allowed: {sorted(_JC_SORTABLE_COLUMNS)}."
+            ),
+        }
+    sort_col = sort_by
+    sort_dir = "ASC" if (sort_order or "").upper() == "ASC" else "DESC"
+
     offset = (page - 1) * page_size
     rows = await conn.fetch(
         f"""
@@ -862,7 +1183,7 @@ async def list_job_cards(
                    AND sh.so_number IS NOT NULL) AS so_numbers
         FROM job_card_v2 jc
         WHERE {where}
-        ORDER BY jc.plan_id DESC, jc.plan_line_id, jc.step_number, jc.job_card_id
+        ORDER BY jc.{sort_col} {sort_dir}, jc.job_card_id {sort_dir}
         LIMIT ${idx} OFFSET ${idx + 1}
         """,
         *params, page_size, offset,
@@ -876,6 +1197,15 @@ async def list_job_cards(
             "total": total or 0,
             "total_pages": ((total or 0) + page_size - 1) // page_size if total else 0,
         },
+        "counters": {
+            "total":            counters_row["total"]            or 0,
+            "locked":           counters_row["locked"]           or 0,
+            "in_progress":      counters_row["in_progress"]      or 0,
+            "completed":        counters_row["completed"]        or 0,
+            "pending_issuance": counters_row["pending_issuance"] or 0,
+            "overdue":          counters_row["overdue"]          or 0,
+        },
+        "sort":   {"sort_by": sort_col, "sort_order": sort_dir},
     }
 
 
@@ -1178,10 +1508,20 @@ async def record_output(conn, *, job_card_id: int,
     rm_consumed > 0; NULL otherwise. The JC's status is NOT auto-flipped
     here — explicit /complete and /close calls handle that.
     """
-    if output_qty_kg is None or rm_consumed_kg is None:
-        return {"error": "missing_qty"}
-    if output_qty_kg < 0 or rm_consumed_kg < 0:
-        return {"error": "negative_qty"}
+    lock_err = await assert_not_locked(conn, job_card_id)
+    if lock_err:
+        return lock_err
+    # Validate + normalize inputs and compute yield. rm_consumed_kg is
+    # optional: a packaging / later stage records FG output (and PM
+    # consumption) without an RM figure, so a missing value normalizes to 0
+    # and yield is left uncomputed. The implausible-yield guard (NUMERIC(6,3)
+    # overflow / unit-typo protection) lives in compute_output_row.
+    calc = compute_output_row(output_qty_kg, rm_consumed_kg)
+    if "error" in calc:
+        return calc
+    rm_consumed_kg = calc["rm_consumed_kg"]
+    yield_pct = calc["yield_pct"]
+
     jc = await conn.fetchrow(
         "SELECT job_card_id, output_kind FROM job_card_v2 WHERE job_card_id=$1 AND deleted_at IS NULL",
         job_card_id,
@@ -1190,22 +1530,6 @@ async def record_output(conn, *, job_card_id: int,
         return {"error": "job_card_not_found"}
 
     kind = output_kind or jc["output_kind"]
-    # yield_pct lives in a NUMERIC(6,3) column — max absolute value 999.999.
-    # If the computed yield blows that bound, the operator almost certainly
-    # typo'd a value (output entered in grams instead of kg, RM and output
-    # swapped, etc.). Reject loudly with the numbers so they can see what
-    # tripped the check, rather than letting asyncpg raise a 500 the
-    # operator can't act on.
-    yield_pct = None
-    if rm_consumed_kg > 0:
-        yield_pct = round((output_qty_kg / rm_consumed_kg) * 100, 3)
-        if abs(yield_pct) >= 1000:
-            return {
-                "error": "implausible_yield",
-                "yield_pct":      yield_pct,
-                "rm_consumed_kg": rm_consumed_kg,
-                "output_qty_kg":  output_qty_kg,
-            }
 
     async def _insert_output():
         return await conn.fetchrow(
@@ -1230,6 +1554,12 @@ async def record_output(conn, *, job_card_id: int,
 
 VALID_BALANCE_TYPES = ('extra_given', 'returned', 'wastage', 'control_sample')
 
+# Consolidated-EGA sentinel: operationally, nobody can attribute EGA to a
+# specific RM after the batch is run, so the UI submits ONE EGA row with
+# this sentinel as material_name (bom_line_id=NULL). The item-type gate
+# below skips when this token is present — the packing-stage gate stays.
+EGA_CONSOLIDATED_SENTINEL = 'CONSOLIDATED'
+
 
 async def replace_balance_materials(conn, *, job_card_id: int,
                                     rows: list[dict],
@@ -1243,10 +1573,25 @@ async def replace_balance_materials(conn, *, job_card_id: int,
     `extra_given` row's bom_line_id can be NULL (the operator picks the
     article via a spinner) and NULL columns don't conflict in PostgreSQL.
 
+    R11 EGA validation (B6): rows with balance_type='extra_given' must
+        (a) point at a BOM material whose item_type='rm' (not 'pm') and
+        (b) be on a packing-stage JC. Both gated at the top so we don't
+        delete the existing rows on a doomed save.
+
+    R6 lock guard (B6 H1 fix): blocks the wholesale replace on a locked
+    JC. Other balance-material entry paths already gate; this one was
+    missing the check.
+
     Wholesale replace matches the v1 engine's pattern
     (job_card_engine.record_output_v2). Returns the inserted rows so the
     response can echo back what was saved."""
+    # B6 H1: lock guard.
+    lock_err = await assert_not_locked(conn, job_card_id)
+    if lock_err:
+        return lock_err
+
     saved: list[dict] = []
+    has_ega = False
     for r in rows:
         balance_type = r.get("balance_type")
         if balance_type not in VALID_BALANCE_TYPES:
@@ -1257,6 +1602,82 @@ async def replace_balance_materials(conn, *, job_card_id: int,
         material_name = r.get("material_name") or r.get("material_sku_name")
         if not material_name:
             return {"error": "missing_material_name", "balance_type": balance_type}
+        if balance_type == 'extra_given' and qty > 0:
+            has_ega = True
+
+    # R11: EGA-specific gates (only run if at least one extra_given row has
+    # qty > 0 — saving zero EGA is a no-op and shouldn't be blocked).
+    if has_ega:
+        jc_meta = await conn.fetchrow(
+            "SELECT bom_id, stage FROM job_card_v2 "
+            "WHERE  job_card_id=$1 AND deleted_at IS NULL "
+            "FOR    UPDATE",
+            job_card_id,
+        )
+        if jc_meta is None:
+            return {"error": "job_card_not_found"}
+        # B6 C2 fix: substring match (normalised) instead of exact-string.
+        if not is_packing_stage(jc_meta["stage"]):
+            return {
+                "error": "ega_non_packing_stage",
+                "stage": jc_meta["stage"],
+                "message": (
+                    f"EGA can only be recorded on packing stages "
+                    f"(got '{jc_meta['stage']}')."
+                ),
+            }
+        # B6 H2/H3 fix: prefer bom_line_id when the row carries it; only
+        # fall back to fuzzy name match otherwise. ORDER BY line_number on
+        # the name fallback so the choice is deterministic if multiple
+        # rows share the same material name. Affirmatively require 'rm'
+        # rather than just rejecting 'pm' (M2 from the review).
+        for r in rows:
+            if r.get("balance_type") != 'extra_given':
+                continue
+            qty = float(r.get("qty_kg") or 0)
+            if qty == 0:
+                continue
+            # Consolidated EGA — operator-stated: per-article attribution
+            # is unknowable post-run. The packing-stage gate above still
+            # ran; the per-material item_type gate is skipped here.
+            material_name = (r.get("material_name") or r.get("material_sku_name") or "").strip()
+            if material_name.upper() == EGA_CONSOLIDATED_SENTINEL:
+                continue
+            bom_line_id = r.get("bom_line_id")
+            if bom_line_id:
+                item_type = await conn.fetchval(
+                    "SELECT item_type FROM bom_line WHERE bom_line_id=$1",
+                    bom_line_id,
+                )
+                lookup_key = f"bom_line_id={bom_line_id}"
+            else:
+                material_name = r.get("material_name") or r.get("material_sku_name")
+                item_type = await conn.fetchval(
+                    "SELECT item_type FROM bom_line "
+                    "WHERE  bom_id=$1 AND material_sku_name=$2 "
+                    "ORDER  BY line_number LIMIT 1",
+                    jc_meta["bom_id"], material_name,
+                )
+                lookup_key = f"material='{material_name}'"
+            if item_type is None:
+                return {
+                    "error": "ega_material_not_in_bom",
+                    "lookup": lookup_key,
+                    "message": (
+                        f"EGA material ({lookup_key}) is not in the "
+                        "JC's BOM line items."
+                    ),
+                }
+            if item_type.strip().lower() != 'rm':
+                return {
+                    "error": "ega_non_rm_material",
+                    "lookup": lookup_key,
+                    "item_type": item_type,
+                    "message": (
+                        f"EGA refused for material ({lookup_key}) with "
+                        f"item_type='{item_type}' - EGA is only valid for RM."
+                    ),
+                }
 
     await conn.execute(
         "DELETE FROM job_card_balance_material_v2 WHERE job_card_id = $1",
@@ -1376,15 +1797,21 @@ async def start_job_card(conn, *, job_card_id: int) -> dict:
         in_progress / completed / closed / cancelled → refused (idempotent
                             "already there" or terminal state)
     """
+    # R6 lock guard owns the 'locked' rejection. assert_not_locked sees
+    # is_locked=TRUE (which always coincides with status='locked' on
+    # well-formed rows) and returns the error dict; force_unlock flips
+    # both is_locked AND status='unlocked' in the same txn so a JC with
+    # status='locked' AND force_unlocked=TRUE is structurally impossible.
+    # Result: no separate status='locked' branch needed below.
+    lock_err = await assert_not_locked(conn, job_card_id)
+    if lock_err:
+        return lock_err
     jc = await conn.fetchrow(
         "SELECT status, start_time FROM job_card_v2 WHERE job_card_id=$1 AND deleted_at IS NULL",
         job_card_id,
     )
     if not jc:
         return {"error": "job_card_not_found"}
-    if jc["status"] == 'locked':
-        return {"error": "locked",
-                "message": "JC is locked. Wait for the previous stage to dispatch material first."}
     if jc["status"] in ('in_progress', 'completed', 'closed', 'cancelled'):
         return {"error": "invalid_status",
                 "message": f"Cannot start a JC in status '{jc['status']}'"}
@@ -1409,7 +1836,10 @@ async def start_job_card(conn, *, job_card_id: int) -> dict:
     }
 
 
-async def complete_job_card(conn, *, job_card_id: int) -> dict:
+async def complete_job_card(conn, *, job_card_id: int,
+                             force: bool = False,
+                             request_id: int | None = None,
+                             completed_by: str | None = None) -> dict:
     """Move a v2 JC from 'in_progress' to 'completed'.
 
     Side effects:
@@ -1418,6 +1848,19 @@ async def complete_job_card(conn, *, job_card_id: int) -> dict:
           roll-up alone (it's already the source of truth). Otherwise
           compute end_time - start_time as a fallback for JCs that didn't
           use multi-shift capture.
+
+    R9 closure gate:
+        Reads job_card_accounting_v2.is_balanced. When False, refuses with
+        {"error": "unbalanced", ...} unless the caller supplies BOTH
+        force=True AND a request_id - an R8 maker-checker amendment of
+        type 'unbalanced_close_override' that has been approved. The
+        approved-status check on the request_id is enforced at the
+        amendment service layer (B11); until B11 ships, the request_id
+        is accepted as an audit-trail token only.
+
+    R13 closure gate:
+        Refuses if any phase row for this JC is still 'open'. Phases must
+        be closed (or cancelled) before /complete can run.
 
     NOTE: v2 does NOT auto-unlock the next stage on complete. The dispatch
     flow (POST /dispatch-to-next) handles that — handing off material to
@@ -1447,8 +1890,125 @@ async def complete_job_card(conn, *, job_card_id: int) -> dict:
         return {"error": "open_shift",
                 "message": "Stop the open shift segment before completing"}
 
+    # ── R13: refuse if any phase is still open.
+    open_phase = await conn.fetchrow(
+        """
+        SELECT phase_id, phase_number, phase_date
+        FROM   job_card_phase_v2
+        WHERE  job_card_id = $1 AND status = 'open'
+        LIMIT  1
+        """,
+        job_card_id,
+    )
+    if open_phase:
+        return {
+            "error":        "open_phase",
+            "phase_id":     open_phase["phase_id"],
+            "phase_number": open_phase["phase_number"],
+            "phase_date":   open_phase["phase_date"].isoformat() if open_phase["phase_date"] else None,
+            "message": (
+                f"Phase {open_phase['phase_number']} "
+                f"({open_phase['phase_date']}) is still open. Close it "
+                "before completing the JC."
+            ),
+        }
+
+    # ── R9: reject when accounting is unbalanced unless caller force-
+    # overrides with an R8-approved request_id. is_balanced is the
+    # canonical truth from the most recent accounting summary save (B4).
+    # If no accounting row exists yet, treat as unbalanced (operator
+    # must save accounting before close).
+    # FOR UPDATE locks the accounting row so a concurrent B4 save can't
+    # flip is_balanced between this read and the JC status UPDATE below.
+    acct = await conn.fetchrow(
+        """
+        SELECT is_balanced, balance_difference_qty
+        FROM   job_card_accounting_v2
+        WHERE  job_card_id = $1
+        FOR    UPDATE
+        """,
+        job_card_id,
+    )
+    if acct is None:
+        return {
+            "error": "no_accounting",
+            "message": (
+                "Accounting summary not saved yet. Save the summary "
+                "before completing so the balance check can run."
+            ),
+        }
+
+    # If unbalanced, the only path forward is an R8 amendment override.
+    # C1 fix: the request_id has to actually exist, point at this JC, and
+    # be the right type. B11 will add the status='approved' enforcement;
+    # for now we at least validate the row IS what it claims to be so a
+    # random integer can't bypass the gate.
+    override_valid = False
+    if force and request_id is not None:
+        amendment = await conn.fetchrow(
+            """
+            SELECT request_id, request_type, status
+            FROM   bom_amendment_request_v2
+            WHERE  request_id  = $1
+              AND  job_card_id = $2
+            """,
+            request_id, job_card_id,
+        )
+        if amendment is None:
+            return {
+                "error": "override_request_not_found",
+                "request_id": request_id,
+                "message": (
+                    f"No bom_amendment_request_v2 row with request_id={request_id} "
+                    f"references this JC. File the unbalanced_close_override "
+                    "amendment first."
+                ),
+            }
+        if amendment["request_type"] != 'unbalanced_close_override':
+            return {
+                "error": "override_request_wrong_type",
+                "request_id": request_id,
+                "request_type": amendment["request_type"],
+                "message": (
+                    "Override request_id must point at an "
+                    "'unbalanced_close_override' amendment; got "
+                    f"'{amendment['request_type']}'."
+                ),
+            }
+        # B11 closes the loop: require the amendment to have advanced
+        # through the maker-checker chain. 'approved' or 'applied' both
+        # mean the checker(s) signed off; 'applied' just means the
+        # apply step already noop-completed for this request_type.
+        if amendment["status"] not in ('approved', 'applied'):
+            return {
+                "error": "override_request_not_approved",
+                "request_id": request_id,
+                "status":     amendment["status"],
+                "message": (
+                    f"Override request_id={request_id} is in status "
+                    f"'{amendment['status']}' - awaiting approval. "
+                    "Cannot be used to force-close until status='approved' "
+                    "or 'applied'."
+                ),
+            }
+        override_valid = True
+
+    if not acct["is_balanced"] and not override_valid:
+        return {
+            "error": "unbalanced",
+            "balance_difference_qty": float(acct["balance_difference_qty"]),
+            "message": (
+                "Accounting is unbalanced. Resolve the variance OR file an "
+                "'unbalanced_close_override' amendment (R8 row 12) and "
+                "retry with force=true and the approved request_id."
+            ),
+        }
+
     # Fallback total_time_min only when shift log didn't populate it.
     use_fallback = (jc["total_time_min"] is None or float(jc["total_time_min"]) == 0)
+    # B5 C2 audit trail: stamp force_closed + request_id when the override
+    # was exercised. Migration 031 added the columns; pre-031 builds
+    # would error here.
     row = await conn.fetchrow(
         """
         UPDATE job_card_v2
@@ -1458,11 +2018,18 @@ async def complete_job_card(conn, *, job_card_id: int) -> dict:
                                   WHEN $2::bool AND start_time IS NOT NULL
                                   THEN EXTRACT(EPOCH FROM (NOW() - start_time)) / 60.0
                                   ELSE total_time_min
-                                END
+                                END,
+               force_closed           = CASE WHEN $3::bool THEN TRUE ELSE force_closed END,
+               force_close_request_id = CASE WHEN $3::bool THEN $4 ELSE force_close_request_id END,
+               force_close_by         = CASE WHEN $3::bool THEN $5 ELSE force_close_by END,
+               force_close_at         = CASE WHEN $3::bool THEN NOW() ELSE force_close_at END
          WHERE job_card_id = $1
-        RETURNING status, end_time, total_time_min
+        RETURNING status, end_time, total_time_min, force_closed
         """,
         job_card_id, use_fallback,
+        override_valid,
+        request_id if override_valid else None,
+        completed_by if override_valid else None,
     )
     return {
         "completed":      True,
@@ -1525,6 +2092,13 @@ _PATCH_ALLOWED_COLUMNS = frozenset({
     'floor', 'machine_id',
 })
 
+# R1 gate: header edits are allowed up to and including 'material_received'.
+# Once the JC reaches 'in_progress' (or any terminal status) the only way to
+# change state is operational entry - output, accounting, QC. Mirrors
+# jc_editor.EDITABLE_STATUSES on the v1 path; intentionally not imported so
+# the two paths can diverge later if their rules drift.
+PATCHABLE_STATUSES = frozenset({"locked", "unlocked", "assigned", "material_received"})
+
 
 async def patch_job_card(conn, *, job_card_id: int,
                           fields: dict, updated_by: str | None = None) -> dict:
@@ -1532,9 +2106,32 @@ async def patch_job_card(conn, *, job_card_id: int,
     (status, plan lineage, audit columns, chain pointers) are silently
     ignored — use the dedicated lifecycle endpoints for those.
 
+    R1 status gate: PATCH is blocked once the JC reaches 'in_progress'
+    or a terminal state. Lifecycle endpoints handle those transitions.
+
     Returns the updated row, or {"error": "no_change"} when nothing in
     the payload was an allowed column.
     """
+    # R1 status gate - pre-fetch so we can return a specific error rather
+    # than letting an UPDATE with an extra WHERE clause silently no-op.
+    jc = await conn.fetchrow(
+        "SELECT status FROM job_card_v2 "
+        "WHERE  job_card_id=$1 AND deleted_at IS NULL",
+        job_card_id,
+    )
+    if not jc:
+        return {"error": "job_card_not_found"}
+    if jc["status"] not in PATCHABLE_STATUSES:
+        return {
+            "error": "invalid_status",
+            "status": jc["status"],
+            "message": (
+                f"Header edits blocked in status '{jc['status']}'. "
+                "Use the lifecycle endpoints (/start, /complete, /close, "
+                "/stop) for state transitions."
+            ),
+        }
+
     sets: list[str] = []
     params: list = []
     idx = 1
@@ -1603,6 +2200,113 @@ async def cancel_job_card(conn, *, job_card_id: int,
         job_card_id, deleted_by, reason.strip(),
     )
     return {"cancelled": True, "job_card": _serialize(row)}
+
+
+# ---------------------------------------------------------------------------
+# Stop Process (R1)
+# ---------------------------------------------------------------------------
+
+async def stop_job_card(conn, *, job_card_id: int,
+                        reason: str, stopped_by: str | None = None,
+                        request_id: int | None = None) -> dict:
+    """R1 Stop Process: mid-run cancellation for JCs that are receiving
+    material or already running. Distinct from cancel_job_card (which only
+    handles the pre-start range) - this is the operator-facing 'stop
+    everything' button for material_received / in_progress JCs.
+
+    Side effects in one txn:
+      - Any OPEN R13 phase for this JC is set to 'cancelled' first.
+        Phase-table partial UNIQUE index uq_jcphase_one_open guarantees
+        at most one open phase, so a single UPDATE handles it.
+      - job_card_v2.status -> 'cancelled', deleted_at = NOW(),
+        cancellation_reason carries the audit prefix
+        '[STOP_PROCESS][req:<id>] ' when request_id is supplied,
+        '[STOP_PROCESS] ' otherwise. The bracketed prefix is grep-safe
+        so future audits can correlate the JC cancel with the R8
+        amendment that authorised it. The dedicated FK column lands
+        with B11.
+
+    Approval composition: per R8 matrix row 8 (floor_manager maker,
+    admin / production_manager checker). Approval enforcement still
+    lives upstream - this service just performs the state transition.
+    """
+    if not reason or not reason.strip():
+        return {"error": "missing_reason", "message": "reason is required"}
+
+    # FOR UPDATE serialises concurrent /stop calls on the same JC so two
+    # operators racing the button can't both pass the status check and
+    # overwrite each other's cancellation_reason. asyncpg passes the
+    # row-lock through the wrapping conn.transaction(); the lock releases
+    # when the txn commits/rolls back at the router layer.
+    jc = await conn.fetchrow(
+        """
+        SELECT status FROM job_card_v2
+        WHERE  job_card_id = $1 AND deleted_at IS NULL
+        FOR    UPDATE
+        """,
+        job_card_id,
+    )
+    if not jc:
+        return {"error": "job_card_not_found"}
+    if jc["status"] not in ('material_received', 'in_progress'):
+        return {"error": "invalid_status",
+                "message": (
+                    f"Cannot stop a JC in '{jc['status']}'. Stop-process "
+                    "applies only to 'material_received' or 'in_progress'. "
+                    "Use cancel for pre-start; close for completed."
+                )}
+
+    # Close any open shift segment so the partial-unique index
+    # uq_jcsl_v2_one_open doesn't leave a dangling open row that future
+    # /shifts/start calls (or analytics) trip over. Mirrors the manual
+    # stop_shift path - end_at = NOW(), paused_minutes left at 0 since
+    # the operator didn't intend a normal stop.
+    await conn.execute(
+        """
+        UPDATE job_card_shift_log_v2
+           SET end_at = NOW(),
+               notes  = COALESCE(notes || E'\n', '') ||
+                        'Closed by stop-process: ' || $2
+         WHERE job_card_id = $1
+           AND end_at IS NULL
+        """,
+        job_card_id, reason.strip(),
+    )
+
+    # Cancel any open phase next (single-open invariant from migration 029).
+    await conn.execute(
+        """
+        UPDATE job_card_phase_v2
+           SET status    = 'cancelled',
+               ended_at  = COALESCE(ended_at, NOW()),
+               closed_at = NOW(),
+               closed_by = $2,
+               notes     = COALESCE(notes || E'\n', '') ||
+                           'Cancelled by stop-process: ' || $3
+         WHERE job_card_id = $1
+           AND status      = 'open'
+        """,
+        job_card_id, stopped_by, reason.strip(),
+    )
+
+    prefix = (
+        f"[STOP_PROCESS][req:{request_id}] "
+        if request_id is not None
+        else "[STOP_PROCESS] "
+    )
+    row = await conn.fetchrow(
+        """
+        UPDATE job_card_v2
+           SET status              = 'cancelled',
+               deleted_at          = NOW(),
+               deleted_by          = $2,
+               cancellation_reason = $4 || $3
+         WHERE job_card_id = $1
+        RETURNING *
+        """,
+        job_card_id, stopped_by, reason.strip(), prefix,
+    )
+    return {"stopped": True, "job_card": _serialize(row)}
 
 
 # ---------------------------------------------------------------------------
@@ -1804,12 +2508,17 @@ async def get_job_card(conn, job_card_id: int) -> dict | None:
     # shape the Android Output form deserialises (ByproductLine.java).
     # Column `quantity` is aliased to `qty_kg` so the JSON keys round-trip
     # without a client-side mapping layer.
+    #
+    # Migration 034 added material_name + bom_line_id so off-grade /
+    # rejection rows can persist their article attribution. These are
+    # NULL for control_sample / pm_* / dust / etc.
     byproduct_rows = await conn.fetch(
         """
-        SELECT byproduct_id, category, quantity AS qty_kg, uom, remarks
+        SELECT byproduct_id, category, quantity AS qty_kg, uom, remarks,
+               material_name, bom_line_id
         FROM   job_card_byproducts_v2
         WHERE  job_card_id = $1
-        ORDER  BY category
+        ORDER  BY category, COALESCE(material_name, '')
         """,
         job_card_id,
     )
@@ -1835,6 +2544,37 @@ async def get_job_card(conn, job_card_id: int) -> dict | None:
         """,
         job_card_id,
     )
+
+    # ─── FG per-unit kg from all_sku (R2 canonical source) ───────────────
+    # all_sku.uom is the per-unit kg multiplier (NUMERIC(15,3)) per
+    # schema.sql:54 — single source of truth. bom_header.pack_size_kg is a
+    # downstream snapshot kept as fallback for FG SKUs not yet in the master
+    # (or master rows where uom is NULL).
+    sku_uom: float | None = None
+    if h.get("fg_sku_name"):
+        sku_row = await conn.fetchrow(
+            "SELECT uom FROM all_sku WHERE particulars = $1 LIMIT 1",
+            h["fg_sku_name"],
+        )
+        if sku_row and sku_row["uom"] is not None:
+            sku_uom = float(sku_row["uom"])
+    net_wt_per_unit_kg: float | None = (
+        sku_uom if (sku_uom is not None and sku_uom > 0) else bom_pack_size
+    )
+    # expected_units: prefer the planner's stored planned_qty_units (R2
+    # primary input); otherwise derive from planned_qty_kg ÷ net_wt_per_unit_kg.
+    expected_units: int | None = None
+    if h.get("planned_qty_units") is not None:
+        expected_units = int(h["planned_qty_units"])
+    elif (
+        net_wt_per_unit_kg is not None
+        and net_wt_per_unit_kg > 0
+        and h.get("planned_qty_kg") is not None
+    ):
+        try:
+            expected_units = int(round(float(h["planned_qty_kg"]) / net_wt_per_unit_kg))
+        except (TypeError, ValueError):
+            expected_units = None
 
     # ─── v1 compat: sectioned payload derived from v2 data ───────────────
     section_1_product = {
@@ -1866,8 +2606,10 @@ async def get_job_card(conn, job_card_id: int) -> dict | None:
         # Aliases the v1 detail screen looks for; not in the v2 schema today.
         # Kept as null so the UI shows "--" instead of erroring out.
         "article_code":         None,
-        "net_wt_per_unit_kg":   None,
-        "expected_units":       None,
+        # net_wt_per_unit_kg + expected_units now sourced from all_sku.uom
+        # (R2 framework). See block above this dict where the lookup runs.
+        "net_wt_per_unit_kg":   net_wt_per_unit_kg,
+        "expected_units":       expected_units,
         "mrp":                  None,
         "ean_code":             None,
         "best_before_date":     None,

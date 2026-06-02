@@ -126,7 +126,7 @@ To check if user U can perform action A on module M / sub_module S:
 |------|-----------|
 | `admin` | All permissions |
 | `planner` | plans, fulfillment, MRP, indents, AI |
-| `stores_manager` | inventory, day_end, offgrade |
+| `inventory_manager` | inventory, day_end, offgrade |
 | `team_leader` | job_cards lifecycle & output |
 | `qc_inspector` | job_cards annexures + sign_offs |
 | `floor_manager` | inventory, day_end, discrepancy |

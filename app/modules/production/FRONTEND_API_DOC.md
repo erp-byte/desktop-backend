@@ -689,7 +689,7 @@ Scan detail with all line items and variance flags.
 Adjust floor_inventory to match physical count.
 
 ```json
-{ "reviewed_by": "Stores Manager" }
+{ "reviewed_by": "Inventory Manager" }
 ```
 
 ---

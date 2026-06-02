@@ -18,10 +18,31 @@ from app.modules.production.schemas.job_card_edit import (
     WeightCheckPatchRequest, LossReconciliationPatchRequest,
     RemarkPatchRequest, AnnexureDeleteRequest,
 )
+# L3: B13 cost-metric gate. Hoisted to the top so endpoint bodies stay
+# clean and the gate is one obvious dependency at the module head.
+from app.modules.production.services.response_filters import strip_cost_fields
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/production", tags=["Production"])
+
+
+# ---------------------------------------------------------------------------
+# Router helpers
+# ---------------------------------------------------------------------------
+
+def _raise_if_locked(result: dict | None) -> None:
+    """R6 lock-guard translation: if a v2 JC service returns the locked
+    error dict (set by services/job_card_v2.py::assert_not_locked), raise
+    HTTP 409 with the full lock context so the client can show the lock
+    reason and offer the force-unlock action.
+
+    Called immediately after the service await on every endpoint whose
+    service uses assert_not_locked() - prevents a generic catch-all
+    `if result.get("error"):` from mis-mapping the 409 to a 400.
+    """
+    if result and result.get("error") == "locked":
+        raise HTTPException(status_code=409, detail=result)
 
 
 # ---------------------------------------------------------------------------
@@ -243,15 +264,24 @@ async def chart_summary(
     so_number: str = Query(None),
     article: str = Query(None),
     status: str = Query(None),
+    user=Depends(get_current_user),
 ):
-    """Aggregated data for dashboard charts — not paginated."""
+    """Aggregated data for dashboard charts — not paginated.
+
+    B13 cost-metric gate: the SO surface this aggregates over can carry
+    ``rate_inr`` / ``amount_inr``; gate the response for deny-listed roles."""
     from app.modules.production.services.fulfillment import get_chart_summary
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
-        return await get_chart_summary(
+        result = await get_chart_summary(
             conn, entity=entity, financial_year=financial_year,
             customer=customer, so_number=so_number, article=article, status=status,
         )
+    return strip_cost_fields(
+        result,
+        getattr(user, "role_name", None),
+        is_admin=getattr(user, "is_admin", False),
+    )
 
 
 @router.get("/fulfillment/filter-options")
@@ -282,14 +312,23 @@ async def customer_view(
     entity: str = Query(None),
     financial_year: str = Query(None),
     customer: str = Query(None),
+    user=Depends(get_current_user),
 ):
-    """Customer-grouped fulfillment with BOM details, process route + floors, and inventory status."""
+    """Customer-grouped fulfillment with BOM details, process route + floors, and inventory status.
+
+    B13 cost-metric gate: customer-view embeds SO lines that often carry
+    ``rate_inr`` and amount columns; strip for deny-listed roles."""
     from app.modules.production.services.fulfillment import get_enriched_fulfillment
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
-        return await get_enriched_fulfillment(
+        result = await get_enriched_fulfillment(
             conn, entity=entity, financial_year=financial_year, customer=customer,
         )
+    return strip_cost_fields(
+        result,
+        getattr(user, "role_name", None),
+        is_admin=getattr(user, "is_admin", False),
+    )
 
 
 @router.get("/fulfillment/fy-review")
@@ -297,12 +336,21 @@ async def fy_review(
     request: Request,
     entity: str = Query(None),
     financial_year: str = Query(None),
+    user=Depends(get_current_user),
 ):
-    """All unfulfilled orders for FY close review."""
+    """All unfulfilled orders for FY close review.
+
+    B13 cost-metric gate: FY-review surfaces SO money columns; strip for
+    deny-listed roles."""
     from app.modules.production.services.fulfillment import get_fy_review
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
-        return await get_fy_review(conn, entity, financial_year)
+        result = await get_fy_review(conn, entity, financial_year)
+    return strip_cost_fields(
+        result,
+        getattr(user, "role_name", None),
+        is_admin=getattr(user, "is_admin", False),
+    )
 
 
 @router.get("/fulfillment/{fulfillment_id}/detail")
@@ -523,14 +571,21 @@ async def chart_summary_v2(
     so_number: str = Query(None),
     article: str = Query(None),
     status: str = Query(None),
+    user=Depends(get_current_user),
 ):
+    """B13 cost-metric gate applied — same rationale as v1 chart-summary."""
     from app.modules.production.services.fulfillment_v2 import get_chart_summary
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
-        return await get_chart_summary(
+        result = await get_chart_summary(
             conn, entity=entity, financial_year=financial_year,
             customer=customer, so_number=so_number, article=article, status=status,
         )
+    return strip_cost_fields(
+        result,
+        getattr(user, "role_name", None),
+        is_admin=getattr(user, "is_admin", False),
+    )
 
 
 @router.get("/fulfillment-v2/customer-view")
@@ -539,13 +594,20 @@ async def customer_view_v2(
     entity: str = Query(None),
     financial_year: str = Query(None),
     customer: str = Query(None),
+    user=Depends(get_current_user),
 ):
+    """B13 cost-metric gate applied — same rationale as v1 customer-view."""
     from app.modules.production.services.fulfillment_v2 import get_enriched_fulfillment
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
-        return await get_enriched_fulfillment(
+        result = await get_enriched_fulfillment(
             conn, entity=entity, financial_year=financial_year, customer=customer,
         )
+    return strip_cost_fields(
+        result,
+        getattr(user, "role_name", None),
+        is_admin=getattr(user, "is_admin", False),
+    )
 
 
 @router.get("/fulfillment-v2/fy-review")
@@ -553,11 +615,18 @@ async def fy_review_v2(
     request: Request,
     entity: str = Query(None),
     financial_year: str = Query(None),
+    user=Depends(get_current_user),
 ):
+    """B13 cost-metric gate applied — same rationale as v1 fy-review."""
     from app.modules.production.services.fulfillment_v2 import get_fy_review
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
-        return await get_fy_review(conn, entity=entity, financial_year=financial_year)
+        result = await get_fy_review(conn, entity=entity, financial_year=financial_year)
+    return strip_cost_fields(
+        result,
+        getattr(user, "role_name", None),
+        is_admin=getattr(user, "is_admin", False),
+    )
 
 
 @router.post("/fulfillment-v2/cancel")
@@ -3914,6 +3983,12 @@ class ByproductLineV2(BaseModel):
     qty_kg: float
     uom: str = "kg"
     remarks: str | None = None
+    # Migration 034 — article attribution. Both optional: control_sample,
+    # pm_*, dust etc. don't carry an article. Off-grade rows DO. Without
+    # these fields on the model, Pydantic silently dropped them on parse
+    # and the operator's article selection vanished on save.
+    material_name: str | None = None
+    bom_line_id:   int | None = None
 
 
 class RmConsumptionLineV2(BaseModel):
@@ -4687,26 +4762,52 @@ class ShiftStopRequest(BaseModel):
 @router.get("/job-cards-v2")
 async def list_job_cards_v2(
     request: Request,
-    entity:   str | None = Query(None),
-    factory:  str | None = Query(None),
-    floor:    str | None = Query(None),
-    status:   str | None = Query(None),
-    plan_id:  int | None = Query(None),
-    customer: str | None = Query(None),
-    search:   str | None = Query(None),
-    page:      int = Query(1, ge=1),
-    page_size: int = Query(100, ge=1, le=500),
+    entity:     str | None = Query(None),
+    factory:    str | None = Query(None),
+    floor:      str | None = Query(None),
+    status:     str | None = Query(None),
+    plan_id:    int | None = Query(None),
+    so_number:  str | None = Query(None),
+    machine_id: int | None = Query(None),
+    customer:   str | None = Query(None),
+    search:     str | None = Query(None),
+    date_field: Literal["created_at", "start_time", "end_time"] = Query("created_at"),
+    date_from:  date | None = Query(None),
+    date_to:    date | None = Query(None),
+    pendency:   Literal["overdue", "due_today", "due_this_week", "future"] | None = Query(
+        None,
+        description="overdue | due_today | due_this_week | future",
+    ),
+    sort_by:    Literal[
+        "created_at", "start_time", "end_time", "plan_id",
+        "status", "step_number", "job_card_id", "planned_qty_kg",
+    ] = Query("created_at"),
+    sort_order: Literal["ASC", "DESC", "asc", "desc"] = Query("DESC"),
+    page:       int = Query(1, ge=1),
+    page_size:  int = Query(100, ge=1, le=500),
     user=Depends(get_current_user),
 ):
-    """Paginated list of v2 job cards. Non-admin users with a factory /
-    floor lock get the result intersected with their assignment when no
-    explicit factory / floor param is given. Explicit out-of-scope params
-    return 403.
+    """Paginated list of v2 job cards with R3.D filter / sort / counter
+    extensions. Non-admin users with a factory / floor lock get the result
+    intersected with their assignment when no explicit factory / floor
+    param is given. Explicit out-of-scope params return 403.
 
-    Filter params:
-      entity (cfpl/cdpl), factory (W-202/A-185), floor (canonical floor),
-      status (comma-sep), plan_id, customer (comma-sep), search (ILIKE on
-      job_card_number / fg_sku_name / customer_name / batch_number)."""
+    Filters:
+      entity, factory, floor (scope), status (comma-sep), plan_id,
+      so_number (ILIKE), machine_id, customer (comma-sep), search
+      (ILIKE on job_card_number / fg_sku_name / customer_name / batch_number).
+    Date window:
+      date_field (created_at | start_time | end_time), date_from, date_to.
+    Pendency chip:
+      pendency (overdue | due_today | due_this_week | future).
+    Sort:
+      sort_by (created_at | start_time | end_time | plan_id | status |
+               step_number | job_card_id | planned_qty_kg),
+      sort_order (ASC | DESC).
+    Returns:
+      results, pagination, counters (total / locked / in_progress /
+      completed / pending_issuance / overdue), sort metadata.
+    """
     from app.modules.production.services.job_card_v2 import list_job_cards
     pool = request.app.state.db_pool
 
@@ -4722,15 +4823,31 @@ async def list_job_cards_v2(
                             detail=f"User is not assigned to floor '{floor}'")
 
     async with pool.acquire() as conn:
-        return await list_job_cards(
+        result = await list_job_cards(
             conn,
             entity=entity, factory=factory, floor=floor,
-            status=status, plan_id=plan_id,
+            status=status, plan_id=plan_id, so_number=so_number,
+            machine_id=machine_id,
             customer=customer, search=search,
+            date_field=date_field, date_from=date_from, date_to=date_to,
+            pendency=pendency,
+            sort_by=sort_by, sort_order=sort_order,
             page=page, page_size=page_size,
             user_scope_warehouses=None if is_admin or factory else user_warehouses or None,
             user_scope_floors=None     if is_admin or floor   else user_floors     or None,
         )
+    # FastAPI's Literal validation catches typos at the param boundary,
+    # but the service still validates defensively. Surface those as 400.
+    if isinstance(result, dict) and result.get("error") in (
+        "invalid_sort_by", "invalid_date_field", "invalid_pendency",
+    ):
+        raise HTTPException(status_code=400, detail=result)
+    # B13: strip cost fields from each result row.
+    return strip_cost_fields(
+        result,
+        getattr(user, "role_name", None),
+        is_admin=getattr(user, "is_admin", False),
+    )
 
 
 @router.get("/job-cards-v2/search")
@@ -4773,12 +4890,18 @@ async def search_job_cards_v2(
                             detail=f"User is not assigned to floor '{floor}'")
 
     async with pool.acquire() as conn:
-        return await search_job_cards(
+        result = await search_job_cards(
             conn,
             q=q, status=status, entity=entity, factory=factory, floor=floor,
             user_scope_warehouses=None if is_admin or factory else user_warehouses or None,
             user_scope_floors=None     if is_admin or floor   else user_floors     or None,
         )
+    # B13 cost-metric gate on search hits (same surface as list_job_cards_v2).
+    return strip_cost_fields(
+        result,
+        getattr(user, "role_name", None),
+        is_admin=getattr(user, "is_admin", False),
+    )
 
 
 @router.get("/job-cards-v2/{job_card_id}")
@@ -4787,7 +4910,11 @@ async def get_job_card_v2(
     job_card_id: int,
     user=Depends(get_current_user),
 ):
-    """Full v2 job card detail — header + shifts + outputs + indents + sign-offs."""
+    """Full v2 job card detail — header + shifts + outputs + indents + sign-offs.
+
+    B13 cost-metric gate: strip currency-bearing fields when the caller
+    is deny-listed.
+    """
     from app.modules.production.services.job_card_v2 import get_job_card
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -4800,7 +4927,11 @@ async def get_job_card_v2(
             raise HTTPException(status_code=403, detail="JC outside your factory scope")
         if user.allowed_floors and result.get("floor") and result["floor"] not in user.allowed_floors:
             raise HTTPException(status_code=403, detail="JC outside your floor scope")
-    return result
+    return strip_cost_fields(
+        result,
+        getattr(user, "role_name", None),
+        is_admin=getattr(user, "is_admin", False),
+    )
 
 
 @router.get("/job-cards-v2/{job_card_id}/chain")
@@ -4847,7 +4978,7 @@ async def job_card_chain_v2(
             """,
             anchor["plan_line_id"],
         )
-        return [
+        result = [
             {
                 "job_card_id":           r["job_card_id"],
                 "job_card_number":       r["job_card_number"],
@@ -4870,6 +5001,14 @@ async def job_card_chain_v2(
             }
             for r in rows
         ]
+        # B13 cost-metric gate: today the chain query selects no cost
+        # columns, but the gate is wired in defensively so future SELECT
+        # additions are auto-stripped for deny-listed roles.
+        return strip_cost_fields(
+            result,
+            getattr(user, "role_name", None),
+            is_admin=getattr(user, "is_admin", False),
+        )
 
 
 @router.post("/job-cards-v2/{job_card_id}/shifts/start")
@@ -4898,6 +5037,7 @@ async def start_shift_v2(
                 operator_name=body.operator_name or user.full_name or user.phone,
                 notes=body.notes,
             )
+    _raise_if_locked(result)
     if result.get("error") == "open_segment_exists":
         raise HTTPException(status_code=400, detail=result)
     if result.get("error") == "invalid_shift":
@@ -5019,13 +5159,22 @@ class AccountingConsumptionRequest(BaseModel):
 
 
 class AccountingByproductRow(BaseModel):
+    # B6 C1 fix: the pm_* categories were added in migration 028 and the
+    # service-side gate exists, but this Literal had to be extended too -
+    # otherwise FastAPI returned 422 *before* the gate could fire,
+    # making the gate dead code.
     category:  Literal[
         'tukda', 'damaged', 'black_stained', 'without_shell', 'empty_shells',
         'dust', 'balance_material', 'rejection', 'control_sample', 'other',
+        'pm_torn', 'pm_damaged', 'pm_misprint', 'pm_rejection', 'pm_wasted',
     ]
     quantity:  float
     uom:       str = 'KGS'
     remarks:   str | None = None
+    # Migration 034 — see ByproductLineV2 above. Mirrored here so the
+    # dedicated /accounting/byproducts endpoint accepts the attribution too.
+    material_name: str | None = None
+    bom_line_id:   int | None = None
 
 
 class AccountingByproductsRequest(BaseModel):
@@ -5059,14 +5208,23 @@ async def get_accounting_v2(
 ):
     """Full accounting view for a v2 JC. Includes:
        stage context (step number, position, prev/next IDs, carried qty),
-       consumption rows, byproduct rows, accounting summary."""
+       consumption rows, byproduct rows, accounting summary.
+
+    B13 cost-metric gate: strips currency-bearing fields from the
+    response when the caller's role is in the deny list. Qty / yield /
+    conservation math stays for everyone; only cost is restricted.
+    """
     from app.modules.production.services.jc_accounting_v2 import get_accounting
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
         result = await get_accounting(conn, job_card_id)
     if result.get("error") == "job_card_not_found":
         raise HTTPException(status_code=404, detail="Job card not found")
-    return result
+    return strip_cost_fields(
+        result,
+        getattr(user, "role_name", None),
+        is_admin=getattr(user, "is_admin", False),
+    )
 
 
 @router.put("/job-cards-v2/{job_card_id}/accounting/consumption")
@@ -5087,6 +5245,7 @@ async def save_consumption_v2(
                 rows=[r.model_dump() for r in body.rows],
                 recorded_by=user.full_name or user.phone,
             )
+    _raise_if_locked(result)
     if result.get("error"):
         raise HTTPException(status_code=400, detail=result)
     return result
@@ -5109,6 +5268,7 @@ async def save_byproducts_v2(
                 rows=[r.model_dump() for r in body.rows],
                 recorded_by=user.full_name or user.phone,
             )
+    _raise_if_locked(result)
     if result.get("error"):
         raise HTTPException(status_code=400, detail=result)
     return result
@@ -5132,6 +5292,7 @@ async def save_accounting_summary_v2(
                 payload=body.model_dump(),
                 saved_by=user.full_name or user.phone,
             )
+    _raise_if_locked(result)
     if result.get("error") == "job_card_not_found":
         raise HTTPException(status_code=404, detail="Job card not found")
     if result.get("error"):
@@ -5289,11 +5450,20 @@ async def record_output_v2(
     malicious payload from updating consumption on a different JC.
     """
     from app.modules.production.services.job_card_v2 import (
-        record_output, upsert_consumption_lines,
+        assert_not_locked, record_output, upsert_consumption_lines,
     )
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
         async with conn.transaction():
+            # R6 lock guard fired at the endpoint top because /outputs
+            # is the only handler that calls multiple write services
+            # (upsert_consumption_lines + record_output). Checking once
+            # here means a locked JC cannot waste the rm/pm consumption
+            # upserts before record_output's own guard fires. record_output
+            # still re-checks defensively for callers that bypass the
+            # router (e.g. job_card_engine.record_output_v2).
+            lock_err = await assert_not_locked(conn, job_card_id)
+            _raise_if_locked(lock_err)
             # ── Per-BOM-line consumption ──────────────────────────────
             # Validated against the JC's BOM catalog (bom_line for the
             # JC's bom_id) — every stage can record consumption against
@@ -5355,6 +5525,7 @@ async def record_output_v2(
                 process_loss_kg=body.process_loss_kg,
                 recorded_by=user.full_name or user.phone,
             )
+            _raise_if_locked(result)
             # ── Byproducts (v2) ───────────────────────────────────────
             # The legacy v1 client posts byproducts alongside the
             # output row; persist them into job_card_byproducts_v2 via
@@ -5370,10 +5541,17 @@ async def record_output_v2(
                     raw_uom = (b.uom or "KGS").strip().upper()
                     norm_uom = "KGS" if raw_uom == "KG" else raw_uom
                     rows.append({
-                        "category": b.category,
-                        "quantity": b.qty_kg,
-                        "uom":      norm_uom,
-                        "remarks":  b.remarks,
+                        "category":      b.category,
+                        "quantity":      b.qty_kg,
+                        "uom":           norm_uom,
+                        "remarks":       b.remarks,
+                        # Migration 034 — article attribution must be
+                        # forwarded explicitly; the previous hand-built
+                        # dict dropped these fields and the operator's
+                        # picked SKU vanished on the way to
+                        # save_byproducts.
+                        "material_name": b.material_name,
+                        "bom_line_id":   b.bom_line_id,
                     })
                 bp_result = await save_byproducts(
                     conn, job_card_id=job_card_id,
@@ -5423,7 +5601,7 @@ async def record_output_v2(
     if result.get("error") == "negative_qty":
         raise HTTPException(status_code=400, detail="qty values must be >= 0")
     if result.get("error") == "missing_qty":
-        raise HTTPException(status_code=400, detail="rm_consumed_kg and output_qty_kg are required")
+        raise HTTPException(status_code=400, detail="output_qty_kg (or fg_actual_kg) is required")
     if result.get("error") == "implausible_yield":
         # Operator typo: yield outside ±999.999% almost always means a
         # value was entered in the wrong unit (grams instead of kg, units
@@ -5435,6 +5613,268 @@ async def record_output_v2(
                 f"output_qty_kg ({result['output_qty_kg']}) and "
                 f"rm_consumed_kg ({result['rm_consumed_kg']}) are both in kg."
             ),
+        )
+    return result
+
+
+# ─── R13 Phased closure ─────────────────────────────────────────────────────
+
+class PhaseOpenRequest(BaseModel):
+    """POST /job-cards-v2/{id}/phase/open"""
+    planned_qty_kg: float | None = Field(default=None, ge=0)
+    phase_date:     date  | None = None
+    notes:          str   | None = None
+
+
+class PhaseCloseRequest(BaseModel):
+    """POST /job-cards-v2/{id}/phase/{phase_id}/close"""
+    produced_qty_kg:     float        = Field(ge=0)
+    output_kind:         str   | None = None
+    output_uom:          str   | None = None
+    output_qty_units:    float | None = None
+    yield_pct:           float | None = None
+    rm_consumed_kg:      float        = 0.0
+    extra_give_away_qty: float        = 0.0
+    notes:               str   | None = None
+
+
+class PhaseCancelRequest(BaseModel):
+    """POST /job-cards-v2/{id}/phase/{phase_id}/cancel"""
+    reason: str | None = Field(default=None, max_length=500)
+
+
+@router.post("/job-cards-v2/{job_card_id}/phase/open")
+async def phase_open_v2(
+    request: Request,
+    job_card_id: int,
+    body: PhaseOpenRequest | None = None,
+    user=Depends(get_current_user),
+):
+    """R13: open a new phase row for this JC. Refused (409) if another
+    phase is already open."""
+    from app.modules.production.services import job_card_phase_v2 as svc
+    pool = request.app.state.db_pool
+    body = body or PhaseOpenRequest()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await svc.open_phase(
+                conn,
+                job_card_id=job_card_id,
+                planned_qty_kg=body.planned_qty_kg,
+                phase_date=body.phase_date,
+                notes=body.notes,
+            )
+    _raise_if_locked(result)
+    if result.get("error") == "job_card_not_found":
+        raise HTTPException(status_code=404, detail="Job card not found")
+    if result.get("error") == "phase_already_open":
+        raise HTTPException(status_code=409, detail=result)
+    return result
+
+
+@router.post("/job-cards-v2/{job_card_id}/phase/{phase_id}/close")
+async def phase_close_v2(
+    request: Request,
+    job_card_id: int,
+    phase_id: int,
+    body: PhaseCloseRequest,
+    user=Depends(get_current_user),
+):
+    """R13: close a phase. In one txn: stamp phase row, write the output,
+    auto-dispatch to next JC, unlock downstream if it was waiting."""
+    from app.modules.production.services import job_card_phase_v2 as svc
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await svc.close_phase(
+                conn,
+                phase_id=phase_id,
+                job_card_id=job_card_id,
+                produced_qty_kg=body.produced_qty_kg,
+                output_kind=body.output_kind,
+                output_uom=body.output_uom,
+                output_qty_units=body.output_qty_units,
+                yield_pct=body.yield_pct,
+                rm_consumed_kg=body.rm_consumed_kg,
+                extra_give_away_qty=body.extra_give_away_qty,
+                notes=body.notes,
+                closed_by=user.full_name or user.phone,
+            )
+    _raise_if_locked(result)
+    if result.get("error") in ("phase_not_found", "job_card_not_found"):
+        raise HTTPException(status_code=404, detail=result.get("message", result["error"]))
+    if result.get("error") == "phase_jc_mismatch":
+        raise HTTPException(status_code=404, detail=result)
+    if result.get("error") in ("phase_not_open", "phase_already_open",
+                                "phase_date_taken", "phase_number_taken"):
+        raise HTTPException(status_code=409, detail=result)
+    if result.get("error") in ("invalid_produced_qty", "yield_unreasonable"):
+        raise HTTPException(status_code=400, detail=result.get("message", result["error"]))
+    return result
+
+
+@router.get("/job-cards-v2/{job_card_id}/phases")
+async def phase_list_v2(
+    request: Request,
+    job_card_id: int,
+    user=Depends(get_current_user),
+):
+    """R13: list all phases (open + closed + cancelled) for the JC,
+    ordered by phase_number."""
+    from app.modules.production.services import job_card_phase_v2 as svc
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        rows = await svc.list_phases(conn, job_card_id)
+    return {"phases": rows}
+
+
+@router.post("/job-cards-v2/{job_card_id}/phase/{phase_id}/cancel")
+async def phase_cancel_v2(
+    request: Request,
+    job_card_id: int,
+    phase_id: int,
+    body: PhaseCancelRequest | None = None,
+    user=Depends(get_current_user),
+):
+    """R13: cancel an open phase that has no attached output / dispatch /
+    shift rows. Useful for phases opened by mistake."""
+    from app.modules.production.services import job_card_phase_v2 as svc
+    pool = request.app.state.db_pool
+    body = body or PhaseCancelRequest()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await svc.cancel_phase(
+                conn,
+                phase_id=phase_id,
+                job_card_id=job_card_id,
+                reason=body.reason,
+                cancelled_by=user.full_name or user.phone,
+            )
+    _raise_if_locked(result)
+    if result.get("error") == "phase_not_found":
+        raise HTTPException(status_code=404, detail="Phase not found")
+    if result.get("error") == "phase_jc_mismatch":
+        raise HTTPException(status_code=404, detail=result)
+    if result.get("error") in ("phase_not_open", "phase_has_attached_rows"):
+        raise HTTPException(status_code=409, detail=result)
+    return result
+
+
+# ─── R12 notify-QC ──────────────────────────────────────────────────────────
+
+class NotifyQCRequest(BaseModel):
+    """POST /job-cards-v2/{id}/notify-qc (R12)
+
+    Triggered once the JC is `completed` to alert the assigned QC team.
+    The transport itself is pluggable - see services/qc_notify.py for
+    the hook registry. note is an optional free-form payload that gets
+    threaded into the hook call and logged to qc_notification_log_v2.
+    """
+    note: str | None = Field(default=None, max_length=2000)
+
+
+@router.post("/job-cards-v2/{job_card_id}/notify-qc")
+async def notify_qc_v2(
+    request: Request,
+    job_card_id: int,
+    body: NotifyQCRequest | None = None,
+    user=Depends(get_current_user),
+):
+    """Alert the QC team scoped to this JC's entity / factory / floor.
+    Allowed only when the JC is in status='completed'. Logs every
+    dispatch attempt to qc_notification_log_v2 regardless of hook
+    delivery outcome.
+    """
+    from app.modules.production.services import qc_notify
+    pool = request.app.state.db_pool
+    body = body or NotifyQCRequest()
+
+    # B8 C2 fix: hook calls must NOT hold a Postgres transaction open
+    # (a live WhatsApp transport could take seconds per recipient and
+    # would otherwise pin connection-pool slots and row locks). We split
+    # the work into three phases:
+    #   1. Short txn: validate JC status, fetch recipients.
+    #   2. NO txn:    iterate recipients calling the (possibly slow) hook;
+    #                 collect outcomes in memory.
+    #   3. Short txn: write all log rows in a single tight loop.
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            jc = await conn.fetchrow(
+                """
+                SELECT status, entity, factory, floor
+                FROM   job_card_v2
+                WHERE  job_card_id=$1 AND deleted_at IS NULL
+                """,
+                job_card_id,
+            )
+            if jc is None:
+                raise HTTPException(status_code=404, detail="Job card not found")
+            if jc["status"] != 'completed':
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error":  "invalid_status",
+                        "status": jc["status"],
+                        "message": (
+                            "notify-qc fires only on 'completed' JCs - "
+                            f"current status is '{jc['status']}'."
+                        ),
+                    },
+                )
+            recipients = await conn.fetch(
+                """
+                SELECT u.user_id, u.phone, u.full_name
+                FROM   auth_user u
+                JOIN   auth_role r ON r.role_id = u.role_id
+                WHERE  r.role_name = 'qc_inspector'
+                  AND  u.is_active = TRUE
+                  AND  (
+                        SELECT TRUE FROM auth_role_permission rp
+                         WHERE  rp.role_id = u.role_id
+                           AND  (rp.allowed_entities   IS NULL
+                                 OR cardinality(rp.allowed_entities)   = 0
+                                 OR $1 = ANY(rp.allowed_entities))
+                           AND  (rp.allowed_warehouses IS NULL
+                                 OR cardinality(rp.allowed_warehouses) = 0
+                                 OR $2 = ANY(rp.allowed_warehouses))
+                           AND  (rp.allowed_floors     IS NULL
+                                 OR cardinality(rp.allowed_floors)     = 0
+                                 OR $3 IS NULL
+                                 OR $3 = ANY(rp.allowed_floors))
+                         LIMIT 1
+                  )
+                """,
+                jc["entity"], jc["factory"], jc["floor"],
+            )
+
+    # If no recipients matched, log a single sentinel row (audit "we
+    # tried but nobody was scoped") and return the real dispatch result
+    # so the notification_id is observable. B8 H4 fix.
+    if not recipients:
+        async with pool.acquire() as conn:
+            base = (body.note or "")
+            suffix = " [no_qc_recipients_in_scope]"
+            trimmed = base[: max(0, 2000 - len(suffix))]
+            result = await qc_notify.dispatch(
+                conn,
+                job_card_id=job_card_id,
+                recipients=[{"user_id": None, "phone": None, "full_name": None}],
+                note=trimmed + suffix,
+                dispatched_by=user.user_id,
+            )
+        result.setdefault("warning", "no_qc_recipients_in_scope")
+        return result
+
+    # Dispatch acquires per-recipient mini-txns internally; do NOT wrap
+    # in an outer transaction here - the slow hook call must stay out
+    # of any open txn (B8 C2).
+    async with pool.acquire() as conn:
+        result = await qc_notify.dispatch(
+            conn,
+            job_card_id=job_card_id,
+            recipients=[dict(r) for r in recipients],
+            note=body.note,
+            dispatched_by=user.user_id,
         )
     return result
 
@@ -5468,18 +5908,89 @@ async def sign_off_v2(
     user=Depends(get_current_user),
 ):
     """Record a per-role sign-off. UNIQUE (job_card_id, role) — re-signing
-    under the same role refreshes the row instead of erroring."""
+    under the same role refreshes the row instead of erroring.
+
+    R12 access gate (qc_inspector role only):
+      * The calling user must hold the qc_inspector role.
+      * The caller's permission scope (allowed_entities / warehouses /
+        floors) must cover the JC's entity, factory, and floor. Wildcard
+        (empty list) scopes are treated as "all allowed".
+      * signed_by is force-stamped from the JWT identity - body's
+        signed_by_name is IGNORED on QC sign-offs to block front-end
+        spoofing. Other roles keep the typed-name override.
+    """
     from app.modules.production.services.job_card_v2 import add_sign_off
     pool = request.app.state.db_pool
-    # Typed name takes precedence over the JWT user so the operator
-    # can sign on someone else's behalf (common pattern: the
-    # production head's name is typed in by whoever's at the device).
-    # Strip + fall back to JWT identity when the typed name is empty
-    # so we never persist a blank signer.
-    typed = (body.signed_by_name or "").strip()
-    signer = typed if typed else (user.full_name or user.phone)
+
+    is_qc_sign_off = body.role == 'qc_inspector'
+
+    # B7 H2/H3 fix: ONE pool.acquire() and ONE transaction wrapping the
+    # scope check, the JC existence assertion (with deleted_at IS NULL AND
+    # FOR UPDATE), and the sign-off insert. Closes the race where a PATCH
+    # moves the JC out of scope between read and write.
     async with pool.acquire() as conn:
         async with conn.transaction():
+            jc_scope = await conn.fetchrow(
+                "SELECT entity, factory, floor FROM job_card_v2 "
+                "WHERE  job_card_id=$1 AND deleted_at IS NULL "
+                "FOR    UPDATE",
+                job_card_id,
+            )
+            if jc_scope is None:
+                raise HTTPException(status_code=404, detail="Job card not found")
+
+            if is_qc_sign_off:
+                # B7 C1 fix: admin users bypass the role gate (matches the
+                # admin-can-do-anything convention used elsewhere). For
+                # non-admin callers the role must be qc_inspector AND the
+                # caller's scope must cover the JC's location.
+                if not (getattr(user, "is_admin", False)
+                        or user.role_name == 'qc_inspector'):
+                    raise HTTPException(
+                        status_code=403,
+                        detail={
+                            "error": "qc_role_required",
+                            "message": (
+                                "Only admin or qc_inspector users can verify "
+                                "QC on a JC."
+                            ),
+                        },
+                    )
+
+                def _in_scope(value, allowed: list[str]) -> bool:
+                    # Empty allowed list = wildcard (no restriction).
+                    return (not allowed) or (value in allowed)
+
+                if not (getattr(user, "is_admin", False)
+                        or (_in_scope(jc_scope["entity"],   user.allowed_entities)
+                            and _in_scope(jc_scope["factory"], user.allowed_warehouses)
+                            and _in_scope(jc_scope["floor"],   user.allowed_floors))):
+                    # B7 L2: don't leak the user's full allowed list back.
+                    raise HTTPException(
+                        status_code=403,
+                        detail={
+                            "error": "qc_scope_mismatch",
+                            "jc_entity":   jc_scope["entity"],
+                            "jc_factory":  jc_scope["factory"],
+                            "jc_floor":    jc_scope["floor"],
+                            "message": (
+                                "Your QC scope does not cover this JC's entity, "
+                                "factory, or floor."
+                            ),
+                        },
+                    )
+                # Server-stamp the signer; ignore body.signed_by_name on QC.
+                signer = user.full_name or user.phone or f"user#{user.user_id}"
+            else:
+                # B7 H1: other roles also keep server-stamped signer when
+                # the caller is admin. Non-admin callers can still pass a
+                # typed name (e.g. signing on the production_head's behalf
+                # while they're at the device) - this matches the legacy
+                # behaviour and the framework expressly defers role-scoped
+                # enforcement for non-QC roles to a later workstream.
+                typed = (body.signed_by_name or "").strip()
+                signer = typed if typed else (user.full_name or user.phone or f"user#{user.user_id}")
+
             result = await add_sign_off(
                 conn,
                 job_card_id=job_card_id,
@@ -5498,6 +6009,25 @@ class ForceUnlockV2Request(BaseModel):
     """PUT /job-cards-v2/{id}/force-unlock"""
     authority: str       # operator / supervisor name
     reason:    str
+
+
+class StopJobCardV2Request(BaseModel):
+    """POST /job-cards-v2/{id}/stop (R1)
+
+    Mid-run cancellation for material_received / in_progress JCs.
+    Cancels any open R13 phase atomically. Approval per R8 row 8 is
+    enforced upstream at the amendments layer; this endpoint records
+    the linkage but does not (yet) require it - field becomes
+    mandatory once B11 ships the amendment service.
+    """
+    reason:     str       = Field(min_length=1, max_length=500)
+    request_id: int | None = Field(
+        default=None,
+        description=(
+            "bom_amendment_request_v2.request_id that authorised this stop. "
+            "Optional until B11 lands the maker-checker enforcement."
+        ),
+    )
 
 
 class PatchJobCardV2Request(BaseModel):
@@ -5535,30 +6065,70 @@ async def start_jc_v2(
     async with pool.acquire() as conn:
         async with conn.transaction():
             result = await start_job_card(conn, job_card_id=job_card_id)
+    _raise_if_locked(result)
     if result.get("error") == "job_card_not_found":
         raise HTTPException(status_code=404, detail="Job card not found")
-    if result.get("error") in ("locked", "invalid_status"):
+    if result.get("error") == "invalid_status":
         raise HTTPException(status_code=400, detail=result["message"])
     return result
+
+
+class CompleteJCV2Request(BaseModel):
+    """PUT /job-cards-v2/{id}/complete (R9 closure gate + R13 phase gate)
+
+    Body is optional - default complete with no overrides. To force-close
+    an unbalanced JC (per R8 row 12) the caller must supply BOTH
+    force=true AND request_id pointing at the approved
+    bom_amendment_request_v2 row.
+    """
+    force:      bool       = Field(default=False)
+    request_id: int | None = Field(
+        default=None,
+        description=(
+            "bom_amendment_request_v2.request_id authorising an unbalanced "
+            "close. Required when force=true. Approval-status validation "
+            "lands with B11."
+        ),
+    )
 
 
 @router.put("/job-cards-v2/{job_card_id}/complete")
 async def complete_jc_v2(
     request: Request,
     job_card_id: int,
+    body: CompleteJCV2Request | None = None,
     user=Depends(get_current_user),
 ):
-    """Move a v2 JC from 'in_progress' to 'completed'. Refuses when an
-    open shift segment is still running (would skew total_time_min)."""
+    """Move a v2 JC from 'in_progress' to 'completed'. Refuses when:
+      * An open shift segment is still running (would skew total_time_min)
+      * Any R13 phase row is still 'open' (close the phase first)
+      * R9 balance check fails (is_balanced=false on the latest accounting
+        save) unless an R8 'unbalanced_close_override' is supplied via
+        force=true + request_id.
+    """
     from app.modules.production.services.job_card_v2 import complete_job_card
     pool = request.app.state.db_pool
+    body = body or CompleteJCV2Request()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            result = await complete_job_card(conn, job_card_id=job_card_id)
+            result = await complete_job_card(
+                conn,
+                job_card_id=job_card_id,
+                force=body.force,
+                request_id=body.request_id,
+                completed_by=user.full_name or user.phone,
+            )
     if result.get("error") == "job_card_not_found":
         raise HTTPException(status_code=404, detail="Job card not found")
-    if result.get("error") in ("invalid_status", "open_shift"):
+    if result.get("error") == "no_accounting":
         raise HTTPException(status_code=400, detail=result["message"])
+    # B5 H2: invalid_status / open_shift are state conflicts -> 409.
+    if result.get("error") in ("invalid_status", "open_shift",
+                                "unbalanced", "open_phase",
+                                "override_request_not_found",
+                                "override_request_wrong_type",
+                                "override_request_not_approved"):
+        raise HTTPException(status_code=409, detail=result)
     return result
 
 
@@ -5588,6 +6158,39 @@ async def force_unlock_v2(
     return result
 
 
+@router.post("/job-cards-v2/{job_card_id}/stop")
+async def stop_jc_v2(
+    request: Request,
+    job_card_id: int,
+    body: StopJobCardV2Request,
+    user=Depends(get_current_user),
+):
+    """R1 Stop Process: mid-run cancel for JCs already receiving material
+    or in_progress. Cancels any open R13 phase first inside the same txn,
+    then flips the JC to 'cancelled' with a [STOP_PROCESS]-prefixed reason.
+
+    Approval composition with R8 row 8 (floor_manager maker, admin or
+    production_manager checker) lives at the /amendments layer - this
+    endpoint executes once the request is approved.
+    """
+    from app.modules.production.services.job_card_v2 import stop_job_card
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await stop_job_card(
+                conn,
+                job_card_id=job_card_id,
+                reason=body.reason,
+                stopped_by=user.full_name or user.phone,
+                request_id=body.request_id,
+            )
+    if result.get("error") == "job_card_not_found":
+        raise HTTPException(status_code=404, detail="Job card not found")
+    if result.get("error") in ("invalid_status", "missing_reason"):
+        raise HTTPException(status_code=400, detail=result.get("message", result["error"]))
+    return result
+
+
 @router.patch("/job-cards-v2/{job_card_id}")
 async def patch_jc_v2(
     request: Request,
@@ -5612,6 +6215,10 @@ async def patch_jc_v2(
             )
     if result.get("error") == "job_card_not_found":
         raise HTTPException(status_code=404, detail="Job card not found")
+    if result.get("error") == "invalid_status":
+        # R1 header-edit gate (PATCHABLE_STATUSES). 409 because the JC's
+        # state conflicts with the requested operation.
+        raise HTTPException(status_code=409, detail=result)
     if result.get("error") == "no_change":
         raise HTTPException(status_code=400, detail=result["message"])
     return result
@@ -5801,6 +6408,7 @@ async def add_metal_detection_v2(
                 failed_units=body.failed_units, remarks=body.remarks,
                 recorded_by=user.full_name or user.phone,
             )
+    _raise_if_locked(r)
     if r.get("error"): raise HTTPException(status_code=400, detail=r)
     return r
 
@@ -5880,6 +6488,7 @@ async def add_weight_check_v2(
                 conn, job_card_id=job_card_id, **body.model_dump(),
                 recorded_by=user.full_name or user.phone,
             )
+    _raise_if_locked(r)
     if r.get("error"): raise HTTPException(status_code=400, detail=r)
     return r
 
@@ -5956,6 +6565,7 @@ async def add_environment_v2(
                 conn, job_card_id=job_card_id, **body.model_dump(),
                 recorded_by=user.full_name or user.phone,
             )
+    _raise_if_locked(r)
     if r.get("error"): raise HTTPException(status_code=400, detail=r)
     return r
 
@@ -6040,6 +6650,7 @@ async def add_loss_recon_v2(
                 conn, job_card_id=job_card_id, **body.model_dump(),
                 recorded_by=user.full_name or user.phone,
             )
+    _raise_if_locked(r)
     if r.get("error"): raise HTTPException(status_code=400, detail=r)
     return r
 
@@ -6113,6 +6724,7 @@ async def add_remark_v2(
                 remark_type=body.remark_type, content=body.content,
                 recorded_by=user.full_name or user.phone,
             )
+    _raise_if_locked(r)
     if r.get("error"): raise HTTPException(status_code=400, detail=r)
     return r
 
@@ -6173,7 +6785,12 @@ async def job_card_pdf_v2(
     """Render a v2 job card to PDF using the same fpdf renderer as v1.
     The renderer reads `section_1_product` / `section_3_team` / etc. from
     the JC dict — get_job_card (v2) already populates those legacy keys
-    so the renderer works without code changes."""
+    so the renderer works without code changes.
+
+    B13 cost-metric gate: strip currency-bearing keys from the dict the
+    renderer reads BEFORE the PDF is generated. The memory note flags
+    PDFs as an easy oversight surface — if a deny-listed role can hit
+    this URL, the rendered PDF must not embed cost figures."""
     from app.modules.production.services.job_card_v2 import get_job_card
     from app.modules.production.services.job_card_pdf import generate_job_card_pdf
     pool = request.app.state.db_pool
@@ -6181,6 +6798,14 @@ async def job_card_pdf_v2(
         jc_data = await get_job_card(conn, job_card_id)
     if jc_data is None:
         raise HTTPException(status_code=404, detail="Job card not found")
+    # H1: strip cost fields before the renderer reads them. Deep-copies
+    # the dict so callers (including the v1 fallback below) see an
+    # untouched original.
+    jc_data = strip_cost_fields(
+        jc_data,
+        getattr(user, "role_name", None),
+        is_admin=getattr(user, "is_admin", False),
+    )
     pdf_bytes = generate_job_card_pdf(jc_data, mode=mode)
     return Response(
         content=pdf_bytes,
@@ -6198,7 +6823,10 @@ async def job_card_pdf_v1(
 ):
     """v1 PDF for legacy job_card rows. Auth-required — when the row
     isn't in v1 (because it's a v2 JC and the caller hit this URL by
-    mistake), falls back to the v2 detail so the PDF still renders."""
+    mistake), falls back to the v2 detail so the PDF still renders.
+
+    B13 cost-metric gate applied here too — both the v1 detail dict and
+    the v2 fallback dict get stripped before the renderer reads them."""
     from app.modules.production.services.job_card_engine import get_job_card_detail
     from app.modules.production.services.job_card_v2 import get_job_card as get_jc_v2
     from app.modules.production.services.job_card_pdf import generate_job_card_pdf
@@ -6212,6 +6840,13 @@ async def job_card_pdf_v1(
             jc_data = await get_jc_v2(conn, job_card_id)
     if jc_data is None:
         raise HTTPException(status_code=404, detail="Job card not found")
+    # H1: strip cost fields BEFORE the renderer reads them. Applies to
+    # whichever branch produced jc_data (v1 detail or v2 fallback).
+    jc_data = strip_cost_fields(
+        jc_data,
+        getattr(user, "role_name", None),
+        is_admin=getattr(user, "is_admin", False),
+    )
     pdf_bytes = generate_job_card_pdf(jc_data, mode=mode)
     return Response(
         content=pdf_bytes,

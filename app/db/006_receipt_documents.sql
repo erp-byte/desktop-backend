@@ -155,11 +155,11 @@ SELECT r.role_id, p.permission_id
    AND p.module = 'receipt'
 ON CONFLICT DO NOTHING;
 
--- stores_manager: read + create + update (no delete) for COA; invoice both
+-- inventory_manager: read + create + update (no delete) for COA; invoice both
 INSERT INTO auth_role_permission (role_id, permission_id)
 SELECT r.role_id, p.permission_id
   FROM auth_role r, auth_permission p
- WHERE r.role_name = 'stores_manager'
+ WHERE r.role_name = 'inventory_manager'
    AND p.module = 'receipt'
    AND ((p.sub_module = 'coa'     AND p.action IN ('read', 'create', 'update'))
      OR (p.sub_module = 'invoice'))

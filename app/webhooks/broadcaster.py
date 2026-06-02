@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 # Role → event type prefixes this role receives
 ROLE_EVENT_MAP: dict[str, list[str]] = {
     "planner": ["plan.", "mrp.", "fulfillment."],
-    "store_manager": ["indent.", "material.", "store_alert."],
+    "inventory_manager": ["indent.", "material.", "store_alert."],
     "floor_supervisor": ["job_card.", "qc.", "dayend."],
     "purchase": ["indent."],
     "admin": ["*"],
