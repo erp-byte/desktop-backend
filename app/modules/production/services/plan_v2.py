@@ -598,6 +598,328 @@ async def delete_plan(conn, plan_id: int, *, reason: str, deleted_by: str) -> di
 # Step-level CRUD
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Admin step-edit → JC sync helpers
+#
+# When an admin edits a plan's step structure post-approval, the spawned
+# job cards (snapshot at create_job_cards_from_plan time) drift out of
+# sync with the plan record.  The helpers below propagate those edits
+# back onto the JC chain when it's safe to do so.
+#
+# Safe = every JC on the line is in 'locked' or 'unlocked' state.  Once
+# any JC has been assigned / received material / been worked on, we
+# refuse to restructure — the admin needs to cancel + re-approve the
+# plan to regenerate the JC chain.
+# ---------------------------------------------------------------------------
+
+# JC states that may be safely mutated by an admin plan-side edit. Past
+# this point the floor has started interacting with the JC and silent
+# server-side mutations would surprise the operator.
+_JC_SAFE_TO_MUTATE = ("locked", "unlocked")
+
+
+async def _line_jcs_safety(conn, plan_line_id: int) -> dict:
+    """Snapshot every JC on this plan line and report whether they're
+    safe to mutate together.
+
+    Returns: {"safe": bool, "jcs": [...], "blocking": [(jc_id, status), ...]}
+    """
+    rows = await conn.fetch(
+        """
+        SELECT job_card_id, plan_step_id, step_number, status,
+               prev_job_card_id, next_job_card_id
+        FROM job_card_v2
+        WHERE plan_line_id = $1 AND deleted_at IS NULL
+        ORDER BY step_number
+        """,
+        plan_line_id,
+    )
+    jcs = [dict(r) for r in rows]
+    blocking = [
+        (j["job_card_id"], j["status"]) for j in jcs
+        if j["status"] not in _JC_SAFE_TO_MUTATE
+    ]
+    return {"safe": not blocking, "jcs": jcs, "blocking": blocking}
+
+
+async def _sync_jc_attrs_from_step(
+    conn,
+    *,
+    step_id: int,
+    process_name: str | None = None,
+    stage: str | None = None,
+    floor: str | None = None,
+) -> dict:
+    """Propagate label-only step edits (process_name / stage / floor) to
+    the matching job_card_v2 row.  Restricted to safe-state JCs so an
+    in-flight operator doesn't see their stage flip mid-shift.
+    """
+    sets, params = [], []
+    if process_name is not None:
+        sets.append(f"process_name = ${len(params) + 1}")
+        params.append(process_name)
+    if stage is not None:
+        sets.append(f"stage = ${len(params) + 1}")
+        params.append(stage)
+    if floor is not None:
+        sets.append(f"floor = ${len(params) + 1}")
+        params.append(floor)
+    if not sets:
+        return {"applied": False, "updated": 0, "reason": "no_label_fields"}
+    params.append(step_id)
+    safe_states_clause = (
+        "status IN ("
+        + ", ".join(f"'{s}'" for s in _JC_SAFE_TO_MUTATE)
+        + ")"
+    )
+    result = await conn.execute(
+        f"""
+        UPDATE job_card_v2
+        SET {", ".join(sets)}
+        WHERE plan_step_id = ${len(params)}
+              AND deleted_at IS NULL
+              AND {safe_states_clause}
+        """,
+        *params,
+    )
+    # asyncpg returns "UPDATE <n>"
+    try:
+        n = int(result.split()[-1])
+    except (ValueError, IndexError):
+        n = 0
+    # Did we leave any blocked JCs?  Surface them so the admin sees.
+    blocked_rows = await conn.fetch(
+        f"""
+        SELECT job_card_id, status FROM job_card_v2
+        WHERE plan_step_id = $1 AND deleted_at IS NULL
+              AND NOT ({safe_states_clause})
+        """,
+        step_id,
+    )
+    return {
+        "applied": True,
+        "updated": n,
+        "blocked": [
+            {"job_card_id": r["job_card_id"], "status": r["status"]}
+            for r in blocked_rows
+        ],
+    }
+
+
+async def _resync_jcs_after_step_change(
+    conn, plan_line_id: int, reason: str,
+) -> dict:
+    """Rewalk the line's plan_step chain and align every JC's
+    step_number + prev/next pointers + input/output kind + status with
+    the new ordering.  Used after reorder / add / delete to keep the
+    spawned JC chain consistent with the plan record.
+
+    Refuses to mutate when any JC on the line has progressed past
+    'unlocked' (i.e. material received, work in progress, etc.) — the
+    admin sees the warning and can cancel + re-approve if a full
+    regeneration is needed.
+
+    Skips the resync entirely when the line has no JCs at all (the
+    plan is approved but the JC fan-out hasn't run, or every JC has
+    been soft-deleted).
+    """
+    safety = await _line_jcs_safety(conn, plan_line_id)
+    if not safety["jcs"]:
+        return {"applied": False, "skipped_reason": "no_jcs"}
+    if not safety["safe"]:
+        return {
+            "applied": False,
+            "skipped_reason": "jc_in_flight",
+            "blocking_jcs": [
+                {"job_card_id": jid, "status": st}
+                for jid, st in safety["blocking"]
+            ],
+            "message": (
+                "Some job cards have already started — plan record updated "
+                "but JC chain left as-is. Cancel + re-approve to regenerate."
+            ),
+        }
+
+    plan_steps = await conn.fetch(
+        """
+        SELECT step_id, step_order, process_name, stage, floor
+        FROM production_plan_step_v2
+        WHERE plan_line_id = $1
+        ORDER BY step_order
+        """,
+        plan_line_id,
+    )
+    # Map plan_step_id → JC row.  After add_step + JC spawn, the new JC
+    # exists; after delete_step, we expect zero matching JC entries for
+    # the removed plan_step (we hard-delete via cancel_job_card_v2 path).
+    by_step = {j["plan_step_id"]: j for j in safety["jcs"]}
+
+    ordered_jcs: list[dict] = []
+    for ps in plan_steps:
+        jc = by_step.get(ps["step_id"])
+        if jc is None:
+            continue
+        ordered_jcs.append({**jc, "plan_step": dict(ps)})
+
+    if not ordered_jcs:
+        return {"applied": False, "skipped_reason": "no_matching_jcs"}
+
+    # Two-pass step_number rewrite — UNIQUE(plan_id, plan_line_id,
+    # step_number) does not exist on job_card_v2 (so we don't strictly
+    # need two passes), but job_card_number is UNIQUE and we want to
+    # avoid a transient collision if we ever rebuild it.  We don't
+    # rebuild job_card_number — historical identifier — so a single
+    # pass is enough.
+    n = len(ordered_jcs)
+    prev_jc_id: int | None = None
+    for idx, item in enumerate(ordered_jcs):
+        is_first = idx == 0
+        is_last  = idx == n - 1
+        input_kind  = "RM" if is_first else "SFG"
+        output_kind = "FG" if is_last  else "WIP"
+        new_step_number = idx + 1
+        await conn.execute(
+            """
+            UPDATE job_card_v2
+            SET step_number      = $2,
+                prev_job_card_id = $3,
+                input_kind       = $4,
+                output_kind      = $5,
+                process_name     = $6,
+                stage            = $7,
+                floor            = $8
+            WHERE job_card_id = $1
+            """,
+            item["job_card_id"],
+            new_step_number,
+            prev_jc_id,
+            input_kind, output_kind,
+            item["plan_step"]["process_name"],
+            (item["plan_step"]["stage"]
+             or (item["plan_step"]["process_name"] or "").strip().lower().replace(" ", "_")
+             or "unknown"),
+            item["plan_step"]["floor"],
+        )
+        prev_jc_id = item["job_card_id"]
+
+    # Now wire next pointers (walk again — every prev has been set, so
+    # we just step forward and set each row's next to the row after it).
+    for idx in range(n):
+        nxt = ordered_jcs[idx + 1]["job_card_id"] if idx + 1 < n else None
+        await conn.execute(
+            "UPDATE job_card_v2 SET next_job_card_id = $2 WHERE job_card_id = $1",
+            ordered_jcs[idx]["job_card_id"], nxt,
+        )
+
+    return {
+        "applied": True,
+        "reason": reason,
+        "updated": n,
+        "line_jc_count": len(safety["jcs"]),
+    }
+
+
+async def _spawn_jc_for_new_step(
+    conn,
+    *,
+    plan_line_id: int,
+    step_id: int,
+) -> int | None:
+    """Append a JC for a newly-added plan step, hooked to the end of the
+    line's existing chain.  Returns the new job_card_id or None when
+    the line has no JCs yet (the plan hasn't been approved / fanned out).
+    """
+    # Need the plan_id / entity / warehouse / line-level details for the
+    # INSERT. Pull them off the line + plan rows.
+    line = await conn.fetchrow(
+        """
+        SELECT l.plan_line_id, l.plan_id, l.fg_sku_name, l.customer_name,
+               l.bom_id, l.planned_qty_kg, l.planned_qty_units,
+               p.entity, p.warehouse
+        FROM production_plan_line_v2 l
+        JOIN production_plan_v2 p ON p.plan_id = l.plan_id
+        WHERE l.plan_line_id = $1
+        """,
+        plan_line_id,
+    )
+    if not line:
+        return None
+    # If the line has no JCs (plan still in draft, never approved), do
+    # not spawn anything — the regular create_job_cards_from_plan path
+    # at approval time picks the new step up.
+    existing = await conn.fetchval(
+        "SELECT COUNT(*) FROM job_card_v2 "
+        "WHERE plan_line_id = $1 AND deleted_at IS NULL",
+        plan_line_id,
+    )
+    if not existing:
+        return None
+    step = await conn.fetchrow(
+        """
+        SELECT step_id, step_order, process_name, stage, floor
+        FROM production_plan_step_v2
+        WHERE step_id = $1
+        """,
+        step_id,
+    )
+    if not step:
+        return None
+
+    # The new step has the largest step_order on the line, so it's the
+    # new tail.  Mark output_kind = 'FG'; the resync pass below flips
+    # the old tail from FG → WIP.
+    candidate_jc_number = (
+        f"PLAN-{line['plan_id']}-L{line['plan_line_id']}-S{step['step_order']}"
+    )
+
+    async def _insert():
+        return await conn.fetchval(
+            """
+            INSERT INTO job_card_v2 (
+                job_card_id, job_card_number,
+                plan_id, plan_line_id, plan_step_id, bom_id,
+                step_number, process_name, stage,
+                fg_sku_name, customer_name, batch_number,
+                planned_qty_kg, planned_qty_units, uom,
+                input_kind, output_kind,
+                factory, floor, entity,
+                is_locked, locked_reason, status
+            ) VALUES (
+                $1, $2,
+                $3, $4, $5, $6,
+                $7, $8, $9,
+                $10, $11, $12,
+                $13, $14, $15,
+                $16, $17,
+                $18, $19, $20,
+                TRUE, 'awaiting_previous_stage', 'locked'
+            )
+            RETURNING job_card_id
+            """,
+            new_short_time_id(),
+            candidate_jc_number,
+            line["plan_id"], line["plan_line_id"], step["step_id"], line["bom_id"],
+            step["step_order"], step["process_name"],
+            (step["stage"]
+             or (step["process_name"] or "").strip().lower().replace(" ", "_")
+             or "unknown"),
+            line["fg_sku_name"], line["customer_name"],
+            _batch_number_for_resync(line["plan_id"], line["plan_line_id"], step["step_order"]),
+            line["planned_qty_kg"], line["planned_qty_units"], "KGS",
+            "SFG", "FG",
+            line["warehouse"], step["floor"], line["entity"],
+        )
+
+    return await insert_with_pk_retry(conn, _insert)
+
+
+def _batch_number_for_resync(plan_id: int, plan_line_id: int, step_order: int) -> str:
+    """Mirror job_card_v2._batch_number exactly so an add_step-spawned
+    JC carries the same batch label shape as one spawned at approve time.
+    """
+    return f"P{plan_id}-L{plan_line_id}-S{step_order}"
+
+
 async def reorder_steps(conn, plan_line_id: int, step_ids: list[int]) -> dict:
     """Reassign step_order to match the given step_ids sequence (1..N).
     Two-pass swap so the UNIQUE(plan_line_id, step_order) constraint isn't
@@ -616,20 +938,42 @@ async def reorder_steps(conn, plan_line_id: int, step_ids: list[int]) -> dict:
                        f"steps belonging to plan_line_id={plan_line_id}",
         }
 
-    # Pass 1: set to negative ints (avoids UNIQUE violation)
+    # Pass 1: park each row in a positive offset above any current
+    # step_order so neither the UNIQUE(plan_line_id, step_order) nor the
+    # CHECK (step_order > 0) constraint is violated by intermediate
+    # state.  The old implementation parked at -i which tripped the
+    # CHECK constraint (existing bug; previously masked when there were
+    # never any reorders against an approved plan).  step_order is
+    # SMALLINT, max 32767 — N steps + offset stays well under that for
+    # any realistic plan line.
+    current_max = await conn.fetchval(
+        "SELECT COALESCE(MAX(step_order), 0) FROM production_plan_step_v2 "
+        "WHERE plan_line_id = $1",
+        plan_line_id,
+    ) or 0
+    park_offset = int(current_max) + 1
     for i, sid in enumerate(step_ids, start=1):
         await conn.execute(
             "UPDATE production_plan_step_v2 SET step_order = $2 WHERE step_id = $1",
-            sid, -i,
+            sid, park_offset + i,
         )
-    # Pass 2: set to final positive ints
+    # Pass 2: set to final 1..N
     for i, sid in enumerate(step_ids, start=1):
         await conn.execute(
             "UPDATE production_plan_step_v2 SET step_order = $2 WHERE step_id = $1",
             sid, i,
         )
 
-    return {"reordered": True, "plan_line_id": plan_line_id, "count": len(step_ids)}
+    # Propagate the new ordering to any spawned job cards (admin step
+    # edits on an approved plan need to show up on the JC list too).
+    jc_sync = await _resync_jcs_after_step_change(conn, plan_line_id, reason="reorder")
+
+    return {
+        "reordered": True,
+        "plan_line_id": plan_line_id,
+        "count": len(step_ids),
+        "jc_sync": jc_sync,
+    }
 
 
 async def update_step(conn, step_id: int, fields: dict) -> dict:
@@ -665,7 +1009,25 @@ async def update_step(conn, step_id: int, fields: dict) -> dict:
     )
     if not result:
         return {"error": "not_found"}
-    return {"updated": True, "step": _serialize_row(result)}
+
+    # Propagate label-only edits to spawned JCs.  process_name / stage /
+    # floor are the only fields the JC snapshot carries from the plan
+    # step at create time — the other editable fields (notes, std_time,
+    # loss_pct) are plan-only.
+    label_fields = {
+        k: fields[k] for k in ("process_name", "stage", "floor")
+        if k in fields
+    }
+    jc_sync: dict | None = None
+    if label_fields:
+        jc_sync = await _sync_jc_attrs_from_step(
+            conn, step_id=step_id, **label_fields,
+        )
+
+    out = {"updated": True, "step": _serialize_row(result)}
+    if jc_sync is not None:
+        out["jc_sync"] = jc_sync
+    return out
 
 
 def derive_stage_from_process(process_name: str | None) -> str | None:
@@ -727,11 +1089,59 @@ async def add_step(conn, plan_line_id: int, step_data: dict) -> dict:
             step_data.get('notes'),
         )
     result = await insert_with_pk_retry(conn, _insert_step)
-    return {"added": True, "step": _serialize_row(result)}
+
+    # If the plan has already been approved + fanned out into JCs,
+    # spawn a JC for the new step and rewire the chain so the floor
+    # surface mirrors the new plan structure. The spawn is gated by
+    # _line_jcs_safety inside the resync helper — when any existing JC
+    # has progressed past 'unlocked' we leave the chain untouched and
+    # report the skip so the admin sees the gap.
+    safety = await _line_jcs_safety(conn, plan_line_id)
+    jc_sync: dict | None = None
+    if safety["jcs"] and safety["safe"]:
+        new_jc_id = await _spawn_jc_for_new_step(
+            conn,
+            plan_line_id=plan_line_id,
+            step_id=result["step_id"],
+        )
+        if new_jc_id is not None:
+            jc_sync = await _resync_jcs_after_step_change(
+                conn, plan_line_id, reason="add_step",
+            )
+        else:
+            jc_sync = {"applied": False, "skipped_reason": "spawn_returned_none"}
+    elif safety["jcs"] and not safety["safe"]:
+        jc_sync = {
+            "applied": False,
+            "skipped_reason": "jc_in_flight",
+            "blocking_jcs": [
+                {"job_card_id": jid, "status": st}
+                for jid, st in safety["blocking"]
+            ],
+            "message": (
+                "Plan step added but no JC was spawned — some job cards on "
+                "this line have already started. Cancel + re-approve to "
+                "regenerate the chain."
+            ),
+        }
+
+    out = {"added": True, "step": _serialize_row(result)}
+    if jc_sync is not None:
+        out["jc_sync"] = jc_sync
+    return out
 
 
 async def delete_step(conn, step_id: int) -> dict:
-    """Delete a step and compact the remaining steps' ordering."""
+    """Delete a step and compact the remaining steps' ordering.
+
+    On approved plans the matching job_card_v2 row holds a NOT NULL
+    plan_step_id with ON DELETE RESTRICT (017_job_card_v2.sql:51).
+    Hard-deleting the plan_step would FK-violate; the JC's downstream
+    indent / consumption / output rows can't be dropped cleanly either.
+    So when a matching JC exists we refuse the plan-side delete with a
+    clear message — the admin's path forward is to cancel the offending
+    JC (existing endpoint) or revoke the plan approval and re-plan.
+    """
     old = await conn.fetchrow(
         "SELECT plan_line_id, step_order FROM production_plan_step_v2 WHERE step_id = $1",
         step_id,
@@ -741,6 +1151,24 @@ async def delete_step(conn, step_id: int) -> dict:
 
     plan_line_id = old['plan_line_id']
     removed_order = old['step_order']
+
+    matching_jc = await conn.fetchrow(
+        "SELECT job_card_id, status FROM job_card_v2 "
+        "WHERE plan_step_id = $1 AND deleted_at IS NULL",
+        step_id,
+    )
+    if matching_jc is not None:
+        return {
+            "error": "jc_exists",
+            "message": (
+                f"Cannot delete this step — job card {matching_jc['job_card_id']} "
+                f"(status={matching_jc['status']}) still references it. "
+                "Cancel that job card first, or revoke plan approval to "
+                "regenerate the whole chain."
+            ),
+            "job_card_id": matching_jc["job_card_id"],
+            "job_card_status": matching_jc["status"],
+        }
 
     await conn.execute(
         "DELETE FROM production_plan_step_v2 WHERE step_id = $1",

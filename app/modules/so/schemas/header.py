@@ -10,6 +10,16 @@ class SOLineWithRecon(BaseModel):
     """Line item with its GST reconciliation result inline."""
     line: SOLineOut
     gst_recon: GSTReconLineOut
+    # Set by the upload reconciler when an existing SO is re-ingested. None
+    # for fresh inserts so callers can branch on presence.
+    #   "new"       — article wasn't on file under this SO, just added
+    #   "bumped"    — qty was increased to the incoming total
+    #   "warning"   — incoming qty < existing; no change applied
+    #   "unchanged" — incoming qty == existing; metadata may still differ
+    reconcile_status: str | None = None
+    reconcile_note: str | None = None
+    qty_delta_kg: float | None = None      # delta against existing quantity_units (kg)
+    qty_delta_units: float | None = None   # delta against existing quantity (pack count)
 
 
 class SODetail(BaseModel):
@@ -26,6 +36,11 @@ class SODetail(BaseModel):
     gst_mismatch: int
     gst_warning: int
     lines: list[SOLineWithRecon]
+    # Reconcile-specific fields. False / 0 / [] for fresh SOs.
+    was_existing: bool = False
+    added_line_count: int = 0
+    qty_bumped_count: int = 0
+    qty_warning_count: int = 0
 
 
 class SOHeaderOut(BaseModel):

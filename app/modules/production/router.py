@@ -4657,6 +4657,12 @@ async def delete_step_v2(request: Request, step_id: int):
             result = await delete_step(conn, step_id)
     if result.get("error") == "not_found":
         raise HTTPException(status_code=404, detail="Step not found")
+    if result.get("error") == "jc_exists":
+        # Approved-plan path: the matching JC still references this
+        # step.  409 (Conflict) so the client can distinguish "step
+        # gone" (404) from "step still wired into a JC".  The admin's
+        # path forward is to cancel the JC first.
+        raise HTTPException(status_code=409, detail=result.get("message"))
     return result
 
 

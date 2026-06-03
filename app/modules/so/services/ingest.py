@@ -6,10 +6,151 @@ from datetime import date, datetime
 from app.core.helpers import insert_with_pk_retry, new_short_time_id, safe_float
 from app.modules.so.services.gst_reconciliation import reconcile_line
 from app.modules.so.services.item_matcher import MasterItem, match_sku
+from app.modules.so.services.reconciler import reconcile_existing_so
 from app.modules.so.services.so_book_parser import parse_so_book
 from app.modules.so.services.parser import parse_sales_register
 
 logger = logging.getLogger(__name__)
+
+
+def _compute_quantity_units(matched_item, quantity) -> tuple[float | None, str | None]:
+    """Replicate the qty→kg computation used by the ingest path.
+
+    Returns (computed_qty_units_in_kg, rate_type) — both None when no
+    master match exists or the row carries no qty.
+    """
+    if not matched_item or matched_item.uom is None:
+        return None, None
+    rate_type = "per_kg" if matched_item.uom == 1 else "per_unit"
+    if quantity is None or matched_item.uom <= 0:
+        return None, rate_type
+    # round() to preserve fractional units; int() silently truncates.
+    return round(quantity * matched_item.uom, 3), rate_type
+
+
+def _build_sales_register_normalized_rows(
+    rows: list[dict],
+    line_matches: dict,
+    so_number: str,
+) -> list[dict]:
+    """Adapt parse_sales_register output into the reconciler's row shape.
+
+    Each output dict carries the inputs the reconciler needs to either
+    bump an existing so_line or insert a fresh one, plus the GST
+    recon_input wired the same way as the fresh-ingest path.
+    """
+    normalized: list[dict] = []
+    for line_idx, row in enumerate(rows, start=1):
+        matched_item, score = line_matches[(so_number, line_idx)]
+        quantity = row.get("quantity")
+        computed_qty_units, rate_type = _compute_quantity_units(matched_item, quantity)
+
+        recon_input = {
+            "amount_inr": row.get("amount_inr"),
+            "igst_amount": row.get("igst_amount"),
+            "sgst_amount": row.get("sgst_amount"),
+            "cgst_amount": row.get("cgst_amount"),
+            "apmc_amount": row.get("apmc_amount", 0),
+            "packing_amount": row.get("packing_amount", 0),
+            "freight_amount": row.get("freight_amount", 0),
+            "processing_amount": row.get("processing_amount", 0),
+            "total_amount_inr": row.get("total_amount_inr"),
+            "uom": str(row.get("uom")) if row.get("uom") is not None else None,
+            "quantity": quantity,
+            "quantity_units": computed_qty_units,
+        }
+
+        normalized.append({
+            "line_number": line_idx,
+            "sku_name": row.get("article"),
+            "item_category": row.get("item_category"),
+            "sub_category": row.get("sub_category"),
+            "uom": str(row.get("uom")) if row.get("uom") is not None else None,
+            "grp_code": row.get("grp_code"),
+            "quantity": quantity,
+            "computed_qty_units": computed_qty_units,
+            "rate_inr": row.get("rate_inr"),
+            "rate_type": rate_type,
+            "amount_inr": row.get("amount_inr"),
+            "igst_amount": row.get("igst_amount"),
+            "sgst_amount": row.get("sgst_amount"),
+            "cgst_amount": row.get("cgst_amount"),
+            "apmc_amount": row.get("apmc_amount", 0),
+            "packing_amount": row.get("packing_amount", 0),
+            "freight_amount": row.get("freight_amount", 0),
+            "processing_amount": row.get("processing_amount", 0),
+            "total_amount_inr": row.get("total_amount_inr"),
+            "matched_item": matched_item,
+            "score": score,
+            "recon_input": recon_input,
+        })
+    return normalized
+
+
+def _build_so_book_normalized_rows(
+    so_lines: list[dict],
+    so_line_matches: dict,
+    so_number: str,
+) -> list[dict]:
+    """SO Book variant of the normalizer (different parser key names)."""
+    normalized: list[dict] = []
+    for line in so_lines:
+        line_number = line.get("line_number", 1)
+        matched_item, score = so_line_matches[(so_number, line_number)]
+        # SO Book falls back to master categories when the parser didn't
+        # supply them — same precedence the fresh-ingest path uses.
+        item_cat = line.get("item_category") or (
+            matched_item.group if matched_item else None
+        )
+        item_subcat = line.get("sub_category") or (
+            matched_item.sub_group if matched_item else None
+        )
+        quantity = line.get("quantity")
+        computed_qty_units, rate_type = _compute_quantity_units(matched_item, quantity)
+
+        recon_input = {
+            "amount_inr": line.get("amount_inr"),
+            "igst_amount": line.get("igst_amount", 0),
+            "sgst_amount": line.get("sgst_amount", 0),
+            "cgst_amount": line.get("cgst_amount", 0),
+            "apmc_amount": 0,
+            "packing_amount": line.get("packing_amount", 0),
+            "freight_amount": line.get("freight_amount", 0),
+            "processing_amount": 0,
+            "total_amount_inr": line.get("total_amount_inr"),
+            "uom": line.get("uom"),
+            "quantity": quantity,
+            # SO Book carries an Excel-reported alt_units; reconcile against
+            # that rather than the locally-derived computed_qty_units (which
+            # would be tautologically equal by construction).
+            "quantity_units": line.get("alt_units"),
+        }
+
+        normalized.append({
+            "line_number": line_number,
+            "sku_name": line.get("sku_name"),
+            "item_category": item_cat,
+            "sub_category": item_subcat,
+            "uom": line.get("uom"),
+            "grp_code": None,
+            "quantity": quantity,
+            "computed_qty_units": computed_qty_units,
+            "rate_inr": line.get("rate_inr"),
+            "rate_type": rate_type,
+            "amount_inr": line.get("amount_inr"),
+            "igst_amount": line.get("igst_amount"),
+            "sgst_amount": line.get("sgst_amount"),
+            "cgst_amount": line.get("cgst_amount"),
+            "apmc_amount": 0,
+            "packing_amount": line.get("packing_amount", 0),
+            "freight_amount": line.get("freight_amount", 0),
+            "processing_amount": 0,
+            "total_amount_inr": line.get("total_amount_inr"),
+            "matched_item": matched_item,
+            "score": score,
+            "recon_input": recon_input,
+        })
+    return normalized
 
 
 async def ingest_sales_register(
@@ -42,6 +183,10 @@ async def ingest_sales_register(
     total_gst_ok = 0
     total_gst_mismatch = 0
     total_gst_warning = 0
+    reconciled_sos = 0
+    total_added_lines = 0
+    total_qty_bumped = 0
+    total_qty_warning = 0
 
     async with pool.acquire() as conn:
         for so_number, rows in groups.items():
@@ -51,16 +196,6 @@ async def ingest_sales_register(
                 async with conn.transaction():
                     first_row = rows[0]
 
-                    # Bug 9: Reject duplicates before INSERT to give a clear error
-                    # rather than letting the DB raise a cryptic unique violation.
-                    exists = await conn.fetchval(
-                        "SELECT 1 FROM so_header WHERE so_number = $1", so_number
-                    )
-                    if exists:
-                        logger.warning("SO '%s' already exists, skipping duplicate.", so_number)
-                        skipped_sos.append({"so_number": so_number, "reason": "duplicate"})
-                        continue
-
                     # Parse date
                     so_date = None
                     raw_date = first_row.get("date")
@@ -69,6 +204,64 @@ async def ingest_sales_register(
                             so_date = raw_date.date()
                         elif isinstance(raw_date, date):
                             so_date = raw_date
+
+                    # Existing SO → reconcile in place: refresh header,
+                    # append any new articles, bump qty deltas, warn on
+                    # negative deltas. Replaces the old "skip duplicate"
+                    # short-circuit so re-uploads don't strand new
+                    # articles or qty extensions.
+                    existing_so_id = await conn.fetchval(
+                        "SELECT so_id FROM so_header WHERE so_number = $1",
+                        so_number,
+                    )
+                    if existing_so_id is not None:
+                        normalized = _build_sales_register_normalized_rows(
+                            rows, line_matches, so_number,
+                        )
+                        result = await reconcile_existing_so(
+                            conn,
+                            so_id=existing_so_id,
+                            so_number=so_number,
+                            so_date=so_date,
+                            header_meta={
+                                "customer_name": first_row.get("customer_name"),
+                                "common_customer_name": first_row.get("common_customer_name"),
+                                "company": first_row.get("company"),
+                                "voucher_type": first_row.get("voucher_type"),
+                            },
+                            normalized_rows=normalized,
+                        )
+
+                        reconciled_sos += 1
+                        total_lines += len(result["lines"])
+                        total_matched += result["matched_lines"]
+                        total_unmatched += result["unmatched_lines"]
+                        total_gst_ok += result["gst_ok"]
+                        total_gst_mismatch += result["gst_mismatch"]
+                        total_gst_warning += result["gst_warning"]
+                        total_added_lines += result["added_line_count"]
+                        total_qty_bumped += result["qty_bumped_count"]
+                        total_qty_warning += result["qty_warning_count"]
+
+                        all_so_details.append({
+                            "so_id": existing_so_id,
+                            "so_number": so_number,
+                            "so_date": str(so_date) if so_date else None,
+                            "customer_name": first_row.get("customer_name"),
+                            "common_customer_name": first_row.get("common_customer_name"),
+                            "company": first_row.get("company"),
+                            "voucher_type": first_row.get("voucher_type"),
+                            "total_lines": len(result["lines"]),
+                            "gst_ok": result["gst_ok"],
+                            "gst_mismatch": result["gst_mismatch"],
+                            "gst_warning": result["gst_warning"],
+                            "lines": result["lines"],
+                            "was_existing": True,
+                            "added_line_count": result["added_line_count"],
+                            "qty_bumped_count": result["qty_bumped_count"],
+                            "qty_warning_count": result["qty_warning_count"],
+                        })
+                        continue
 
                     # INSERT so_header
                     header = await conn.fetchrow(
@@ -276,14 +469,21 @@ async def ingest_sales_register(
         logger.warning("Skipped %d SO(s): %s", len(skipped_sos), skipped_sos)
 
     logger.info(
-        "Ingested %d SOs, %d lines (%d matched, %d unmatched), GST: %d ok, %d mismatch, %d warning",
-        len(all_so_details), total_lines, total_matched, total_unmatched,
+        "Ingested %d SOs (%d reconciled), %d lines (%d matched, %d unmatched, "
+        "%d added, %d bumped, %d qty-warning), GST: %d ok, %d mismatch, %d warning",
+        len(all_so_details), reconciled_sos, total_lines,
+        total_matched, total_unmatched,
+        total_added_lines, total_qty_bumped, total_qty_warning,
         total_gst_ok, total_gst_mismatch, total_gst_warning,
     )
 
     return {
         "summary": {
             "total_sos": len(all_so_details),
+            "reconciled_sos": reconciled_sos,
+            "added_lines": total_added_lines,
+            "qty_bumped_lines": total_qty_bumped,
+            "qty_warning_lines": total_qty_warning,
             "total_lines": total_lines,
             "matched_lines": total_matched,
             "unmatched_lines": total_unmatched,
@@ -582,6 +782,10 @@ async def ingest_so_book(
     total_gst_ok = 0
     total_gst_mismatch = 0
     total_gst_warning = 0
+    reconciled_sos = 0
+    total_added_lines = 0
+    total_qty_bumped = 0
+    total_qty_warning = 0
 
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -593,13 +797,62 @@ async def ingest_so_book(
                     except (ValueError, TypeError):
                         pass
 
-                # Skip duplicate SOs instead of aborting the entire upload
-                exists = await conn.fetchval(
-                    "SELECT 1 FROM so_header WHERE so_number = $1", so["so_number"]
+                # Existing SO → reconcile rather than skip.  Adds any new
+                # articles to the SO, bumps qty when the incoming total is
+                # higher than what's on file, and warns when the incoming
+                # is lower than the on-file ordered total (likely already
+                # partially produced).
+                existing_so_id = await conn.fetchval(
+                    "SELECT so_id FROM so_header WHERE so_number = $1",
+                    so["so_number"],
                 )
-                if exists:
-                    logger.info("Skipping duplicate SO '%s'", so["so_number"])
-                    skipped_duplicates += 1
+                if existing_so_id is not None:
+                    normalized = _build_so_book_normalized_rows(
+                        so.get("lines", []), so_line_matches, so["so_number"],
+                    )
+                    result = await reconcile_existing_so(
+                        conn,
+                        so_id=existing_so_id,
+                        so_number=so["so_number"],
+                        so_date=so_date,
+                        header_meta={
+                            "customer_name": so.get("customer_name"),
+                            "common_customer_name": so.get("common_customer_name"),
+                            "company": so.get("company"),
+                            "voucher_type": so.get("voucher_type"),
+                        },
+                        normalized_rows=normalized,
+                    )
+
+                    reconciled_sos += 1
+                    total_lines += len(result["lines"])
+                    total_matched += result["matched_lines"]
+                    total_unmatched += result["unmatched_lines"]
+                    total_gst_ok += result["gst_ok"]
+                    total_gst_mismatch += result["gst_mismatch"]
+                    total_gst_warning += result["gst_warning"]
+                    total_added_lines += result["added_line_count"]
+                    total_qty_bumped += result["qty_bumped_count"]
+                    total_qty_warning += result["qty_warning_count"]
+
+                    all_so_details.append({
+                        "so_id": existing_so_id,
+                        "so_number": so["so_number"],
+                        "so_date": so.get("so_date"),
+                        "customer_name": so.get("customer_name"),
+                        "common_customer_name": so.get("common_customer_name"),
+                        "company": so.get("company"),
+                        "voucher_type": so.get("voucher_type"),
+                        "total_lines": len(result["lines"]),
+                        "gst_ok": result["gst_ok"],
+                        "gst_mismatch": result["gst_mismatch"],
+                        "gst_warning": result["gst_warning"],
+                        "lines": result["lines"],
+                        "was_existing": True,
+                        "added_line_count": result["added_line_count"],
+                        "qty_bumped_count": result["qty_bumped_count"],
+                        "qty_warning_count": result["qty_warning_count"],
+                    })
                     continue
 
                 header = await conn.fetchrow(
@@ -828,8 +1081,12 @@ async def ingest_so_book(
                 })
 
     logger.info(
-        "SO Book ingested: %d SOs (%d skipped duplicates), %d lines (%d matched, %d unmatched), GST: %d ok, %d mismatch, %d warning",
-        len(all_so_details), skipped_duplicates, total_lines, total_matched, total_unmatched,
+        "SO Book ingested: %d SOs (%d reconciled, %d skipped duplicates), "
+        "%d lines (%d matched, %d unmatched, %d added, %d bumped, %d qty-warning), "
+        "GST: %d ok, %d mismatch, %d warning",
+        len(all_so_details), reconciled_sos, skipped_duplicates,
+        total_lines, total_matched, total_unmatched,
+        total_added_lines, total_qty_bumped, total_qty_warning,
         total_gst_ok, total_gst_mismatch, total_gst_warning,
     )
 
@@ -837,6 +1094,10 @@ async def ingest_so_book(
         "summary": {
             "total_sos": len(all_so_details),
             "skipped_duplicates": skipped_duplicates,
+            "reconciled_sos": reconciled_sos,
+            "added_lines": total_added_lines,
+            "qty_bumped_lines": total_qty_bumped,
+            "qty_warning_lines": total_qty_warning,
             "total_lines": total_lines,
             "matched_lines": total_matched,
             "unmatched_lines": total_unmatched,

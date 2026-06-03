@@ -8,6 +8,17 @@ from app.modules.so.schemas.header import SODetail
 class UploadSummary(BaseModel):
     total_sos: int
     skipped_duplicates: int = 0
+    # Existing SOs that were reconciled in-place rather than skipped: a
+    # re-upload now refreshes header metadata, adds any new articles, and
+    # bumps qty for lines whose incoming total is larger than what's on
+    # file. The DB stores qty as ordered-total (not net-of-consumption),
+    # so a *positive* delta means a real extension of the order; a
+    # *non-positive* delta with production already in flight is flagged as
+    # a warning rather than silently reducing the line.
+    reconciled_sos: int = 0
+    added_lines: int = 0          # new SKU rows attached to an existing SO
+    qty_bumped_lines: int = 0     # existing rows whose qty was increased
+    qty_warning_lines: int = 0    # incoming qty < existing — left unchanged
     total_lines: int
     matched_lines: int
     unmatched_lines: int

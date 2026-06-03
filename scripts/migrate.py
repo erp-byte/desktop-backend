@@ -47,6 +47,16 @@ SQL_FILES = [
     # that replaced the admin-only reset path. One row per user (PK), 60s
     # TTL, deleted on successful reset.
     DB_DIR / "033_password_reset_otp.sql",
+    # ── Sample Issuing module ──────────────────────────────────────────
+    # 035 adds the business_head / npd_team roles + the `sample` permission
+    # catalog (inventory_manager already exists from 028).
+    DB_DIR / "035_sample_roles.sql",
+    # 036 builds the GENERIC gate_passes table + registers sample movement
+    # types 265/266. Must run before 037 (sample tables FK gate_passes).
+    DB_DIR / "036_gate_passes.sql",
+    # 037 creates the sample_* tables, seeds the approval role-map with real
+    # roles, and extends material_document. Depends on 035 + 036.
+    DB_DIR / "037_sample_module.sql",
 ]
 
 
