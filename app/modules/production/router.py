@@ -4781,7 +4781,8 @@ async def list_job_cards_v2(
     sort_by:    Literal[
         "created_at", "start_time", "end_time", "plan_id",
         "status", "step_number", "job_card_id", "planned_qty_kg",
-    ] = Query("created_at"),
+        "plan_date",
+    ] = Query("plan_date"),  # operator-stated default: latest plan first
     sort_order: Literal["ASC", "DESC", "asc", "desc"] = Query("DESC"),
     page:       int = Query(1, ge=1),
     page_size:  int = Query(100, ge=1, le=500),

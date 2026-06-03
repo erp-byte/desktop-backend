@@ -634,9 +634,21 @@ async def reorder_steps(conn, plan_line_id: int, step_ids: list[int]) -> dict:
 
 async def update_step(conn, step_id: int, fields: dict) -> dict:
     """Patch a step. Editable: floor, notes, std_time_min, loss_pct,
-    process_name, stage. step_order goes through reorder_steps()."""
+    process_name, stage. step_order goes through reorder_steps().
+
+    Edge case: if the caller changes process_name but doesn't supply a
+    new stage, derive stage from the new process_name so the row stays
+    self-consistent and the downstream NOT-NULL job_card_v2.stage
+    constraint isn't violated when the plan is approved. The caller
+    can still override by sending stage explicitly.
+    """
     allowed = {'floor', 'notes', 'std_time_min', 'loss_pct',
                'process_name', 'stage'}
+    fields = dict(fields)  # local copy — avoid mutating caller dict
+    if 'process_name' in fields and 'stage' not in fields:
+        derived = derive_stage_from_process(fields['process_name'])
+        if derived is not None:
+            fields['stage'] = derived
     sets, params, idx = [], [], 1
     for k, v in fields.items():
         if k not in allowed:
@@ -656,8 +668,35 @@ async def update_step(conn, step_id: int, fields: dict) -> dict:
     return {"updated": True, "step": _serialize_row(result)}
 
 
+def derive_stage_from_process(process_name: str | None) -> str | None:
+    """Derive a stage token from a process_name when the caller hasn't
+    supplied one. Mirrors the legacy convention seen in the seed BOMs:
+
+        "Sorting"     → "sorting"
+        "Bar Forming" → "bar_forming"
+        "De-seeding"  → "de-seeding"
+
+    Lowercase + space → underscore. Other punctuation preserved (so
+    "Slicing/Dicing/Slivering" stays as one token rather than fragmenting).
+    Returns None when the input is empty/None — caller may want to bail
+    on missing process_name separately rather than write an empty stage.
+    """
+    if not process_name:
+        return None
+    cleaned = process_name.strip()
+    if not cleaned:
+        return None
+    return cleaned.lower().replace(' ', '_')
+
+
 async def add_step(conn, plan_line_id: int, step_data: dict) -> dict:
-    """Append a new step at end (step_order = MAX+1)."""
+    """Append a new step at end (step_order = MAX+1).
+
+    R8/B11 Add Step path: clients send a process_name but may leave
+    stage NULL (the dropdown only edits process). We derive a sensible
+    stage token here so the downstream job_card_v2 INSERT (which has
+    stage NOT NULL) doesn't 500 when the plan is approved.
+    """
     next_order = await conn.fetchval(
         "SELECT COALESCE(MAX(step_order), 0) + 1 FROM production_plan_step_v2 "
         "WHERE plan_line_id = $1",
@@ -667,6 +706,7 @@ async def add_step(conn, plan_line_id: int, step_data: dict) -> dict:
     if not process_name:
         return {"error": "missing_process_name",
                 "message": "process_name is required"}
+    stage = step_data.get('stage') or derive_stage_from_process(process_name)
     async def _insert_step():
         return await conn.fetchrow(
             """
@@ -680,7 +720,7 @@ async def add_step(conn, plan_line_id: int, step_data: dict) -> dict:
             new_short_time_id(),
             plan_line_id, next_order,
             process_name,
-            step_data.get('stage'),
+            stage,
             step_data.get('floor'),
             step_data.get('std_time_min'),
             step_data.get('loss_pct'),

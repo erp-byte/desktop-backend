@@ -39,7 +39,13 @@ class Settings(BaseSettings):
     LOGIN_RATE_LIMIT_MAX: int = 10              # attempts per window per (ip, phone)
     LOGIN_RATE_LIMIT_WINDOW_SECONDS: int = 60
     LOGIN_LOCKOUT_THRESHOLD: int = 5            # failed_login_count → lock
-    LOGIN_LOCKOUT_MINUTES: int = 15
+    # Operator-stated: lock duration is 5 minutes. Auto-unlock fires
+    # at the natural expiry of locked_until — the login gate checks
+    # `locked_until > now` and treats a past timestamp as unlocked, so
+    # the next login attempt 5+ min after lockout succeeds with no
+    # admin intervention. (See auth_service.login:237-252 + 266-276
+    # for the check + the success-path clear of the lockout fields.)
+    LOGIN_LOCKOUT_MINUTES: int = 5
 
     # ── SMTP (notification mail; best-effort) ─────────────────────────────
     SMTP_HOST: str = ""                         # empty → mail send is a no-op

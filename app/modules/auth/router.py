@@ -527,6 +527,14 @@ async def list_users(request: Request):
                    u.allowed_entities, u.allowed_warehouses, u.allowed_floors,
                    u.is_active, u.status, u.created_at, u.last_login_at,
                    u.must_change_password, u.password_changed_at,
+                   -- Lock state so the admin UI can render the "Locked"
+                   -- chip + the manual Unlock CTA without re-fetching.
+                   -- locked_until > NOW() means currently locked; a past
+                   -- timestamp means the auto-unlock window has elapsed
+                   -- but failed_login_count hasn't been cleared yet (the
+                   -- next successful login clears it; admin unlock does
+                   -- so immediately).
+                   u.locked_until, u.failed_login_count,
                    r.role_id, r.role_name, r.is_admin
             FROM auth_user u
             LEFT JOIN auth_role r ON u.role_id = r.role_id
@@ -702,6 +710,58 @@ async def admin_reset_password(
         new_password=body.new_password,
         actor_user_id=str(actor["user_id"]),
     )
+
+
+@router.post("/users/{user_id}/unlock")
+async def admin_unlock_user(request: Request, user_id: int):
+    """Admin-only: immediately unlock a target user.
+
+    Clears `locked_until` and resets `failed_login_count` to 0 so the
+    user can attempt login right away — same end-state the natural
+    auto-unlock (LOGIN_LOCKOUT_MINUTES expiry) produces on the next
+    successful login. Distinct from /reset-password in that the user
+    keeps their current password and isn't forced to change it.
+
+    Existing sessions are NOT revoked — a lockout only affects the
+    login gate; live sessions are independent. If you want to revoke
+    sessions too, use /reset-password instead.
+
+    Returns:
+      { user_id, unlocked: bool, was_locked: bool }
+        was_locked is true when locked_until > NOW() before the
+        update — useful for the UI to differentiate "actually unlocked
+        a locked account" from "cleared stale counters on an already-
+        unlocked account".
+    """
+    actor = await _require_admin(request)
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT user_id, locked_until FROM auth_user WHERE user_id = $1",
+            user_id,
+        )
+        if row is None:
+            raise HTTPException(status_code=404, detail="User not found")
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        lu = row["locked_until"]
+        if lu is not None and lu.tzinfo is None:
+            lu = lu.replace(tzinfo=timezone.utc)
+        was_locked = bool(lu and lu > now)
+        await conn.execute(
+            """
+            UPDATE auth_user
+               SET locked_until       = NULL,
+                   failed_login_count = 0
+             WHERE user_id = $1
+            """,
+            user_id,
+        )
+    logger.info(
+        "admin_unlock_user: actor=%s target=%s was_locked=%s",
+        actor.get("user_id"), user_id, was_locked,
+    )
+    return {"user_id": user_id, "unlocked": True, "was_locked": was_locked}
 
 
 # ── role & permission management ─────────────────────────────────────────

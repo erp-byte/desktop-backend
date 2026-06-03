@@ -715,7 +715,17 @@ async def create_job_cards_from_plan(conn, plan_id: int) -> dict:
                     """,
                     candidate, _jc_number,
                     plan_id, plan_line_id, _step["step_id"], ln["bom_id"],
-                    _step["step_order"], _step["process_name"], _step["stage"],
+                    _step["step_order"], _step["process_name"],
+                    # job_card_v2.stage is NOT NULL. plan_steps created
+                    # via /lines/{id}/steps before the stage auto-derive
+                    # landed (or hand-loaded into the DB) can have NULL
+                    # stage; derive from process_name on the fly so the
+                    # approve doesn't 500 on those rows. New saves go
+                    # through plan_v2.add_step which derives at insert
+                    # time, so this is purely curative for legacy data.
+                    (_step["stage"]
+                     or (_step["process_name"] or "").strip().lower().replace(" ", "_")
+                     or "unknown"),
                     ln["fg_sku_name"], ln["customer_name"], _batch_no,
                     ln["planned_qty_kg"], ln["planned_qty_units"], 'KGS',
                     _input_kind, _output_kind,
@@ -937,7 +947,21 @@ async def list_shifts(conn, job_card_id: int) -> list[dict]:
 _JC_SORTABLE_COLUMNS = frozenset({
     "created_at", "start_time", "end_time", "plan_id", "status",
     "step_number", "job_card_id", "planned_qty_kg",
+    # plan_date lives on production_plan_v2 — see _JC_SORT_EXPR below
+    # for how the ORDER BY routes around the table alias.
+    "plan_date",
 })
+
+# Map sortable column → SQL expression. Most are jc.<col>; plan_date
+# routes to the subquery so the operator can sort the JC list by the
+# planning date without us having to denormalise it onto job_card_v2.
+def _jc_sort_expr(sort_col: str) -> str:
+    if sort_col == "plan_date":
+        return (
+            "(SELECT plan_date FROM production_plan_v2 ppv "
+            "WHERE ppv.plan_id = jc.plan_id)"
+        )
+    return f"jc.{sort_col}"
 _JC_DATE_FIELDS    = frozenset({"created_at", "start_time", "end_time"})
 _JC_PENDENCY_CHIPS = frozenset({"overdue", "due_today", "due_this_week", "future"})
 
@@ -1153,6 +1177,11 @@ async def list_job_cards(
         }
     sort_col = sort_by
     sort_dir = "ASC" if (sort_order or "").upper() == "ASC" else "DESC"
+    sort_expr = _jc_sort_expr(sort_col)
+    # NULLS LAST so JCs without a linked plan_date (data anomaly) don't
+    # float to the top under DESC sort. Tie-break on job_card_id keeps
+    # the order stable when many JCs share the same plan_date.
+    nulls = "NULLS LAST" if sort_dir == "DESC" else "NULLS FIRST"
 
     offset = (page - 1) * page_size
     rows = await conn.fetch(
@@ -1169,6 +1198,11 @@ async def list_job_cards(
                jc.prev_job_card_id, jc.next_job_card_id,
                jc.carried_qty_kg, jc.dispatched_to_next_kg,
                jc.created_at,
+               -- Planning date pulled from the parent plan. Separate from
+               -- SO date (which the operator never wants to mutate). Used
+               -- on the list page for sorting + the "Plan Date" column.
+               (SELECT plan_date FROM production_plan_v2 ppv
+                 WHERE ppv.plan_id = jc.plan_id) AS plan_date,
                -- Aggregated SO numbers for this JC's plan line. A plan line
                -- can fulfil multiple SOs (multi-SO bundling), so this is an
                -- array. ARRAY_AGG over the joined chain; NULL so_number rows
@@ -1183,7 +1217,7 @@ async def list_job_cards(
                    AND sh.so_number IS NOT NULL) AS so_numbers
         FROM job_card_v2 jc
         WHERE {where}
-        ORDER BY jc.{sort_col} {sort_dir}, jc.job_card_id {sort_dir}
+        ORDER BY {sort_expr} {sort_dir} {nulls}, jc.job_card_id {sort_dir}
         LIMIT ${idx} OFFSET ${idx + 1}
         """,
         *params, page_size, offset,
