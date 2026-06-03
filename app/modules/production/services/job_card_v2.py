@@ -1870,6 +1870,144 @@ async def start_job_card(conn, *, job_card_id: int) -> dict:
     }
 
 
+async def _derive_accounting_payload(conn, job_card_id: int) -> dict:
+    """Reconstruct an accounting-summary payload from the persisted raw
+    data for this JC, so complete_job_card can self-heal when the
+    operator hits Complete before Save Output has fired the explicit
+    PUT /accounting/summary.
+
+    Mirrors the formulas the web SummaryCard uses byte-for-byte (RM-
+    only consumption denominator, wastage folded into Process Loss for
+    display but kept separate in the persisted columns, off-grade and
+    rejection collapsed into one bucket per operator policy).
+
+    Returns a dict in the AccountingSummaryRequest shape (router.py:5185).
+    Used only as a fallback — when the operator goes through the normal
+    Save Output → /complete flow with a recent client build, the
+    explicit PUT /accounting/summary has already run and this code path
+    is skipped.
+    """
+    # Latest output row carries fg_actual_kg/units + process_loss_kg.
+    out_row = await conn.fetchrow(
+        """
+        SELECT output_qty_kg, output_qty_units, process_loss_kg
+        FROM   job_card_output_v2
+        WHERE  job_card_id = $1
+        ORDER  BY recorded_at DESC
+        LIMIT  1
+        """,
+        job_card_id,
+    )
+    output_qty       = float(out_row["output_qty_kg"] or 0) if out_row else 0.0
+    output_qty_units = (float(out_row["output_qty_units"])
+                       if out_row and out_row["output_qty_units"] is not None
+                       else None)
+    process_loss_kg  = float(out_row["process_loss_kg"] or 0) if out_row else 0.0
+
+    # total_input: prefer canonical rm_issued + carried_in; fall back to
+    # RM-only consumption sum (PM rows excluded since packaging doesn't
+    # convert into FG mass).
+    rm_issued = float(await conn.fetchval(
+        """
+        SELECT COALESCE(SUM(issued_qty), 0)
+        FROM   job_card_rm_indent_v2
+        WHERE  job_card_id = $1
+        """,
+        job_card_id,
+    ) or 0)
+    carried_in = float(await conn.fetchval(
+        "SELECT carried_qty_kg FROM job_card_v2 WHERE job_card_id = $1",
+        job_card_id,
+    ) or 0)
+    canonical_input = rm_issued + carried_in
+    if canonical_input <= 0:
+        # RM-only consumption sum. input_kind='RM' filter excludes the
+        # PM rows the operator typed alongside in the same grid.
+        rm_consumption = float(await conn.fetchval(
+            """
+            SELECT COALESCE(SUM(actual_consumed_qty), 0)
+            FROM   job_card_material_consumption_v2
+            WHERE  job_card_id = $1
+              AND  COALESCE(input_kind, 'RM') = 'RM'
+            """,
+            job_card_id,
+        ) or 0)
+        total_input = rm_consumption
+    else:
+        total_input = canonical_input
+
+    # Byproducts roll up: off-grade is everything except control_sample,
+    # balance_material, pm_*, and wastage. Wastage stays separate; the
+    # display aggregates it into Process Loss but the persisted column
+    # is its own bucket so the conservation identity stays clean.
+    bp_rows = await conn.fetch(
+        """
+        SELECT category, COALESCE(SUM(quantity), 0) AS qty
+        FROM   job_card_byproducts_v2
+        WHERE  job_card_id = $1
+        GROUP  BY category
+        """,
+        job_card_id,
+    )
+    offgrade_total = 0.0
+    wastage        = 0.0
+    control_sample = 0.0
+    for r in bp_rows:
+        cat = (r["category"] or "").strip()
+        qty = float(r["qty"] or 0)
+        if cat == "control_sample":
+            control_sample += qty
+        elif cat == "wastage":
+            wastage += qty
+        elif cat == "balance_material":
+            # balance_material on byproducts is legacy; the canonical
+            # path uses balance_materials with balance_type='returned'.
+            # Don't double-count.
+            pass
+        elif cat.startswith("pm_"):
+            # PM variance is its own track (pm_variance_breakdown JSONB),
+            # not part of the kg conservation identity.
+            pass
+        else:
+            offgrade_total += qty
+
+    # balance_materials roll up: 'returned' is the per-line leftover; the
+    # 'extra_given' (consolidated EGA) qty is summed separately.
+    bm_rows = await conn.fetch(
+        """
+        SELECT balance_type, COALESCE(SUM(qty_kg), 0) AS qty
+        FROM   job_card_balance_material_v2
+        WHERE  job_card_id = $1
+        GROUP  BY balance_type
+        """,
+        job_card_id,
+    )
+    balance_material_qty = 0.0
+    extra_give_away      = 0.0
+    for r in bm_rows:
+        bt  = (r["balance_type"] or "").strip()
+        qty = float(r["qty"] or 0)
+        if bt == "returned":
+            balance_material_qty += qty
+        elif bt == "extra_given":
+            extra_give_away += qty
+
+    return {
+        "total_input_qty":      total_input,
+        "input_uom":             "KGS",
+        "output_qty":            output_qty,
+        "output_uom":            "KGS",
+        "output_qty_units":      output_qty_units,
+        "process_loss_qty":      process_loss_kg,
+        "extra_give_away_qty":   extra_give_away,
+        "balance_material_qty":  balance_material_qty,
+        "offgrade_total_qty":    offgrade_total,
+        "rejection_qty":         0.0,      # one bucket with off-grade per op policy
+        "wastage_qty":           wastage,
+        "control_sample_qty":    control_sample,
+    }
+
+
 async def complete_job_card(conn, *, job_card_id: int,
                              force: bool = False,
                              request_id: int | None = None,
@@ -1964,13 +2102,51 @@ async def complete_job_card(conn, *, job_card_id: int,
         job_card_id,
     )
     if acct is None:
-        return {
-            "error": "no_accounting",
-            "message": (
-                "Accounting summary not saved yet. Save the summary "
-                "before completing so the balance check can run."
-            ),
-        }
+        # Self-heal: derive an accounting payload from the persisted raw
+        # data (outputs + consumption + byproducts + balance_materials)
+        # and run save_accounting inline. Otherwise the operator gets a
+        # confusing 400 ("Accounting summary not saved yet") even after
+        # a successful Save Output — because /outputs doesn't fire
+        # /accounting/summary as a side effect, and older client builds
+        # don't fire it explicitly. With this fallback, /complete always
+        # has an accounting row to read.
+        from app.modules.production.services.jc_accounting_v2 import save_accounting
+        derived = await _derive_accounting_payload(conn, job_card_id)
+        save_result = await save_accounting(
+            conn,
+            job_card_id=job_card_id,
+            payload=derived,
+            saved_by=completed_by,
+        )
+        if save_result.get("error"):
+            return {
+                "error": "accounting_save_failed",
+                "message": (
+                    "Couldn't auto-derive an accounting summary: "
+                    f"{save_result.get('message') or save_result.get('error')}. "
+                    "Save the summary manually before completing."
+                ),
+                "underlying": save_result,
+            }
+        # Re-read the now-saved row with FOR UPDATE so the rest of the
+        # gate runs on a stable snapshot.
+        acct = await conn.fetchrow(
+            """
+            SELECT is_balanced, balance_difference_qty
+            FROM   job_card_accounting_v2
+            WHERE  job_card_id = $1
+            FOR    UPDATE
+            """,
+            job_card_id,
+        )
+        if acct is None:
+            return {
+                "error": "no_accounting",
+                "message": (
+                    "Auto-derive succeeded but no accounting row materialised "
+                    "(unexpected). Save the summary manually."
+                ),
+            }
 
     # If unbalanced, the only path forward is an R8 amendment override.
     # C1 fix: the request_id has to actually exist, point at this JC, and

@@ -6123,6 +6123,10 @@ async def complete_jc_v2(
         raise HTTPException(status_code=404, detail="Job card not found")
     if result.get("error") == "no_accounting":
         raise HTTPException(status_code=400, detail=result["message"])
+    if result.get("error") == "accounting_save_failed":
+        # Auto-derive ran but save_accounting refused (most likely a
+        # locked JC). Surface enough detail for the operator to act.
+        raise HTTPException(status_code=400, detail=result)
     # B5 H2: invalid_status / open_shift are state conflicts -> 409.
     if result.get("error") in ("invalid_status", "open_shift",
                                 "unbalanced", "open_phase",
