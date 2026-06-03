@@ -19,6 +19,7 @@ Targets:
 There is NO machine reference at this layer. Per-step `floor` is free-text.
 """
 
+import json
 import logging
 from datetime import date, datetime
 from decimal import Decimal
@@ -307,6 +308,7 @@ async def get_plan(conn, plan_id: int) -> dict | None:
 
 async def list_plans(conn, *, entity=None, warehouse=None, plan_type=None,
                       status=None, date_from=None, date_to=None,
+                      search=None,
                       page=1, page_size=50,
                       user_scope_warehouses: list[str] | None = None) -> dict:
     """Paginated plan list with simple filters.
@@ -314,6 +316,11 @@ async def list_plans(conn, *, entity=None, warehouse=None, plan_type=None,
     `user_scope_warehouses` is the caller's user-level factory lock. When
     non-None and non-empty, restricts results to those warehouses regardless
     of the `warehouse` arg. Admins should pass None to bypass the lock.
+
+    `search` is a case-insensitive substring match across plan_name,
+    warehouse, plan_id (as text), and JOIN-side fg_sku_name + customer_name
+    (so operators searching for "Pista" or "ALIGN" find every matching
+    plan).
     """
     conditions: list[str] = []
     params: list = []
@@ -341,6 +348,24 @@ async def list_plans(conn, *, entity=None, warehouse=None, plan_type=None,
         conditions.append(f"p.plan_date >= ${idx}"); params.append(date_from); idx += 1
     if date_to:
         conditions.append(f"p.plan_date <= ${idx}"); params.append(date_to); idx += 1
+    if search:
+        # ILIKE wildcard search over plan_id, warehouse, and the
+        # line-side article + customer columns. production_plan_v2
+        # has no `plan_name` column (the frontend synthesises the
+        # label from plan_id when displaying), so we don't reference
+        # it here.  EXISTS keeps the COUNT honest — joining lines
+        # directly would multiply plan rows by their line count.
+        like = f"%{search.strip()}%"
+        conditions.append(
+            f"(p.plan_id::text ILIKE ${idx} "
+            f"OR p.warehouse ILIKE ${idx} "
+            f"OR p.entity ILIKE ${idx} "
+            f"OR EXISTS (SELECT 1 FROM production_plan_line_v2 ll "
+            f"           WHERE ll.plan_id = p.plan_id "
+            f"             AND (ll.fg_sku_name ILIKE ${idx} "
+            f"                  OR ll.customer_name ILIKE ${idx})))"
+        )
+        params.append(like); idx += 1
 
     where = " AND ".join(conditions) if conditions else "TRUE"
     total = await conn.fetchval(
@@ -354,7 +379,8 @@ async def list_plans(conn, *, entity=None, warehouse=None, plan_type=None,
             p.*,
             COALESCE(l.line_count, 0)          AS line_count,
             COALESCE(l.total_planned_kg, 0)    AS total_planned_kg,
-            COALESCE(l.total_planned_units, 0) AS total_planned_units
+            COALESCE(l.total_planned_units, 0) AS total_planned_units,
+            COALESCE(sl.lines_summary, '[]'::jsonb) AS lines_summary
         FROM production_plan_v2 p
         LEFT JOIN (
             SELECT plan_id,
@@ -364,6 +390,22 @@ async def list_plans(conn, *, entity=None, warehouse=None, plan_type=None,
             FROM production_plan_line_v2
             GROUP BY plan_id
         ) l ON l.plan_id = p.plan_id
+        LEFT JOIN (
+            SELECT plan_id,
+                   jsonb_agg(
+                       jsonb_build_object(
+                           'plan_line_id',      plan_line_id,
+                           'fg_sku_name',       fg_sku_name,
+                           'customer_name',     customer_name,
+                           'planned_qty_kg',    planned_qty_kg,
+                           'planned_qty_units', planned_qty_units,
+                           'area',              area
+                       )
+                       ORDER BY plan_line_id
+                   ) AS lines_summary
+            FROM production_plan_line_v2
+            GROUP BY plan_id
+        ) sl ON sl.plan_id = p.plan_id
         WHERE {where}
         ORDER BY p.plan_date DESC, p.plan_id DESC
         LIMIT ${idx} OFFSET ${idx + 1}
@@ -371,8 +413,25 @@ async def list_plans(conn, *, entity=None, warehouse=None, plan_type=None,
         *params, page_size, offset,
     )
 
+    # asyncpg returns JSONB as a text string when no type codec is
+    # registered.  Decode `lines_summary` once per row so the API
+    # surface is a plain list instead of a stringified blob the client
+    # would have to re-parse.
+    serialised: list[dict] = []
+    for r in rows:
+        d = _serialize_row(r)
+        raw = d.get("lines_summary")
+        if isinstance(raw, str):
+            try:
+                d["lines_summary"] = json.loads(raw)
+            except (TypeError, ValueError):
+                d["lines_summary"] = []
+        elif raw is None:
+            d["lines_summary"] = []
+        serialised.append(d)
+
     return {
-        "results": [_serialize_row(r) for r in rows],
+        "results": serialised,
         "pagination": {
             "page": page, "page_size": page_size,
             "total": total or 0,

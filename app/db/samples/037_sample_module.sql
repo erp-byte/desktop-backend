@@ -10,9 +10,9 @@
 --     floor_manager, inventory_manager) — no stand-ins.
 --   • gate passes are the generic gate_passes table (036); sample-only fields
 --     live in gate_pass_sample_details below.
---   • linked_job_card_id is a plain BIGINT (no FK yet). The job_card vs
---     job_card_v2 target + the job_card back-reference column land in a
---     follow-up migration (038) once that decision is confirmed.
+--   • linked_job_card_id is a plain INT (no FK yet). It targets the legacy
+--     job_card table (the live lifecycle table written by create_job_cards);
+--     the FK + the job_card back-reference columns land in migration 038.
 --
 -- Depends on: 035 (business_head / npd_team roles), 036 (gate_passes),
 --             schema.sql (all_sku), production_schema.sql (bom_header),
@@ -29,7 +29,7 @@ BEGIN;
 -- =========================================================================
 CREATE TABLE IF NOT EXISTS sample_requisitions (
     id                        SERIAL PRIMARY KEY,
-    requisition_number        TEXT UNIQUE NOT NULL,                 -- SMP-YYYY-NNNN (app-formatted via sequence)
+    requisition_number        TEXT UNIQUE NOT NULL,                 -- SMP-YYYYMMDD-NNNN (service _gen_id pattern, seq_sample_req)
     sample_type               TEXT NOT NULL
                               CHECK (sample_type IN ('BASIS_RM','BASIS_FG','NPD','INTERNAL')),
     status                    TEXT NOT NULL DEFAULT 'DRAFT'
@@ -50,7 +50,7 @@ CREATE TABLE IF NOT EXISTS sample_requisitions (
     purpose_note              TEXT,
     base_bom_id               INT REFERENCES bom_header(bom_id),    -- NPD base BOM
     npd_draft_bom_id          INT,                                  -- FK added below, after npd_draft_boms exists
-    linked_job_card_id        BIGINT,                               -- FK added in 038 (job_card vs job_card_v2 TBC)
+    linked_job_card_id        INT,                                  -- FK added in 038 -> job_card(job_card_id) (latest JC in chain)
     linked_gate_pass_id       INT,                                  -- FK added below, references gate_passes(id)
     converted_from_id         INT REFERENCES sample_requisitions(id), -- redirect / partial-conversion chain
     internal_override         BOOLEAN NOT NULL DEFAULT FALSE,
@@ -71,7 +71,9 @@ CREATE INDEX IF NOT EXISTS idx_sample_req_entity     ON sample_requisitions(enti
 CREATE INDEX IF NOT EXISTS idx_sample_req_requestor  ON sample_requisitions(requestor_user_id);
 CREATE INDEX IF NOT EXISTS idx_sample_req_created_at ON sample_requisitions(created_at);
 
-CREATE SEQUENCE IF NOT EXISTS sample_requisition_seq START 1;
+-- Service formats requisition_number as SMP-YYYYMMDD-NNNN (same _gen_id house
+-- pattern as MATDOC/ISN: 8-digit date + nextval). Collision-safe; no MAX(id)+1.
+CREATE SEQUENCE IF NOT EXISTS seq_sample_req START 1;
 
 -- =========================================================================
 -- 2. sample_requisition_articles — article line items
@@ -148,8 +150,8 @@ CREATE INDEX IF NOT EXISTS idx_npd_draft_boms_status ON npd_draft_boms(status);
 CREATE TABLE IF NOT EXISTS npd_draft_bom_lines (
     id                SERIAL PRIMARY KEY,
     draft_bom_id      INT NOT NULL REFERENCES npd_draft_boms(id) ON DELETE CASCADE,
-    sku_id            INT NOT NULL REFERENCES all_sku(sku_id),
-    sku_name          TEXT NOT NULL,                                -- snapshot
+    sku_id            INT REFERENCES all_sku(sku_id),               -- nullable: clone-from-base lines are name-based (bom_line has no sku_id)
+    sku_name          TEXT NOT NULL,                                -- snapshot (authoritative; clone copies material_sku_name)
     qty               NUMERIC NOT NULL CHECK (qty >= 0),
     uom               TEXT NOT NULL,
     item_type         TEXT CHECK (item_type IN ('rm','pm')),        -- matches bom_line.item_type

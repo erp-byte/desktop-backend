@@ -41,8 +41,10 @@ COST_FIELDS_DENY_ROLES = frozenset({
 
 COST_FIELDS_ALLOW_ROLES = frozenset({
     "admin", "planner", "purchase_manager", "inventory_manager",
+    "business_head",                           # sample module — management role sees cost
     "commercial_manager", "cost_controller",  # future
 })
+# NOTE: npd_team is intentionally NOT here — default-deny (sample open decision).
 
 # Every cost-bearing field name across the v2 surface. Append here as
 # new cost columns / JSONB keys land - the central list keeps one

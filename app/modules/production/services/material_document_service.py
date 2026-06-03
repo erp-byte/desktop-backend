@@ -23,6 +23,11 @@ MVT_QC_REJECT       = '322'   # QC Hold → Blocked (Reject)
 MVT_FG_RECEIPT      = '531'   # FG Receipt from Production
 MVT_SCRAP           = '551'   # Scrapping / Write-off
 MVT_LEGACY          = '561'   # Initial Stock Upload
+MVT_GI_SAMPLE       = '265'   # Goods Issue to Sample (sample module — 036)
+MVT_REVERSE_SAMPLE  = '266'   # Reversal of Sample Goods Issue (sample module — 036)
+
+# ── reference_type constant (material_document.reference_type) ──
+REF_SAMPLE_REQ      = 'SAMPLE_REQ'   # reference_id -> sample_requisitions.id
 
 
 async def create_material_document(conn, *, movement_type, reference_type=None,

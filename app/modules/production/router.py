@@ -4393,13 +4393,18 @@ async def list_plans_v2(
     status: str = Query(None),
     date_from: date = Query(None),
     date_to: date = Query(None),
+    search: str = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=500),
     user=Depends(get_current_user),
 ):
     """List plans. For non-admin users with a warehouse lock, the result set
     is restricted to their assigned warehouses regardless of the `warehouse`
-    query param (a request for a warehouse outside the lock returns 403)."""
+    query param (a request for a warehouse outside the lock returns 403).
+
+    `search` is a free-text ILIKE applied to plan_name, plan_id,
+    warehouse, and joined fg_sku_name + customer_name so operators can
+    find a plan by article or customer."""
     user_scope_warehouses: list[str] | None = None
     if not user.is_admin and user.allowed_warehouses:
         if warehouse:
@@ -4419,7 +4424,7 @@ async def list_plans_v2(
         return await list_plans(
             conn, entity=entity, warehouse=warehouse, plan_type=plan_type,
             status=status, date_from=date_from, date_to=date_to,
-            page=page, page_size=page_size,
+            search=search, page=page, page_size=page_size,
             user_scope_warehouses=user_scope_warehouses,
         )
 

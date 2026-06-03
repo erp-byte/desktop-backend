@@ -30,9 +30,15 @@ ON CONFLICT (role_name) DO NOTHING;
 
 -- 2. Sample permission catalog -------------------------------------------
 INSERT INTO auth_permission (module, sub_module, sub_sub_module, action, description) VALUES
+    -- view stays module-level (all sample data is broadly viewable).
     ('sample', NULL,             NULL,      'view',   'View sample requisitions & gate passes'),
-    ('sample', NULL,             NULL,      'create', 'Create sample requisitions'),
-    ('sample', NULL,             NULL,      'edit',   'Edit / resubmit draft sample requisitions'),
+    -- Requestor create/edit live under a sub_module so they do NOT occupy the
+    -- bare (sample, NULL, create/edit) slot. check_permission falls back
+    -- sub->NULL, so a bare module-level create grant would otherwise satisfy
+    -- EVERY stage endpoint (approve / gate_pass / convert ...). Keeping these
+    -- under 'requisition' preserves separation of duties.
+    ('sample', 'requisition',    NULL,      'create', 'Create sample requisitions'),
+    ('sample', 'requisition',    NULL,      'edit',   'Edit / resubmit draft sample requisitions'),
     ('sample', 'approve',        NULL,      'create', 'Business-head approval / rejection (BH_APPROVAL)'),
     ('sample', 'production_ack', NULL,      'create', 'Production acknowledgement (PRODUCTION_ACK)'),
     ('sample', 'inv_signoff',    NULL,      'create', 'Inventory-manager verification & sign-off (INV_MGR_*)'),
@@ -67,7 +73,7 @@ WHERE r.role_name = 'business_head'
   AND (
         p.action = 'view'
      OR p.sub_module IN ('approve', 'convert')
-     OR (p.sub_module IS NULL AND p.action IN ('create', 'edit'))
+     OR (p.sub_module = 'requisition' AND p.action IN ('create', 'edit'))
   )
 ON CONFLICT DO NOTHING;
 
@@ -80,7 +86,7 @@ WHERE r.role_name = 'npd_team'
   AND (
         p.action = 'view'
      OR p.sub_module = 'npd'
-     OR (p.sub_module IS NULL AND p.action IN ('create', 'edit'))
+     OR (p.sub_module = 'requisition' AND p.action IN ('create', 'edit'))
   )
 ON CONFLICT DO NOTHING;
 
@@ -114,7 +120,7 @@ SELECT r.role_id, p.permission_id
 FROM auth_role r, auth_permission p
 WHERE r.role_name = 'planner'
   AND p.module = 'sample'
-  AND (p.action = 'view' OR (p.sub_module IS NULL AND p.action IN ('create', 'edit')))
+  AND (p.action = 'view' OR (p.sub_module = 'requisition' AND p.action IN ('create', 'edit')))
 ON CONFLICT DO NOTHING;
 
 COMMIT;

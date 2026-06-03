@@ -25,7 +25,7 @@ BEGIN;
 -- 1. Generic gate-pass header --------------------------------------------
 CREATE TABLE IF NOT EXISTS gate_passes (
     id                   SERIAL PRIMARY KEY,
-    gate_pass_number     TEXT NOT NULL UNIQUE,                -- GP-<TYPE>-YYYY-NNNN  e.g. GP-SMP-2026-0001
+    gate_pass_number     TEXT NOT NULL UNIQUE,                -- GP-YYYYMMDD-NNNN  e.g. GP-20260603-0042 (service _gen_id pattern, seq_gate_pass)
     gate_pass_type       TEXT NOT NULL DEFAULT 'SAMPLE'
                          CHECK (gate_pass_type IN ('SAMPLE','TRANSFER','OTHER')),
     -- Polymorphic source reference (SAMPLE -> source_ref_type='SAMPLE_REQ',
@@ -67,8 +67,9 @@ CREATE INDEX IF NOT EXISTS idx_gate_passes_issued ON gate_passes(issued_at);
 CREATE INDEX IF NOT EXISTS idx_gate_passes_voided ON gate_passes(voided);
 CREATE INDEX IF NOT EXISTS idx_gate_passes_entity ON gate_passes(entity);
 
--- App formats the human number; the sequence guarantees a collision-free
--- suffix under concurrent issuance (no MAX(id)+1).
+-- Service formats the number as GP-YYYYMMDD-NNNN (same _gen_id house pattern
+-- as MATDOC/ISN/etc.: 8-digit date + nextval). The sequence guarantees a
+-- collision-free suffix under concurrent issuance (no MAX(id)+1).
 CREATE SEQUENCE IF NOT EXISTS seq_gate_pass START 1;
 
 -- 2. Sample movement types in the SAP registry --------------------------

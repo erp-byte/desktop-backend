@@ -98,8 +98,18 @@ async def create_production_orders(conn, plan_id: int, entity: str) -> dict:
 # Job Card Generation
 # ---------------------------------------------------------------------------
 
-async def create_job_cards(conn, prod_order_id: int) -> dict:
-    """Generate sequential job cards for a production order."""
+async def create_job_cards(conn, prod_order_id: int, *,
+                           sample_requisition_id: int | None = None,
+                           jobcard_type: str = "REGULAR") -> dict:
+    """Generate sequential job cards for a production order.
+
+    The sample module passes sample_requisition_id + jobcard_type to mark the
+    generated cards as a sample run (BASIS_FG_SAMPLE / NPD_SAMPLE /
+    INTERNAL_FG_OVERRIDE). Those columns are stamped via a single post-loop
+    UPDATE that only runs when sample_requisition_id is provided, so the
+    regular production path is unchanged and never references the columns
+    added by migration 038.
+    """
 
     order = await conn.fetchrow("SELECT * FROM production_order WHERE prod_order_id = $1", prod_order_id)
     if not order:
@@ -260,6 +270,16 @@ async def create_job_cards(conn, prod_order_id: int) -> dict:
                 "UPDATE job_card SET prev_job_card_id = $1 WHERE job_card_id = $2",
                 jc["job_card_id"], next_id,
             )
+
+    # Sample linkage (sample module). Only touches the columns added by
+    # migration 038, and only when a sample requisition is supplied — the
+    # regular production path skips this entirely.
+    if sample_requisition_id is not None:
+        await conn.execute(
+            "UPDATE job_card SET sample_requisition_id = $1, jobcard_type = $2 "
+            "WHERE prod_order_id = $3",
+            sample_requisition_id, jobcard_type, prod_order_id,
+        )
 
     # Update production order
     await conn.execute(
