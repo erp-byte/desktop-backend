@@ -295,10 +295,13 @@ async def create_plan(conn, payload: dict) -> dict:
                 # zero. Roll the whole create_plan tx back via raising —
                 # the router wraps us in conn.transaction() so any prior
                 # inserts in this run get reverted automatically.
+                # constraint_name is set dynamically by asyncpg (not in its
+                # type stubs) — read via getattr so the type checker is happy
+                # and a missing attribute degrades to None instead of raising.
                 raise ValueError(
                     f"Would over-allocate fulfillment {fids}: "
                     f"requested {planned_kg} kg / {planned_units} pcs but "
-                    f"pending isn't enough. ({exc.constraint_name})"
+                    f"pending isn't enough. ({getattr(exc, 'constraint_name', None)})"
                 ) from exc
 
     logger.info("Plan v2 created: plan_id=%d with %d line(s)", plan_id, len(line_ids))
