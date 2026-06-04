@@ -70,6 +70,11 @@ SQL_FILES = [
     # orphaned 034_byproducts_material_attribution.sql). De-dupes, drops the
     # stale 2-col UNIQUE, then creates the index; guarded like 039.
     DB_DIR / "040_fix_byproducts_unique_index.sql",
+    # 041 reconciles the remaining unique indexes declared in runner-orphaned
+    # migrations (011/017/021/029/032_b11/005): idx_bom_override_v2_unique
+    # (ON CONFLICT-backed, de-duped keep-latest) + the integrity partial
+    # indexes (created only when data is clean, else NOTICE + skip). Guarded.
+    DB_DIR / "041_reconcile_orphaned_unique_indexes.sql",
 ]
 
 
