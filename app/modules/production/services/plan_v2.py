@@ -27,8 +27,32 @@ from decimal import Decimal
 from asyncpg.exceptions import CheckViolationError
 
 from app.core.helpers import insert_with_pk_retry, new_short_time_id  # noqa: F401
+from app.modules.production.services.job_card_v2 import is_packing_stage
 
 logger = logging.getLogger(__name__)
+
+
+def order_steps_packing_last(steps, *, stage_of=None):
+    """Return ``steps`` reordered so packing/packaging stages come last,
+    preserving the relative order of every other step (a stable partition).
+
+    Domain invariant: packaging is the terminal production stage. A route
+    snapshotted with packaging earlier — observed as {Packaging, Sorting} on a
+    real plan line — locks the JC chain backwards (step 1 unlocks first), so
+    the floor is told to pack before it sorts. This normalizes that without
+    imposing a full canonical order on the middle stages: sorting / roasting /
+    flavouring keep whatever sequence they were given.
+
+    ``stage_of`` extracts the stage string from each element; it defaults to
+    dict-style ``stage`` then ``process_name`` (matching create_plan's own
+    stage-derive fallback). create_plan passes an explicit extractor for
+    asyncpg Records, which are subscriptable but not ``.get``-able.
+    """
+    if stage_of is None:
+        stage_of = lambda s: (s.get("stage") or s.get("process_name"))
+    non_pack = [s for s in steps if not is_packing_stage(stage_of(s))]
+    pack     = [s for s in steps if is_packing_stage(stage_of(s))]
+    return non_pack + pack
 
 
 # ---------------------------------------------------------------------------
@@ -175,9 +199,18 @@ async def create_plan(conn, payload: dict) -> dict:
         line_ids.append(plan_line_id)
 
         # Snapshot steps — use caller-supplied list if present, else copy
-        # from bom_process_route. Order is preserved as given / step_number.
+        # from bom_process_route. Order is preserved as given / step_number,
+        # then normalized so packing is terminal (see order_steps_packing_last:
+        # guards against a {Packaging, Sorting} route that would lock the chain
+        # backwards). step_order is (re)assigned from the normalized position.
         custom_steps = ln.get('steps')
         if custom_steps:
+            ordered = order_steps_packing_last(custom_steps)
+            if ordered != list(custom_steps):
+                logger.warning(
+                    "create_plan: reordered packing-last for line sku=%r "
+                    "(client sent steps out of order)", ln.get('fg_sku_name'),
+                )
             step_rows = [
                 (i + 1,
                  s['process_name'],
@@ -186,7 +219,7 @@ async def create_plan(conn, payload: dict) -> dict:
                  s.get('std_time_min'),
                  s.get('loss_pct'),
                  s.get('notes'))
-                for i, s in enumerate(custom_steps)
+                for i, s in enumerate(ordered)
             ]
         else:
             bom_steps = await conn.fetch(
@@ -198,6 +231,15 @@ async def create_plan(conn, payload: dict) -> dict:
                 """,
                 bom_id,
             )
+            ordered = order_steps_packing_last(
+                bom_steps, stage_of=lambda s: (s['stage'] or s['process_name']),
+            )
+            if ordered != list(bom_steps):
+                logger.warning(
+                    "create_plan: reordered packing-last for line sku=%r "
+                    "(bom_process_route bom_id=%s has packing not last)",
+                    ln.get('fg_sku_name'), bom_id,
+                )
             step_rows = [
                 (i + 1,
                  s['process_name'],
@@ -206,7 +248,7 @@ async def create_plan(conn, payload: dict) -> dict:
                  s['std_time_min'],
                  s['loss_pct'],
                  None)
-                for i, s in enumerate(bom_steps)
+                for i, s in enumerate(ordered)
             ]
 
         for order, name, stage, floor, std_t, loss, notes in step_rows:
@@ -526,6 +568,137 @@ async def approve_plan(conn, plan_id: int, approved_by: str) -> dict:
         "approved": True,
         "plan": _serialize_row(result),
         "job_cards": jc_result,
+    }
+
+
+_SPLIT_MODES = ("per_line", "sku", "customer")
+
+
+async def split_plan(conn, plan_id: int, mode: str = "per_line") -> dict:
+    """Split a DRAFT plan's lines into separate plans.
+
+    A daily plan can bundle many products under one plan_id / SO (e.g. plan
+    58795071 = 15 SKUs). This regroups its lines into distinct plans so each
+    appears on its own. Steps reference plan_line_id (not plan_id) and a draft
+    plan has no job cards yet, so the split is a pure repoint — no step copy,
+    no JC rewrite, and quantities/fulfilment bookkeeping are untouched (the
+    same lines, just regrouped).
+
+    mode:
+      * per_line — one new plan per plan-line (finest).
+      * sku      — group lines by fg_sku_name.
+      * customer — group lines by customer_name.
+
+    The FIRST group keeps the original plan_id; groups 2..N get fresh plan_ids.
+
+    APPROVED / executed plans are refused (status != draft): those carry job
+    cards, MRP output and draft indents that would need re-derivation — out of
+    scope for this v1. Returns ``{"source_plan_id", "mode", "plan_count",
+    "plans": [{"plan_id", "plan_line_ids", "kept_original"}]}`` or an ``error``.
+    """
+    if mode not in _SPLIT_MODES:
+        return {"error": "invalid_mode", "mode": mode, "allowed": list(_SPLIT_MODES)}
+
+    plan = await conn.fetchrow(
+        """
+        SELECT plan_id, entity, warehouse, plan_type, plan_date,
+               date_from, date_to, status
+        FROM   production_plan_v2 WHERE plan_id = $1
+        """,
+        plan_id,
+    )
+    if not plan:
+        return {"error": "plan_not_found"}
+    if plan["status"] != "draft":
+        return {
+            "error": "not_draft",
+            "status": plan["status"],
+            "message": ("Only draft plans can be split. Approved/executed plans "
+                        "carry job cards, MRP and indents that need re-derivation."),
+        }
+    # Defensive: a draft normally has no JCs, but never split out from under
+    # already-generated cards.
+    jc_n = await conn.fetchval(
+        "SELECT COUNT(*) FROM job_card_v2 WHERE plan_id = $1 AND deleted_at IS NULL",
+        plan_id,
+    )
+    if jc_n:
+        return {
+            "error": "has_job_cards",
+            "count": jc_n,
+            "message": "Plan already has job cards; split before approval.",
+        }
+
+    lines = await conn.fetch(
+        """
+        SELECT plan_line_id, fg_sku_name, customer_name
+        FROM   production_plan_line_v2
+        WHERE  plan_id = $1
+        ORDER  BY plan_line_id
+        """,
+        plan_id,
+    )
+    if len(lines) <= 1:
+        return {"error": "nothing_to_split", "line_count": len(lines),
+                "message": "Plan has 0 or 1 line; nothing to split."}
+
+    def _key(ln):
+        if mode == "sku":
+            return (ln["fg_sku_name"] or "").strip().lower()
+        if mode == "customer":
+            return (ln["customer_name"] or "").strip().lower()
+        return ln["plan_line_id"]   # per_line
+
+    groups: dict = {}
+    order: list = []
+    for ln in lines:
+        k = _key(ln)
+        if k not in groups:
+            groups[k] = []
+            order.append(k)
+        groups[k].append(ln["plan_line_id"])
+
+    if len(order) <= 1:
+        return {"error": "nothing_to_split", "group_count": len(order),
+                "message": f"All lines fall into one group under mode='{mode}'."}
+
+    result_plans = [{
+        "plan_id": plan_id,
+        "plan_line_ids": groups[order[0]],
+        "kept_original": True,
+    }]
+    for k in order[1:]:
+        async def _insert_plan_header(_p=plan):
+            candidate = new_short_time_id()
+            return await conn.fetchval(
+                """
+                INSERT INTO production_plan_v2 (
+                    plan_id, entity, warehouse, plan_type, plan_date,
+                    date_from, date_to, status, revision_number
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'draft', 0)
+                RETURNING plan_id
+                """,
+                candidate, _p["entity"], _p["warehouse"], _p["plan_type"],
+                _p["plan_date"], _p["date_from"], _p["date_to"],
+            )
+        new_plan_id = await insert_with_pk_retry(conn, _insert_plan_header)
+        await conn.execute(
+            "UPDATE production_plan_line_v2 SET plan_id = $1 WHERE plan_line_id = ANY($2)",
+            new_plan_id, groups[k],
+        )
+        result_plans.append({
+            "plan_id": new_plan_id,
+            "plan_line_ids": groups[k],
+            "kept_original": False,
+        })
+
+    logger.info("Split plan_id=%d into %d plans (mode=%s)",
+                plan_id, len(result_plans), mode)
+    return {
+        "source_plan_id": plan_id,
+        "mode": mode,
+        "plan_count": len(result_plans),
+        "plans": result_plans,
     }
 
 
