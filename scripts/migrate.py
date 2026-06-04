@@ -60,6 +60,11 @@ SQL_FILES = [
     # 038 extends the legacy job_card table (sample_requisition_id,
     # jobcard_type) and adds the sample_requisitions.linked_job_card_id FK.
     DB_DIR / "samples" / "038_job_card_sample_fk.sql",
+    # 039 repairs the missing uq_jcmc_v2_jc_material unique index that
+    # job_card_v2.upsert_consumption_lines' ON CONFLICT relies on (declared in
+    # the orphaned 018_jc_accounting_v2.sql). De-dupes then creates the index;
+    # to_regclass-guarded so it no-ops if the table isn't present yet.
+    DB_DIR / "039_fix_jcmc_unique_index.sql",
 ]
 
 
