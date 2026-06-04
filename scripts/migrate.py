@@ -65,6 +65,11 @@ SQL_FILES = [
     # the orphaned 018_jc_accounting_v2.sql). De-dupes then creates the index;
     # to_regclass-guarded so it no-ops if the table isn't present yet.
     DB_DIR / "039_fix_jcmc_unique_index.sql",
+    # 040 repairs the missing uq_byproducts_jc_cat_mat expression index that
+    # jc_accounting_v2.save_byproducts' ON CONFLICT relies on (declared in the
+    # orphaned 034_byproducts_material_attribution.sql). De-dupes, drops the
+    # stale 2-col UNIQUE, then creates the index; guarded like 039.
+    DB_DIR / "040_fix_byproducts_unique_index.sql",
 ]
 
 
