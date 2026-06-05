@@ -27,6 +27,7 @@ from decimal import Decimal
 from asyncpg.exceptions import CheckViolationError
 
 from app.core.helpers import insert_with_pk_retry, new_short_time_id  # noqa: F401
+from app.core.warehouse_scope import WAREHOUSE_NORM_ANY_SQL, WAREHOUSE_NORM_SQL
 from app.modules.production.services.job_card_v2 import is_packing_stage
 
 logger = logging.getLogger(__name__)
@@ -374,12 +375,15 @@ async def list_plans(conn, *, entity=None, warehouse=None, plan_type=None,
     if entity:
         conditions.append(f"p.entity = ${idx}"); params.append(entity); idx += 1
     if warehouse:
-        conditions.append(f"p.warehouse = ${idx}"); params.append(warehouse); idx += 1
+        conditions.append(
+            f"{WAREHOUSE_NORM_SQL('p.warehouse')} = {WAREHOUSE_NORM_SQL(f'${idx}')}"
+        )
+        params.append(warehouse); idx += 1
     elif user_scope_warehouses:
         # Implicit lock filter — no explicit `warehouse` arg, but the caller
         # is restricted at the user level. Use ANY($) so we get the full
         # union of their assigned warehouses, not just one.
-        conditions.append(f"p.warehouse = ANY(${idx}::text[])")
+        conditions.append(WAREHOUSE_NORM_ANY_SQL("p.warehouse", f"${idx}"))
         params.append(list(user_scope_warehouses)); idx += 1
     if plan_type:
         conditions.append(f"p.plan_type = ${idx}"); params.append(plan_type); idx += 1

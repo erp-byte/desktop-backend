@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from app.core.helpers import insert_with_pk_retry, new_short_time_id
+from app.core.warehouse_scope import WAREHOUSE_NORM_ANY_SQL, WAREHOUSE_NORM_SQL
 from app.modules.production.services.output_calc import compute_output_row
 
 logger = logging.getLogger(__name__)
@@ -1078,9 +1079,12 @@ async def list_job_cards(
     if entity:
         conditions.append(f"entity = ${idx}"); params.append(entity); idx += 1
     if factory:
-        conditions.append(f"factory = ${idx}"); params.append(factory); idx += 1
+        conditions.append(
+            f"{WAREHOUSE_NORM_SQL('factory')} = {WAREHOUSE_NORM_SQL(f'${idx}')}"
+        )
+        params.append(factory); idx += 1
     elif user_scope_warehouses:
-        conditions.append(f"factory = ANY(${idx}::text[])")
+        conditions.append(WAREHOUSE_NORM_ANY_SQL("factory", f"${idx}"))
         params.append(list(user_scope_warehouses)); idx += 1
     if floor:
         conditions.append(f"floor = ${idx}"); params.append(floor); idx += 1
@@ -1350,9 +1354,12 @@ async def search_job_cards(
     if entity:
         conditions.append(f"entity = ${idx}"); params.append(entity); idx += 1
     if factory:
-        conditions.append(f"factory = ${idx}"); params.append(factory); idx += 1
+        conditions.append(
+            f"{WAREHOUSE_NORM_SQL('factory')} = {WAREHOUSE_NORM_SQL(f'${idx}')}"
+        )
+        params.append(factory); idx += 1
     elif user_scope_warehouses:
-        conditions.append(f"factory = ANY(${idx}::text[])")
+        conditions.append(WAREHOUSE_NORM_ANY_SQL("factory", f"${idx}"))
         params.append(list(user_scope_warehouses)); idx += 1
     if floor:
         conditions.append(f"floor = ${idx}"); params.append(floor); idx += 1

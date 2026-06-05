@@ -25,6 +25,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from app.core.helpers import insert_with_pk_retry, new_short_time_id
+from app.core.warehouse_scope import user_has_warehouse
 from app.modules.production.services.job_card_v2 import assert_not_locked
 
 logger = logging.getLogger(__name__)
@@ -117,7 +118,7 @@ async def assert_jc_in_scope(conn, *, job_card_id: int,
     )
     if not jc:
         return {"error": "job_card_not_found"}
-    if allowed_warehouses and jc["factory"] not in allowed_warehouses:
+    if allowed_warehouses and not user_has_warehouse(allowed_warehouses, jc["factory"]):
         return {"error": "out_of_scope", "scope": "factory",
                 "value": jc["factory"], "allowed": allowed_warehouses}
     if allowed_floors and jc["floor"] and jc["floor"] not in allowed_floors:
