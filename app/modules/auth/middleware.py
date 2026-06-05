@@ -28,6 +28,7 @@ from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.core.middleware.request_context import AuthError
+from app.core.warehouse_scope import user_has_warehouse
 
 logger = logging.getLogger(__name__)
 
@@ -170,7 +171,8 @@ def require_permission(
                 details={"entity": request.query_params["entity"],
                          "allowed_entities": user.allowed_entities},
             )
-        if warehouse and user.allowed_warehouses and warehouse not in user.allowed_warehouses:
+        if (warehouse and user.allowed_warehouses
+                and not user_has_warehouse(user.allowed_warehouses, warehouse)):
             raise AuthError(
                 "forbidden",
                 f"User is not assigned to warehouse '{warehouse}'",

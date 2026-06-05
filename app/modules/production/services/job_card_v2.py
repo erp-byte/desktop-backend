@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from app.core.helpers import insert_with_pk_retry, new_short_time_id
+from app.core.warehouse_scope import WAREHOUSE_NORM_ANY_SQL, WAREHOUSE_NORM_SQL
 from app.modules.production.services.output_calc import compute_output_row
 
 logger = logging.getLogger(__name__)
@@ -601,6 +602,71 @@ async def backfill_indents_for_jc(conn, job_card_id: int) -> dict:
     }
 
 
+async def get_plan_job_card_groups(conn, plan_id: int) -> dict:
+    """Job cards for a plan, grouped per plan-line (one product per group)
+    with a per-group summary.
+
+    A daily plan can bundle many products (e.g. plan 58795071 = 15 SKUs / 33
+    stages). Returned flat, their stage chains interleave and the operator
+    can't follow any one product's Sorting→Packaging sequence. This groups the
+    cards so the UI can render each product as its own collapsible section.
+
+    Groups are ordered by planned_qty_kg DESC (largest run first); stages
+    within a group are ordered by step_number (the corrected chain order).
+    Returns ``{"plan_id", "group_count", "groups": [...]}``; ``groups`` is the
+    empty list for an unknown / JC-less plan (callers show "no job cards").
+    """
+    rows = await conn.fetch(
+        """
+        SELECT plan_line_id, job_card_id, job_card_number,
+               step_number, process_name, stage, status, is_locked,
+               floor, planned_qty_kg, planned_qty_units,
+               fg_sku_name, customer_name, batch_number
+        FROM   job_card_v2
+        WHERE  plan_id = $1 AND deleted_at IS NULL
+        ORDER  BY planned_qty_kg DESC NULLS LAST, plan_line_id, step_number
+        """,
+        plan_id,
+    )
+    groups: dict = {}
+    order: list = []
+    for r in rows:
+        pl = r["plan_line_id"]
+        g = groups.get(pl)
+        if g is None:
+            g = {
+                "plan_line_id":      pl,
+                "fg_sku_name":       r["fg_sku_name"],
+                "customer_name":     r["customer_name"],
+                "planned_qty_kg":    float(r["planned_qty_kg"]) if r["planned_qty_kg"] is not None else None,
+                "planned_qty_units": r["planned_qty_units"],
+                "stage_count":       0,
+                "completed_count":   0,
+                "stages":            [],
+            }
+            groups[pl] = g
+            order.append(pl)
+        g["stages"].append({
+            "job_card_id":     r["job_card_id"],
+            "job_card_number": r["job_card_number"],
+            "step_number":     r["step_number"],
+            "process_name":    r["process_name"],
+            "stage":           r["stage"],
+            "status":          r["status"],
+            "is_locked":       r["is_locked"],
+            "floor":           r["floor"],
+            "batch_number":    r["batch_number"],
+        })
+        g["stage_count"] += 1
+        if r["status"] in ("completed", "closed"):
+            g["completed_count"] += 1
+    return {
+        "plan_id":     plan_id,
+        "group_count": len(order),
+        "groups":      [groups[pl] for pl in order],
+    }
+
+
 async def create_job_cards_from_plan(conn, plan_id: int) -> dict:
     """Generate one job_card_v2 per (line × step) for the given plan.
 
@@ -1013,9 +1079,12 @@ async def list_job_cards(
     if entity:
         conditions.append(f"entity = ${idx}"); params.append(entity); idx += 1
     if factory:
-        conditions.append(f"factory = ${idx}"); params.append(factory); idx += 1
+        conditions.append(
+            f"{WAREHOUSE_NORM_SQL('factory')} = {WAREHOUSE_NORM_SQL(f'${idx}')}"
+        )
+        params.append(factory); idx += 1
     elif user_scope_warehouses:
-        conditions.append(f"factory = ANY(${idx}::text[])")
+        conditions.append(WAREHOUSE_NORM_ANY_SQL("factory", f"${idx}"))
         params.append(list(user_scope_warehouses)); idx += 1
     if floor:
         conditions.append(f"floor = ${idx}"); params.append(floor); idx += 1
@@ -1285,9 +1354,12 @@ async def search_job_cards(
     if entity:
         conditions.append(f"entity = ${idx}"); params.append(entity); idx += 1
     if factory:
-        conditions.append(f"factory = ${idx}"); params.append(factory); idx += 1
+        conditions.append(
+            f"{WAREHOUSE_NORM_SQL('factory')} = {WAREHOUSE_NORM_SQL(f'${idx}')}"
+        )
+        params.append(factory); idx += 1
     elif user_scope_warehouses:
-        conditions.append(f"factory = ANY(${idx}::text[])")
+        conditions.append(WAREHOUSE_NORM_ANY_SQL("factory", f"${idx}"))
         params.append(list(user_scope_warehouses)); idx += 1
     if floor:
         conditions.append(f"floor = ${idx}"); params.append(floor); idx += 1

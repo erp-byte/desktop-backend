@@ -21,6 +21,7 @@ from app.modules.production.schemas.job_card_edit import (
 # L3: B13 cost-metric gate. Hoisted to the top so endpoint bodies stay
 # clean and the gate is one obvious dependency at the module head.
 from app.modules.production.services.response_filters import strip_cost_fields
+from app.core.warehouse_scope import user_has_warehouse
 
 logger = logging.getLogger(__name__)
 
@@ -4364,7 +4365,7 @@ async def create_plan_v2(
     """
     if (not user.is_admin
             and user.allowed_warehouses
-            and body.warehouse not in user.allowed_warehouses):
+            and not user_has_warehouse(user.allowed_warehouses, body.warehouse)):
         raise HTTPException(
             status_code=403,
             detail=f"User is not assigned to warehouse '{body.warehouse}'",
@@ -4408,7 +4409,7 @@ async def list_plans_v2(
     user_scope_warehouses: list[str] | None = None
     if not user.is_admin and user.allowed_warehouses:
         if warehouse:
-            if warehouse not in user.allowed_warehouses:
+            if not user_has_warehouse(user.allowed_warehouses, warehouse):
                 raise HTTPException(
                     status_code=403,
                     detail=f"User is not assigned to warehouse '{warehouse}'",
@@ -4441,6 +4442,30 @@ async def get_plan_v2(request: Request, plan_id: int):
     return result
 
 
+@router.get("/plans-v2/{plan_id}/job-card-groups")
+async def plan_job_card_groups(request: Request, plan_id: int, user=Depends(get_current_user)):
+    """Plan's job cards grouped per plan-line (one product per group) with a
+    per-group summary, so the Job Cards view can render each product's stage
+    chain as its own section instead of one interleaved flat list.
+
+    Returns ``{"plan_id", "group_count", "groups": [...]}``. Empty ``groups``
+    when the plan has no job cards (or doesn't exist) — callers show
+    "no job cards" rather than 404, matching job_card_chain_v2's convention.
+    """
+    from app.modules.production.services.job_card_v2 import get_plan_job_card_groups
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        # Factory lock: a plan is warehouse-scoped; don't expose a plan's job
+        # cards to a non-admin outside their assigned warehouse.
+        if not getattr(user, "is_admin", False) and getattr(user, "allowed_warehouses", None):
+            wh = await conn.fetchval(
+                "SELECT warehouse FROM production_plan_v2 WHERE plan_id = $1", plan_id,
+            )
+            if wh is not None and not user_has_warehouse(user.allowed_warehouses, wh):
+                raise HTTPException(status_code=403, detail="Plan outside your factory scope")
+        return await get_plan_job_card_groups(conn, plan_id)
+
+
 @router.put("/plans-v2/{plan_id}")
 async def update_plan_v2(request: Request, plan_id: int, body: PlanV2Update):
     from app.modules.production.services.plan_v2 import update_plan
@@ -4467,6 +4492,41 @@ async def approve_plan_v2(request: Request, plan_id: int, body: PlanV2Approve):
         raise HTTPException(status_code=400, detail=result.get("message"))
     if result.get("error") == "not_found_or_invalid_status":
         raise HTTPException(status_code=404, detail="Plan not found or status not approvable")
+    return result
+
+
+@router.post("/plans-v2/{plan_id}/split")
+async def split_plan_v2(
+    request: Request,
+    plan_id: int,
+    mode: Literal["per_line", "sku", "customer"] = Query("per_line"),
+    user=Depends(get_current_user),
+):
+    """Split a DRAFT plan's lines into separate plans (one product per plan).
+
+    ``mode``: per_line (default) | sku | customer. The first group keeps the
+    original plan_id; the rest get fresh draft plans. Refuses non-draft plans
+    (409) — approved plans carry job cards / MRP / indents that need
+    re-derivation, which is out of scope for this version.
+    """
+    from app.modules.production.services.plan_v2 import split_plan
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        if not getattr(user, "is_admin", False) and getattr(user, "allowed_warehouses", None):
+            wh = await conn.fetchval(
+                "SELECT warehouse FROM production_plan_v2 WHERE plan_id = $1", plan_id,
+            )
+            if wh is not None and not user_has_warehouse(user.allowed_warehouses, wh):
+                raise HTTPException(status_code=403, detail="Plan outside your factory scope")
+        async with conn.transaction():
+            result = await split_plan(conn, plan_id, mode)
+    err = result.get("error")
+    if err == "plan_not_found":
+        raise HTTPException(status_code=404, detail="Plan not found")
+    if err in ("not_draft", "has_job_cards"):
+        raise HTTPException(status_code=409, detail=result.get("message"))
+    if err in ("nothing_to_split", "invalid_mode"):
+        raise HTTPException(status_code=400, detail=result.get("message") or "Cannot split plan")
     return result
 
 
@@ -4827,7 +4887,7 @@ async def list_job_cards_v2(
     user_floors     = getattr(user, "allowed_floors",     []) or []
     is_admin        = getattr(user, "is_admin", False)
 
-    if factory and not is_admin and user_warehouses and factory not in user_warehouses:
+    if factory and not is_admin and user_warehouses and not user_has_warehouse(user_warehouses, factory):
         raise HTTPException(status_code=403,
                             detail=f"User is not assigned to factory '{factory}'")
     if floor and not is_admin and user_floors and floor not in user_floors:
@@ -4894,7 +4954,7 @@ async def search_job_cards_v2(
     # Same explicit-out-of-scope guard as list_job_cards_v2. Without this an
     # operator filtered to a plant outside their assignment would silently
     # see an empty result instead of a clear 403.
-    if factory and not is_admin and user_warehouses and factory not in user_warehouses:
+    if factory and not is_admin and user_warehouses and not user_has_warehouse(user_warehouses, factory):
         raise HTTPException(status_code=403,
                             detail=f"User is not assigned to factory '{factory}'")
     if floor and not is_admin and user_floors and floor not in user_floors:
@@ -4935,7 +4995,7 @@ async def get_job_card_v2(
         raise HTTPException(status_code=404, detail="Job card not found")
     # Enforce user-level factory/floor lock at read time too. Admin bypasses.
     if not getattr(user, "is_admin", False):
-        if user.allowed_warehouses and result.get("factory") not in user.allowed_warehouses:
+        if user.allowed_warehouses and not user_has_warehouse(user.allowed_warehouses, result.get("factory")):
             raise HTTPException(status_code=403, detail="JC outside your factory scope")
         if user.allowed_floors and result.get("floor") and result["floor"] not in user.allowed_floors:
             raise HTTPException(status_code=403, detail="JC outside your floor scope")
@@ -4969,7 +5029,7 @@ async def job_card_chain_v2(
         # Same factory/floor lock the detail endpoint applies — don't expose
         # the chain of a JC the caller couldn't read directly.
         if not getattr(user, "is_admin", False):
-            if user.allowed_warehouses and anchor["factory"] not in user.allowed_warehouses:
+            if user.allowed_warehouses and not user_has_warehouse(user.allowed_warehouses, anchor["factory"]):
                 raise HTTPException(status_code=403, detail="JC outside your factory scope")
             if user.allowed_floors and anchor["floor"] and anchor["floor"] not in user.allowed_floors:
                 raise HTTPException(status_code=403, detail="JC outside your floor scope")
@@ -5973,9 +6033,14 @@ async def sign_off_v2(
                     # Empty allowed list = wildcard (no restriction).
                     return (not allowed) or (value in allowed)
 
+                # Warehouse needs tolerant matching ('A185' ≡ 'A-185'); the
+                # other two compare entity / floor literally.
+                def _wh_in_scope(value, allowed: list[str]) -> bool:
+                    return (not allowed) or user_has_warehouse(allowed, value)
+
                 if not (getattr(user, "is_admin", False)
                         or (_in_scope(jc_scope["entity"],   user.allowed_entities)
-                            and _in_scope(jc_scope["factory"], user.allowed_warehouses)
+                            and _wh_in_scope(jc_scope["factory"], user.allowed_warehouses)
                             and _in_scope(jc_scope["floor"],   user.allowed_floors))):
                     # B7 L2: don't leak the user's full allowed list back.
                     raise HTTPException(
