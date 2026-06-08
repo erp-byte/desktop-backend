@@ -5902,23 +5902,46 @@ async def record_output_v2(
                     recorded_by=rec_by,
                 )
                 result["qc"] = qc_result.get("qc")
+    # Structured envelopes so the frontend's friendlyApiError mapper can
+    # decode the code and render a sentence ("Cannot save — an output qty
+    # is required") instead of dumping raw JSON to the operator. Mirrors
+    # the same fix applied to plans-v2 in 1820645.
     if result.get("error") == "job_card_not_found":
-        raise HTTPException(status_code=404, detail="Job card not found")
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "job_card_not_found", "message": "Job card not found"},
+        )
     if result.get("error") == "negative_qty":
-        raise HTTPException(status_code=400, detail="qty values must be >= 0")
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "negative_qty", "message": "qty values must be >= 0"},
+        )
     if result.get("error") == "missing_qty":
-        raise HTTPException(status_code=400, detail="output_qty_kg (or fg_actual_kg) is required")
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "missing_qty",
+                "message": "output_qty_kg (or fg_actual_kg) is required",
+            },
+        )
     if result.get("error") == "implausible_yield":
         # Operator typo: yield outside ±999.999% almost always means a
         # value was entered in the wrong unit (grams instead of kg, units
-        # vs kg, etc.). Surface the numbers so they can see what tripped.
+        # vs kg, etc.). Surface the numbers in details so the frontend
+        # mapper can show them ("grams vs kg is the usual culprit").
         raise HTTPException(
             status_code=400,
-            detail=(
-                f"Yield computes to {result['yield_pct']:.2f}% — check that "
-                f"output_qty_kg ({result['output_qty_kg']}) and "
-                f"rm_consumed_kg ({result['rm_consumed_kg']}) are both in kg."
-            ),
+            detail={
+                "error": "implausible_yield",
+                "yield_pct": result.get("yield_pct"),
+                "output_qty_kg": result.get("output_qty_kg"),
+                "rm_consumed_kg": result.get("rm_consumed_kg"),
+                "message": (
+                    f"Yield computes to {result['yield_pct']:.2f}% — check that "
+                    f"output_qty_kg ({result['output_qty_kg']}) and "
+                    f"rm_consumed_kg ({result['rm_consumed_kg']}) are both in kg."
+                ),
+            },
         )
     return result
 
