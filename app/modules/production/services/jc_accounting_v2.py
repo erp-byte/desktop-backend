@@ -543,7 +543,8 @@ PM_VALID_UOMS = frozenset({'PCS', 'NOS', 'ROLL', 'SETS', 'BUNDLE'})
 
 async def save_byproducts(conn, *, job_card_id: int,
                           rows: list[dict],
-                          recorded_by: str | None = None) -> dict:
+                          recorded_by: str | None = None,
+                          batch_id: int | None = None) -> dict:
     """Upsert byproduct rows. Zero-qty rows are allowed (the UI can clear
     a previously-saved category by setting it to 0).
 
@@ -633,14 +634,20 @@ async def save_byproducts(conn, *, job_card_id: int,
             _job_card_id=job_card_id, _cat=cat, _qty=qty, _uom=uom,
             _remarks=r.get("remarks"), _recorded_by=recorded_by,
             _material_name=material_name, _bom_line_id=bom_line_id,
+            _batch_id=batch_id,
         ):
+            # Stage 2: UNIQUE key extended to include batch_id (migration
+            # 038 dropped uq_byproducts_jc_cat_mat and created
+            # uq_byproducts_jc_batch_cat_mat).  ON CONFLICT lists the
+            # full key expression so PG matches the index automatically.
             return await conn.fetchrow(
                 """
                 INSERT INTO job_card_byproducts_v2
-                    (byproduct_id, job_card_id, category, quantity, uom,
-                     remarks, recorded_by, material_name, bom_line_id)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                ON CONFLICT (job_card_id, category, (COALESCE(material_name, '')))
+                    (byproduct_id, job_card_id, batch_id, category, quantity,
+                     uom, remarks, recorded_by, material_name, bom_line_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                ON CONFLICT (job_card_id, COALESCE(batch_id, 0),
+                             category, (COALESCE(material_name, '')))
                 DO UPDATE SET
                     quantity    = EXCLUDED.quantity,
                     uom         = EXCLUDED.uom,
@@ -651,8 +658,8 @@ async def save_byproducts(conn, *, job_card_id: int,
                 RETURNING *
                 """,
                 new_short_time_id(),
-                _job_card_id, _cat, _qty, _uom, _remarks, _recorded_by,
-                _material_name, _bom_line_id,
+                _job_card_id, _batch_id, _cat, _qty, _uom, _remarks,
+                _recorded_by, _material_name, _bom_line_id,
             )
         row = await insert_with_pk_retry(conn, _insert)
         saved.append(_serialize(row))

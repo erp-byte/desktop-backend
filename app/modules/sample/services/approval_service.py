@@ -112,22 +112,27 @@ async def act_bh_approval(conn, req_id: int, *, action: str, user,
         await req_svc.transition_status(conn, req_id, target=target, user=user,
                                         remarks=f"BH {action.lower()}")
 
-        # Notifications (spec §11)
-        entity = locked["entity"]
+        # Notifications (spec §11). store_alert is legal-entity scoped, not by
+        # warehouse — emit_alert defaults to the 'cfpl' entity.
         if action == "APPROVED":
-            if locked["sample_type"] in ("BASIS_FG", "NPD"):
+            # NPD / TRIAL clear into NPD development (promote the draft BOM);
+            # FG samples go to production; everything else to inventory outward.
+            st = locked["sample_type"]
+            if st in ("NPD", "TRIAL"):
+                team = notification_service.TEAM_NPD
+            elif st == "BASIS_FG":
                 team = notification_service.TEAM_PRODUCTION
             else:
                 team = notification_service.TEAM_INVENTORY
             await notification_service.emit_alert(
                 conn, alert_type="sample_bh_approved", target_team=team,
                 message=f"Sample {locked['requisition_number']} approved by business head.",
-                related_id=req_id, entity=entity)
+                related_id=req_id)
         else:
             await notification_service.emit_alert(
                 conn, alert_type="sample_bh_rejected",
                 target_team=notification_service.TEAM_BUSINESS,
                 message=f"Sample {locked['requisition_number']} rejected: {remarks}",
-                related_id=req_id, entity=entity)
+                related_id=req_id)
 
     return await req_svc.get_requisition(conn, req_id)

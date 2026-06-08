@@ -221,3 +221,31 @@ class PoDeleteResponse(BaseModel):
     deleted_by: str
     delete_reason: str
     dependent_records: DependentRecords
+
+
+# ── POST /api/v1/po/{transaction_no}/intimation ───────────────────────────
+
+
+class PoIntimationRequest(BaseModel):
+    line_numbers: list[int] = Field(min_length=1)
+    vehicle_number: str = Field(min_length=1)
+    invoice_no: str = Field(min_length=1)
+
+
+class PoIntimationRecipient(BaseModel):
+    role: str
+    phone: str
+    status: str
+    error: str | None = None
+
+
+class PoIntimationSkip(BaseModel):
+    role: str
+    reason: str
+
+
+class PoIntimationResponse(BaseModel):
+    template: str
+    recipients: list[PoIntimationRecipient] = Field(default_factory=list)
+    skipped: list[PoIntimationSkip] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)

@@ -11,6 +11,7 @@ from __future__ import annotations
 from fastapi import HTTPException
 
 from app.modules.sample.services import audit_service
+from app.modules.sample.services import npd_auth
 from app.modules.sample.services import requisition_service as req_svc
 
 
@@ -29,21 +30,25 @@ async def _insert_lines(conn, draft_id: int, lines: list[dict]) -> None:
             """
             INSERT INTO npd_draft_bom_lines
                 (draft_bom_id, sku_id, sku_name, qty, uom, item_type,
-                 delta_type, original_qty, line_order, notes)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                 delta_type, original_qty, ownership, is_off_master,
+                 customer_lot_ref, received_qty, line_order, notes)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             """,
-            draft_id, ln["sku_id"], ln["sku_name"], ln["qty"], ln["uom"],
-            ln.get("item_type"), ln.get("delta_type", "UNCHANGED"),
-            ln.get("original_qty"), ln.get("line_order", i), ln.get("notes"))
+            draft_id, ln.get("sku_id"), ln["sku_name"], ln["qty"], ln["uom"],
+            ln.get("item_type"), ln.get("delta_type", "UNCHANGED"), ln.get("original_qty"),
+            ln.get("ownership", "OWN"), ln.get("is_off_master", False),
+            ln.get("customer_lot_ref"), ln.get("received_qty"),
+            ln.get("line_order", i), ln.get("notes"))
 
 
 async def create_draft_bom(conn, req_id: int, *, payload: dict, user) -> dict:
     """Create an NPD draft BOM for a requisition (optionally cloned from base)."""
     req = req_svc._require(await req_svc._fetch_req(conn, req_id), req_id)
-    if req["sample_type"] != "NPD":
+    if req["sample_type"] not in ("NPD", "TRIAL"):
         raise HTTPException(409, detail={"error": "wrong_flow",
-                                         "message": "Draft BOMs apply only to NPD samples",
+                                         "message": "Draft BOMs apply only to NPD / TRIAL samples",
                                          "details": {"sample_type": req["sample_type"]}})
+    await npd_auth.require_npd_authorized(conn, user, "AUTHOR")
     base_bom_id = payload.get("base_bom_id") or req["base_bom_id"]
     async with conn.transaction():
         draft_id = await conn.fetchval(
@@ -96,6 +101,7 @@ async def replace_lines(conn, draft_id: int, *, lines: list[dict], user) -> dict
         raise HTTPException(409, detail={"error": "not_editable",
                                          "message": "Only DRAFT BOMs can be edited",
                                          "details": {"status": draft["status"]}})
+    await npd_auth.require_npd_authorized(conn, user, "AUTHOR")
     async with conn.transaction():
         await conn.execute("DELETE FROM npd_draft_bom_lines WHERE draft_bom_id = $1", draft_id)
         await _insert_lines(conn, draft_id, lines)
@@ -113,6 +119,7 @@ async def promote_draft(conn, draft_id: int, *, user) -> dict:
         raise HTTPException(409, detail={"error": "not_promotable",
                                          "message": "Only DRAFT BOMs can be promoted",
                                          "details": {"status": draft["status"]}})
+    await npd_auth.require_npd_authorized(conn, user, "PROMOTE")
     req = req_svc._require(await req_svc._fetch_req(conn, draft["requisition_id"]),
                            draft["requisition_id"])
     # BH gate: the parent requisition must have cleared business-head approval.
@@ -142,7 +149,7 @@ async def promote_draft(conn, draft_id: int, *, user) -> dict:
             VALUES ($1, $2, 1, TRUE, $3, $4)
             RETURNING bom_id
             """,
-            draft["fg_sku_name"] or f"NPD-{draft_id}", None, req["entity"],
+            draft["fg_sku_name"] or f"NPD-{draft_id}", None, req.get("entity") or "cfpl",
             f"Promoted from NPD draft {draft_id} (requisition {req['requisition_number']})")
         for i, ln in enumerate(lines, 1):
             await conn.execute(

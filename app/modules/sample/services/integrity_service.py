@@ -16,7 +16,7 @@ async def run_integrity_check(conn, *, emit: bool = True) -> list[dict]:
     # 1. GATE_PASS_ISSUED must have exactly one non-voided gate pass.
     rows = await conn.fetch(
         """
-        SELECT sr.id, sr.requisition_number, sr.entity,
+        SELECT sr.id, sr.requisition_number, sr.warehouse,
                (SELECT COUNT(*) FROM gate_passes gp
                  WHERE gp.source_ref_type = 'SAMPLE_REQ' AND gp.source_ref_id = sr.id
                    AND gp.voided = FALSE) AS gp_count
@@ -30,7 +30,7 @@ async def run_integrity_check(conn, *, emit: bool = True) -> list[dict]:
     # 2. IN_PRODUCTION must link a non-REGULAR job card.
     rows = await conn.fetch(
         """
-        SELECT sr.id, sr.requisition_number, sr.entity, sr.linked_job_card_id, jc.jobcard_type
+        SELECT sr.id, sr.requisition_number, sr.warehouse, sr.linked_job_card_id, jc.jobcard_type
           FROM sample_requisitions sr
           LEFT JOIN job_card jc ON jc.job_card_id = sr.linked_job_card_id
          WHERE sr.status = 'IN_PRODUCTION' AND sr.deleted_at IS NULL
@@ -42,7 +42,7 @@ async def run_integrity_check(conn, *, emit: bool = True) -> list[dict]:
     # 3. PARTIALLY_CONVERTED must have at least one child.
     rows = await conn.fetch(
         """
-        SELECT sr.id, sr.requisition_number, sr.entity
+        SELECT sr.id, sr.requisition_number, sr.warehouse
           FROM sample_requisitions sr
          WHERE sr.status = 'PARTIALLY_CONVERTED' AND sr.deleted_at IS NULL
            AND NOT EXISTS (SELECT 1 FROM sample_requisitions c WHERE c.converted_from_id = sr.id)
@@ -53,7 +53,7 @@ async def run_integrity_check(conn, *, emit: bool = True) -> list[dict]:
     # 4. INTERNALLY_DISPATCHED must have exactly one 265 movement.
     rows = await conn.fetch(
         """
-        SELECT sr.id, sr.requisition_number, sr.entity,
+        SELECT sr.id, sr.requisition_number, sr.warehouse,
                (SELECT COUNT(*) FROM material_document md
                  WHERE md.sample_requisition_id = sr.id AND md.movement_type = '265') AS md_count
           FROM sample_requisitions sr
@@ -69,10 +69,10 @@ async def run_integrity_check(conn, *, emit: bool = True) -> list[dict]:
                 conn, alert_type="sample_integrity_drift",
                 target_team=notification_service.TEAM_STORES,
                 message=f"Sample integrity drift on {d['requisition_number']}: {d['check']} — {d['detail']}",
-                related_id=d["requisition_id"], entity=d["entity"])
+                related_id=d["requisition_id"])
     return drifts
 
 
 def _d(row, check: str, detail: str) -> dict:
     return {"requisition_id": row["id"], "requisition_number": row["requisition_number"],
-            "entity": row["entity"], "check": check, "detail": detail}
+            "warehouse": row["warehouse"], "check": check, "detail": detail}

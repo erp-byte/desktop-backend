@@ -31,10 +31,34 @@ import logging
 from datetime import datetime, timezone
 from decimal import Decimal
 
+from asyncpg.exceptions import UndefinedColumnError
+
 from app.core.helpers import insert_with_pk_retry, new_short_time_id
+from app.core.warehouse_scope import WAREHOUSE_NORM_ANY_SQL, WAREHOUSE_NORM_SQL
 from app.modules.production.services.output_calc import compute_output_row
 
 logger = logging.getLogger(__name__)
+
+# Stage 2 fallback: migration 038 adds batch_id to the four accounting
+# tables.  When the server is restarted on Stage 2 code BEFORE the
+# migration lands, the detail SELECTs catch UndefinedColumnError and
+# fall back to a NULL batch_id projection.  This set tracks which
+# tables we've already logged about so a steady-state polling client
+# doesn't flood the log on every JC detail load.
+_BATCH_ID_MISSING_LOGGED: set[str] = set()
+
+
+def _warn_batch_id_missing_once(table: str) -> None:
+    if table in _BATCH_ID_MISSING_LOGGED:
+        return
+    _BATCH_ID_MISSING_LOGGED.add(table)
+    logger.warning(
+        "%s.batch_id does not exist — apply migration 038_jc_batch_per_record.sql "
+        "to enable Stage 2 per-batch accounting. JC detail reads will return "
+        "batch_id=NULL until then; new writes still default to the JC's open "
+        "batch but the column simply isn't there to persist the tag yet.",
+        table,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +170,16 @@ async def _annexure_rows(conn, kind: str, job_card_id: int) -> list[dict]:
         job_card_id,
     )
     return [_serialize(r) for r in rows]
+
+
+# Lightweight wrapper around jc_additives_v2.list_additives so
+# get_job_card can stay self-contained (no need to deal with module-
+# import ordering between job_card_v2 and jc_additives_v2). The actual
+# query lives in the dedicated service; this helper just hands the
+# connection over.
+async def _list_additives_local(conn, job_card_id: int) -> list[dict]:
+    from app.modules.production.services.jc_additives_v2 import list_additives
+    return await list_additives(conn, job_card_id)
 
 
 # ---------------------------------------------------------------------------
@@ -402,6 +436,7 @@ async def upsert_consumption_lines(
     entries: list[dict],
     input_kind: str,
     recorded_by: str | None,
+    batch_id: int | None = None,
 ) -> int:
     """Write per-BOM-line consumption rows for a JC.
 
@@ -411,10 +446,14 @@ async def upsert_consumption_lines(
     the BOM catalog; SFG/WIP rows are written separately by the stage-
     handoff code path, not this function).
 
+    Stage 2: rows are now tagged with batch_id.  The UNIQUE key on the
+    table changed from (job_card_id, material_sku_name) to
+    (job_card_id, COALESCE(batch_id, 0), material_sku_name) — same
+    material can appear once per batch.  When `batch_id` is None
+    (legacy code path), rows fall into the `0` bucket and the legacy
+    upsert behaviour is preserved.
+
     Per-row semantics:
-      * UNIQUE(job_card_id, material_sku_name) means we UPSERT — same
-        row updated on subsequent saves so the operator can come back
-        and edit a value without ending up with duplicates.
       * issued_qty defaults to 0 here because Material Consumption is
         an output-side ledger; the issued column is filled from the
         indent row at the stage that materialised the indent. Detail
@@ -438,17 +477,22 @@ async def upsert_consumption_lines(
         remarks     = e.get("remarks")
         async def _upsert(_sku=sku, _kind=input_kind, _uom=uom,
                           _qty=qty, _bom_id=bom_line_id, _rem=remarks,
-                          _rec_by=recorded_by):
+                          _rec_by=recorded_by, _batch=batch_id):
+            # ON CONFLICT references the expression UNIQUE INDEX
+            # uq_jcmc_v2_jc_batch_material (migration 038) by its
+            # column list — PG matches the index automatically when
+            # the conflict_target columns + expressions match.
             return await conn.fetchval(
                 """
                 INSERT INTO job_card_material_consumption_v2 (
-                    consumption_id, job_card_id, bom_line_id,
+                    consumption_id, job_card_id, bom_line_id, batch_id,
                     material_sku_name, input_kind, uom,
                     issued_qty, actual_consumed_qty, return_qty,
                     remarks, recorded_by
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, 0, $7, 0, $8, $9)
-                ON CONFLICT (job_card_id, material_sku_name)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8, 0, $9, $10)
+                ON CONFLICT (job_card_id, COALESCE(batch_id, 0),
+                             material_sku_name)
                 DO UPDATE SET
                     bom_line_id         = EXCLUDED.bom_line_id,
                     input_kind          = EXCLUDED.input_kind,
@@ -458,7 +502,7 @@ async def upsert_consumption_lines(
                     recorded_by         = EXCLUDED.recorded_by
                 RETURNING consumption_id
                 """,
-                new_short_time_id(), job_card_id, _bom_id,
+                new_short_time_id(), job_card_id, _bom_id, _batch,
                 _sku, _kind, _uom, float(_qty), _rem, _rec_by,
             )
         await insert_with_pk_retry(conn, _upsert)
@@ -1013,9 +1057,13 @@ async def list_job_cards(
     if entity:
         conditions.append(f"entity = ${idx}"); params.append(entity); idx += 1
     if factory:
-        conditions.append(f"factory = ${idx}"); params.append(factory); idx += 1
+        # Tolerant match: 'A185' / 'A-185' / 'a 185' all collapse to the same canonical key.
+        conditions.append(
+            f"{WAREHOUSE_NORM_SQL('factory')} = {WAREHOUSE_NORM_SQL(f'${idx}')}"
+        )
+        params.append(factory); idx += 1
     elif user_scope_warehouses:
-        conditions.append(f"factory = ANY(${idx}::text[])")
+        conditions.append(WAREHOUSE_NORM_ANY_SQL("factory", f"${idx}"))
         params.append(list(user_scope_warehouses)); idx += 1
     if floor:
         conditions.append(f"floor = ${idx}"); params.append(floor); idx += 1
@@ -1285,9 +1333,12 @@ async def search_job_cards(
     if entity:
         conditions.append(f"entity = ${idx}"); params.append(entity); idx += 1
     if factory:
-        conditions.append(f"factory = ${idx}"); params.append(factory); idx += 1
+        conditions.append(
+            f"{WAREHOUSE_NORM_SQL('factory')} = {WAREHOUSE_NORM_SQL(f'${idx}')}"
+        )
+        params.append(factory); idx += 1
     elif user_scope_warehouses:
-        conditions.append(f"factory = ANY(${idx}::text[])")
+        conditions.append(WAREHOUSE_NORM_ANY_SQL("factory", f"${idx}"))
         params.append(list(user_scope_warehouses)); idx += 1
     if floor:
         conditions.append(f"floor = ${idx}"); params.append(floor); idx += 1
@@ -1597,7 +1648,8 @@ EGA_CONSOLIDATED_SENTINEL = 'CONSOLIDATED'
 
 async def replace_balance_materials(conn, *, job_card_id: int,
                                     rows: list[dict],
-                                    recorded_by: str | None = None) -> dict:
+                                    recorded_by: str | None = None,
+                                    batch_id: int | None = None) -> dict:
     """Replace this JC's balance material rows wholesale (delete-then-
     insert). The Android Output form sends one entry per BOM article on
     every save with `qty_kg = 0` meaning "explicitly no leftover for
@@ -1713,23 +1765,38 @@ async def replace_balance_materials(conn, *, job_card_id: int,
                     ),
                 }
 
-    await conn.execute(
-        "DELETE FROM job_card_balance_material_v2 WHERE job_card_id = $1",
-        job_card_id,
-    )
+    # Stage 2: scope the wholesale delete to the SAME batch we're about
+    # to write into.  Two batches on the same JC can carry independent
+    # balance-material sets.  When batch_id is None (legacy path), we
+    # delete only the rows ALSO tagged NULL so existing batched data is
+    # preserved.
+    if batch_id is None:
+        await conn.execute(
+            "DELETE FROM job_card_balance_material_v2 "
+            "WHERE job_card_id = $1 AND batch_id IS NULL",
+            job_card_id,
+        )
+    else:
+        await conn.execute(
+            "DELETE FROM job_card_balance_material_v2 "
+            "WHERE job_card_id = $1 AND batch_id = $2",
+            job_card_id, batch_id,
+        )
     for r in rows:
-        async def _insert(_r=r):
+        async def _insert(_r=r, _batch=batch_id):
             return await conn.fetchrow(
                 """
                 INSERT INTO job_card_balance_material_v2 (
-                    balance_id, job_card_id, bom_line_id, material_id,
-                    material_name, balance_type, qty_kg, remarks, recorded_by
+                    balance_id, job_card_id, batch_id, bom_line_id,
+                    material_id, material_name, balance_type, qty_kg,
+                    remarks, recorded_by
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                 RETURNING *
                 """,
                 new_short_time_id(),
                 job_card_id,
+                _batch,
                 _r.get("bom_line_id"),
                 _r.get("material_id"),
                 _r.get("material_name") or _r.get("material_sku_name"),
@@ -2031,7 +2098,7 @@ async def complete_job_card(conn, *, job_card_id: int,
         is accepted as an audit-trail token only.
 
     R13 closure gate:
-        Refuses if any phase row for this JC is still 'open'. Phases must
+        Refuses if any batch row for this JC is still 'open'. Batches must
         be closed (or cancelled) before /complete can run.
 
     NOTE: v2 does NOT auto-unlock the next stage on complete. The dispatch
@@ -2062,25 +2129,25 @@ async def complete_job_card(conn, *, job_card_id: int,
         return {"error": "open_shift",
                 "message": "Stop the open shift segment before completing"}
 
-    # ── R13: refuse if any phase is still open.
-    open_phase = await conn.fetchrow(
+    # ── R13: refuse if any batch is still open.
+    open_batch = await conn.fetchrow(
         """
-        SELECT phase_id, phase_number, phase_date
-        FROM   job_card_phase_v2
+        SELECT batch_id, batch_number, batch_date
+        FROM   job_card_batch_v2
         WHERE  job_card_id = $1 AND status = 'open'
         LIMIT  1
         """,
         job_card_id,
     )
-    if open_phase:
+    if open_batch:
         return {
-            "error":        "open_phase",
-            "phase_id":     open_phase["phase_id"],
-            "phase_number": open_phase["phase_number"],
-            "phase_date":   open_phase["phase_date"].isoformat() if open_phase["phase_date"] else None,
+            "error":        "open_batch",
+            "batch_id":     open_batch["batch_id"],
+            "batch_number": open_batch["batch_number"],
+            "batch_date":   open_batch["batch_date"].isoformat() if open_batch["batch_date"] else None,
             "message": (
-                f"Phase {open_phase['phase_number']} "
-                f"({open_phase['phase_date']}) is still open. Close it "
+                f"Batch {open_batch['batch_number']} "
+                f"({open_batch['batch_date']}) is still open. Close it "
                 "before completing the JC."
             ),
         }
@@ -2375,6 +2442,10 @@ async def cancel_job_card(conn, *, job_card_id: int,
     'in_progress' would orphan material that's already flowing.
 
     Side effects:
+        - cancelled_snapshot stamped with the full pre-cancel detail
+          payload (migration 043) so a later read of the cancelled JC
+          can reconstruct exactly what existed at cancel time even if
+          linked tables are mutated afterwards.
         - status = 'cancelled', deleted_at = NOW()
         - cancellation_reason recorded
         - the downstream JC (if it was waiting on this stage's handoff)
@@ -2397,17 +2468,32 @@ async def cancel_job_card(conn, *, job_card_id: int,
         return {"error": "invalid_status",
                 "message": f"Cannot cancel a JC in '{jc['status']}' — use close instead"}
 
+    # Build the cancellation snapshot before flipping status. We compose
+    # it from the canonical detail builder so the JSONB blob matches what
+    # GET /job-cards-v2/{id} returns — saves a future reader from having
+    # to relearn the shape, and stays in lockstep when the detail surface
+    # gains new sections. Any failure here is fatal (the transaction will
+    # roll back) — silent snapshot drop would defeat the purpose.
+    import json
+    snapshot_payload = await get_job_card(conn, job_card_id)
+    snapshot_json = json.dumps(
+        snapshot_payload,
+        default=str,         # stringify Decimal / datetime cleanly
+        ensure_ascii=False,
+    )
+
     row = await conn.fetchrow(
         """
         UPDATE job_card_v2
            SET status              = 'cancelled',
                deleted_at          = NOW(),
                deleted_by          = $2,
-               cancellation_reason = $3
+               cancellation_reason = $3,
+               cancelled_snapshot  = $4::jsonb
          WHERE job_card_id = $1
         RETURNING *
         """,
-        job_card_id, deleted_by, reason.strip(),
+        job_card_id, deleted_by, reason.strip(), snapshot_json,
     )
     return {"cancelled": True, "job_card": _serialize(row)}
 
@@ -2425,9 +2511,9 @@ async def stop_job_card(conn, *, job_card_id: int,
     everything' button for material_received / in_progress JCs.
 
     Side effects in one txn:
-      - Any OPEN R13 phase for this JC is set to 'cancelled' first.
-        Phase-table partial UNIQUE index uq_jcphase_one_open guarantees
-        at most one open phase, so a single UPDATE handles it.
+      - Any OPEN R13 batch for this JC is set to 'cancelled' first.
+        Batch-table partial UNIQUE index uq_jcbatch_one_open guarantees
+        at most one open batch, so a single UPDATE handles it.
       - job_card_v2.status -> 'cancelled', deleted_at = NOW(),
         cancellation_reason carries the audit prefix
         '[STOP_PROCESS][req:<id>] ' when request_id is supplied,
@@ -2483,10 +2569,11 @@ async def stop_job_card(conn, *, job_card_id: int,
         job_card_id, reason.strip(),
     )
 
-    # Cancel any open phase next (single-open invariant from migration 029).
+    # Cancel any open batch next (single-open invariant from migration 029,
+    # table renamed in 036; constraint preserved for Stage 1).
     await conn.execute(
         """
-        UPDATE job_card_phase_v2
+        UPDATE job_card_batch_v2
            SET status    = 'cancelled',
                ended_at  = COALESCE(ended_at, NOW()),
                closed_at = NOW(),
@@ -2702,17 +2789,36 @@ async def get_job_card(conn, job_card_id: int) -> dict | None:
     # at stage 1, but the LAST stage (packaging) commonly records
     # consumption against BOTH kinds because the packaging line uses
     # PM plus any trailing RM (flavourings, etc).
-    consumption_rows = await conn.fetch(
-        """
-        SELECT consumption_id, bom_line_id, material_sku_name, input_kind,
-               uom, issued_qty, actual_consumed_qty, return_qty, variance,
-               remarks
-        FROM   job_card_material_consumption_v2
-        WHERE  job_card_id = $1
-        ORDER  BY input_kind, material_sku_name
-        """,
-        job_card_id,
-    )
+    # Stage 2: batch_id is added by migration 038.  When the server is
+    # restarted on Stage 2 code but the migration hasn't landed yet,
+    # asyncpg raises UndefinedColumnError on the SELECT.  Fall back to
+    # the pre-Stage-2 column list with batch_id surfaced as NULL so the
+    # JC detail page stays loadable until psql is run.
+    try:
+        consumption_rows = await conn.fetch(
+            """
+            SELECT consumption_id, batch_id, bom_line_id, material_sku_name,
+                   input_kind, uom, issued_qty, actual_consumed_qty, return_qty,
+                   variance, remarks
+            FROM   job_card_material_consumption_v2
+            WHERE  job_card_id = $1
+            ORDER  BY input_kind, material_sku_name
+            """,
+            job_card_id,
+        )
+    except UndefinedColumnError:
+        _warn_batch_id_missing_once("job_card_material_consumption_v2")
+        consumption_rows = await conn.fetch(
+            """
+            SELECT consumption_id, NULL::BIGINT AS batch_id, bom_line_id,
+                   material_sku_name, input_kind, uom, issued_qty,
+                   actual_consumed_qty, return_qty, variance, remarks
+            FROM   job_card_material_consumption_v2
+            WHERE  job_card_id = $1
+            ORDER  BY input_kind, material_sku_name
+            """,
+            job_card_id,
+        )
 
     # Byproducts in the legacy `{byproduct_id, category, qty_kg, remarks}`
     # shape the Android Output form deserialises (ByproductLine.java).
@@ -2722,28 +2828,54 @@ async def get_job_card(conn, job_card_id: int) -> dict | None:
     # Migration 034 added material_name + bom_line_id so off-grade /
     # rejection rows can persist their article attribution. These are
     # NULL for control_sample / pm_* / dust / etc.
-    byproduct_rows = await conn.fetch(
-        """
-        SELECT byproduct_id, category, quantity AS qty_kg, uom, remarks,
-               material_name, bom_line_id
-        FROM   job_card_byproducts_v2
-        WHERE  job_card_id = $1
-        ORDER  BY category, COALESCE(material_name, '')
-        """,
-        job_card_id,
-    )
+    try:
+        byproduct_rows = await conn.fetch(
+            """
+            SELECT byproduct_id, batch_id, category, quantity AS qty_kg, uom,
+                   remarks, material_name, bom_line_id
+            FROM   job_card_byproducts_v2
+            WHERE  job_card_id = $1
+            ORDER  BY category, COALESCE(material_name, '')
+            """,
+            job_card_id,
+        )
+    except UndefinedColumnError:
+        _warn_batch_id_missing_once("job_card_byproducts_v2")
+        byproduct_rows = await conn.fetch(
+            """
+            SELECT byproduct_id, NULL::BIGINT AS batch_id, category,
+                   quantity AS qty_kg, uom, remarks, material_name, bom_line_id
+            FROM   job_card_byproducts_v2
+            WHERE  job_card_id = $1
+            ORDER  BY category, COALESCE(material_name, '')
+            """,
+            job_card_id,
+        )
     # Balance materials (migration 027). Returned per-row so the Output
     # form can pre-fill the qty input next to each BOM article.
-    balance_material_rows = await conn.fetch(
-        """
-        SELECT balance_id, bom_line_id, material_id, material_name,
-               balance_type, qty_kg, remarks
-        FROM   job_card_balance_material_v2
-        WHERE  job_card_id = $1
-        ORDER  BY balance_type, material_name
-        """,
-        job_card_id,
-    )
+    try:
+        balance_material_rows = await conn.fetch(
+            """
+            SELECT balance_id, batch_id, bom_line_id, material_id, material_name,
+                   balance_type, qty_kg, remarks
+            FROM   job_card_balance_material_v2
+            WHERE  job_card_id = $1
+            ORDER  BY balance_type, material_name
+            """,
+            job_card_id,
+        )
+    except UndefinedColumnError:
+        _warn_batch_id_missing_once("job_card_balance_material_v2")
+        balance_material_rows = await conn.fetch(
+            """
+            SELECT balance_id, NULL::BIGINT AS batch_id, bom_line_id,
+                   material_id, material_name, balance_type, qty_kg, remarks
+            FROM   job_card_balance_material_v2
+            WHERE  job_card_id = $1
+            ORDER  BY balance_type, material_name
+            """,
+            job_card_id,
+        )
     # QC summary (migration 027). At most one row per JC.
     qc_row = await conn.fetchrow(
         """
@@ -2886,6 +3018,11 @@ async def get_job_card(conn, job_card_id: int) -> dict | None:
         "annexure_e_remarks":             await _annexure_rows(conn, 'remarks', job_card_id),
         "byproducts":                     [_serialize(r) for r in byproduct_rows],
         "balance_materials":              [_serialize(r) for r in balance_material_rows],
+        # Additives (035) — data-keeping consumption bucket. Lazy import
+        # to avoid a circular dependency between job_card_v2 and
+        # jc_additives_v2 (the latter pulls helpers from job_card_v2 in
+        # future iterations).
+        "additives": await _list_additives_local(conn, job_card_id),
         "qc":                             _serialize(qc_row) if qc_row else None,
         "store_allocations":              [],          # see /allocations endpoint (TODO)
         # total_stages for the chain progress bar.

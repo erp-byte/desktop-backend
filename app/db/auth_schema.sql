@@ -101,6 +101,7 @@ INSERT INTO auth_role (role_name, description, is_admin) VALUES
     ('qc_inspector',    'QC inspector — inspections, annexures, sign-offs',  FALSE),
     ('floor_manager',   'Floor manager — floor operations, discrepancy',     FALSE),
     ('purchase_manager','Purchase manager — indents, PO management',         FALSE),
+    ('qc_manager',      'QC manager — receives inward intimations',          FALSE),
     ('viewer',          'Read-only access to all modules',                   FALSE)
 ON CONFLICT (role_name) DO NOTHING;
 
@@ -206,7 +207,17 @@ INSERT INTO auth_permission (module, sub_module, sub_sub_module, action, descrip
     ('auth',       'users',       NULL,       'delete', 'Deactivate users'),
     ('auth',       'roles',       NULL,       'view',   'View roles'),
     ('auth',       'roles',       NULL,       'create', 'Create roles'),
-    ('auth',       'roles',       NULL,       'edit',   'Edit role permissions')
+    ('auth',       'roles',       NULL,       'edit',   'Edit role permissions'),
+    -- QC module — inward inspection
+    ('qc',         'inspection',  NULL,       'read',   'View QC inspections'),
+    ('qc',         'inspection',  NULL,       'create', 'Start QC inspections'),
+    ('qc',         'inspection',  NULL,       'edit',   'Capture readings/verdict'),
+    ('qc',         'inspection',  NULL,       'delete', 'Delete QC inspection data'),
+    -- QC module — NCR (non-conformance reports)
+    ('qc',         'ncr',         NULL,       'read',   'View NCRs'),
+    ('qc',         'ncr',         NULL,       'create', 'Raise NCRs'),
+    ('qc',         'ncr',         NULL,       'edit',   'Edit NCR / disposition / CAPA / status'),
+    ('qc',         'ncr',         NULL,       'delete', 'Delete NCRs')
 ON CONFLICT (module, sub_module, sub_sub_module, action) DO NOTHING;
 
 -- =========================================================================
@@ -309,4 +320,68 @@ SELECT r.role_id, p.permission_id
 FROM auth_role r, auth_permission p
 WHERE r.role_name = 'viewer'
   AND p.module = 'purchase' AND p.sub_module = 'po' AND p.action = 'read'
+ON CONFLICT DO NOTHING;
+
+-- =========================================================================
+-- QC module — per-role grants
+-- =========================================================================
+
+-- qc_inspector: read + create + edit on qc.inspection
+INSERT INTO auth_role_permission (role_id, permission_id)
+SELECT r.role_id, p.permission_id
+FROM auth_role r, auth_permission p
+WHERE r.role_name = 'qc_inspector'
+  AND p.module = 'qc'
+  AND p.sub_module = 'inspection'
+  AND p.action IN ('read', 'create', 'edit')
+ON CONFLICT DO NOTHING;
+
+-- qc_manager: full access (read + create + edit + delete) on qc.inspection
+-- NOTE: verdict OVERRIDE is further restricted to qc_manager/admin in code —
+--       no separate permission row is needed for that gate.
+INSERT INTO auth_role_permission (role_id, permission_id)
+SELECT r.role_id, p.permission_id
+FROM auth_role r, auth_permission p
+WHERE r.role_name = 'qc_manager'
+  AND p.module = 'qc'
+  AND p.sub_module = 'inspection'
+  AND p.action IN ('read', 'create', 'edit', 'delete')
+ON CONFLICT DO NOTHING;
+
+-- viewer: read-only on qc.inspection
+-- The blanket viewer grant above only matched action='view'; the QC router
+-- gates on action='read', so an explicit row is required here.
+INSERT INTO auth_role_permission (role_id, permission_id)
+SELECT r.role_id, p.permission_id
+FROM auth_role r, auth_permission p
+WHERE r.role_name = 'viewer'
+  AND p.module = 'qc'
+  AND p.sub_module = 'inspection'
+  AND p.action = 'read'
+ON CONFLICT DO NOTHING;
+
+-- qc_inspector: read + create + edit on qc.ncr (raise + work NCRs)
+INSERT INTO auth_role_permission (role_id, permission_id)
+SELECT r.role_id, p.permission_id
+FROM auth_role r, auth_permission p
+WHERE r.role_name = 'qc_inspector'
+  AND p.module = 'qc' AND p.sub_module = 'ncr'
+  AND p.action IN ('read', 'create', 'edit')
+ON CONFLICT DO NOTHING;
+
+-- qc_manager: full access on qc.ncr (incl. delete)
+INSERT INTO auth_role_permission (role_id, permission_id)
+SELECT r.role_id, p.permission_id
+FROM auth_role r, auth_permission p
+WHERE r.role_name = 'qc_manager'
+  AND p.module = 'qc' AND p.sub_module = 'ncr'
+ON CONFLICT DO NOTHING;
+
+-- viewer: read-only on qc.ncr
+INSERT INTO auth_role_permission (role_id, permission_id)
+SELECT r.role_id, p.permission_id
+FROM auth_role r, auth_permission p
+WHERE r.role_name = 'viewer'
+  AND p.module = 'qc' AND p.sub_module = 'ncr'
+  AND p.action = 'read'
 ON CONFLICT DO NOTHING;

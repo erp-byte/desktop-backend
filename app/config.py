@@ -72,6 +72,8 @@ class Settings(BaseSettings):
     WHATSAPP_OTP_TEMPLATE_NAME: str = "visitor_revisit_otp"
     WHATSAPP_OTP_LANG: str = "en_US"
     WHATSAPP_GRAPH_BASE: str = "https://graph.facebook.com/v21.0"
+    WHATSAPP_INTIMATION_TEMPLATE_NAME: str = "qc_inward_intimation"
+    WHATSAPP_INTIMATION_LANG: str = "en"
 
     # ── AWS credentials (read from .env when not present in shell env) ────
     # pydantic-settings reads these from `.env` into the Settings instance;

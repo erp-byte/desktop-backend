@@ -21,6 +21,7 @@ from app.modules.production.schemas.job_card_edit import (
 # L3: B13 cost-metric gate. Hoisted to the top so endpoint bodies stay
 # clean and the gate is one obvious dependency at the module head.
 from app.modules.production.services.response_filters import strip_cost_fields
+from app.core.warehouse_scope import user_has_warehouse
 
 logger = logging.getLogger(__name__)
 
@@ -4009,6 +4010,17 @@ class BalanceMaterialV2(BaseModel):
     remarks: str | None = None
 
 
+class AdditiveLineV2(BaseModel):
+    """Data-keeping additive consumption row.  Either `sku_name` or
+    `material_name` must be set; both null is rejected by the table's
+    CHECK constraint (and gracefully dropped by save_additives with a
+    logger.warning so a partial upload doesn't 500 the save)."""
+    sku_name:      str | None = None    # from all_sku dropdown
+    material_name: str | None = None    # free-text "Others" path
+    qty_kg:        float
+    remarks:       str | None = None
+
+
 class QCDataV2(BaseModel):
     passed: bool
     remarks: str | None = None
@@ -4364,7 +4376,7 @@ async def create_plan_v2(
     """
     if (not user.is_admin
             and user.allowed_warehouses
-            and body.warehouse not in user.allowed_warehouses):
+            and not user_has_warehouse(user.allowed_warehouses, body.warehouse)):
         raise HTTPException(
             status_code=403,
             detail=f"User is not assigned to warehouse '{body.warehouse}'",
@@ -4408,7 +4420,7 @@ async def list_plans_v2(
     user_scope_warehouses: list[str] | None = None
     if not user.is_admin and user.allowed_warehouses:
         if warehouse:
-            if warehouse not in user.allowed_warehouses:
+            if not user_has_warehouse(user.allowed_warehouses, warehouse):
                 raise HTTPException(
                     status_code=403,
                     detail=f"User is not assigned to warehouse '{warehouse}'",
@@ -4471,7 +4483,24 @@ async def approve_plan_v2(request: Request, plan_id: int, body: PlanV2Approve):
 
 
 @router.post("/plans-v2/{plan_id}/cancel")
-async def cancel_plan_v2(request: Request, plan_id: int, body: PlanV2Cancel):
+async def cancel_plan_v2(
+    request: Request,
+    plan_id: int,
+    body: PlanV2Cancel,
+    user=Depends(get_current_user),
+):
+    """Cancel a v2 plan. **Admin-only** — the cancel_plan service releases
+    every line's planned_qty back to the linked so_fulfillment_v2 rows
+    (see plan_v2.cancel_plan), which is a destructive change to demand
+    allocation and must not be available to floor / shop roles."""
+    if not getattr(user, "is_admin", False):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "admin_only",
+                "message": "Only admin users can cancel a plan.",
+            },
+        )
     from app.modules.production.services.plan_v2 import cancel_plan
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -4483,18 +4512,33 @@ async def cancel_plan_v2(request: Request, plan_id: int, body: PlanV2Cancel):
 
 
 @router.post("/plans-v2/{plan_id}/delete")
-async def delete_plan_v2(request: Request, plan_id: int, body: PlanV2Delete):
+async def delete_plan_v2(
+    request: Request,
+    plan_id: int,
+    body: PlanV2Delete,
+    user=Depends(get_current_user),
+):
     """Delete an APPROVED plan and notify every active admin by email.
 
     Uses POST (not HTTP DELETE) so a body can carry the reason + actor.
     Reuses the cancel-plan accounting (planned_qty release) under the hood
     but only accepts approved plans — draft plans go through /cancel.
+    **Admin-only** — same rationale as /plans-v2/{id}/cancel (releases
+    planned_qty back to fulfillment, mass notification side-effect).
 
     Email is best-effort: a transient SMTP failure is logged and swallowed
     so the API still confirms the delete. `admin_email_count` in the
     response tells the caller how many admins were notified (0 means the
     admin list was empty or SMTP was disabled).
     """
+    if not getattr(user, "is_admin", False):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "admin_only",
+                "message": "Only admin users can delete an approved plan.",
+            },
+        )
     if not body.reason or not body.reason.strip():
         raise HTTPException(status_code=400, detail="reason is required")
 
@@ -4827,7 +4871,7 @@ async def list_job_cards_v2(
     user_floors     = getattr(user, "allowed_floors",     []) or []
     is_admin        = getattr(user, "is_admin", False)
 
-    if factory and not is_admin and user_warehouses and factory not in user_warehouses:
+    if factory and not is_admin and user_warehouses and not user_has_warehouse(user_warehouses, factory):
         raise HTTPException(status_code=403,
                             detail=f"User is not assigned to factory '{factory}'")
     if floor and not is_admin and user_floors and floor not in user_floors:
@@ -4894,7 +4938,7 @@ async def search_job_cards_v2(
     # Same explicit-out-of-scope guard as list_job_cards_v2. Without this an
     # operator filtered to a plant outside their assignment would silently
     # see an empty result instead of a clear 403.
-    if factory and not is_admin and user_warehouses and factory not in user_warehouses:
+    if factory and not is_admin and user_warehouses and not user_has_warehouse(user_warehouses, factory):
         raise HTTPException(status_code=403,
                             detail=f"User is not assigned to factory '{factory}'")
     if floor and not is_admin and user_floors and floor not in user_floors:
@@ -4935,7 +4979,7 @@ async def get_job_card_v2(
         raise HTTPException(status_code=404, detail="Job card not found")
     # Enforce user-level factory/floor lock at read time too. Admin bypasses.
     if not getattr(user, "is_admin", False):
-        if user.allowed_warehouses and result.get("factory") not in user.allowed_warehouses:
+        if user.allowed_warehouses and not user_has_warehouse(user.allowed_warehouses, result.get("factory")):
             raise HTTPException(status_code=403, detail="JC outside your factory scope")
         if user.allowed_floors and result.get("floor") and result["floor"] not in user.allowed_floors:
             raise HTTPException(status_code=403, detail="JC outside your floor scope")
@@ -4969,7 +5013,7 @@ async def job_card_chain_v2(
         # Same factory/floor lock the detail endpoint applies — don't expose
         # the chain of a JC the caller couldn't read directly.
         if not getattr(user, "is_admin", False):
-            if user.allowed_warehouses and anchor["factory"] not in user.allowed_warehouses:
+            if user.allowed_warehouses and not user_has_warehouse(user.allowed_warehouses, anchor["factory"]):
                 raise HTTPException(status_code=403, detail="JC outside your factory scope")
             if user.allowed_floors and anchor["floor"] and anchor["floor"] not in user.allowed_floors:
                 raise HTTPException(status_code=403, detail="JC outside your floor scope")
@@ -5394,7 +5438,13 @@ class RecordOutputV2Request(BaseModel):
     `process_loss_kg` persists on the output row (migration 026).
     `balance_materials` write to job_card_balance_material_v2 and `qc`
     writes to job_card_qc_v2 (migration 027). `fg_expected_*` is
-    informational and silently dropped here."""
+    informational and silently dropped here.
+
+    Stage 2 / migration 038: `batch_id` tags every persisted row.  When
+    omitted, the handler resolves it from the JC's currently-open
+    batch (1 open → use it; 0 → 400 no_open_batch; ≥ 2 → 400
+    ambiguous_open_batch).  Stage 3 UI passes it explicitly via the
+    batch selector dropdown."""
     # Lean v2 fields (canonical)
     rm_consumed_kg:   float | None = None
     output_qty_kg:    float | None = None
@@ -5407,8 +5457,13 @@ class RecordOutputV2Request(BaseModel):
     # by bom_line_id (cheap O(1) lookup via the FK index added in
     # migration 023). Splitting RM and PM keeps the kind unambiguous so
     # we hit the right indent table without secondary lookups.
-    rm_consumed:      list[ConsumedLineV2] = []
-    pm_consumed:      list[ConsumedLineV2] = []
+    #
+    # R10 — diff-on-save semantics: None (field omitted) = "leave this
+    # section untouched". Empty list [] = "explicit clear". Old clients
+    # that always sent a list keep working; the new Edit Batch flow
+    # omits fields it didn't touch so the server preserves them.
+    rm_consumed:      list[ConsumedLineV2] | None = None
+    pm_consumed:      list[ConsumedLineV2] | None = None
     # Legacy v1 aliases — populated by older clients. The model
     # validator maps these onto the lean fields when the lean fields
     # are absent.
@@ -5417,9 +5472,19 @@ class RecordOutputV2Request(BaseModel):
     fg_expected_kg:   float | None = None     # informational only — not stored
     fg_expected_units: int | None = None      # informational only — not stored
     process_loss_kg:  float | None = None     # persisted on the output row
-    byproducts:       list[ByproductLineV2]    = []
-    balance_materials: list[BalanceMaterialV2] = []  # job_card_balance_material_v2
+    byproducts:       list[ByproductLineV2]    | None = None
+    balance_materials: list[BalanceMaterialV2] | None = None  # job_card_balance_material_v2
+    additives:        list[AdditiveLineV2]     | None = None  # job_card_additive_consumption_v2
     qc:               QCDataV2 | None = None         # job_card_qc_v2
+    # Stage 2: tag every row written by this save with the batch_id.
+    # None → server-side defaulting from the JC's open batch (see
+    # record_output_v2 handler).
+    batch_id:         int | None = None
+    # Stage 3 polish: admin-only override that permits a save against
+    # a closed / cancelled batch.  The handler validates the caller
+    # actually has is_admin before honouring it; a non-admin sending
+    # this flag gets a 403.
+    admin_override:   bool       = False
 
     @field_validator(
         "rm_consumed_kg", "output_qty_kg", "output_qty_units",
@@ -5476,15 +5541,134 @@ async def record_output_v2(
             # router (e.g. job_card_engine.record_output_v2).
             lock_err = await assert_not_locked(conn, job_card_id)
             _raise_if_locked(lock_err)
+
+            # ── Stage 2: resolve batch_id ─────────────────────────────
+            # When the caller doesn't pass an explicit batch_id, fall
+            # back to "the JC's currently-open batch".  Exactly one
+            # open batch → use it (preserves the existing single-batch
+            # UI flow).  Zero → 400 no_open_batch (operator must open
+            # one).  Two+ → 400 ambiguous_open_batch (Stage 3 UI will
+            # pass explicit batch_id in this case).
+            resolved_batch_id: int | None = body.batch_id
+            if resolved_batch_id is None:
+                open_rows = await conn.fetch(
+                    "SELECT batch_id FROM job_card_batch_v2 "
+                    "WHERE  job_card_id = $1 AND status = 'open' "
+                    "ORDER  BY batch_number",
+                    job_card_id,
+                )
+                if len(open_rows) == 1:
+                    resolved_batch_id = open_rows[0]["batch_id"]
+                elif len(open_rows) == 0:
+                    raise HTTPException(
+                        status_code=400,
+                        detail={
+                            "error": "no_open_batch",
+                            "message": (
+                                "Open a batch on this job card before "
+                                "saving output."
+                            ),
+                        },
+                    )
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail={
+                            "error": "ambiguous_open_batch",
+                            "open_batch_ids": [r["batch_id"] for r in open_rows],
+                            "message": (
+                                "Multiple batches are open on this job "
+                                "card — pass batch_id explicitly in the "
+                                "request body to disambiguate."
+                            ),
+                        },
+                    )
+            else:
+                # Verify the supplied batch belongs to this JC + is open.
+                row = await conn.fetchrow(
+                    "SELECT status, job_card_id "
+                    "FROM   job_card_batch_v2 WHERE batch_id = $1",
+                    resolved_batch_id,
+                )
+                if row is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail={"error": "batch_not_found",
+                                "batch_id": resolved_batch_id},
+                    )
+                if row["job_card_id"] != job_card_id:
+                    raise HTTPException(
+                        status_code=400,
+                        detail={
+                            "error": "batch_jc_mismatch",
+                            "message": "batch_id belongs to a different "
+                                       "job card than the URL path.",
+                        },
+                    )
+                # Closed/cancelled batches reject writes by default.
+                # Admin override (Stage 3 polish) lets admins correct
+                # output post-close.  Non-admin senders of the override
+                # flag get a 403 — surface the role check explicitly
+                # rather than letting the write slip through and a
+                # different gate (e.g. lock) absorb the mistake.
+                if row["status"] not in ("open",):
+                    if body.admin_override:
+                        if not user.is_admin:
+                            raise HTTPException(
+                                status_code=403,
+                                detail={
+                                    "error": "admin_override_forbidden",
+                                    "message": (
+                                        "admin_override is restricted to "
+                                        "users with the admin role."
+                                    ),
+                                },
+                            )
+                        # Audit: append a marker to the batch row's notes
+                        # so a future reviewer can see this batch was
+                        # edited post-close.  Stamped once per save.
+                        audit_actor = user.full_name or user.phone or "admin"
+                        await conn.execute(
+                            """
+                            UPDATE job_card_batch_v2
+                               SET notes = COALESCE(notes || E'\n', '')
+                                         || '[admin_override] saved by '
+                                         || $2 || ' at '
+                                         || to_char(NOW() AT TIME ZONE 'Asia/Kolkata',
+                                                    'YYYY-MM-DD HH24:MI:SS')
+                                         || ' IST'
+                             WHERE batch_id = $1
+                            """,
+                            resolved_batch_id, audit_actor,
+                        )
+                    else:
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "error": "batch_not_open",
+                                "status": row["status"],
+                                "message": "Cannot save output against a "
+                                           f"batch in status '{row['status']}'."
+                                           " Admin users may pass "
+                                           "admin_override=true.",
+                            },
+                        )
             # ── Per-BOM-line consumption ──────────────────────────────
             # Validated against the JC's BOM catalog (bom_line for the
             # JC's bom_id) — every stage can record consumption against
             # every BOM article, not just the ones materialised into
             # this stage's indent rows. The packaging (last) stage
             # commonly records both RM and PM here.
+            #
+            # R10 — diff-on-save: rm_consumed / pm_consumed are now
+            # Optional. None = "section omitted, leave alone" (treated
+            # like empty in the set-union below — no rows to validate
+            # or upsert).
+            rm_rows = body.rm_consumed or []
+            pm_rows = body.pm_consumed or []
             submitted_bom_lines = (
-                {int(r.bom_line_id) for r in body.rm_consumed} |
-                {int(p.bom_line_id) for p in body.pm_consumed}
+                {int(r.bom_line_id) for r in rm_rows} |
+                {int(p.bom_line_id) for p in pm_rows}
             )
             if submitted_bom_lines:
                 valid = await conn.fetch(
@@ -5510,34 +5694,53 @@ async def record_output_v2(
                         },
                     )
 
-                # Upsert into job_card_material_consumption_v2 — UNIQUE
-                # (job_card_id, material_sku_name) keeps re-saves
-                # idempotent (single row per article per JC).
+                # Upsert into job_card_material_consumption_v2 — Stage 2
+                # UNIQUE is (job_card_id, COALESCE(batch_id, 0),
+                # material_sku_name) so the same article can be
+                # recorded once per batch.  Re-save on the same batch
+                # updates in place; first save on a new batch inserts.
                 rec_by = user.full_name or user.phone
                 await upsert_consumption_lines(
                     conn, job_card_id=job_card_id,
-                    entries=[r.model_dump() for r in body.rm_consumed],
+                    entries=[r.model_dump() for r in rm_rows],
                     input_kind='RM', recorded_by=rec_by,
+                    batch_id=resolved_batch_id,
                 )
                 await upsert_consumption_lines(
                     conn, job_card_id=job_card_id,
-                    entries=[p.model_dump() for p in body.pm_consumed],
+                    entries=[p.model_dump() for p in pm_rows],
                     input_kind='PM', recorded_by=rec_by,
+                    batch_id=resolved_batch_id,
                 )
 
-            result = await record_output(
-                conn,
-                job_card_id=job_card_id,
-                rm_consumed_kg=body.rm_consumed_kg,
-                output_qty_kg=body.output_qty_kg,
-                output_qty_units=body.output_qty_units,
-                output_kind=body.output_kind,
-                uom=body.uom,
-                notes=body.notes,
-                process_loss_kg=body.process_loss_kg,
-                recorded_by=user.full_name or user.phone,
+            # R10 — diff-on-save: skip record_output() entirely when the
+            # caller didn't send any output-row fields. Edit Batch saves
+            # that only touch (say) one byproduct row would otherwise
+            # 400 with "missing_qty" because output_qty_kg is None.
+            has_output_payload = (
+                body.output_qty_kg is not None
+                or body.output_qty_units is not None
+                or body.rm_consumed_kg is not None
+                or body.fg_actual_kg is not None
+                or body.fg_actual_units is not None
+                or body.process_loss_kg is not None
             )
-            _raise_if_locked(result)
+            if has_output_payload:
+                result = await record_output(
+                    conn,
+                    job_card_id=job_card_id,
+                    rm_consumed_kg=body.rm_consumed_kg,
+                    output_qty_kg=body.output_qty_kg,
+                    output_qty_units=body.output_qty_units,
+                    output_kind=body.output_kind,
+                    uom=body.uom,
+                    notes=body.notes,
+                    process_loss_kg=body.process_loss_kg,
+                    recorded_by=user.full_name or user.phone,
+                )
+                _raise_if_locked(result)
+            else:
+                result = {"recorded": False, "skipped": "no_output_payload"}
             # ── Byproducts (v2) ───────────────────────────────────────
             # The legacy v1 client posts byproducts alongside the
             # output row; persist them into job_card_byproducts_v2 via
@@ -5568,6 +5771,7 @@ async def record_output_v2(
                 bp_result = await save_byproducts(
                     conn, job_card_id=job_card_id,
                     rows=rows, recorded_by=rec_by,
+                    batch_id=resolved_batch_id,
                 )
                 if "error" in bp_result:
                     raise HTTPException(status_code=400, detail=bp_result)
@@ -5586,10 +5790,31 @@ async def record_output_v2(
                     conn, job_card_id=job_card_id,
                     rows=[m.model_dump() for m in body.balance_materials],
                     recorded_by=rec_by,
+                    batch_id=resolved_batch_id,
                 )
                 if "error" in bm_result:
                     raise HTTPException(status_code=400, detail=bm_result)
                 result["balance_materials"] = bm_result.get("rows", [])
+
+            # ── Additives (035) — data-keeping bucket ────────────────
+            # Replace-all semantics. None = "section omitted, leave
+            # alone" (R10 diff-on-save).  Empty list [] = "explicit
+            # clear" — the operator removed every additive row in the
+            # UI and we honour that.  Old clients that always sent a
+            # list keep working; new Edit Batch flow only sends the
+            # field when additives were edited.
+            if body.additives is not None and "error" not in result:
+                from app.modules.production.services.jc_additives_v2 import (
+                    save_additives,
+                )
+                add_result = await save_additives(
+                    conn, job_card_id=job_card_id,
+                    rows=[a.model_dump() for a in body.additives],
+                    recorded_by=rec_by,
+                    batch_id=resolved_batch_id,
+                )
+                result["additives"] = add_result
+            result["batch_id"] = resolved_batch_id
 
             # ── QC summary (v2, migration 027) ───────────────────────
             # Single-row roll-up. Passing `qc.passed` = None keeps the
@@ -5629,17 +5854,21 @@ async def record_output_v2(
     return result
 
 
-# ─── R13 Phased closure ─────────────────────────────────────────────────────
+# ─── R13 Batch closure ─────────────────────────────────────────────────────
+# (Renamed from "phase" in migration 036 / Stage 1 of the Batch redesign.)
 
-class PhaseOpenRequest(BaseModel):
-    """POST /job-cards-v2/{id}/phase/open"""
+class BatchOpenRequest(BaseModel):
+    """POST /job-cards-v2/{id}/batches/open"""
     planned_qty_kg: float | None = Field(default=None, ge=0)
-    phase_date:     date  | None = None
+    batch_date:     date  | None = None
     notes:          str   | None = None
+    # Stage 2: how much of the JC pool this batch claims to consume.
+    # Optional — no server-side gate; informational only.
+    input_qty_kg:   float | None = Field(default=None, ge=0)
 
 
-class PhaseCloseRequest(BaseModel):
-    """POST /job-cards-v2/{id}/phase/{phase_id}/close"""
+class BatchCloseRequest(BaseModel):
+    """POST /job-cards-v2/{id}/batches/{batch_id}/close"""
     produced_qty_kg:     float        = Field(ge=0)
     output_kind:         str   | None = None
     output_uom:          str   | None = None
@@ -5648,59 +5877,76 @@ class PhaseCloseRequest(BaseModel):
     rm_consumed_kg:      float        = 0.0
     extra_give_away_qty: float        = 0.0
     notes:               str   | None = None
+    # Stage 2 per-batch summary snapshot.  The UI computes these
+    # client-side from the live Output & Accounting form and posts
+    # them on close so the batch row carries a self-contained record.
+    input_qty_kg:           float | None = None
+    process_loss_kg:        float | None = None
+    control_sample_kg:      float | None = None
+    is_balanced:            bool  | None = None
+    balance_difference_qty: float | None = None
+    closure_remarks:        str   | None = None
+    # Stage 3 final: per-batch partial dispatch.  When omitted, the
+    # full produced_qty_kg goes to the next JC (legacy behaviour).
+    # When supplied, only `dispatch_qty_kg` flows downstream and the
+    # remainder stays at this JC's stage — the operator can dispatch
+    # it later via /dispatch-to-next or roll it into a subsequent
+    # batch's close.  Clamped to [0, produced_qty_kg] by close_batch.
+    dispatch_qty_kg:        float | None = Field(default=None, ge=0)
 
 
-class PhaseCancelRequest(BaseModel):
-    """POST /job-cards-v2/{id}/phase/{phase_id}/cancel"""
+class BatchCancelRequest(BaseModel):
+    """POST /job-cards-v2/{id}/batches/{batch_id}/cancel"""
     reason: str | None = Field(default=None, max_length=500)
 
 
-@router.post("/job-cards-v2/{job_card_id}/phase/open")
-async def phase_open_v2(
+@router.post("/job-cards-v2/{job_card_id}/batches/open")
+async def batch_open_v2(
     request: Request,
     job_card_id: int,
-    body: PhaseOpenRequest | None = None,
+    body: BatchOpenRequest | None = None,
     user=Depends(get_current_user),
 ):
-    """R13: open a new phase row for this JC. Refused (409) if another
-    phase is already open."""
-    from app.modules.production.services import job_card_phase_v2 as svc
+    """R13: open a new batch row for this JC. Stage 1 still enforces "at
+    most one open batch per JC" (drops in Stage 2)."""
+    from app.modules.production.services import job_card_batch_v2 as svc
     pool = request.app.state.db_pool
-    body = body or PhaseOpenRequest()
+    body = body or BatchOpenRequest()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            result = await svc.open_phase(
+            result = await svc.open_batch(
                 conn,
                 job_card_id=job_card_id,
                 planned_qty_kg=body.planned_qty_kg,
-                phase_date=body.phase_date,
+                batch_date=body.batch_date,
+                input_qty_kg=body.input_qty_kg,
                 notes=body.notes,
             )
     _raise_if_locked(result)
     if result.get("error") == "job_card_not_found":
         raise HTTPException(status_code=404, detail="Job card not found")
-    if result.get("error") == "phase_already_open":
+    if result.get("error") == "batch_already_open":
         raise HTTPException(status_code=409, detail=result)
     return result
 
 
-@router.post("/job-cards-v2/{job_card_id}/phase/{phase_id}/close")
-async def phase_close_v2(
+@router.post("/job-cards-v2/{job_card_id}/batches/{batch_id}/close")
+async def batch_close_v2(
     request: Request,
     job_card_id: int,
-    phase_id: int,
-    body: PhaseCloseRequest,
+    batch_id: int,
+    body: BatchCloseRequest,
     user=Depends(get_current_user),
 ):
-    """R13: close a phase. In one txn: stamp phase row, write the output,
+    """R13: close a batch. In one txn: stamp batch row, write the output,
     auto-dispatch to next JC, unlock downstream if it was waiting."""
-    from app.modules.production.services import job_card_phase_v2 as svc
+    from app.modules.production.services import job_card_batch_v2 as svc
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
         async with conn.transaction():
-            result = await svc.close_phase(
+            result = await svc.close_batch(
                 conn,
-                phase_id=phase_id,
+                batch_id=batch_id,
                 job_card_id=job_card_id,
                 produced_qty_kg=body.produced_qty_kg,
                 output_kind=body.output_kind,
@@ -5709,65 +5955,72 @@ async def phase_close_v2(
                 yield_pct=body.yield_pct,
                 rm_consumed_kg=body.rm_consumed_kg,
                 extra_give_away_qty=body.extra_give_away_qty,
+                input_qty_kg=body.input_qty_kg,
+                process_loss_kg=body.process_loss_kg,
+                control_sample_kg=body.control_sample_kg,
+                is_balanced=body.is_balanced,
+                balance_difference_qty=body.balance_difference_qty,
+                closure_remarks=body.closure_remarks,
+                dispatch_qty_kg=body.dispatch_qty_kg,
                 notes=body.notes,
                 closed_by=user.full_name or user.phone,
             )
     _raise_if_locked(result)
-    if result.get("error") in ("phase_not_found", "job_card_not_found"):
+    if result.get("error") in ("batch_not_found", "job_card_not_found"):
         raise HTTPException(status_code=404, detail=result.get("message", result["error"]))
-    if result.get("error") == "phase_jc_mismatch":
+    if result.get("error") == "batch_jc_mismatch":
         raise HTTPException(status_code=404, detail=result)
-    if result.get("error") in ("phase_not_open", "phase_already_open",
-                                "phase_date_taken", "phase_number_taken"):
+    if result.get("error") in ("batch_not_open", "batch_already_open",
+                                "batch_date_taken", "batch_number_taken"):
         raise HTTPException(status_code=409, detail=result)
     if result.get("error") in ("invalid_produced_qty", "yield_unreasonable"):
         raise HTTPException(status_code=400, detail=result.get("message", result["error"]))
     return result
 
 
-@router.get("/job-cards-v2/{job_card_id}/phases")
-async def phase_list_v2(
+@router.get("/job-cards-v2/{job_card_id}/batches")
+async def batch_list_v2(
     request: Request,
     job_card_id: int,
     user=Depends(get_current_user),
 ):
-    """R13: list all phases (open + closed + cancelled) for the JC,
-    ordered by phase_number."""
-    from app.modules.production.services import job_card_phase_v2 as svc
+    """R13: list all batches (open + closed + cancelled) for the JC,
+    ordered by batch_number."""
+    from app.modules.production.services import job_card_batch_v2 as svc
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
-        rows = await svc.list_phases(conn, job_card_id)
-    return {"phases": rows}
+        rows = await svc.list_batches(conn, job_card_id)
+    return {"batches": rows}
 
 
-@router.post("/job-cards-v2/{job_card_id}/phase/{phase_id}/cancel")
-async def phase_cancel_v2(
+@router.post("/job-cards-v2/{job_card_id}/batches/{batch_id}/cancel")
+async def batch_cancel_v2(
     request: Request,
     job_card_id: int,
-    phase_id: int,
-    body: PhaseCancelRequest | None = None,
+    batch_id: int,
+    body: BatchCancelRequest | None = None,
     user=Depends(get_current_user),
 ):
-    """R13: cancel an open phase that has no attached output / dispatch /
-    shift rows. Useful for phases opened by mistake."""
-    from app.modules.production.services import job_card_phase_v2 as svc
+    """R13: cancel an open batch that has no attached output / dispatch /
+    shift rows. Useful for batches opened by mistake."""
+    from app.modules.production.services import job_card_batch_v2 as svc
     pool = request.app.state.db_pool
-    body = body or PhaseCancelRequest()
+    body = body or BatchCancelRequest()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            result = await svc.cancel_phase(
+            result = await svc.cancel_batch(
                 conn,
-                phase_id=phase_id,
+                batch_id=batch_id,
                 job_card_id=job_card_id,
                 reason=body.reason,
                 cancelled_by=user.full_name or user.phone,
             )
     _raise_if_locked(result)
-    if result.get("error") == "phase_not_found":
-        raise HTTPException(status_code=404, detail="Phase not found")
-    if result.get("error") == "phase_jc_mismatch":
+    if result.get("error") == "batch_not_found":
+        raise HTTPException(status_code=404, detail="Batch not found")
+    if result.get("error") == "batch_jc_mismatch":
         raise HTTPException(status_code=404, detail=result)
-    if result.get("error") in ("phase_not_open", "phase_has_attached_rows"):
+    if result.get("error") in ("batch_not_open", "batch_has_attached_rows"):
         raise HTTPException(status_code=409, detail=result)
     return result
 
@@ -5973,9 +6226,14 @@ async def sign_off_v2(
                     # Empty allowed list = wildcard (no restriction).
                     return (not allowed) or (value in allowed)
 
+                # Warehouse needs tolerant matching ('A185' ≡ 'A-185'); the
+                # other two compare entity / floor literally.
+                def _wh_in_scope(value, allowed: list[str]) -> bool:
+                    return (not allowed) or user_has_warehouse(allowed, value)
+
                 if not (getattr(user, "is_admin", False)
                         or (_in_scope(jc_scope["entity"],   user.allowed_entities)
-                            and _in_scope(jc_scope["factory"], user.allowed_warehouses)
+                            and _wh_in_scope(jc_scope["factory"], user.allowed_warehouses)
                             and _in_scope(jc_scope["floor"],   user.allowed_floors))):
                     # B7 L2: don't leak the user's full allowed list back.
                     raise HTTPException(
@@ -6140,7 +6398,7 @@ async def complete_jc_v2(
         raise HTTPException(status_code=400, detail=result)
     # B5 H2: invalid_status / open_shift are state conflicts -> 409.
     if result.get("error") in ("invalid_status", "open_shift",
-                                "unbalanced", "open_phase",
+                                "unbalanced", "open_batch",
                                 "override_request_not_found",
                                 "override_request_wrong_type",
                                 "override_request_not_approved"):
@@ -6248,7 +6506,21 @@ async def cancel_jc_v2(
     user=Depends(get_current_user),
 ):
     """Soft-cancel a v2 JC. Allowed only before 'in_progress' — past that
-    point, finish via complete/close instead."""
+    point, finish via complete/close instead. **Admin-only** — non-admin
+    operators see a 403; this is a destructive action that releases
+    plan-level allocations and rewrites the JC status, so it stays
+    behind the admin gate. The cancel_job_card service stamps a JSONB
+    snapshot of the full pre-cancel state on the row before flipping
+    status (migration 043) so a future read can reconstruct what the
+    operator saw at the moment they hit Cancel."""
+    if not getattr(user, "is_admin", False):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "admin_only",
+                "message": "Only admin users can cancel a job card.",
+            },
+        )
     from app.modules.production.services.job_card_v2 import cancel_job_card
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:

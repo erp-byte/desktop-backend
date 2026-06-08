@@ -2,9 +2,30 @@
 
 import asyncio
 import time
+from datetime import datetime
 from typing import Awaitable, Callable, TypeVar
+from zoneinfo import ZoneInfo
 
 from asyncpg.exceptions import UniqueViolationError
+
+
+# IST = India Standard Time (UTC+05:30, no DST).  Used by the JC batch
+# open/close flow which stores both a canonical UTC TIMESTAMPTZ and a
+# human-readable IST literal so reports / psql queries surface the
+# clock face the floor operator saw — no timezone setup required.
+_IST_TZ = ZoneInfo("Asia/Kolkata")
+
+
+def ist_now_text() -> str:
+    """Current wall-clock time in IST, formatted as 'YYYY-MM-DD HH:MM:SS IST'.
+
+    Use for the *_at_ist text columns added by migration 038.  The
+    canonical TIMESTAMPTZ columns (started_at, closed_at, ended_at)
+    continue to use NOW() — those stay in UTC under the hood and remain
+    the source of truth for ordering / math.  The IST literal is a
+    sibling for human reading only.
+    """
+    return datetime.now(_IST_TZ).strftime("%Y-%m-%d %H:%M:%S IST")
 
 
 # Defaults for the time-ID savepoint-retry pattern. Inserts colliding on a

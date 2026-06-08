@@ -11,8 +11,9 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
-SampleType = Literal["BASIS_RM", "BASIS_FG", "NPD", "INTERNAL"]
+SampleType = Literal["BASIS_RM", "BASIS_FG", "NPD", "INTERNAL", "TRIAL"]
 ArticleRole = Literal["RM", "FG", "NPD_INPUT", "NPD_OUTPUT"]
+Warehouse = Literal["W202", "A185", "A68", "F53", "A101", "D-39", "D-514", "Rishi", "Supreme"]
 PurposeTag = Literal[
     "CUSTOMER_DISPLAY", "CUSTOMER_ISSUE", "TASTING_SENSORY",
     "PHYSICAL_PARAMETERS", "INTERNAL_OTHER",
@@ -31,12 +32,16 @@ class ArticleIn(BaseModel):
 
 class RequisitionCreate(BaseModel):
     sample_type: SampleType
-    entity: Optional[str] = None
+    warehouse: Warehouse
     requestor_team: Optional[str] = None
     purpose_tag: Optional[PurposeTag] = None
     purpose_note: Optional[str] = None
     base_bom_id: Optional[int] = None
+    npd_target_name: Optional[str] = None    # requested new NPD article name
+    quantity: Optional[float] = None         # requested quantity (free float)
     internal_override: bool = False
+    transporter_name: Optional[str] = None   # optional / nullable
+    vehicle_number: Optional[str] = None     # optional / nullable
     articles: list[ArticleIn] = Field(default_factory=list)
 
 
@@ -45,6 +50,9 @@ class RequisitionUpdate(BaseModel):
     purpose_tag: Optional[PurposeTag] = None
     purpose_note: Optional[str] = None
     base_bom_id: Optional[int] = None
+    quantity: Optional[float] = None
+    transporter_name: Optional[str] = None
+    vehicle_number: Optional[str] = None
     articles: Optional[list[ArticleIn]] = None
 
 
@@ -78,6 +86,12 @@ class NpdLineIn(BaseModel):
     item_type: Optional[Literal["rm", "pm"]] = None
     delta_type: Literal["UNCHANGED", "ADDED", "MODIFIED", "REMOVED"] = "UNCHANGED"
     original_qty: Optional[float] = None
+    # Per-ingredient ownership (NPD plan §3): CUSTOMER / off-master lines are
+    # traceability-only — the accounting backbone posts inventory for OWN lines.
+    ownership: Literal["OWN", "CUSTOMER"] = "OWN"
+    is_off_master: bool = False
+    customer_lot_ref: Optional[str] = None
+    received_qty: Optional[float] = Field(default=None, ge=0)
     line_order: int = 0
     notes: Optional[str] = None
 
@@ -93,6 +107,73 @@ class NpdDraftCreate(BaseModel):
 
 class NpdLinesReplace(BaseModel):
     lines: list[NpdLineIn]
+
+
+# ── Standalone NPD development job cards ───────────────────────────────────
+# Pure R&D, decoupled from sample requisitions. The recipe lines reuse NpdLineIn
+# (same name-based, sku_id-nullable shape as the requisition draft BOM lines).
+class DevJobCardCreate(BaseModel):
+    title: str
+    description: Optional[str] = None
+    warehouse: Optional[Warehouse] = None
+    base_bom_id: Optional[int] = None
+    fg_sku_id: Optional[int] = None
+    fg_sku_name: Optional[str] = None
+    target_qty: Optional[float] = Field(default=None, ge=0)
+    uom: Optional[str] = None
+    clone_from_base: bool = False
+    lines: list[NpdLineIn] = Field(default_factory=list)
+
+
+class DevJobCardClose(BaseModel):
+    output_qty: Optional[float] = Field(default=None, ge=0)
+    output_uom: Optional[str] = None
+    yield_pct: Optional[float] = Field(default=None, ge=0)   # server recomputes when rm_consumed_qty given
+    rm_consumed_qty: Optional[float] = Field(default=None, ge=0)
+    wastage_qty: Optional[float] = Field(default=None, ge=0)
+    extra_give_away_qty: Optional[float] = Field(default=None, ge=0)
+    output_notes: Optional[str] = None
+
+
+class DevDispatchBody(BaseModel):
+    recipient: Optional[str] = None
+    qty: Optional[float] = Field(default=None, ge=0)
+
+
+# ── RM Issue / Collection Form (Document 015, NPD plan §10) ────────────────
+class RmIssueLineIn(BaseModel):
+    sku_id: Optional[int] = None
+    sku_name: str
+    location: Optional[str] = None
+    reqd_qty: float = Field(ge=0)
+    uom: str = "kg"
+    ownership: Literal["OWN", "CUSTOMER"] = "OWN"
+    is_off_master: bool = False
+    notes: Optional[str] = None
+    line_order: int = 0
+
+
+class RmIssueFormCreate(BaseModel):
+    trial_name: Optional[str] = None
+    product_name: Optional[str] = None
+    customer_name: Optional[str] = None
+    purpose_tag: Optional[str] = None
+    source_type: Optional[str] = None       # NPD_DEV_JC | SAMPLE_REQ | STANDALONE
+    source_id: Optional[int] = None
+    requisition_id: Optional[int] = None
+    notes: Optional[str] = None
+    submit: bool = True                      # raise (SUBMITTED) vs save DRAFT
+    lines: list[RmIssueLineIn] = Field(default_factory=list)
+
+
+class RmIssueLineResult(BaseModel):
+    line_id: int
+    issued_qty: float = Field(ge=0)
+    lot_no: Optional[str] = None
+
+
+class RmIssueBody(BaseModel):
+    issued: list[RmIssueLineResult] = Field(default_factory=list)
 
 
 # ── Gate pass / conversion ────────────────────────────────────────────────

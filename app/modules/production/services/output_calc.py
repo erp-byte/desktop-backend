@@ -17,7 +17,7 @@ def compute_output_row(output_qty_kg: float | None,
     requiring it rejected those saves with a 400. job_card_output_v2.
     rm_consumed_kg is NOT NULL DEFAULT 0, so a missing value normalizes to 0
     and yield is left uncomputed (NULL) — the same rule job_card_engine and
-    job_card_phase_v2 already apply.
+    job_card_batch_v2 already apply.
 
     `output_qty_kg` is the one genuinely required field (it is the quantity
     being recorded, and the column is NOT NULL CHECK >= 0).

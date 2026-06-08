@@ -30,11 +30,14 @@ from app.modules.purchase.schemas.po_api import (
     CommitResponse,
     PoDeleteResponse,
     PoDetailResponse,
+    PoIntimationRequest,
+    PoIntimationResponse,
     PoLinesResponse,
     PoListResponse,
     PreviewResponse,
 )
 from app.modules.purchase.services import po_commit, po_delete, po_preview, po_query
+from app.modules.purchase.services import qc_intimation
 
 logger = logging.getLogger(__name__)
 
@@ -385,3 +388,64 @@ async def delete_po(
         actor_role=user.role_name,
         actor_is_admin=user.is_admin,
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 7. POST /api/v1/po/{transaction_no}/intimation
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@router.post("/{transaction_no}/intimation", response_model=PoIntimationResponse)
+async def send_qc_intimation(
+    request: Request,
+    transaction_no: str,
+    body: PoIntimationRequest,
+    user: AuthUser = Depends(require_permission("purchase", "po", action="edit")),
+):
+    """Send a QC Inward Intimation WhatsApp message to all active qc_member /
+    qc_manager users, with a generated article-list PNG as the header image.
+
+    Returns per-recipient send status; never hard-fails on WhatsApp errors so
+    the caller can surface partial success.
+    """
+    # Load PO header (entity-scoped, 404 if missing/wrong entity).
+    header = await _fetch_header(request, transaction_no, include_deleted=False, user=user)
+
+    # Fetch selected lines.
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        line_rows = await conn.fetch(
+            "SELECT * FROM po_line WHERE transaction_no = $1 AND line_number = ANY($2::int[]) ORDER BY line_number",
+            transaction_no, body.line_numbers,
+        )
+
+    article_names = [
+        (r["sku_name"] or r["particulars"] or "—") for r in line_rows
+    ]
+    if not article_names:
+        raise AuthError("validation_error", "No matching article lines for this PO", 400)
+
+    # Persist one qc_intimation arrival row per selected article BEFORE
+    # attempting WhatsApp send — arrivals are recorded even when WA is disabled.
+    line_dicts = [dict(r) for r in line_rows]
+    await qc_intimation.record_arrivals(
+        pool,
+        po_number=header.get("po_number"),
+        transaction_no=transaction_no,
+        supplier_id=header.get("supplier_id"),
+        supplier_name=header.get("vendor_supplier_name"),
+        entity=header.get("entity"),
+        vehicle_no=body.vehicle_number,
+        invoice_no=body.invoice_no,
+        lines=line_dicts,
+    )
+
+    result = await qc_intimation.send_intimation(
+        pool,
+        po_number=header.get("po_number") or transaction_no,
+        vendor_name=header.get("vendor_supplier_name") or "—",
+        article_names=article_names,
+        vehicle_number=body.vehicle_number,
+        invoice_no=body.invoice_no,
+    )
+    return result

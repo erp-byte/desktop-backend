@@ -13,11 +13,11 @@ from datetime import datetime, timezone
 
 from fastapi import HTTPException
 
-from app.modules.sample.services import audit_service
+from app.modules.sample.services import audit_service, notification_service
 
-VALID_ENTITIES = ("cfpl", "cdpl")
+WAREHOUSES = ("W202", "A185", "A68", "F53", "A101", "D-39", "D-514", "Rishi", "Supreme")
 
-SAMPLE_TYPES = ("BASIS_RM", "BASIS_FG", "NPD", "INTERNAL")
+SAMPLE_TYPES = ("BASIS_RM", "BASIS_FG", "NPD", "INTERNAL", "TRIAL")
 
 # Status state machine (spec §8). Maps current -> set of allowed next states.
 TRANSITIONS: dict[str, set[str]] = {
@@ -83,11 +83,11 @@ async def create_requisition(conn, *, payload: dict, user) -> dict:
         raise HTTPException(422, detail={"error": "invalid_sample_type",
                                          "message": f"sample_type must be one of {SAMPLE_TYPES}",
                                          "details": {"sample_type": sample_type}})
-    entity = (payload.get("entity") or user.entity or "").lower()
-    if entity not in VALID_ENTITIES:
-        raise HTTPException(422, detail={"error": "invalid_entity",
-                                         "message": "entity must be 'cfpl' or 'cdpl'",
-                                         "details": {"entity": entity}})
+    warehouse = payload.get("warehouse")
+    if warehouse not in WAREHOUSES:
+        raise HTTPException(422, detail={"error": "invalid_warehouse",
+                                         "message": f"warehouse must be one of {WAREHOUSES}",
+                                         "details": {"warehouse": warehouse}})
 
     articles = payload.get("articles") or []
 
@@ -99,14 +99,17 @@ async def create_requisition(conn, *, payload: dict, user) -> dict:
             INSERT INTO sample_requisitions
                 (requisition_number, sample_type, status, requestor_user_id,
                  requestor_team, purpose_tag, purpose_note, base_bom_id,
-                 internal_override, entity, created_by, updated_by)
-            VALUES ($1, $2, 'DRAFT', $3, $4, $5, $6, $7, $8, $9, $3, $3)
+                 internal_override, warehouse, transporter_name, vehicle_number,
+                 npd_target_name, quantity, created_by, updated_by)
+            VALUES ($1, $2, 'DRAFT', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $3, $3)
             RETURNING id
             """,
             number, sample_type, user.user_id, payload.get("requestor_team"),
             payload.get("purpose_tag"), payload.get("purpose_note"),
             payload.get("base_bom_id"),
-            bool(payload.get("internal_override", False)), entity,
+            bool(payload.get("internal_override", False)), warehouse,
+            payload.get("transporter_name"), payload.get("vehicle_number"),
+            payload.get("npd_target_name"), payload.get("quantity"),
         )
         await _insert_articles(conn, req_id, articles)
         await audit_service.write_audit(
@@ -163,7 +166,7 @@ async def get_requisition(conn, req_id: int) -> dict:
 
 async def list_requisitions(conn, *, status: str | None = None,
                             sample_type: str | None = None,
-                            entity: str | None = None,
+                            warehouse: str | None = None,
                             limit: int = 50, offset: int = 0) -> list[dict]:
     rows = await conn.fetch(
         """
@@ -171,11 +174,11 @@ async def list_requisitions(conn, *, status: str | None = None,
         WHERE deleted_at IS NULL
           AND ($1::text IS NULL OR status = $1)
           AND ($2::text IS NULL OR sample_type = $2)
-          AND ($3::text IS NULL OR entity = $3)
+          AND ($3::text IS NULL OR warehouse = $3)
         ORDER BY created_at DESC
         LIMIT $4 OFFSET $5
         """,
-        status, sample_type, entity, limit, offset)
+        status, sample_type, warehouse, limit, offset)
     return [dict(r) for r in rows]
 
 
@@ -194,15 +197,20 @@ async def update_requisition(conn, req_id: int, *, payload: dict, user) -> dict:
         await conn.execute(
             """
             UPDATE sample_requisitions
-               SET requestor_team = COALESCE($2, requestor_team),
-                   purpose_tag    = COALESCE($3, purpose_tag),
-                   purpose_note   = COALESCE($4, purpose_note),
-                   base_bom_id    = COALESCE($5, base_bom_id),
+               SET requestor_team   = COALESCE($2, requestor_team),
+                   purpose_tag      = COALESCE($3, purpose_tag),
+                   purpose_note     = COALESCE($4, purpose_note),
+                   base_bom_id      = COALESCE($5, base_bom_id),
+                   transporter_name = COALESCE($7, transporter_name),
+                   vehicle_number   = COALESCE($8, vehicle_number),
+                   quantity         = COALESCE($9, quantity),
                    updated_at = NOW(), updated_by = $6
              WHERE id = $1
             """,
             req_id, payload.get("requestor_team"), payload.get("purpose_tag"),
-            payload.get("purpose_note"), payload.get("base_bom_id"), user.user_id)
+            payload.get("purpose_note"), payload.get("base_bom_id"), user.user_id,
+            payload.get("transporter_name"), payload.get("vehicle_number"),
+            payload.get("quantity"))
         if payload.get("articles") is not None:
             await conn.execute(
                 "DELETE FROM sample_requisition_articles WHERE requisition_id = $1", req_id)
@@ -219,13 +227,17 @@ async def submit_requisition(conn, req_id: int, *, user) -> dict:
     req = _require(await _fetch_req(conn, req_id), req_id)
     _assert_transition(req["status"], "SUBMITTED")
 
-    n_articles = await conn.fetchval(
-        "SELECT COUNT(*) FROM sample_requisition_articles WHERE requisition_id = $1", req_id)
-    if not n_articles:
-        raise HTTPException(422, detail={
-            "error": "no_articles",
-            "message": "A requisition needs at least one article before submission",
-            "details": {"id": req_id}})
+    # NPD / TRIAL requests are a pure ask — they name the target article only;
+    # the NPD team authors the recipe (articles/BOM) later. Article lines are
+    # therefore required only for the issuance flows (Basis RM/FG, Internal).
+    if req["sample_type"] not in ("NPD", "TRIAL"):
+        n_articles = await conn.fetchval(
+            "SELECT COUNT(*) FROM sample_requisition_articles WHERE requisition_id = $1", req_id)
+        if not n_articles:
+            raise HTTPException(422, detail={
+                "error": "no_articles",
+                "message": "A requisition needs at least one article before submission",
+                "details": {"id": req_id}})
 
     async with conn.transaction():
         await conn.execute(
@@ -236,6 +248,18 @@ async def submit_requisition(conn, req_id: int, *, user) -> dict:
             old_value={"status": req["status"]}, new_value={"status": "SUBMITTED"},
             actor_user_id=user.user_id, actor_role=user.role_name,
             remarks="Submitted for BH approval")
+        # Path A handoff: a raised NPD / TRIAL request is the business team asking
+        # NPD to develop an article — alert the NPD team so they can pick it up
+        # (recipe authoring is allowed pre-approval; promotion still needs the BH
+        # gate). Other sample types route through the approval-stage alerts only.
+        if req["sample_type"] in ("NPD", "TRIAL"):
+            tgt = req.get("npd_target_name")
+            await notification_service.emit_alert(
+                conn, alert_type="sample_npd_requested",
+                target_team=notification_service.TEAM_NPD,
+                message=(f"New {req['sample_type']} request {req['requisition_number']} "
+                         f"raised for development" + (f": {tgt}." if tgt else ".")),
+                related_id=req_id)
     return await get_requisition(conn, req_id)
 
 

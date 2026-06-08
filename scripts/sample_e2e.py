@@ -35,7 +35,8 @@ from app.modules.sample.services import (  # noqa: E402
 )
 
 load_dotenv()
-ENTITY = "cfpl"
+ENTITY = "cfpl"        # legal entity for bom_header / material_document seeding
+WAREHOUSE = "W202"     # sample requisition warehouse (post-040 rename)
 
 
 class FakeUser:
@@ -102,7 +103,7 @@ async def flow_basis_rm(conn):
     requestor, bh, inv = FakeUser(uid, "planner"), FakeUser(uid, "business_head"), FakeUser(uid, "inventory_manager")
 
     req = await req_svc.create_requisition(conn, payload={
-        "sample_type": "BASIS_RM", "entity": ENTITY, "articles": _articles(sku_id, sku_name)}, user=requestor)
+        "sample_type": "BASIS_RM", "warehouse": WAREHOUSE, "articles": _articles(sku_id, sku_name)}, user=requestor)
     assert req["status"] == "DRAFT" and req["requisition_number"].startswith("SMP-"), req["status"]
     rid = req["id"]
 
@@ -137,7 +138,7 @@ async def flow_internal_full(conn):
     requestor, bh, inv = FakeUser(uid, "planner"), FakeUser(uid, "business_head"), FakeUser(uid, "inventory_manager")
 
     req = await req_svc.create_requisition(conn, payload={
-        "sample_type": "INTERNAL", "entity": ENTITY, "articles": _articles(sku_id, sku_name)}, user=requestor)
+        "sample_type": "INTERNAL", "warehouse": WAREHOUSE, "articles": _articles(sku_id, sku_name)}, user=requestor)
     rid = req["id"]
     await req_svc.submit_requisition(conn, rid, user=requestor)
     await _approve(conn, rid, bh)
@@ -160,7 +161,7 @@ async def flow_internal_partial(conn):
     requestor, bh, inv = FakeUser(uid, "planner"), FakeUser(uid, "business_head"), FakeUser(uid, "inventory_manager")
 
     req = await req_svc.create_requisition(conn, payload={
-        "sample_type": "INTERNAL", "entity": ENTITY, "articles": _articles(sku_id, sku_name, qty=10)}, user=requestor)
+        "sample_type": "INTERNAL", "warehouse": WAREHOUSE, "articles": _articles(sku_id, sku_name, qty=10)}, user=requestor)
     rid = req["id"]
     await req_svc.submit_requisition(conn, rid, user=requestor)
     await _approve(conn, rid, bh)
@@ -183,7 +184,7 @@ async def flow_npd_draft(conn):
     requestor, bh, npd = FakeUser(uid, "npd_team"), FakeUser(uid, "business_head"), FakeUser(uid, "npd_team")
 
     req = await req_svc.create_requisition(conn, payload={
-        "sample_type": "NPD", "entity": ENTITY, "base_bom_id": bom_id,
+        "sample_type": "NPD", "warehouse": WAREHOUSE, "base_bom_id": bom_id,
         "articles": _articles(sku_id, sku_name, role="NPD_OUTPUT")}, user=requestor)
     rid = req["id"]
 
@@ -206,7 +207,7 @@ async def flow_basis_fg(conn):
     requestor, bh, floor = FakeUser(uid, "planner"), FakeUser(uid, "business_head"), FakeUser(uid, "floor_manager")
 
     req = await req_svc.create_requisition(conn, payload={
-        "sample_type": "BASIS_FG", "entity": ENTITY, "base_bom_id": bom_id,
+        "sample_type": "BASIS_FG", "warehouse": WAREHOUSE, "base_bom_id": bom_id,
         "articles": _articles(sku_id, sku_name, role="FG", qty=3)}, user=requestor)
     rid = req["id"]
     await req_svc.submit_requisition(conn, rid, user=requestor)

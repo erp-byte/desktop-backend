@@ -71,8 +71,7 @@ async def convert_full(conn, req_id: int, *, user, payload: dict | None = None) 
             conn, alert_type="sample_conversion_approved",
             target_team=notification_service.TEAM_INVENTORY,
             message=f"Sample {req['requisition_number']} converted to external gate pass.",
-            related_id=gp_id, related_type=notification_service.REL_SAMPLE_GATE_PASS,
-            entity=req["entity"])
+            related_id=gp_id, related_type=notification_service.REL_SAMPLE_GATE_PASS)
     return await gp_svc.get_gate_pass(conn, gp_id)
 
 
@@ -111,14 +110,14 @@ async def convert_partial(conn, req_id: int, *, qty: float, user,
             """
             INSERT INTO sample_requisitions
                 (requisition_number, sample_type, status, requestor_user_id,
-                 requestor_team, purpose_tag, purpose_note, entity,
+                 requestor_team, purpose_tag, purpose_note, warehouse,
                  converted_from_id, converted_to_external, created_by, updated_by)
             VALUES ($1, $2, 'READY_FOR_DISPATCH', $3, $4, $5, $6, $7, $8, TRUE, $9, $9)
             RETURNING id
             """,
             number, parent["sample_type"], parent["requestor_user_id"],
             parent["requestor_team"], parent["purpose_tag"], parent["purpose_note"],
-            parent["entity"], req_id, user.user_id)
+            parent["warehouse"], req_id, user.user_id)
         await audit_service.write_audit(
             conn, child_id, audit_service.EV_CONVERSION,
             new_value={"mode": "partial_child", "parent": req_id, "qty": qty},
@@ -142,6 +141,5 @@ async def convert_partial(conn, req_id: int, *, qty: float, user,
             conn, alert_type="sample_conversion_initiated",
             target_team=notification_service.TEAM_INVENTORY,
             message=f"Partial conversion of {parent['requisition_number']} ({qty}) -> {number}.",
-            related_id=gp_id, related_type=notification_service.REL_SAMPLE_GATE_PASS,
-            entity=parent["entity"])
+            related_id=gp_id, related_type=notification_service.REL_SAMPLE_GATE_PASS)
     return await req_svc.get_requisition(conn, req_id)

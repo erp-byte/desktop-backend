@@ -55,7 +55,7 @@ async def inv_verify(conn, req_id: int, *, user, remarks: str | None = None) -> 
             conn, alert_type="sample_inv_mgr_verified",
             target_team=notification_service.TEAM_BUSINESS,
             message=f"Sample {req['requisition_number']} verified by inventory manager.",
-            related_id=req_id, entity=req["entity"])
+            related_id=req_id)
     return await req_svc.get_requisition(conn, req_id)
 
 
@@ -90,8 +90,7 @@ async def issue_gate_pass(conn, req_id: int, *, user, recipient_name: str | None
             conn, alert_type="sample_gate_pass_issued",
             target_team=notification_service.TEAM_BUSINESS,
             message=f"Gate pass issued for sample {req['requisition_number']}.",
-            related_id=gp_id, related_type=notification_service.REL_SAMPLE_GATE_PASS,
-            entity=req["entity"])
+            related_id=gp_id, related_type=notification_service.REL_SAMPLE_GATE_PASS)
     return await get_gate_pass(conn, gp_id)
 
 
@@ -111,14 +110,14 @@ async def _create_gate_pass_row(conn, *, req: dict, user, recipient_name, recipi
             (gate_pass_number, gate_pass_type, source_ref_type, source_ref_id,
              material_document_id, from_location, to_location, recipient_name,
              recipient_contact, vehicle_carrier, driver_name, issued_by,
-             approver1_user_id, approver1_at, approver2_user_id, approver2_at, entity)
+             approver1_user_id, approver1_at, approver2_user_id, approver2_at, warehouse)
         VALUES ($1, 'SAMPLE', 'SAMPLE_REQ', $2, $3, $4, $5, $6, $7, $8, $9, $10,
                 $11, NOW(), $12, NOW(), $13)
         RETURNING id
         """,
         number, req["id"], md_id, from_location, None, recipient_name,
         recipient_contact, vehicle_carrier, driver_name, user.user_id,
-        bh_id, user.user_id, req["entity"])
+        bh_id, user.user_id, req["warehouse"])
     await conn.execute(
         """
         INSERT INTO gate_pass_sample_details
@@ -199,6 +198,5 @@ async def void_gate_pass(conn, gate_pass_id: int, *, reason: str, user) -> dict:
                 conn, alert_type="sample_gate_pass_voided",
                 target_team=notification_service.TEAM_STORES,
                 message=f"Gate pass {gp['gate_pass_number']} voided: {reason}",
-                related_id=gate_pass_id, related_type=notification_service.REL_SAMPLE_GATE_PASS,
-                entity=gp["entity"])
+                related_id=gate_pass_id, related_type=notification_service.REL_SAMPLE_GATE_PASS)
     return await get_gate_pass(conn, gate_pass_id)

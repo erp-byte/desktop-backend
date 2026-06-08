@@ -25,7 +25,8 @@ async def emit_alert(
     alert_type: str,
     target_team: str,
     message: str,
-    entity: str,
+    entity: str = "cfpl",   # store_alert is legal-entity scoped (cfpl/cdpl), NOT
+                            # the sample warehouse; default to the CFPL entity.
     related_id: int | None = None,
     related_type: str = REL_SAMPLE_REQ,
 ) -> None:

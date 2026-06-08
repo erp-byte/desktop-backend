@@ -24,7 +24,7 @@ from app.modules.sample.services import requisition_service as req_svc  # noqa: 
 from app.modules.sample.services.gate_pass_service import _gen_gate_pass_number  # noqa: E402
 
 load_dotenv()
-ENTITY = "cfpl"
+WAREHOUSE = "W202"     # sample requisition / gate_pass warehouse (post-040 rename)
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 100
 
 
@@ -32,7 +32,7 @@ class FakeUser:
     def __init__(self, user_id):
         self.user_id = user_id
         self.role_name = "planner"
-        self.entity = ENTITY
+        self.entity = "cfpl"   # unused by create now; kept for any service that reads it
         self.full_name = "stress"
         self.is_admin = False
 
@@ -54,7 +54,7 @@ async def _one_requisition(pool, user, sku_id, sku_name):
     await tr.start()
     try:
         req = await req_svc.create_requisition(conn, payload={
-            "sample_type": "BASIS_RM", "entity": ENTITY,
+            "sample_type": "BASIS_RM", "warehouse": WAREHOUSE,
             "articles": [{"sku_id": sku_id, "sku_name": sku_name, "required_qty": 1,
                           "uom": "kg", "article_role": "RM"}]}, user=user)
         return req["requisition_number"]
@@ -72,8 +72,8 @@ async def _one_gate_pass(pool, uid):
         seq = await conn.fetchval("SELECT nextval('seq_gate_pass')")
         number = _gen_gate_pass_number(seq)
         await conn.execute(
-            "INSERT INTO gate_passes (gate_pass_number, gate_pass_type, issued_by, entity) "
-            "VALUES ($1, 'SAMPLE', $2, $3)", number, uid, ENTITY)
+            "INSERT INTO gate_passes (gate_pass_number, gate_pass_type, issued_by, warehouse) "
+            "VALUES ($1, 'SAMPLE', $2, $3)", number, uid, WAREHOUSE)
         return number
     finally:
         await tr.rollback()

@@ -16,7 +16,7 @@ from app.modules.production.services.job_card_engine import create_job_cards
 from app.modules.sample.services import audit_service, notification_service
 from app.modules.sample.services import requisition_service as req_svc
 
-JOBCARD_TYPE = {"BASIS_FG": "BASIS_FG_SAMPLE", "NPD": "NPD_SAMPLE"}
+JOBCARD_TYPE = {"BASIS_FG": "BASIS_FG_SAMPLE", "NPD": "NPD_SAMPLE", "TRIAL": "TRIAL_SAMPLE"}
 
 
 async def _create_sample_production_order(conn, req: dict, bom_id: int,
@@ -50,7 +50,8 @@ async def _create_sample_production_order(conn, req: dict, bom_id: int,
         """,
         prod_order_number, bom_id, bom["fg_sku_name"], bom.get("customer_name"),
         batch_number, batch_size_kg, float(bom.get("pack_size_kg") or 0),
-        date.today() + timedelta(days=shelf_life), total_stages, req["entity"],
+        # production_order is legal-entity scoped (cfpl/cdpl), not by warehouse.
+        date.today() + timedelta(days=shelf_life), total_stages, "cfpl",
         bom.get("factory") or "W202", floors[0] if floors else None)
     return {"prod_order_id": prod_order_id, "prod_order_number": prod_order_number}
 
@@ -58,9 +59,9 @@ async def _create_sample_production_order(conn, req: dict, bom_id: int,
 async def start_production(conn, req_id: int, *, user) -> dict:
     """BH_APPROVED -> IN_PRODUCTION: create sample production order + job cards."""
     req = req_svc._require(await req_svc._fetch_req(conn, req_id), req_id)
-    if req["sample_type"] not in ("BASIS_FG", "NPD"):
+    if req["sample_type"] not in ("BASIS_FG", "NPD", "TRIAL"):
         raise HTTPException(409, detail={"error": "wrong_flow",
-                                         "message": "Job cards apply only to BASIS_FG / NPD samples",
+                                         "message": "Job cards apply only to BASIS_FG / NPD / TRIAL samples",
                                          "details": {"sample_type": req["sample_type"]}})
     if req["status"] != "BH_APPROVED":
         raise HTTPException(409, detail={"error": "not_approved",
@@ -101,7 +102,7 @@ async def start_production(conn, req_id: int, *, user) -> dict:
             conn, alert_type="sample_jobcard_created",
             target_team=notification_service.TEAM_PRODUCTION,
             message=f"Sample {req['requisition_number']} job cards issued ({po['prod_order_number']}).",
-            related_id=req_id, entity=req["entity"])
+            related_id=req_id)
     return await req_svc.get_requisition(conn, req_id)
 
 
@@ -115,7 +116,7 @@ async def mark_packing(conn, req_id: int, *, user) -> dict:
             conn, alert_type="sample_jobcard_completed",
             target_team=notification_service.TEAM_INVENTORY,
             message=f"Sample {req['requisition_number']} production complete — packing.",
-            related_id=req_id, entity=req["entity"])
+            related_id=req_id)
     return await req_svc.get_requisition(conn, req_id)
 
 

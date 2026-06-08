@@ -65,10 +65,12 @@ async def issue_outward(conn, req_id: int, *, user,
                 "to_location": "SAMPLE",
             })
 
+        # material_document is legal-entity scoped (cfpl/cdpl), not by warehouse;
+        # create_material_document defaults entity='cfpl'.
         doc = await create_material_document(
             conn, movement_type=MVT_GI_SAMPLE, reference_type=REF_SAMPLE_REQ,
             reference_id=str(req_id), created_by=user.full_name or str(user.user_id),
-            entity=req["entity"], lines=lines,
+            lines=lines,
             notes=f"Sample outward for {req['requisition_number']}")
         # Stamp the new sample linkage column (create_material_document is generic)
         await conn.execute(
@@ -91,7 +93,7 @@ async def issue_outward(conn, req_id: int, *, user,
             conn, alert_type="sample_rm_outward_done",
             target_team=notification_service.TEAM_INVENTORY,
             message=f"Sample {req['requisition_number']} material issued (265).",
-            related_id=req_id, entity=req["entity"])
+            related_id=req_id)
 
     return await req_svc.get_requisition(conn, req_id)
 
@@ -112,5 +114,5 @@ async def dispatch_internal(conn, req_id: int, *, user) -> dict:
             conn, alert_type="sample_internally_dispatched",
             target_team=notification_service.TEAM_INVENTORY,
             message=f"Sample {req['requisition_number']} dispatched internally.",
-            related_id=req_id, entity=req["entity"])
+            related_id=req_id)
     return await req_svc.get_requisition(conn, req_id)

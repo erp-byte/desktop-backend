@@ -18,11 +18,14 @@ from app.modules.sample.services import (
     conversion_service,
     gate_pass_service,
     jobcard_service,
+    npd_dev_service,
     npd_service,
     outward_service,
     requisition_service,
+    rm_issue_form_service,
 )
 from app.modules.sample.services.sample_gate_pass_pdf import generate_sample_gate_pass_pdf
+from app.modules.sample.services.rm_issue_form_pdf import generate_rm_issue_form_pdf
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +50,7 @@ async def list_requisitions(
     request: Request,
     status: str | None = Query(None),
     sample_type: str | None = Query(None),
-    entity: str | None = Query(None),
+    warehouse: str | None = Query(None),
     limit: int = Query(50, le=200),
     offset: int = Query(0, ge=0),
     user: AuthUser = Depends(require_permission("sample", action="view")),
@@ -55,7 +58,7 @@ async def list_requisitions(
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
         return await requisition_service.list_requisitions(
-            conn, status=status, sample_type=sample_type, entity=entity,
+            conn, status=status, sample_type=sample_type, warehouse=warehouse,
             limit=limit, offset=offset)
 
 
@@ -238,6 +241,251 @@ async def promote_npd_draft(
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
         return await npd_service.promote_draft(conn, draft_id, user=user)
+
+
+# ── Standalone NPD development job cards ───────────────────────────────────
+# Pure R&D, decoupled from sample requisitions. Create / edit / start gate on
+# the `sample/npd` permission (npd_team + admin); closing — which promotes the
+# recipe into a live BOM — gates on `sample/npd/promote` like the draft promote.
+@router.post("/npd-dev-job-cards")
+async def create_dev_job_card(
+    request: Request,
+    body: schemas.DevJobCardCreate,
+    user: AuthUser = Depends(require_permission("sample", "npd", action="create")),
+):
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await npd_dev_service.create_dev_job_card(conn, payload=body.model_dump(), user=user)
+
+
+@router.get("/npd-dev-job-cards")
+async def list_dev_job_cards(
+    request: Request,
+    status: str | None = Query(None),
+    limit: int = Query(50, le=200),
+    offset: int = Query(0, ge=0),
+    user: AuthUser = Depends(require_permission("sample", action="view")),
+):
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await npd_dev_service.list_dev_job_cards(
+            conn, status=status, limit=limit, offset=offset)
+
+
+@router.get("/boms")
+async def search_boms(
+    request: Request,
+    search: str | None = Query(None),
+    limit: int = Query(30, le=100),
+    user: AuthUser = Depends(require_permission("sample", action="view")),
+):
+    """Searchable BOM list for the dev job-card 'Base BOM' picker."""
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await npd_dev_service.search_boms(conn, search=search, limit=limit)
+
+
+@router.get("/bom-browse")
+async def browse_boms(
+    request: Request,
+    item_type: str | None = Query(None),
+    item_group: str | None = Query(None),
+    sub_group: str | None = Query(None),
+    particulars: str | None = Query(None),
+    user: AuthUser = Depends(require_permission("sample", action="view")),
+):
+    """Cascade browse (Item type -> Group -> Sub-group -> Item) for the Base-BOM picker."""
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await npd_dev_service.browse_boms(
+            conn, item_type=item_type, item_group=item_group,
+            sub_group=sub_group, particulars=particulars)
+
+
+@router.get("/boms/{bom_id}/lines")
+async def get_bom_lines(
+    request: Request,
+    bom_id: int,
+    user: AuthUser = Depends(require_permission("sample", action="view")),
+):
+    """Full material list of a BOM — seeds the dev job-card trial recipe."""
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await npd_dev_service.get_bom_lines(conn, bom_id)
+
+
+@router.get("/npd-dev-job-cards/{dev_jc_id}")
+async def get_dev_job_card(
+    request: Request,
+    dev_jc_id: int,
+    user: AuthUser = Depends(require_permission("sample", action="view")),
+):
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await npd_dev_service.get_dev_job_card(conn, dev_jc_id)
+
+
+@router.put("/npd-dev-job-cards/{dev_jc_id}/lines")
+async def replace_dev_lines(
+    request: Request,
+    dev_jc_id: int,
+    body: schemas.NpdLinesReplace,
+    user: AuthUser = Depends(require_permission("sample", "npd", action="create")),
+):
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await npd_dev_service.replace_lines(
+            conn, dev_jc_id, lines=[ln.model_dump() for ln in body.lines], user=user)
+
+
+@router.post("/npd-dev-job-cards/{dev_jc_id}/start")
+async def start_dev_job_card(
+    request: Request,
+    dev_jc_id: int,
+    user: AuthUser = Depends(require_permission("sample", "npd", action="create")),
+):
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await npd_dev_service.start_development(conn, dev_jc_id, user=user)
+
+
+@router.post("/npd-dev-job-cards/{dev_jc_id}/close")
+async def close_dev_job_card(
+    request: Request,
+    dev_jc_id: int,
+    body: schemas.DevJobCardClose,
+    user: AuthUser = Depends(require_permission("sample", "npd", "promote", action="create")),
+):
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await npd_dev_service.close_dev_job_card(conn, dev_jc_id, payload=body.model_dump(), user=user)
+
+
+@router.post("/npd-dev-job-cards/{dev_jc_id}/dispatch")
+async def dispatch_dev_sample(
+    request: Request,
+    dev_jc_id: int,
+    body: schemas.DevDispatchBody,
+    user: AuthUser = Depends(require_permission("sample", "npd", action="create")),
+):
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await npd_dev_service.dispatch_dev_sample(
+            conn, dev_jc_id, recipient=body.recipient, qty=body.qty, user=user)
+
+
+@router.post("/npd-dev-job-cards/{dev_jc_id}/cancel")
+async def cancel_dev_job_card(
+    request: Request,
+    dev_jc_id: int,
+    body: schemas.CancelBody,
+    user: AuthUser = Depends(require_permission("sample", "npd", action="create")),
+):
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await npd_dev_service.cancel_dev_job_card(conn, dev_jc_id, reason=body.reason, user=user)
+
+
+# ── RM Issue / Collection Form (Document 015, §10) ─────────────────────────
+# Raise Indent is the NPD author (maker → sample/npd); approve + issue are the
+# Store/Inventory checker (sample/inv_signoff). The Store-issue action fires the
+# 265 Goods Issue (Step A). Maker can never be the checker.
+@router.post("/rm-issue-forms")
+async def create_rm_issue_form(
+    request: Request,
+    body: schemas.RmIssueFormCreate,
+    user: AuthUser = Depends(require_permission("sample", "npd", action="create")),
+):
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await rm_issue_form_service.raise_indent(conn, payload=body.model_dump(), user=user)
+
+
+@router.get("/rm-issue-forms")
+async def list_rm_issue_forms(
+    request: Request,
+    status: str | None = Query(None),
+    source_type: str | None = Query(None),
+    limit: int = Query(50, le=200),
+    offset: int = Query(0, ge=0),
+    user: AuthUser = Depends(require_permission("sample", action="view")),
+):
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await rm_issue_form_service.list_forms(
+            conn, status=status, source_type=source_type, limit=limit, offset=offset)
+
+
+@router.get("/rm-issue-forms/{form_id}")
+async def get_rm_issue_form(
+    request: Request,
+    form_id: int,
+    user: AuthUser = Depends(require_permission("sample", action="view")),
+):
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await rm_issue_form_service.get_form(conn, form_id)
+
+
+@router.post("/rm-issue-forms/{form_id}/submit")
+async def submit_rm_issue_form(
+    request: Request,
+    form_id: int,
+    user: AuthUser = Depends(require_permission("sample", "npd", action="create")),
+):
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await rm_issue_form_service.submit_form(conn, form_id, user=user)
+
+
+@router.post("/rm-issue-forms/{form_id}/approve")
+async def approve_rm_issue_form(
+    request: Request,
+    form_id: int,
+    user: AuthUser = Depends(require_permission("sample", "inv_signoff", action="create")),
+):
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await rm_issue_form_service.approve_form(conn, form_id, user=user)
+
+
+@router.post("/rm-issue-forms/{form_id}/issue")
+async def issue_rm_issue_form(
+    request: Request,
+    form_id: int,
+    body: schemas.RmIssueBody,
+    user: AuthUser = Depends(require_permission("sample", "inv_signoff", action="create")),
+):
+    pool = request.app.state.db_pool
+    issued = {ln.line_id: {"issued_qty": ln.issued_qty, "lot_no": ln.lot_no} for ln in body.issued}
+    async with pool.acquire() as conn:
+        return await rm_issue_form_service.issue_form(conn, form_id, issued=issued, user=user)
+
+
+@router.post("/rm-issue-forms/{form_id}/cancel")
+async def cancel_rm_issue_form(
+    request: Request,
+    form_id: int,
+    body: schemas.CancelBody,
+    user: AuthUser = Depends(require_permission("sample", "npd", action="create")),
+):
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await rm_issue_form_service.cancel_form(conn, form_id, reason=body.reason, user=user)
+
+
+@router.get("/rm-issue-forms/{form_id}/pdf")
+async def print_rm_issue_form(
+    request: Request,
+    form_id: int,
+    user: AuthUser = Depends(require_permission("sample", action="view")),
+):
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        form = await rm_issue_form_service.get_form(conn, form_id)
+        pdf = generate_rm_issue_form_pdf(form)
+    return Response(content=pdf, media_type="application/pdf",
+                    headers={"Content-Disposition": f"inline; filename={form['form_number']}.pdf"})
 
 
 # ── Gate pass ─────────────────────────────────────────────────────────────
