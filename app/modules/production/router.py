@@ -4390,9 +4390,19 @@ async def create_plan_v2(
                 result = await create_plan(conn, body.model_dump())
     except ValueError as exc:
         # Over-allocation against so_fulfillment_v2 pending_qty bounds.
-        raise HTTPException(status_code=400, detail=str(exc))
+        # Surface as a structured envelope so the frontend's friendlyApiError
+        # mapper can label it instead of rendering raw JSON.
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "over_allocation", "message": str(exc)},
+        )
     if result.get("error") in ("no_lines", "no_bom"):
-        raise HTTPException(status_code=400, detail=result.get("message"))
+        # Pass the full {error, message} envelope through so the client gets
+        # an action-quality error ("create plan — one or more selected SKUs
+        # have no BOM") instead of the bare message text. Without this,
+        # FastAPI's HTTPException would stringify detail and the frontend
+        # mapper falls back to raw text.
+        raise HTTPException(status_code=400, detail=result)
     return result
 
 
