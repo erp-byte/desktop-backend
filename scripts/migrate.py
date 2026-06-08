@@ -98,6 +98,13 @@ SQL_FILES = [
     # (ON CONFLICT-backed, de-duped keep-latest) + the integrity partial
     # indexes (created only when data is clean, else NOTICE + skip). Guarded.
     DB_DIR / "041_reconcile_orphaned_unique_indexes.sql",
+    # 044 swaps consumption + byproducts + balance-material UNIQUE indexes
+    # to the batch-aware shape the multi-batch app code targets
+    # (upsert_consumption_lines / save_byproducts use
+    # ON CONFLICT … COALESCE(batch_id, 0) …). 039 + 040 re-created the
+    # OLD 2-col indexes by mistake; the new ones never landed because
+    # 038_jc_batch_per_record.sql was never wired in. Idempotent + guarded.
+    DB_DIR / "044_batch_aware_consumption_byproducts_indexes.sql",
     # 040 (samples/) renames entity -> warehouse on sample_requisitions /
     # gate_passes (new CHECK = warehouse codes) + transporter_name + vehicle_number.
     DB_DIR / "samples" / "040_sample_warehouse.sql",
@@ -141,6 +148,12 @@ SQL_FILES = [
     DB_DIR / "samples" / "052_requisition_request_id.sql",
     # 053 adds a nullable float `quantity` the requester can put on the request.
     DB_DIR / "samples" / "053_requisition_quantity.sql",
+    # 054 adds the ON_HOLD requisition status + HOLD approval action for the NPD
+    # team's review (approve / reject / hold with a reason).
+    DB_DIR / "samples" / "054_npd_review_hold.sql",
+    # 055 converts request_id from the generated 10000000+id column to a plain
+    # BIGINT (UNIQUE) so the app can supply a time-based id (new_short_time_id).
+    DB_DIR / "samples" / "055_requisition_request_id_timeid.sql",
 ]
 
 
