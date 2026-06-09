@@ -115,6 +115,15 @@ SQL_FILES = [
     # re-opens with empty Process Loss / FG Actual on closed batches.
     # Idempotent (DROP + CREATE OR REPLACE).
     DB_DIR / "045_extend_batch_view.sql",
+    # 046 backfills job_card_output_v2.batch_id on historical rows.
+    # record_output never accepted batch_id, so every POST /outputs save
+    # left the column NULL even though sibling tables (consumption /
+    # byproducts / balance) carried the correct batch_id. The frontend's
+    # batchScopedDefaults fallback filters output rows by batch_id, so
+    # null-tagged outputs were always skipped → FG Actual / Process Loss
+    # looked blank after every reload. Idempotent — maps each null output
+    # to the JC's batch that was open at its recorded_at.
+    DB_DIR / "046_backfill_output_batch_id.sql",
     # 040 (samples/) renames entity -> warehouse on sample_requisitions /
     # gate_passes (new CHECK = warehouse codes) + transporter_name + vehicle_number.
     DB_DIR / "samples" / "040_sample_warehouse.sql",

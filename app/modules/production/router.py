@@ -5839,6 +5839,16 @@ async def record_output_v2(
                     notes=body.notes,
                     process_loss_kg=body.process_loss_kg,
                     recorded_by=user.full_name or user.phone,
+                    # Tag the output row with the batch it belongs to.
+                    # Sibling persistence calls (upsert_consumption_lines,
+                    # save_byproducts, replace_balance_materials) already
+                    # pass this; record_output was the odd one out and was
+                    # leaving job_card_output_v2.batch_id = NULL on every
+                    # save — which broke the frontend's batchScopedDefaults
+                    # fallback (it filters rows by batch_id, so null-tagged
+                    # outputs were always skipped). Result: FG Actual /
+                    # Process Loss looked blank after every reload.
+                    batch_id=resolved_batch_id,
                 )
                 _raise_if_locked(result)
             else:

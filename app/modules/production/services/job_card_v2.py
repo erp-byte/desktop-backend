@@ -1648,7 +1648,8 @@ async def record_output(conn, *, job_card_id: int,
                         uom: str | None = None,
                         notes: str | None = None,
                         process_loss_kg: float | None = None,
-                        recorded_by: str | None = None) -> dict:
+                        recorded_by: str | None = None,
+                        batch_id: int | None = None) -> dict:
     """Append an output row for this JC. The output_kind defaults to the
     JC's declared output_kind (SFG / WIP / FG from the stage chain) unless
     overridden — e.g. when the floor reports a partial FG batch that's
@@ -1657,6 +1658,13 @@ async def record_output(conn, *, job_card_id: int,
     yield_pct is computed server-side as (output / rm_consumed) × 100 when
     rm_consumed > 0; NULL otherwise. The JC's status is NOT auto-flipped
     here — explicit /complete and /close calls handle that.
+
+    `batch_id` tags the row with the batch it belongs to (migration 036).
+    Sibling tables (consumption_lines, byproducts, balance_materials) all
+    already tag their rows; without this column being written here too,
+    the JC form's batchScopedDefaults can't fall back to the latest
+    output row when the BatchRow snapshot is null, so FG Actual Kg /
+    Process Loss appear blank after reload on open batches.
     """
     lock_err = await assert_not_locked(conn, job_card_id)
     if lock_err:
@@ -1685,14 +1693,16 @@ async def record_output(conn, *, job_card_id: int,
         return await conn.fetchrow(
             """
             INSERT INTO job_card_output_v2
-                (output_id, job_card_id, rm_consumed_kg, output_qty_kg, output_qty_units,
-                 output_kind, uom, yield_pct, notes, recorded_by, process_loss_kg)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                (output_id, job_card_id, batch_id, rm_consumed_kg, output_qty_kg,
+                 output_qty_units, output_kind, uom, yield_pct, notes,
+                 recorded_by, process_loss_kg)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             RETURNING *
             """,
             new_short_time_id(),
-            job_card_id, rm_consumed_kg, output_qty_kg, output_qty_units,
-            kind, uom, yield_pct, notes, recorded_by, process_loss_kg or 0,
+            job_card_id, batch_id, rm_consumed_kg, output_qty_kg,
+            output_qty_units, kind, uom, yield_pct, notes,
+            recorded_by, process_loss_kg or 0,
         )
     inserted = await insert_with_pk_retry(conn, _insert_output)
     return {"recorded": True, "output": _serialize(inserted), "yield_pct": yield_pct}
