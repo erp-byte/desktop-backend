@@ -403,19 +403,28 @@ async def close_batch(conn, *, batch_id: int,
             else f"Auto-dispatch on batch {batch['batch_number']} close"
         )
 
-        dispatch_row = await conn.fetchrow(
-            """
-            INSERT INTO job_card_partial_dispatch_v2 (
-                from_job_card_id, to_job_card_id, qty_kg, qty_units,
-                dispatched_by, batch_id,
-                notes
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-            RETURNING *
-            """,
-            resolved_jc_id, jc["next_job_card_id"], effective_dispatch,
-            effective_dispatch_units, closed_by, batch_id,
-            note_suffix,
-        )
+        # Migration 019 dropped BIGSERIAL on dispatch_id — ids are now
+        # app-supplied via new_short_time_id() with the same PK-retry
+        # pattern as record_output / open_batch above. Without this
+        # wrapper, the INSERT sends NULL into a NOT NULL column and 500s
+        # with NotNullViolationError on dispatch_id.
+        async def _insert_dispatch():
+            return await conn.fetchrow(
+                """
+                INSERT INTO job_card_partial_dispatch_v2 (
+                    dispatch_id,
+                    from_job_card_id, to_job_card_id, qty_kg, qty_units,
+                    dispatched_by, batch_id,
+                    notes
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                RETURNING *
+                """,
+                new_short_time_id(),
+                resolved_jc_id, jc["next_job_card_id"], effective_dispatch,
+                effective_dispatch_units, closed_by, batch_id,
+                note_suffix,
+            )
+        dispatch_row = await insert_with_pk_retry(conn, _insert_dispatch)
         await conn.execute(
             "UPDATE job_card_v2 SET dispatched_to_next_kg = "
             "dispatched_to_next_kg + $2 WHERE job_card_id=$1",
