@@ -158,8 +158,26 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException) 
     if isinstance(detail, dict):
         # callers can raise HTTPException(detail={"error": "...", "message": "...", "details": {...}})
         code = detail.get("error") or _DEFAULT_HTTP_CODES.get(exc.status_code, "error")
-        message = detail.get("message") or _http_status_message(exc.status_code)
-        details = detail.get("details") or {}
+        # When the caller supplied an explicit error code but no message,
+        # use the code as a fallback (e.g. "invalid_uom") rather than the
+        # generic status name ("Bad request"). The frontend's
+        # friendlyApiError catalog can then map the code to an actual
+        # sentence; an operator should never see just "Bad request".
+        # `details` (with the dict the caller passed minus the envelope
+        # keys) is still surfaced so the frontend has all the context.
+        explicit_message = detail.get("message")
+        if explicit_message:
+            message = explicit_message
+        elif detail.get("error"):
+            # Humanise the code for the rare case where the frontend's
+            # catalog doesn't have it either: "invalid_uom" → "Invalid uom"
+            message = detail["error"].replace("_", " ").capitalize()
+        else:
+            message = _http_status_message(exc.status_code)
+        details = detail.get("details") or {
+            k: v for k, v in detail.items()
+            if k not in ("error", "message", "details")
+        }
     else:
         code = _DEFAULT_HTTP_CODES.get(exc.status_code, "error")
         message = str(detail) if detail else _http_status_message(exc.status_code)
