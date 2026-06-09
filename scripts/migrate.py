@@ -105,6 +105,16 @@ SQL_FILES = [
     # OLD 2-col indexes by mistake; the new ones never landed because
     # 038_jc_batch_per_record.sql was never wired in. Idempotent + guarded.
     DB_DIR / "044_batch_aware_consumption_byproducts_indexes.sql",
+    # 045 extends the job_card_batch_v2 view to expose the Stage-2
+    # batch-summary columns (process_loss_kg, fg_actual_kg, fg_actual_units,
+    # control_sample_kg, is_balanced, balance_difference_qty,
+    # closure_remarks, input_qty_kg) that 038_jc_batch_per_record.sql
+    # would have added — but that migration was never wired in. Without
+    # this, GET /batches returns null for those columns even though the
+    # underlying job_card_phase_v2 row holds the values, so the JC form
+    # re-opens with empty Process Loss / FG Actual on closed batches.
+    # Idempotent (DROP + CREATE OR REPLACE).
+    DB_DIR / "045_extend_batch_view.sql",
     # 040 (samples/) renames entity -> warehouse on sample_requisitions /
     # gate_passes (new CHECK = warehouse codes) + transporter_name + vehicle_number.
     DB_DIR / "samples" / "040_sample_warehouse.sql",
@@ -154,6 +164,9 @@ SQL_FILES = [
     # 055 converts request_id from the generated 10000000+id column to a plain
     # BIGINT (UNIQUE) so the app can supply a time-based id (new_short_time_id).
     DB_DIR / "samples" / "055_requisition_request_id_timeid.sql",
+    # 056 soft-links a request to the dev job card created from its "Develop"
+    # button (source_requisition_id on the card, linked_dev_jc_id on the request).
+    DB_DIR / "samples" / "056_dev_jc_requisition_link.sql",
 ]
 
 
