@@ -5710,6 +5710,33 @@ async def record_output_v2(
                             """,
                             resolved_batch_id, audit_actor,
                         )
+                        # Sync the BatchRow snapshot with the new values.
+                        # close_batch wrote fg_actual_kg / fg_actual_units /
+                        # process_loss_kg on the underlying job_card_phase_v2
+                        # row when the batch was closed. Without this UPDATE,
+                        # an admin_override save would INSERT a fresh
+                        # job_card_output_v2 row with the corrected values
+                        # but the form would re-open showing the OLD
+                        # batch-table values — making the save look like a
+                        # no-op even though the audit log + output row both
+                        # changed. COALESCE preserves untouched fields when
+                        # the operator's diff-on-save omits them.
+                        # `body.output_qty_kg` / `output_qty_units` are
+                        # populated by the _bridge_legacy validator from
+                        # `fg_actual_kg` / `fg_actual_units` when only the
+                        # legacy aliases are sent.
+                        await conn.execute(
+                            """
+                            UPDATE job_card_batch_v2
+                               SET fg_actual_kg     = COALESCE($2, fg_actual_kg),
+                                   fg_actual_units  = COALESCE($3, fg_actual_units),
+                                   process_loss_kg  = COALESCE($4, process_loss_kg)
+                             WHERE batch_id = $1
+                            """,
+                            resolved_batch_id,
+                            body.output_qty_kg, body.output_qty_units,
+                            body.process_loss_kg,
+                        )
                     else:
                         raise HTTPException(
                             status_code=409,
