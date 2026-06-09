@@ -5810,16 +5810,22 @@ async def record_output_v2(
                 )
 
             # R10 — diff-on-save: skip record_output() entirely when the
-            # caller didn't send any output-row fields. Edit Batch saves
-            # that only touch (say) one byproduct row would otherwise
-            # 400 with "missing_qty" because output_qty_kg is None.
+            # caller didn't send an FG quantity. The output row REQUIRES
+            # output_qty_kg (record_output returns missing_qty otherwise),
+            # so secondary fields alone — process_loss_kg, rm_consumed_kg
+            # (often auto-derived from rm_consumed[].consumed_qty by
+            # _bridge_legacy when the operator types per-line consumption)
+            # — must NOT be enough to trigger the insert. Without this
+            # tighter check, a save with only consumption + byproducts
+            # filled (no FG Actual) 400'd because rm_consumed_kg got
+            # bridged from the line list and process_loss_kg defaulted to
+            # 0 on the frontend, flipping has_output_payload true and
+            # forcing record_output to fail validation.
             has_output_payload = (
                 body.output_qty_kg is not None
                 or body.output_qty_units is not None
-                or body.rm_consumed_kg is not None
                 or body.fg_actual_kg is not None
                 or body.fg_actual_units is not None
-                or body.process_loss_kg is not None
             )
             if has_output_payload:
                 result = await record_output(
