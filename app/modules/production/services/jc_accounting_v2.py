@@ -528,7 +528,14 @@ async def save_consumption(conn, *, job_card_id: int,
 
 VALID_BP_CATEGORIES = (
     'tukda', 'damaged', 'black_stained', 'without_shell', 'empty_shells',
-    'dust', 'balance_material', 'rejection', 'control_sample', 'other',
+    'dust', 'balance_material', 'rejection', 'control_sample',
+    # Migration 047 promoted 'wastage' to a first-class category — the
+    # frontend's Off-Grade dropdown has had it for ages with a comment
+    # claiming it was already allowed server-side, but neither this
+    # tuple nor the DB CHECK constraint included it, so every save with
+    # a Wastage off-grade row 400'd with invalid_category.
+    'wastage',
+    'other',
     # R11 PM variance buckets - migration 028 extends the DB CHECK enum.
     'pm_torn', 'pm_damaged', 'pm_misprint', 'pm_rejection', 'pm_wasted',
 )

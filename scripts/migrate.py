@@ -124,6 +124,13 @@ SQL_FILES = [
     # looked blank after every reload. Idempotent — maps each null output
     # to the JC's batch that was open at its recorded_at.
     DB_DIR / "046_backfill_output_batch_id.sql",
+    # 047 adds 'wastage' to job_card_byproducts_v2.category CHECK list.
+    # The frontend Off-Grade dropdown exposed Wastage with a comment
+    # claiming it was already a server-side bucket, but neither the
+    # Python VALID_BP_CATEGORIES nor the DB CHECK declared it — every
+    # save with a Wastage row 400'd invalid_category. Idempotent (drops
+    # + re-adds the CHECK with the extended list).
+    DB_DIR / "047_byproducts_wastage_category.sql",
     # 040 (samples/) renames entity -> warehouse on sample_requisitions /
     # gate_passes (new CHECK = warehouse codes) + transporter_name + vehicle_number.
     DB_DIR / "samples" / "040_sample_warehouse.sql",
