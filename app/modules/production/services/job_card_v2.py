@@ -495,6 +495,16 @@ async def upsert_consumption_lines(
                              material_sku_name)
                 DO UPDATE SET
                     bom_line_id         = EXCLUDED.bom_line_id,
+                    -- Promote batch_id so a save against batch X always
+                    -- leaves the row tagged with X. Without this, the
+                    -- ON CONFLICT key's COALESCE(batch_id, 0) can match a
+                    -- legacy batch_id=NULL row (or one mistakenly written
+                    -- by an older record_output that ignored batch_id),
+                    -- and the DO UPDATE would otherwise preserve the
+                    -- stale NULL — stranding the row under the legacy
+                    -- bucket and blanking the operator's form on the
+                    -- next read because matchesBatch couldn't find it.
+                    batch_id            = EXCLUDED.batch_id,
                     input_kind          = EXCLUDED.input_kind,
                     uom                 = EXCLUDED.uom,
                     actual_consumed_qty = EXCLUDED.actual_consumed_qty,

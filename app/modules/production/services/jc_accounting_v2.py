@@ -654,6 +654,14 @@ async def save_byproducts(conn, *, job_card_id: int,
                     remarks     = EXCLUDED.remarks,
                     recorded_by = EXCLUDED.recorded_by,
                     bom_line_id = EXCLUDED.bom_line_id,
+                    -- Promote batch_id so a save against batch X always
+                    -- leaves the row tagged with X. The ON CONFLICT key
+                    -- uses COALESCE(batch_id, 0) and can match a legacy
+                    -- NULL-batch row; without this, the DO UPDATE would
+                    -- preserve the stale NULL and the operator's form
+                    -- would blank the rejection / control_sample / pm_*
+                    -- row on the next read (matchesBatch can't find it).
+                    batch_id    = EXCLUDED.batch_id,
                     recorded_at = NOW()
                 RETURNING *
                 """,
