@@ -9,11 +9,16 @@ dedicated sequence) — see material_document_service._gen_id.
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 
+import asyncpg
 from fastapi import HTTPException
 
+from app.core.helpers import new_short_time_id
 from app.modules.sample.services import audit_service, notification_service
+
+logger = logging.getLogger(__name__)
 
 WAREHOUSES = ("W202", "A185", "A68", "F53", "A101", "D-39", "D-514", "Rishi", "Supreme")
 
@@ -22,7 +27,9 @@ SAMPLE_TYPES = ("BASIS_RM", "BASIS_FG", "NPD", "INTERNAL", "TRIAL")
 # Status state machine (spec §8). Maps current -> set of allowed next states.
 TRANSITIONS: dict[str, set[str]] = {
     "DRAFT":                 {"SUBMITTED", "CANCELLED"},
-    "SUBMITTED":             {"BH_APPROVED", "BH_REJECTED", "CANCELLED"},
+    # NPD review of a BH-sent request: approve / reject / hold.
+    "SUBMITTED":             {"BH_APPROVED", "BH_REJECTED", "ON_HOLD", "CANCELLED"},
+    "ON_HOLD":               {"BH_APPROVED", "BH_REJECTED", "SUBMITTED", "CANCELLED"},
     "BH_REJECTED":           {"SUBMITTED", "CANCELLED"},
     "BH_APPROVED":           {"IN_PRODUCTION", "READY_FOR_DISPATCH", "CANCELLED"},
     "IN_PRODUCTION":         {"PACKING", "CANCELLED"},
@@ -91,26 +98,58 @@ async def create_requisition(conn, *, payload: dict, user) -> dict:
 
     articles = payload.get("articles") or []
 
+    # Quantity is derived from pcs × weight_per_piece when both are given (the NPD
+    # request captures pieces + per-piece weight); otherwise the sent quantity.
+    pcs = payload.get("pcs")
+    wpp = payload.get("weight_per_piece")
+    quantity = payload.get("quantity")
+    if pcs is not None and wpp is not None:
+        quantity = round(float(pcs) * float(wpp), 3)
+
     async with conn.transaction():
         seq = await conn.fetchval("SELECT nextval('seq_sample_req')")
         number = _gen_requisition_number(seq)
-        req_id = await conn.fetchval(
-            """
-            INSERT INTO sample_requisitions
-                (requisition_number, sample_type, status, requestor_user_id,
-                 requestor_team, purpose_tag, purpose_note, base_bom_id,
-                 internal_override, warehouse, transporter_name, vehicle_number,
-                 npd_target_name, quantity, created_by, updated_by)
-            VALUES ($1, $2, 'DRAFT', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $3, $3)
-            RETURNING id
-            """,
-            number, sample_type, user.user_id, payload.get("requestor_team"),
-            payload.get("purpose_tag"), payload.get("purpose_note"),
-            payload.get("base_bom_id"),
-            bool(payload.get("internal_override", False)), warehouse,
-            payload.get("transporter_name"), payload.get("vehicle_number"),
-            payload.get("npd_target_name"), payload.get("quantity"),
-        )
+        # request_id is an app-supplied 8-digit time-based BIGINT (new_short_time_id,
+        # the same pattern as job_card_id / plan_id). It carries a UNIQUE index but
+        # is NOT the PK, so the house insert_with_pk_retry (which only retries on
+        # '_pkey' collisions) doesn't apply — retry on the unique violation here.
+        req_id = None
+        for _attempt in range(5):
+            request_id = new_short_time_id()
+            try:
+                async with conn.transaction():   # savepoint for the unique retry
+                    req_id = await conn.fetchval(
+                        """
+                        INSERT INTO sample_requisitions
+                            (request_id, requisition_number, sample_type, status, requestor_user_id,
+                             requestor_team, purpose_tag, purpose_note, base_bom_id,
+                             internal_override, warehouse, transporter_name, vehicle_number,
+                             npd_target_name, quantity, description,
+                             company_name, customer_name, customer_contact, customer_ship_to_address,
+                             mode_of_transport, expected_dispatch_date, confirmed_dispatch_date,
+                             pcs, weight_per_piece,
+                             created_by, updated_by)
+                        VALUES ($1, $2, $3, 'DRAFT', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+                                $16, $17, $18, $19, $20, $21, $22, $23, $24, $4, $4)
+                        RETURNING id
+                        """,
+                        request_id, number, sample_type, user.user_id,
+                        payload.get("requestor_team"), payload.get("purpose_tag"),
+                        payload.get("purpose_note"), payload.get("base_bom_id"),
+                        bool(payload.get("internal_override", False)), warehouse,
+                        payload.get("transporter_name"), payload.get("vehicle_number"),
+                        payload.get("npd_target_name"), quantity,
+                        payload.get("description"),
+                        payload.get("company_name"), payload.get("customer_name"),
+                        payload.get("customer_contact"), payload.get("customer_ship_to_address"),
+                        payload.get("mode_of_transport"), payload.get("expected_dispatch_date"),
+                        payload.get("confirmed_dispatch_date"),
+                        pcs, wpp,
+                    )
+                break
+            except asyncpg.UniqueViolationError:
+                if _attempt == 4:
+                    raise
         await _insert_articles(conn, req_id, articles)
         await audit_service.write_audit(
             conn, req_id, audit_service.EV_STATUS_CHANGE,
@@ -167,19 +206,67 @@ async def get_requisition(conn, req_id: int) -> dict:
 async def list_requisitions(conn, *, status: str | None = None,
                             sample_type: str | None = None,
                             warehouse: str | None = None,
+                            sample_types: list[str] | None = None,
+                            statuses: list[str] | None = None,
+                            requestor: str | None = None,
+                            q: str | None = None,
+                            date_from=None, date_to=None,
                             limit: int = 50, offset: int = 0) -> list[dict]:
+    """List requisitions with the queue filters.
+
+    `sample_type` keeps the legacy single-type filter; `sample_types` narrows to a
+    set (the NPD queue passes NPD/TRIAL). `statuses` filters to a set of statuses
+    (the NPD queue maps its 3 review buckets — Pending/Hold/Accepted — onto the
+    underlying lifecycle states). `q` is a free-text search across the number,
+    request_id, target article, description and requestor. `date_from` / `date_to`
+    bound created_at (inclusive, by calendar date). Each row carries `hold_reason`
+    — the most recent HOLD remark — so the queue can surface it on the Hold pill.
+    """
     rows = await conn.fetch(
         """
-        SELECT * FROM sample_requisitions
-        WHERE deleted_at IS NULL
-          AND ($1::text IS NULL OR status = $1)
-          AND ($2::text IS NULL OR sample_type = $2)
-          AND ($3::text IS NULL OR warehouse = $3)
-        ORDER BY created_at DESC
-        LIMIT $4 OFFSET $5
+        SELECT sr.*,
+               (SELECT a.remarks FROM sample_approvals a
+                 WHERE a.requisition_id = sr.id AND a.action = 'HOLD'
+                 ORDER BY a.actioned_at DESC NULLS LAST, a.sequence_no DESC
+                 LIMIT 1) AS hold_reason
+          FROM sample_requisitions sr
+         WHERE sr.deleted_at IS NULL
+          AND ($1::text   IS NULL OR sr.status = $1)
+          AND ($2::text   IS NULL OR sr.sample_type = $2)
+          AND ($3::text   IS NULL OR sr.warehouse = $3)
+          AND ($4::text[] IS NULL OR sr.sample_type = ANY($4))
+          AND ($5::text   IS NULL OR sr.requestor_team = $5)
+          AND ($6::date   IS NULL OR sr.created_at::date >= $6)
+          AND ($7::date   IS NULL OR sr.created_at::date <= $7)
+          AND ($8::text   IS NULL OR (
+                sr.requisition_number              ILIKE '%' || $8 || '%'
+             OR sr.request_id::text                ILIKE '%' || $8 || '%'
+             OR COALESCE(sr.npd_target_name, '')   ILIKE '%' || $8 || '%'
+             OR COALESCE(sr.description, '')        ILIKE '%' || $8 || '%'
+             OR COALESCE(sr.requestor_team, '')     ILIKE '%' || $8 || '%'
+          ))
+          AND ($9::text[] IS NULL OR sr.status = ANY($9))
+         ORDER BY sr.created_at DESC
+         LIMIT $10 OFFSET $11
         """,
-        status, sample_type, warehouse, limit, offset)
+        status, sample_type, warehouse, sample_types, requestor,
+        date_from, date_to, q, statuses, limit, offset)
     return [dict(r) for r in rows]
+
+
+async def list_requestors(conn, *, sample_types: list[str] | None = None) -> list[str]:
+    """Distinct requestor labels — feeds the queue's Requestor filter dropdown."""
+    rows = await conn.fetch(
+        """
+        SELECT DISTINCT requestor_team
+          FROM sample_requisitions
+         WHERE deleted_at IS NULL
+           AND requestor_team IS NOT NULL AND requestor_team <> ''
+           AND ($1::text[] IS NULL OR sample_type = ANY($1))
+         ORDER BY requestor_team
+        """,
+        sample_types)
+    return [r["requestor_team"] for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -188,11 +275,24 @@ async def list_requisitions(conn, *, status: str | None = None,
 async def update_requisition(conn, req_id: int, *, payload: dict, user) -> dict:
     """Edit a DRAFT or BH_REJECTED requisition (header + article replacement)."""
     req = _require(await _fetch_req(conn, req_id), req_id)
-    if req["status"] not in ("DRAFT", "BH_REJECTED"):
+    if req["status"] not in ("DRAFT", "SUBMITTED", "BH_REJECTED"):
         raise HTTPException(409, detail={
             "error": "not_editable",
-            "message": "Only DRAFT or BH_REJECTED requisitions can be edited",
+            "message": "Only DRAFT, SUBMITTED or BH_REJECTED requisitions can be edited",
             "details": {"status": req["status"]}})
+    new_warehouse = payload.get("warehouse")
+    if new_warehouse is not None and new_warehouse not in WAREHOUSES:
+        raise HTTPException(422, detail={"error": "invalid_warehouse",
+                                         "message": f"warehouse must be one of {WAREHOUSES}",
+                                         "details": {"warehouse": new_warehouse}})
+    # Recompute quantity from the merged pcs × weight_per_piece (existing values
+    # used where the patch omits one). Falls back to the sent quantity otherwise.
+    eff_pcs = payload.get("pcs") if payload.get("pcs") is not None else req.get("pcs")
+    eff_wpp = (payload.get("weight_per_piece") if payload.get("weight_per_piece") is not None
+               else req.get("weight_per_piece"))
+    quantity = payload.get("quantity")
+    if eff_pcs is not None and eff_wpp is not None:
+        quantity = round(float(eff_pcs) * float(eff_wpp), 3)
     async with conn.transaction():
         await conn.execute(
             """
@@ -204,13 +304,31 @@ async def update_requisition(conn, req_id: int, *, payload: dict, user) -> dict:
                    transporter_name = COALESCE($7, transporter_name),
                    vehicle_number   = COALESCE($8, vehicle_number),
                    quantity         = COALESCE($9, quantity),
+                   npd_target_name  = COALESCE($10, npd_target_name),
+                   warehouse        = COALESCE($11, warehouse),
+                   description      = COALESCE($12, description),
+                   company_name             = COALESCE($13, company_name),
+                   customer_name            = COALESCE($14, customer_name),
+                   customer_contact         = COALESCE($15, customer_contact),
+                   customer_ship_to_address = COALESCE($16, customer_ship_to_address),
+                   mode_of_transport        = COALESCE($17, mode_of_transport),
+                   expected_dispatch_date   = COALESCE($18, expected_dispatch_date),
+                   confirmed_dispatch_date  = COALESCE($19, confirmed_dispatch_date),
+                   pcs              = COALESCE($20, pcs),
+                   weight_per_piece = COALESCE($21, weight_per_piece),
                    updated_at = NOW(), updated_by = $6
              WHERE id = $1
             """,
             req_id, payload.get("requestor_team"), payload.get("purpose_tag"),
             payload.get("purpose_note"), payload.get("base_bom_id"), user.user_id,
             payload.get("transporter_name"), payload.get("vehicle_number"),
-            payload.get("quantity"))
+            quantity, payload.get("npd_target_name"), new_warehouse,
+            payload.get("description"),
+            payload.get("company_name"), payload.get("customer_name"),
+            payload.get("customer_contact"), payload.get("customer_ship_to_address"),
+            payload.get("mode_of_transport"), payload.get("expected_dispatch_date"),
+            payload.get("confirmed_dispatch_date"),
+            payload.get("pcs"), payload.get("weight_per_piece"))
         if payload.get("articles") is not None:
             await conn.execute(
                 "DELETE FROM sample_requisition_articles WHERE requisition_id = $1", req_id)
@@ -219,6 +337,20 @@ async def update_requisition(conn, req_id: int, *, payload: dict, user) -> dict:
             conn, req_id, audit_service.EV_ARTICLE_EDIT,
             actor_user_id=user.user_id, actor_role=user.role_name,
             remarks="Requisition edited")
+
+    # If the edited request is already in the NPD reviewers' queue (SUBMITTED /
+    # ON_HOLD), re-notify them over WhatsApp with the updated details so they can
+    # re-decide. Best-effort, after commit — never blocks the edit. Edits while
+    # still DRAFT (not yet sent to NPD) don't notify. req["status"] is pre-update;
+    # the PATCH never changes status, so it still reflects the review state.
+    if req["sample_type"] in ("NPD", "TRIAL") and req["status"] in ("SUBMITTED", "ON_HOLD"):
+        try:
+            from app.modules.sample.services import whatsapp_service as wa
+            fresh = await _fetch_req(conn, req_id)
+            await wa.notify_npd_updated(conn, fresh or req)
+        except Exception:  # noqa: BLE001
+            logger.exception("WhatsApp NPD updated notify failed for req %s", req_id)
+
     return await get_requisition(conn, req_id)
 
 
@@ -260,6 +392,16 @@ async def submit_requisition(conn, req_id: int, *, user) -> dict:
                 message=(f"New {req['sample_type']} request {req['requisition_number']} "
                          f"raised for development" + (f": {tgt}." if tgt else ".")),
                 related_id=req_id)
+
+    # WhatsApp the NPD reviewers (best-effort, after commit) so they can accept /
+    # hold straight from WhatsApp — the hold reason is captured from their reply.
+    if req["sample_type"] in ("NPD", "TRIAL"):
+        try:
+            from app.modules.sample.services import whatsapp_service as wa
+            await wa.notify_npd_review(conn, req)
+        except Exception:  # noqa: BLE001
+            logger.exception("WhatsApp NPD review notify failed for req %s", req_id)
+
     return await get_requisition(conn, req_id)
 
 

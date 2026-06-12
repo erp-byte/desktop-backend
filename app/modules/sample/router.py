@@ -7,9 +7,11 @@ external conversion (full + partial).
 """
 from __future__ import annotations
 
+import json
 import logging
+from datetime import date
 
-from fastapi import APIRouter, Depends, Query, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 
 from app.modules.auth.middleware import AuthUser, require_permission
 from app.modules.sample import schemas
@@ -23,6 +25,7 @@ from app.modules.sample.services import (
     outward_service,
     requisition_service,
     rm_issue_form_service,
+    whatsapp_service,
 )
 from app.modules.sample.services.sample_gate_pass_pdf import generate_sample_gate_pass_pdf
 from app.modules.sample.services.rm_issue_form_pdf import generate_rm_issue_form_pdf
@@ -30,6 +33,45 @@ from app.modules.sample.services.rm_issue_form_pdf import generate_rm_issue_form
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/sample", tags=["Sample"])
+
+
+# ── WhatsApp webhook (Meta Cloud API) ──────────────────────────────────────
+# PUBLIC (no auth dep) — Meta calls these. GET is the one-time verify handshake;
+# POST receives inbound messages and drives the NPD accept/hold flow. Inbound
+# senders are authenticated by matching their number to an NPD-role auth_user
+# inside whatsapp_service.handle_inbound; POST bodies are HMAC-checked when
+# WHATSAPP_APP_SECRET is set.
+@router.get("/whatsapp/webhook")
+async def whatsapp_webhook_verify(request: Request):
+    p = request.query_params
+    if (p.get("hub.mode") == "subscribe" and whatsapp_service.VERIFY_TOKEN
+            and p.get("hub.verify_token") == whatsapp_service.VERIFY_TOKEN):
+        return Response(content=p.get("hub.challenge") or "", media_type="text/plain")
+    raise HTTPException(403, detail="verification failed")
+
+
+@router.post("/whatsapp/webhook")
+async def whatsapp_webhook_receive(request: Request):
+    raw = await request.body()
+    if not whatsapp_service.verify_signature(raw, request.headers.get("X-Hub-Signature-256")):
+        raise HTTPException(403, detail="bad signature")
+    try:
+        payload = json.loads(raw or b"{}")
+    except ValueError:
+        payload = {}
+    messages = whatsapp_service.extract_messages(payload)
+    results = []
+    if messages:
+        pool = request.app.state.db_pool
+        async with pool.acquire() as conn:
+            for m in messages:
+                try:
+                    results.append(await whatsapp_service.handle_inbound(
+                        conn, from_phone=m["from"], text=m["text"],
+                        context_id=m.get("context_id")))
+                except Exception:  # noqa: BLE001 — always 200 so Meta doesn't retry-storm
+                    logger.exception("WhatsApp inbound handling failed")
+    return {"received": len(messages), "results": results}
 
 
 # ── Requisitions ─────────────────────────────────────────────────────────
@@ -45,21 +87,63 @@ async def create_requisition(
             conn, payload=body.model_dump(), user=user)
 
 
+# NPD sample requisition — a pure request (type / target article / qty / desc /
+# purpose / requestor / warehouse). NPD-mandatory fields are enforced by the
+# NpdRequisitionCreate schema; it delegates to the shared create with no article
+# lines (the recipe is authored later on /develop). Surfaced id = request_id.
+@router.post("/npd-requisitions")
+async def create_npd_requisition(
+    request: Request,
+    body: schemas.NpdRequisitionCreate,
+    user: AuthUser = Depends(require_permission("sample", "requisition", action="create")),
+):
+    payload = body.model_dump()
+    payload["articles"] = []            # NPD request carries no article lines
+    payload["internal_override"] = False
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await requisition_service.create_requisition(
+            conn, payload=payload, user=user)
+
+
 @router.get("/requisitions")
 async def list_requisitions(
     request: Request,
     status: str | None = Query(None),
     sample_type: str | None = Query(None),
     warehouse: str | None = Query(None),
+    sample_types: str | None = Query(None, description="CSV of sample_type values (e.g. NPD,TRIAL)"),
+    statuses: str | None = Query(None, description="CSV of status values (e.g. DRAFT,SUBMITTED)"),
+    requestor: str | None = Query(None),
+    q: str | None = Query(None, description="Free-text search: number / request_id / target / description / requestor"),
+    date_from: date | None = Query(None),
+    date_to: date | None = Query(None),
     limit: int = Query(50, le=200),
     offset: int = Query(0, ge=0),
     user: AuthUser = Depends(require_permission("sample", action="view")),
 ):
+    types = [t for t in (sample_types.split(",") if sample_types else []) if t] or None
+    status_set = [s for s in (statuses.split(",") if statuses else []) if s] or None
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
         return await requisition_service.list_requisitions(
             conn, status=status, sample_type=sample_type, warehouse=warehouse,
-            limit=limit, offset=offset)
+            sample_types=types, statuses=status_set, requestor=requestor, q=q,
+            date_from=date_from, date_to=date_to, limit=limit, offset=offset)
+
+
+# NB: declared BEFORE /requisitions/{req_id} so "requestors" isn't parsed as an id.
+@router.get("/requisitions/requestors")
+async def list_requisition_requestors(
+    request: Request,
+    sample_types: str | None = Query(None, description="CSV of sample_type values"),
+    user: AuthUser = Depends(require_permission("sample", action="view")),
+):
+    """Distinct requestor labels for the queue's Requestor filter dropdown."""
+    types = [t for t in (sample_types.split(",") if sample_types else []) if t] or None
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await requisition_service.list_requestors(conn, sample_types=types)
 
 
 @router.get("/requisitions/{req_id}")
@@ -133,6 +217,21 @@ async def bh_approve(
     async with pool.acquire() as conn:
         return await approval_service.act_bh_approval(
             conn, req_id, action=body.action, user=user, remarks=body.remarks)
+
+
+@router.post("/requisitions/{req_id}/npd-review")
+async def npd_review(
+    request: Request,
+    req_id: int,
+    body: schemas.NpdReviewBody,
+    user: AuthUser = Depends(require_permission("sample", "npd", action="create")),
+):
+    """NPD team reviews a BH-sent request: approve / reject / hold (reason + hold start date)."""
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await approval_service.act_npd_review(
+            conn, req_id, action=body.action, user=user, reason=body.reason,
+            start_date=body.start_date)
 
 
 # ── Outward (Basis RM / Internal) ────────────────────────────────────────
@@ -384,6 +483,72 @@ async def cancel_dev_job_card(
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
         return await npd_dev_service.cancel_dev_job_card(conn, dev_jc_id, reason=body.reason, user=user)
+
+
+# ── Dev job-card trial phases (multi-day start/complete) ───────────────────
+@router.post("/npd-dev-job-cards/{dev_jc_id}/phases")
+async def add_dev_phase(
+    request: Request,
+    dev_jc_id: int,
+    body: schemas.DevPhaseCreate,
+    user: AuthUser = Depends(require_permission("sample", "npd", action="create")),
+):
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await npd_dev_service.add_phase(
+            conn, dev_jc_id, name=body.name,
+            clone_from_phase_id=body.clone_from_phase_id, user=user)
+
+
+@router.put("/npd-dev-job-cards/{dev_jc_id}/phases/{phase_id}/lines")
+async def replace_dev_phase_lines(
+    request: Request,
+    dev_jc_id: int,
+    phase_id: int,
+    body: schemas.NpdLinesReplace,
+    user: AuthUser = Depends(require_permission("sample", "npd", action="create")),
+):
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await npd_dev_service.replace_phase_lines(
+            conn, dev_jc_id, phase_id, lines=[ln.model_dump() for ln in body.lines], user=user)
+
+
+@router.delete("/npd-dev-job-cards/{dev_jc_id}/phases/{phase_id}")
+async def delete_dev_phase(
+    request: Request,
+    dev_jc_id: int,
+    phase_id: int,
+    user: AuthUser = Depends(require_permission("sample", "npd", action="create")),
+):
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await npd_dev_service.delete_phase(conn, dev_jc_id, phase_id, user=user)
+
+
+@router.post("/npd-dev-job-cards/{dev_jc_id}/phases/{phase_id}/start")
+async def start_dev_phase(
+    request: Request,
+    dev_jc_id: int,
+    phase_id: int,
+    user: AuthUser = Depends(require_permission("sample", "npd", action="create")),
+):
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await npd_dev_service.start_phase(conn, dev_jc_id, phase_id, user=user)
+
+
+@router.post("/npd-dev-job-cards/{dev_jc_id}/phases/{phase_id}/complete")
+async def complete_dev_phase(
+    request: Request,
+    dev_jc_id: int,
+    phase_id: int,
+    body: schemas.DevPhaseComplete,
+    user: AuthUser = Depends(require_permission("sample", "npd", action="create")),
+):
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await npd_dev_service.complete_phase(conn, dev_jc_id, phase_id, payload=body.model_dump(), user=user)
 
 
 # ── RM Issue / Collection Form (Document 015, §10) ─────────────────────────

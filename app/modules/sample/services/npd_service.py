@@ -143,14 +143,23 @@ async def promote_draft(conn, draft_id: int, *, user) -> dict:
             ORDER BY sequence_no DESC LIMIT 1""", req["id"])
 
     async with conn.transaction():
+        # Supersede any existing active BOM for this FG and mint the next version —
+        # only one active BOM per fg_sku_name is allowed (uq_bom_header_active_fg),
+        # so always inserting version 1 active would 500 on a repeated FG name.
+        fg_name = draft["fg_sku_name"] or f"NPD-{draft_id}"
+        entity = req.get("entity") or "cfpl"
+        await conn.execute(
+            "UPDATE bom_header SET is_active = FALSE WHERE fg_sku_name = $1 AND is_active = TRUE", fg_name)
+        next_ver = await conn.fetchval(
+            "SELECT COALESCE(MAX(version), 0) + 1 FROM bom_header WHERE fg_sku_name = $1", fg_name)
         new_bom_id = await conn.fetchval(
             """
             INSERT INTO bom_header (fg_sku_name, customer_name, version, is_active, entity, notes)
-            VALUES ($1, $2, 1, TRUE, $3, $4)
+            VALUES ($1, $2, $3, TRUE, $4, $5)
             RETURNING bom_id
             """,
-            draft["fg_sku_name"] or f"NPD-{draft_id}", None, req.get("entity") or "cfpl",
-            f"Promoted from NPD draft {draft_id} (requisition {req['requisition_number']})")
+            fg_name, None, next_ver, entity,
+            f"Promoted from NPD draft {draft_id} (requisition {req['requisition_number']}, v{next_ver})")
         for i, ln in enumerate(lines, 1):
             await conn.execute(
                 """

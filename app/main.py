@@ -3,6 +3,8 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import asyncpg
+
 import hmac as _hmac
 
 from fastapi import FastAPI, HTTPException, Request
@@ -41,6 +43,24 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 
+async def _wait_for_db(pool: asyncpg.Pool, *, attempts: int = 10, delay: float = 3.0) -> None:
+    """Tolerate a transient DNS/network blip at startup. The pool is lazy
+    (min_size=0), so the first real connect happens here — retry a lightweight
+    `SELECT 1` a few times before giving up, instead of crashing the whole boot
+    on a single failed DNS lookup (gaierror) or refused connection."""
+    for i in range(1, attempts + 1):
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute("SELECT 1")
+            return
+        except (OSError, asyncpg.PostgresError, asyncpg.InterfaceError) as e:
+            if i == attempts:
+                raise
+            logger.warning("DB unreachable at startup (attempt %d/%d): %s; retrying in %.0fs",
+                           i, attempts, e, delay)
+            await asyncio.sleep(delay)
+
+
 @asynccontextmanager
 async def lifespan(fastapi_app: FastAPI):
     settings = Settings()
@@ -49,6 +69,7 @@ async def lifespan(fastapi_app: FastAPI):
     pool = await create_pool(settings)
     fastapi_app.state.db_pool = pool
 
+    await _wait_for_db(pool)
     master_items = await load_master_items(pool)
     fastapi_app.state.master_items = master_items
 

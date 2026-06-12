@@ -17,14 +17,23 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import asyncpg
 from fastapi import HTTPException
 
+from app.core.helpers import new_short_time_id
 from app.modules.sample.services import npd_auth
 from app.modules.sample.services import sample_inventory_service as inv
 
 # Live BOMs minted on promotion carry the legal entity axis; the sample module
 # stays on 'cfpl' (the physical-warehouse axis lives only on sample tables).
 _BOM_ENTITY = "cfpl"
+
+# Customer + dispatch-planning columns shared by sample_requisitions and
+# npd_dev_job_cards — the card inherits them from the requisition it spawns.
+_DISPATCH_FIELDS = (
+    "company_name", "customer_name", "customer_contact", "customer_ship_to_address",
+    "mode_of_transport", "expected_dispatch_date", "confirmed_dispatch_date",
+)
 
 
 def _gen_dev_jc_number(seq_val: int) -> str:
@@ -41,16 +50,18 @@ async def _fetch(conn, dev_jc_id: int) -> dict:
     return dict(row)
 
 
-async def _insert_lines(conn, dev_jc_id: int, lines: list[dict]) -> None:
+async def _insert_lines(conn, dev_jc_id: int, lines: list[dict], *, phase_id=None) -> None:
+    """Insert recipe lines. phase_id IS NULL = the card base recipe; a phase_id
+    ties the lines to one trial phase's recipe."""
     for i, ln in enumerate(lines):
         await conn.execute(
             """
             INSERT INTO npd_dev_job_card_lines
-                (dev_jc_id, sku_id, sku_name, qty, uom, item_type,
+                (dev_jc_id, phase_id, sku_id, sku_name, qty, uom, item_type,
                  ownership, is_off_master, customer_lot_ref, received_qty, line_order, notes)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             """,
-            dev_jc_id, ln.get("sku_id"), ln["sku_name"], ln["qty"], ln["uom"], ln.get("item_type"),
+            dev_jc_id, phase_id, ln.get("sku_id"), ln["sku_name"], ln["qty"], ln["uom"], ln.get("item_type"),
             ln.get("ownership", "OWN"), ln.get("is_off_master", False),
             ln.get("customer_lot_ref"), ln.get("received_qty"),
             ln.get("line_order", i), ln.get("notes"))
@@ -63,17 +74,62 @@ async def create_dev_job_card(conn, *, payload: dict, user) -> dict:
     async with conn.transaction():
         seq = await conn.fetchval("SELECT nextval('seq_npd_dev_jc')")
         number = _gen_dev_jc_number(seq)
-        dev_jc_id = await conn.fetchval(
-            """
-            INSERT INTO npd_dev_job_cards
-                (dev_jc_number, title, description, warehouse, base_bom_id,
-                 fg_sku_id, fg_sku_name, target_qty, uom, status, created_by)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'DRAFT', $10)
-            RETURNING id
-            """,
-            number, payload["title"], payload.get("description"), payload.get("warehouse"),
-            base_bom_id, payload.get("fg_sku_id"), payload.get("fg_sku_name"),
-            payload.get("target_qty"), payload.get("uom"), user.user_id)
+        src_req = payload.get("source_requisition_id")
+        # Customer + dispatch planning is attached to the job card: inherit each
+        # field from the source requisition (the explicit payload value wins) so a
+        # card developed from a request carries its company / customer / dispatch
+        # plan automatically.
+        inherit_cols = _DISPATCH_FIELDS + ("pcs", "weight_per_piece")
+        cust = {k: payload.get(k) for k in inherit_cols}
+        if src_req:
+            rq = await conn.fetchrow(
+                f"SELECT {', '.join(inherit_cols)} FROM sample_requisitions WHERE id = $1",
+                src_req)
+            if rq:
+                for k in inherit_cols:
+                    if cust[k] is None:
+                        cust[k] = rq[k]
+        # id is an app-supplied 8-digit time-based BIGINT (new_short_time_id, the
+        # same handle pattern as request_id / job_card_id). It is the PK, so retry
+        # on the rare unique collision via a per-attempt savepoint.
+        dev_jc_id = None
+        for _attempt in range(5):
+            cand = new_short_time_id()
+            try:
+                async with conn.transaction():
+                    await conn.execute(
+                        """
+                        INSERT INTO npd_dev_job_cards
+                            (id, dev_jc_number, title, description, warehouse, base_bom_id,
+                             fg_sku_id, fg_sku_name, target_qty, uom, source_requisition_id,
+                             company_name, customer_name, customer_contact, customer_ship_to_address,
+                             mode_of_transport, expected_dispatch_date, confirmed_dispatch_date,
+                             pcs, weight_per_piece,
+                             status, created_by)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                                $12, $13, $14, $15, $16, $17, $18, $19, $20, 'DRAFT', $21)
+                        """,
+                        cand, number, payload["title"], payload.get("description"),
+                        payload.get("warehouse"), base_bom_id, payload.get("fg_sku_id"),
+                        payload.get("fg_sku_name"), payload.get("target_qty"),
+                        payload.get("uom"), src_req,
+                        cust["company_name"], cust["customer_name"], cust["customer_contact"],
+                        cust["customer_ship_to_address"], cust["mode_of_transport"],
+                        cust["expected_dispatch_date"], cust["confirmed_dispatch_date"],
+                        cust["pcs"], cust["weight_per_piece"],
+                        user.user_id)
+                dev_jc_id = cand
+                break
+            except asyncpg.UniqueViolationError:
+                if _attempt == 4:
+                    raise
+
+        # Back-link the request so its detail/list shows "Open" (to this card)
+        # instead of "Develop". Soft link — no FK; the dev-jc track stays decoupled.
+        if src_req:
+            await conn.execute(
+                "UPDATE sample_requisitions SET linked_dev_jc_id = $1, updated_at = NOW() WHERE id = $2",
+                dev_jc_id, src_req)
 
         if payload.get("clone_from_base") and base_bom_id:
             base_lines = await conn.fetch(
@@ -90,9 +146,22 @@ async def create_dev_job_card(conn, *, payload: dict, user) -> dict:
 
 async def get_dev_job_card(conn, dev_jc_id: int) -> dict:
     jc = await _fetch(conn, dev_jc_id)
-    lines = await conn.fetch(
-        "SELECT * FROM npd_dev_job_card_lines WHERE dev_jc_id = $1 ORDER BY line_order, id", dev_jc_id)
-    jc["lines"] = [dict(r) for r in lines]
+    all_lines = [dict(r) for r in await conn.fetch(
+        "SELECT * FROM npd_dev_job_card_lines WHERE dev_jc_id = $1 ORDER BY line_order, id", dev_jc_id)]
+    # Card base recipe = lines with no phase; each phase carries its own recipe.
+    jc["lines"] = [l for l in all_lines if l.get("phase_id") is None]
+    # Open phases at the top (the active one first), completed phases at the
+    # bottom: IN_PROGRESS -> PENDING -> COMPLETED, then by phase_number.
+    phases = [dict(r) for r in await conn.fetch(
+        """SELECT * FROM npd_dev_job_card_phases WHERE dev_jc_id = $1
+            ORDER BY CASE status
+                       WHEN 'IN_PROGRESS' THEN 0
+                       WHEN 'PENDING' THEN 1
+                       ELSE 2 END,
+                     phase_number""", dev_jc_id)]
+    for ph in phases:
+        ph["lines"] = [l for l in all_lines if l.get("phase_id") == ph["phase_id"]]
+    jc["phases"] = phases
     # Resolve the base BOM's FG name for the detail header (lineage clarity).
     jc["base_bom_name"] = (
         await conn.fetchval("SELECT fg_sku_name FROM bom_header WHERE bom_id = $1", jc["base_bom_id"])
@@ -216,15 +285,19 @@ async def get_bom_lines(conn, bom_id: int) -> list[dict]:
 
 
 async def replace_lines(conn, dev_jc_id: int, *, lines: list[dict], user) -> dict:
+    """Replace the card BASE recipe (phase_id IS NULL) — the starting point the
+    first phase clones. Editable while the card is DRAFT or IN_DEVELOPMENT (same
+    rule as the per-phase recipes). Per-phase recipes use replace_phase_lines."""
     jc = await _fetch(conn, dev_jc_id)
-    if jc["status"] != "DRAFT":
+    if jc["status"] not in ("DRAFT", "IN_DEVELOPMENT"):
         raise HTTPException(409, detail={"error": "not_editable",
-                                         "message": "Recipe lines can only be edited while the job card is a DRAFT",
+                                         "message": "The base recipe is editable while the card is a DRAFT or IN_DEVELOPMENT",
                                          "details": {"status": jc["status"]}})
     await npd_auth.require_npd_authorized(conn, user, "AUTHOR")
     async with conn.transaction():
-        await conn.execute("DELETE FROM npd_dev_job_card_lines WHERE dev_jc_id = $1", dev_jc_id)
-        await _insert_lines(conn, dev_jc_id, lines)
+        await conn.execute(
+            "DELETE FROM npd_dev_job_card_lines WHERE dev_jc_id = $1 AND phase_id IS NULL", dev_jc_id)
+        await _insert_lines(conn, dev_jc_id, lines, phase_id=None)
         await conn.execute("UPDATE npd_dev_job_cards SET updated_at = NOW() WHERE id = $1", dev_jc_id)
     return await get_dev_job_card(conn, dev_jc_id)
 
@@ -251,6 +324,168 @@ async def start_development(conn, dev_jc_id: int, *, user) -> dict:
     return await get_dev_job_card(conn, dev_jc_id)
 
 
+# ---------------------------------------------------------------------------
+# Trial phases (multi-day) — operator-defined, started/completed independently.
+# Mirrors the production job_card_process_step lifecycle (PENDING -> IN_PROGRESS
+# -> COMPLETED). Phases live inside the card's IN_DEVELOPMENT state.
+# ---------------------------------------------------------------------------
+async def _fetch_phase(conn, dev_jc_id: int, phase_id: int) -> dict:
+    row = await conn.fetchrow(
+        "SELECT * FROM npd_dev_job_card_phases WHERE phase_id = $1 AND dev_jc_id = $2",
+        phase_id, dev_jc_id)
+    if not row:
+        raise HTTPException(404, detail={"error": "not_found",
+                                         "message": f"Phase {phase_id} not found on this job card",
+                                         "details": {"phase_id": phase_id, "dev_jc_id": dev_jc_id}})
+    return dict(row)
+
+
+async def add_phase(conn, dev_jc_id: int, *, name: str, clone_from_phase_id=None, user) -> dict:
+    """Add a trial phase, cloning a recipe as its starting point. Source order:
+    the given clone_from_phase_id, else the latest existing phase, else the card
+    base recipe. Allowed while DRAFT (planning) or IN_DEVELOPMENT."""
+    jc = await _fetch(conn, dev_jc_id)
+    if jc["status"] not in ("DRAFT", "IN_DEVELOPMENT"):
+        raise HTTPException(409, detail={"error": "wrong_status",
+                                         "message": "Phases can be added only while the card is a DRAFT or IN_DEVELOPMENT",
+                                         "details": {"status": jc["status"]}})
+    await npd_auth.require_npd_authorized(conn, user, "AUTHOR")
+    async with conn.transaction():
+        n = await conn.fetchval(
+            "SELECT COALESCE(MAX(phase_number), 0) + 1 FROM npd_dev_job_card_phases WHERE dev_jc_id = $1",
+            dev_jc_id)
+        # Resolve the recipe to clone: explicit phase, else the latest phase.
+        src_phase = clone_from_phase_id
+        if src_phase is None:
+            src_phase = await conn.fetchval(
+                "SELECT phase_id FROM npd_dev_job_card_phases WHERE dev_jc_id = $1 "
+                "ORDER BY phase_number DESC LIMIT 1", dev_jc_id)
+        if src_phase is not None:
+            src_lines = await conn.fetch(
+                "SELECT * FROM npd_dev_job_card_lines WHERE dev_jc_id = $1 AND phase_id = $2 "
+                "ORDER BY line_order, id", dev_jc_id, src_phase)
+        else:  # first phase → clone the card base recipe
+            src_lines = await conn.fetch(
+                "SELECT * FROM npd_dev_job_card_lines WHERE dev_jc_id = $1 AND phase_id IS NULL "
+                "ORDER BY line_order, id", dev_jc_id)
+        # phase_id is an app-supplied 8-digit time-based BIGINT (new_short_time_id),
+        # the same handle pattern as the job-card id. Retry on the rare collision.
+        new_phase_id = None
+        for _attempt in range(5):
+            cand = new_short_time_id()
+            try:
+                async with conn.transaction():
+                    await conn.execute(
+                        "INSERT INTO npd_dev_job_card_phases (phase_id, dev_jc_id, phase_number, name) "
+                        "VALUES ($1, $2, $3, $4)",
+                        cand, dev_jc_id, n, name.strip())
+                new_phase_id = cand
+                break
+            except asyncpg.UniqueViolationError:
+                if _attempt == 4:
+                    raise
+        if src_lines:
+            await _insert_lines(conn, dev_jc_id, [dict(r) for r in src_lines], phase_id=new_phase_id)
+        await conn.execute("UPDATE npd_dev_job_cards SET updated_at = NOW() WHERE id = $1", dev_jc_id)
+    return await get_dev_job_card(conn, dev_jc_id)
+
+
+async def replace_phase_lines(conn, dev_jc_id: int, phase_id: int, *, lines: list[dict], user) -> dict:
+    """Replace one phase's recipe (its own independent formulation). Editable while
+    the card is DRAFT or IN_DEVELOPMENT and the phase is not yet COMPLETED."""
+    jc = await _fetch(conn, dev_jc_id)
+    if jc["status"] not in ("DRAFT", "IN_DEVELOPMENT"):
+        raise HTTPException(409, detail={"error": "not_editable",
+                                         "message": "Phase recipes are editable while the card is a DRAFT or IN_DEVELOPMENT",
+                                         "details": {"status": jc["status"]}})
+    await npd_auth.require_npd_authorized(conn, user, "AUTHOR")
+    ph = await _fetch_phase(conn, dev_jc_id, phase_id)
+    if ph["status"] == "COMPLETED":
+        raise HTTPException(409, detail={"error": "phase_completed",
+                                         "message": "A completed phase's recipe can no longer be edited",
+                                         "details": {"phase_id": phase_id}})
+    async with conn.transaction():
+        await conn.execute(
+            "DELETE FROM npd_dev_job_card_lines WHERE dev_jc_id = $1 AND phase_id = $2", dev_jc_id, phase_id)
+        await _insert_lines(conn, dev_jc_id, lines, phase_id=phase_id)
+        await conn.execute("UPDATE npd_dev_job_cards SET updated_at = NOW() WHERE id = $1", dev_jc_id)
+    return await get_dev_job_card(conn, dev_jc_id)
+
+
+async def start_phase(conn, dev_jc_id: int, phase_id: int, *, user) -> dict:
+    """PENDING -> IN_PROGRESS. The card must be IN_DEVELOPMENT (the trial is running)."""
+    jc = await _fetch(conn, dev_jc_id)
+    if jc["status"] != "IN_DEVELOPMENT":
+        raise HTTPException(409, detail={"error": "wrong_status",
+                                         "message": "Start development before running phases",
+                                         "details": {"status": jc["status"]}})
+    await npd_auth.require_npd_authorized(conn, user, "AUTHOR")
+    ph = await _fetch_phase(conn, dev_jc_id, phase_id)
+    if ph["status"] != "PENDING":
+        raise HTTPException(409, detail={"error": "wrong_phase_status",
+                                         "message": "Only a PENDING phase can be started",
+                                         "details": {"status": ph["status"]}})
+    await conn.execute(
+        """UPDATE npd_dev_job_card_phases
+              SET status = 'IN_PROGRESS', started_at = NOW(), started_by = $1
+            WHERE phase_id = $2""",
+        user.user_id, phase_id)
+    await conn.execute("UPDATE npd_dev_job_cards SET updated_at = NOW() WHERE id = $1", dev_jc_id)
+    return await get_dev_job_card(conn, dev_jc_id)
+
+
+async def complete_phase(conn, dev_jc_id: int, phase_id: int, *, payload=None, user) -> dict:
+    """IN_PROGRESS -> COMPLETED, recording the phase's output + material accounting.
+    yield_pct is derived from output / RM consumed (same rule as the card close)."""
+    payload = payload or {}
+    jc = await _fetch(conn, dev_jc_id)
+    if jc["status"] != "IN_DEVELOPMENT":
+        raise HTTPException(409, detail={"error": "wrong_status",
+                                         "message": "Phases can only be completed while the card is IN_DEVELOPMENT",
+                                         "details": {"status": jc["status"]}})
+    await npd_auth.require_npd_authorized(conn, user, "AUTHOR")
+    ph = await _fetch_phase(conn, dev_jc_id, phase_id)
+    if ph["status"] != "IN_PROGRESS":
+        raise HTTPException(409, detail={"error": "wrong_phase_status",
+                                         "message": "Only an IN_PROGRESS phase can be completed",
+                                         "details": {"status": ph["status"]}})
+    out_qty = payload.get("output_qty")
+    rm = payload.get("rm_consumed_qty")
+    yield_pct = None
+    if out_qty is not None and rm not in (None, 0) and float(rm) > 0:
+        yield_pct = round(float(out_qty) / float(rm) * 100, 2)
+    await conn.execute(
+        """UPDATE npd_dev_job_card_phases
+              SET status = 'COMPLETED', completed_at = NOW(), completed_by = $1,
+                  output_qty = $2, output_uom = $3, rm_consumed_qty = $4,
+                  wastage_qty = $5, extra_give_away_qty = $6, yield_pct = $7,
+                  notes = COALESCE($8, notes)
+            WHERE phase_id = $9""",
+        user.user_id, out_qty, payload.get("output_uom"), rm,
+        payload.get("wastage_qty"), payload.get("extra_give_away_qty"), yield_pct,
+        payload.get("notes"), phase_id)
+    await conn.execute("UPDATE npd_dev_job_cards SET updated_at = NOW() WHERE id = $1", dev_jc_id)
+    return await get_dev_job_card(conn, dev_jc_id)
+
+
+async def delete_phase(conn, dev_jc_id: int, phase_id: int, *, user) -> dict:
+    """Delete a trial phase and its recipe lines (npd_dev_job_card_lines.phase_id is
+    ON DELETE CASCADE). Allowed while the card is a DRAFT or IN_DEVELOPMENT."""
+    jc = await _fetch(conn, dev_jc_id)
+    if jc["status"] not in ("DRAFT", "IN_DEVELOPMENT"):
+        raise HTTPException(409, detail={"error": "wrong_status",
+                                         "message": "Phases can be deleted only while the card is a DRAFT or IN_DEVELOPMENT",
+                                         "details": {"status": jc["status"]}})
+    await npd_auth.require_npd_authorized(conn, user, "AUTHOR")
+    await _fetch_phase(conn, dev_jc_id, phase_id)   # 404 if not on this card
+    async with conn.transaction():
+        await conn.execute(
+            "DELETE FROM npd_dev_job_card_phases WHERE phase_id = $1 AND dev_jc_id = $2",
+            phase_id, dev_jc_id)
+        await conn.execute("UPDATE npd_dev_job_cards SET updated_at = NOW() WHERE id = $1", dev_jc_id)
+    return await get_dev_job_card(conn, dev_jc_id)
+
+
 async def close_dev_job_card(conn, dev_jc_id: int, *, payload: dict, user) -> dict:
     """IN_DEVELOPMENT -> CLOSED: record the trial output AND promote the recipe
     into a live bom_header + bom_line. Returns the closed job card with its
@@ -262,33 +497,78 @@ async def close_dev_job_card(conn, dev_jc_id: int, *, payload: dict, user) -> di
                                          "details": {"status": jc["status"]}})
     # Close both records output and promotes the recipe → gate on CLOSE.
     await npd_auth.require_npd_authorized(conn, user, "CLOSE")
-    lines = await conn.fetch(
-        "SELECT * FROM npd_dev_job_card_lines WHERE dev_jc_id = $1 ORDER BY line_order, id", dev_jc_id)
-    if not lines:
-        raise HTTPException(422, detail={"error": "empty_recipe",
-                                         "message": "Cannot close — the development recipe has no lines to promote",
-                                         "details": {"id": dev_jc_id}})
+    # Promote the recipe of the operator-chosen FINAL-TRIAL phase; fall back to
+    # the card base recipe (phase_id IS NULL) when no phase is given (a legacy /
+    # no-phase card). When a phase is chosen the card's output + accounting are
+    # INHERITED from that phase (already recorded when it was completed) — the
+    # close is a "pick the final trial and finish" step, not a second accounting
+    # entry. The card-level payload accounting is only used for no-phase cards.
+    promote_phase_id = payload.get("promote_phase_id")
+    phase = None
+    if promote_phase_id is not None:
+        phase = await _fetch_phase(conn, dev_jc_id, promote_phase_id)   # 404 if not on this card
+        lines = await conn.fetch(
+            "SELECT * FROM npd_dev_job_card_lines WHERE dev_jc_id = $1 AND phase_id = $2 "
+            "ORDER BY line_order, id", dev_jc_id, promote_phase_id)
+        if not lines:
+            raise HTTPException(422, detail={"error": "empty_recipe",
+                                             "message": "The chosen phase has no recipe lines to promote",
+                                             "details": {"phase_id": promote_phase_id}})
+    else:
+        lines = await conn.fetch(
+            "SELECT * FROM npd_dev_job_card_lines WHERE dev_jc_id = $1 AND phase_id IS NULL "
+            "ORDER BY line_order, id", dev_jc_id)
+        if not lines:
+            raise HTTPException(422, detail={"error": "empty_recipe",
+                                             "message": "Cannot close — pick a phase whose recipe to promote",
+                                             "details": {"id": dev_jc_id}})
 
     fg_name = jc["fg_sku_name"] or jc["title"]
-    out_qty = payload.get("output_qty")
-    rm_consumed = payload.get("rm_consumed_qty")
-    # Auto yield % = FG output / RM consumed × 100 (the job-card material-balance
-    # yield). Falls back to any explicitly-provided yield_pct when RM consumed is
-    # absent/zero.
-    yield_pct = payload.get("yield_pct")
-    if out_qty is not None and rm_consumed not in (None, 0) and float(rm_consumed) > 0:
-        yield_pct = round(float(out_qty) / float(rm_consumed) * 100, 2)
+    if phase is not None:
+        # Inherit the final-trial phase's recorded output + accounting verbatim.
+        out_qty = phase["output_qty"]
+        out_uom = phase["output_uom"]
+        rm_consumed = phase["rm_consumed_qty"]
+        wastage = phase["wastage_qty"]
+        ega = phase["extra_give_away_qty"]
+        yield_pct = phase["yield_pct"]
+    else:
+        # Legacy no-phase card — accounting comes from the payload. Auto yield % =
+        # FG output / RM consumed × 100; falls back to the supplied yield_pct.
+        out_qty = payload.get("output_qty")
+        out_uom = payload.get("output_uom")
+        rm_consumed = payload.get("rm_consumed_qty")
+        wastage = payload.get("wastage_qty")
+        ega = payload.get("extra_give_away_qty")
+        yield_pct = payload.get("yield_pct")
+        if out_qty is not None and rm_consumed not in (None, 0) and float(rm_consumed) > 0:
+            yield_pct = round(float(out_qty) / float(rm_consumed) * 100, 2)
+    out_notes = payload.get("output_notes")
     async with conn.transaction():
-        # Promote the trial recipe into a live BOM (mirrors npd_service.promote_draft
-        # minus the requisition BH gate — there is no requisition here).
-        new_bom_id = await conn.fetchval(
-            """
-            INSERT INTO bom_header (fg_sku_name, version, is_active, entity, notes)
-            VALUES ($1, 1, TRUE, $2, $3)
-            RETURNING bom_id
-            """,
-            fg_name, _BOM_ENTITY,
-            f"Promoted from NPD development job card {jc['dev_jc_number']}")
+        # Promote the trial recipe into a live BOM. Only ONE active BOM is allowed
+        # per fg_sku_name (uq_bom_header_active_fg), and (fg_sku_name, version) is
+        # unique among active rows — so supersede any existing active BOM for this
+        # FG and mint the NEXT version, rather than always inserting version 1
+        # (which 500'd with a UniqueViolation on a repeated FG name).
+        await conn.execute(
+            "UPDATE bom_header SET is_active = FALSE WHERE fg_sku_name = $1 AND is_active = TRUE", fg_name)
+        next_ver = await conn.fetchval(
+            "SELECT COALESCE(MAX(version), 0) + 1 FROM bom_header WHERE fg_sku_name = $1", fg_name)
+        try:
+            new_bom_id = await conn.fetchval(
+                """
+                INSERT INTO bom_header (fg_sku_name, version, is_active, entity, notes)
+                VALUES ($1, $2, TRUE, $3, $4)
+                RETURNING bom_id
+                """,
+                fg_name, next_ver, _BOM_ENTITY,
+                f"Promoted from NPD development job card {jc['dev_jc_number']} (v{next_ver})")
+        except asyncpg.UniqueViolationError as e:
+            raise HTTPException(409, detail={
+                "error": "bom_conflict",
+                "message": f"Couldn't promote — a live BOM for '{fg_name}' already exists. "
+                           "Rename the target product or deactivate the existing BOM.",
+                "details": {"fg_sku_name": fg_name}}) from e
         for i, ln in enumerate(lines, 1):
             await conn.execute(
                 """
@@ -305,7 +585,7 @@ async def close_dev_job_card(conn, dev_jc_id: int, *, payload: dict, user) -> di
             recv = await inv.receive_fg_sample(
                 conn, sku_name=fg_name, qty_kg=float(out_qty),
                 reference_type="NPD_DEV_JC", reference_id=dev_jc_id, entity=_BOM_ENTITY,
-                uom=(payload.get("output_uom") or jc["uom"] or "kg"),
+                uom=(out_uom or jc["uom"] or "kg"),
                 lot_number=jc["dev_jc_number"], user=user)
             fg_batch_id = recv["batch_id"]
 
@@ -316,14 +596,20 @@ async def close_dev_job_card(conn, dev_jc_id: int, *, payload: dict, user) -> di
                    output_qty = $2, output_uom = $3, yield_pct = $4, output_notes = $5,
                    rm_consumed_qty = $6, wastage_qty = $7, extra_give_away_qty = $8,
                    fg_sample_batch_id = $9,
+                   -- Confirmed dispatch date (By NPD) = the job card's closing date.
+                   confirmed_dispatch_date = CURRENT_DATE,
                    closed_by = $10, closed_at = NOW(), updated_at = NOW()
              WHERE id = $11
             """,
-            new_bom_id, payload.get("output_qty"), payload.get("output_uom"),
-            yield_pct, payload.get("output_notes"),
-            payload.get("rm_consumed_qty"), payload.get("wastage_qty"),
-            payload.get("extra_give_away_qty"), fg_batch_id,
+            new_bom_id, out_qty, out_uom, yield_pct, out_notes,
+            rm_consumed, wastage, ega, fg_batch_id,
             user.user_id, dev_jc_id)
+        # Mirror the confirmed dispatch date onto the source requisition so its
+        # view reflects the NPD-confirmed dispatch once the trial is closed.
+        if jc.get("source_requisition_id"):
+            await conn.execute(
+                "UPDATE sample_requisitions SET confirmed_dispatch_date = CURRENT_DATE, "
+                "updated_at = NOW() WHERE id = $1", jc["source_requisition_id"])
     return await get_dev_job_card(conn, dev_jc_id)
 
 

@@ -156,7 +156,8 @@ async def fetch_counts(conn: asyncpg.Connection) -> dict:
         await conn.fetchval("SELECT COUNT(*) FROM job_card    WHERE created_at > $1", c)
         + await conn.fetchval("SELECT COUNT(*) FROM job_card_v2 WHERE created_at > $1", c)
     )
-    out["jc_completed"] = (
+    # Terminal completions (status reached completed/closed).
+    out["jc_terminal"] = (
         await conn.fetchval(
             "SELECT COUNT(*) FROM job_card    WHERE created_at > $1 AND status = 'completed'", c
         )
@@ -164,6 +165,25 @@ async def fetch_counts(conn: asyncpg.Connection) -> dict:
             "SELECT COUNT(*) FROM job_card_v2 WHERE created_at > $1 AND status IN ('completed','closed')", c
         )
     )
+    # "Filled but stuck": production output was recorded but the JC never
+    # reached a terminal status — typically blocked by the completion gate
+    # (R9 unbalanced accounting / open batch). These are effectively done.
+    out["jc_stuck"] = (
+        await conn.fetchval(
+            """SELECT COUNT(*) FROM job_card jc
+               WHERE created_at > $1 AND status <> 'completed'
+                 AND EXISTS (SELECT 1 FROM job_card_output o WHERE o.job_card_id = jc.job_card_id)""",
+            c,
+        )
+        + await conn.fetchval(
+            """SELECT COUNT(*) FROM job_card_v2 jc
+               WHERE created_at > $1 AND status NOT IN ('completed','closed')
+                 AND EXISTS (SELECT 1 FROM job_card_output_v2 o WHERE o.job_card_id = jc.job_card_id)""",
+            c,
+        )
+    )
+    # Effective complete = terminal + filled-but-stuck.
+    out["jc_completed"] = out["jc_terminal"] + out["jc_stuck"]
 
     # --- Production-order status breakdown -------------------------------
     rows = await conn.fetch(
@@ -312,17 +332,19 @@ async def fetch_pivot_rows(conn: asyncpg.Connection):
     rows = await conn.fetch(
         """
         WITH jc AS (
-            SELECT job_card_id, floor, fg_sku_name, stage, status,
-                   COALESCE(batch_size_kg,0)::numeric kg,
-                   'v1' src
-              FROM job_card
-             WHERE created_at > $1
+            SELECT j.job_card_id, j.floor, j.fg_sku_name, j.stage, j.status,
+                   COALESCE(j.batch_size_kg,0)::numeric kg,
+                   'v1' src,
+                   EXISTS (SELECT 1 FROM job_card_output o WHERE o.job_card_id = j.job_card_id) AS has_output
+              FROM job_card j
+             WHERE j.created_at > $1
             UNION ALL
-            SELECT job_card_id, floor, fg_sku_name, stage, status,
-                   COALESCE(planned_qty_kg,0)::numeric kg,
-                   'v2' src
-              FROM job_card_v2
-             WHERE created_at > $1
+            SELECT j.job_card_id, j.floor, j.fg_sku_name, j.stage, j.status,
+                   COALESCE(j.planned_qty_kg,0)::numeric kg,
+                   'v2' src,
+                   EXISTS (SELECT 1 FROM job_card_output_v2 o WHERE o.job_card_id = j.job_card_id) AS has_output
+              FROM job_card_v2 j
+             WHERE j.created_at > $1
         ),
         loss AS (
             SELECT src, job_card_id, SUM(loss_qty) loss_kg FROM (
@@ -335,7 +357,7 @@ async def fetch_pivot_rows(conn: asyncpg.Connection):
                  WHERE loss_category = 'total_loss' AND deleted_at IS NULL
             ) t GROUP BY 1, 2
         )
-        SELECT jc.floor, jc.fg_sku_name, jc.stage, jc.status, jc.kg,
+        SELECT jc.floor, jc.fg_sku_name, jc.stage, jc.status, jc.has_output, jc.kg,
                COALESCE(loss.loss_kg, 0) AS loss_kg
           FROM jc
           LEFT JOIN loss ON loss.src = jc.src AND loss.job_card_id = jc.job_card_id
@@ -356,13 +378,15 @@ async def fetch_weekly(conn: asyncpg.Connection):
     jc = await conn.fetch(
         """
         WITH jc AS (
-            SELECT date_trunc('week', created_at AT TIME ZONE 'UTC') AS wk, status,
-                   COALESCE(batch_size_kg,0)::numeric AS kg, job_card_id, 'v1' src
-              FROM job_card
+            SELECT date_trunc('week', j.created_at AT TIME ZONE 'UTC') AS wk, j.status,
+                   COALESCE(j.batch_size_kg,0)::numeric AS kg, j.job_card_id, 'v1' src,
+                   EXISTS (SELECT 1 FROM job_card_output o WHERE o.job_card_id = j.job_card_id) AS has_output
+              FROM job_card j
             UNION ALL
-            SELECT date_trunc('week', created_at AT TIME ZONE 'UTC') AS wk, status,
-                   COALESCE(planned_qty_kg,0)::numeric AS kg, job_card_id, 'v2' src
-              FROM job_card_v2
+            SELECT date_trunc('week', j.created_at AT TIME ZONE 'UTC') AS wk, j.status,
+                   COALESCE(j.planned_qty_kg,0)::numeric AS kg, j.job_card_id, 'v2' src,
+                   EXISTS (SELECT 1 FROM job_card_output_v2 o WHERE o.job_card_id = j.job_card_id) AS has_output
+              FROM job_card_v2 j
         ),
         loss AS (
             SELECT 'v1' src, job_card_id, COALESCE(SUM(actual_loss_kg),0)::numeric loss_kg
@@ -375,7 +399,8 @@ async def fetch_weekly(conn: asyncpg.Connection):
         )
         SELECT jc.wk,
                COUNT(*) AS jc_count,
-               COUNT(*) FILTER (WHERE jc.status IN ('completed','closed')) AS jc_done,
+               COUNT(*) FILTER (WHERE jc.status IN ('completed','closed')) AS jc_compl,
+               COUNT(*) FILTER (WHERE jc.status NOT IN ('completed','closed') AND jc.has_output) AS jc_stuck,
                COALESCE(SUM(jc.kg),0) AS kg,
                COALESCE(SUM(l.loss_kg),0) AS loss_kg
           FROM jc LEFT JOIN loss l ON l.src=jc.src AND l.job_card_id=jc.job_card_id
@@ -431,10 +456,14 @@ async def fetch_weekly(conn: asyncpg.Connection):
     summary = []
     for wk in all_weeks:
         r = jc_map.get(wk)
+        compl = int(r["jc_compl"]) if r else 0
+        stuck = int(r["jc_stuck"]) if r else 0
         summary.append({
             "wk": wk,
             "jc_count": int(r["jc_count"]) if r else 0,
-            "jc_done": int(r["jc_done"]) if r else 0,
+            "jc_compl": compl,
+            "jc_stuck": stuck,
+            "jc_done": compl + stuck,
             "kg": float(r["kg"] or 0) if r else 0.0,
             "loss_kg": float(r["loss_kg"] or 0) if r else 0.0,
             "po": po.get(wk, 0),
@@ -466,26 +495,28 @@ async def fetch_weekly(conn: asyncpg.Connection):
 
 
 def build_weekly_summary(summary):
-    header = ["Week (Mon)", "JCs", "Now done", "Prod ord", "Plan hdr",
-              "Plan ln", "RM ind", "Batch kg", "Loss kg"]
+    header = ["Week (Mon)", "JCs", "Compl", "Stuck*", "Done", "Prod ord",
+              "Plan hdr", "Plan ln", "RM ind", "Batch kg", "Loss kg"]
+    widths = [26*mm, 13*mm, 14*mm, 14*mm, 13*mm, 16*mm, 15*mm, 14*mm, 14*mm, 22*mm, 20*mm]
     body = []
-    tot = {"jc_count": 0, "jc_done": 0, "po": 0, "ph": 0, "pl": 0, "rm": 0, "kg": 0.0, "loss_kg": 0.0}
+    tot = {"jc_count": 0, "jc_compl": 0, "jc_stuck": 0, "jc_done": 0,
+           "po": 0, "ph": 0, "pl": 0, "rm": 0, "kg": 0.0, "loss_kg": 0.0}
     for r in summary:
         body.append([
             r["wk"].strftime("%Y-%m-%d"),
-            r["jc_count"], r["jc_done"], r["po"], r["ph"], r["pl"], r["rm"],
+            r["jc_count"], r["jc_compl"], r["jc_stuck"], r["jc_done"],
+            r["po"], r["ph"], r["pl"], r["rm"],
             fmt_kg(r["kg"]), fmt_kg(r["loss_kg"]),
         ])
         for k in tot:
             tot[k] += r[k]
+    if not summary:
+        return build_grid_table(header, [["(no rows)"] + ["0"] * 10], widths)
     body.append([
-        "TOTAL", tot["jc_count"], tot["jc_done"], tot["po"], tot["ph"],
-        tot["pl"], tot["rm"], fmt_kg(tot["kg"]), fmt_kg(tot["loss_kg"]),
+        "TOTAL", tot["jc_count"], tot["jc_compl"], tot["jc_stuck"], tot["jc_done"],
+        tot["po"], tot["ph"], tot["pl"], tot["rm"],
+        fmt_kg(tot["kg"]), fmt_kg(tot["loss_kg"]),
     ])
-    if len(body) == 1:  # no data rows, only the would-be total
-        body = [["(no rows)"] + ["0"] * 8]
-        return build_grid_table(header, body, [30*mm, 14*mm, 16*mm, 18*mm, 16*mm, 16*mm, 16*mm, 24*mm, 22*mm])
-    widths = [30*mm, 14*mm, 16*mm, 18*mm, 16*mm, 16*mm, 16*mm, 24*mm, 22*mm]
     return build_grid_table(header, body, widths, left_cols=(0,), total_row=True)
 
 
@@ -521,7 +552,7 @@ def build_kpi_tiles(counts: dict):
     plan_total = (counts["plan_headers_v1"] + counts["plan_headers_v2"]
                   + counts["plan_lines_v1"]  + counts["plan_lines_v2"])
     cells = [
-        ["Plans + plan lines", "Production orders", "Job cards (all)", "Job cards complete"],
+        ["Plans + plan lines", "Production orders", "Job cards (all)", "JC complete (effective)*"],
         [str(plan_total), str(counts["prod_orders"]), str(counts["jc_total"]), str(counts["jc_completed"])],
     ]
     tbl = Table(cells, colWidths=[65*mm]*4, rowHeights=[8*mm, 20*mm])
@@ -594,6 +625,20 @@ def build_jc_status_table(counts):
     return small_table(["Status", "Rows", "% of total"], body, [30*mm, 11*mm, 19*mm])
 
 
+def build_completion_view(counts):
+    """Effective-completion view: terminal + filled-but-stuck = effective."""
+    total = counts["jc_total"] or 1
+    term = counts["jc_terminal"]
+    stuck = counts["jc_stuck"]
+    eff = counts["jc_completed"]
+    body = [
+        ["Completed / closed", str(term),  f"{term/total*100:.1f}%"],
+        ["Filled but stuck*",  str(stuck), f"{stuck/total*100:.1f}%"],
+        ["Effective complete", str(eff),   f"{eff/total*100:.1f}%"],
+    ]
+    return small_table(["Completion view", "JCs", "% all"], body, [30*mm, 11*mm, 19*mm])
+
+
 def build_detail_table(counts):
     body = [[lbl, str(n), fmt_dt(latest)] for (lbl, n, latest) in counts["details"]]
     return small_table(["Table", "Rows", "Latest"], body, [30*mm, 11*mm, 19*mm])
@@ -626,14 +671,21 @@ def build_loss_table(rows):
 
 
 def build_pivot(pivot_rows):
-    """Floor x Article: closed JC count by stage, plus summary columns."""
+    """Floor x Article: done JC count by stage, plus summary columns.
+
+    "Done" = effectively complete: a terminal status (completed/closed) OR a
+    JC that has recorded production output but is stuck short of completion
+    (the completion-gate error). Stuck JCs no longer count as in-progress.
+    """
     closed_set = {"completed", "closed"}
     inprog_set = {"in_progress", "material_received", "assigned"}
 
-    # Discover the union of stages that have at least one closed JC.
+    def is_done(r):
+        return (r["status"] or "").lower() in closed_set or r["has_output"]
+
+    # Discover the union of stages that have at least one done JC.
     stages_with_closed = sorted({
-        r["stage"] for r in pivot_rows
-        if (r["status"] or "").lower() in closed_set and r["stage"]
+        r["stage"] for r in pivot_rows if is_done(r) and r["stage"]
     })
 
     keys = {}
@@ -645,7 +697,7 @@ def build_pivot(pivot_rows):
             "total": 0, "kg": 0.0, "loss_kg": 0.0,
         })
         st = (r["status"] or "").lower()
-        if st in closed_set:
+        if is_done(r):
             rec["closed"] += 1
             if r["stage"]:
                 rec["stage_closed"][r["stage"]] += 1
@@ -664,7 +716,7 @@ def build_pivot(pivot_rows):
     # Sort: floor asc, then fg_sku asc.
     sorted_keys = sorted(visible.items(), key=lambda kv: (kv[0][0], kv[0][1]))
 
-    header = ["Floor", "FG SKU"] + stages_with_closed + ["Closed", "InProg", "Pending", "TotalJC", "Batch kg", "Loss kg"]
+    header = ["Floor", "FG SKU"] + stages_with_closed + ["Done", "InProg", "Pending", "TotalJC", "Batch kg", "Loss kg"]
 
     body_rows = []
     grand = {s: 0 for s in stages_with_closed}
@@ -774,7 +826,9 @@ async def main():
     ))
     story.append(Paragraph(
         f"Cumulative snapshot — ALL rows through {generated} UTC<br/>"
-        f"Generated {generated} UTC / Database: warehouse_db / Includes v1 + v2 schemas",
+        f"Generated {generated} UTC / Database: warehouse_db / Includes v1 + v2 schemas<br/>"
+        f"*Effective completion counts JCs with recorded output that are stuck "
+        f"short of a terminal status (completion-gate error) as complete.",
         styles["SubHead"],
     ))
     story.append(Spacer(1, 4*mm))
@@ -785,6 +839,7 @@ async def main():
     planning_tbl = build_planning_table(counts)
     po_tbl, po_status_tbl = build_po_tables(counts)
     jc_status_tbl = build_jc_status_table(counts)
+    completion_tbl = build_completion_view(counts)
     detail_tbl = build_detail_table(counts)
 
     row1 = Table(
@@ -795,7 +850,10 @@ async def main():
                 Paragraph("<b>Job-card status breakdown</b>", styles["SubHead"]),
                 Paragraph("<b>Job-card detail tables</b>", styles["SubHead"]),
             ],
-            [planning_tbl, [po_tbl, Spacer(1, 1.5*mm), po_status_tbl], jc_status_tbl, detail_tbl],
+            [planning_tbl,
+             [po_tbl, Spacer(1, 1.5*mm), po_status_tbl],
+             [jc_status_tbl, Spacer(1, 1.5*mm), completion_tbl],
+             detail_tbl],
         ],
         colWidths=[65*mm, 65*mm, 65*mm, 65*mm],
     )
@@ -840,7 +898,11 @@ async def main():
 
     story.append(Paragraph(
         "<i>Counts are point-in-time snapshots from warehouse_db. "
-        "Latest = MAX(created_at|updated_at|recorded_at) where present.</i>",
+        "Latest = MAX(created_at|updated_at|recorded_at) where present. "
+        "*Filled but stuck = job cards with recorded production output "
+        "(job_card_output) whose status never reached completed/closed — "
+        "typically blocked by the R9 unbalanced-accounting / open-batch "
+        "completion gate; counted as effectively complete.</i>",
         styles["Tiny"],
     ))
 
@@ -855,9 +917,10 @@ async def main():
     story.append(Spacer(1, 3*mm))
     story.append(Paragraph("<b>Weekly entry counts</b>", styles["Heading3"]))
     story.append(Paragraph(
-        "Each row is one week. 'JCs' = job cards created that week; 'Now done' = "
-        "those currently completed/closed. Plans, orders and indents counted by "
-        "their own creation week.",
+        "Each row is one week. 'JCs' = job cards created that week. "
+        "'Compl' = reached completed/closed; 'Stuck*' = filled (has output) "
+        "but not completed; 'Done' = Compl + Stuck (effective). Plans, orders "
+        "and indents counted by their own creation week.",
         styles["SubHead"],
     ))
     story.append(Spacer(1, 2*mm))
@@ -880,8 +943,9 @@ async def main():
     story.append(Spacer(1, 3*mm))
     story.append(Paragraph("<b>Floor x Article x Stage-of-closure Pivot</b>", styles["Heading3"]))
     story.append(Paragraph(
-        "Stage columns count CLOSED job cards (status in completed/closed). "
-        "Summary columns split closed / in-progress / pending.",
+        "Stage columns count DONE job cards — terminal (completed/closed) OR "
+        "filled-but-stuck (has output, completion errored). Summary columns "
+        "split done / in-progress / pending.",
         styles["SubHead"],
     ))
     story.append(Spacer(1, 2*mm))
@@ -891,7 +955,7 @@ async def main():
     story.append(Spacer(1, 2*mm))
     if hidden:
         story.append(Paragraph(
-            f"<i>Hidden {hidden} (floor, FG SKU) combinations with zero closed and zero in-progress JCs.</i>",
+            f"<i>Hidden {hidden} (floor, FG SKU) combinations with zero done and zero in-progress JCs.</i>",
             styles["Tiny"],
         ))
 

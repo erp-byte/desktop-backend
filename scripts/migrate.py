@@ -183,6 +183,41 @@ SQL_FILES = [
     # 056 soft-links a request to the dev job card created from its "Develop"
     # button (source_requisition_id on the card, linked_dev_jc_id on the request).
     DB_DIR / "samples" / "056_dev_jc_requisition_link.sql",
+    # 057 moves the PRIMARY KEY of sample_requisitions from the SERIAL `id` to
+    # `request_id` (the surfaced 8-digit identifier). `id` is kept as a UNIQUE
+    # column so the 10 inbound FKs (job_card, material_document, etc.) are
+    # untouched. Drops/recreates those FKs around the PK swap; idempotent.
+    DB_DIR / "samples" / "057_requisition_request_id_pkey.sql",
+    # 058 adds a free-text `description` column to sample_requisitions for the
+    # NPD sample-requisition form. Additive + idempotent.
+    DB_DIR / "samples" / "058_requisition_description.sql",
+    # 059 adds a `hold_start_date` column — set when the NPD reviewer holds a
+    # request (alongside the reason). Additive + idempotent.
+    DB_DIR / "samples" / "059_requisition_hold_start_date.sql",
+    # 060 makes the NPD development job-card id an 8-digit time-based BIGINT
+    # (new_short_time_id), widening the lines FK to match. Idempotent.
+    DB_DIR / "samples" / "060_dev_jc_bigint_id.sql",
+    # 061 adds npd_dev_job_card_phases — phase-wise start/complete tracking for
+    # multi-day trials. Additive + idempotent.
+    DB_DIR / "samples" / "061_dev_jc_phases.sql",
+    # 062 adds per-phase output + material accounting columns. Additive + idempotent.
+    DB_DIR / "samples" / "062_dev_jc_phase_accounting.sql",
+    # 063 adds npd_dev_job_card_lines.phase_id — the trial recipe is now stored
+    # per phase (independent recipe per trial iteration). Additive + idempotent.
+    DB_DIR / "samples" / "063_dev_jc_phase_recipe.sql",
+    # 064 adds customer + dispatch-planning fields to sample_requisitions and the
+    # npd_dev_job_cards it spawns (company/customer + expected/confirmed dispatch).
+    DB_DIR / "samples" / "064_requisition_customer_dispatch.sql",
+    # 065 adds wa_pending_action — inbound-WhatsApp state for capturing an NPD
+    # hold reason from the reviewer's reply. Additive + idempotent.
+    DB_DIR / "samples" / "065_wa_pending_action.sql",
+    # 066 adds pcs + weight_per_piece (quantity = pcs × weight) to the requisition
+    # and the dev job card. Additive + idempotent.
+    DB_DIR / "samples" / "066_requisition_pcs_weight.sql",
+    # 067 maps an outbound NPD review/updated template message (Meta wamid) back to
+    # its requisition, so a reviewer's Accept/Hold quick-reply button tap resolves
+    # the request via the button reply's context.id. Additive + idempotent.
+    DB_DIR / "samples" / "067_wa_review_message.sql",
 ]
 
 
