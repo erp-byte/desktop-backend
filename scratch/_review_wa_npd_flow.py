@@ -73,13 +73,17 @@ async def main():
                  kind TEXT NOT NULL DEFAULT 'REVIEW', wa_phone TEXT,
                  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
 
-        # Make user uid an NPD reviewer with the test phone.
-        role_id = await c.fetchval(
-            "SELECT role_id FROM auth_role WHERE role_name IN ('npd_team','admin') ORDER BY role_name LIMIT 1")
+        # Make user uid an npd_team reviewer with the test phone (recipients are
+        # now resolved from the DB by role, so the role must be npd_team).
+        role_id = await c.fetchval("SELECT role_id FROM auth_role WHERE role_name = 'npd_team'")
         uid = await c.fetchval("SELECT user_id FROM auth_user ORDER BY user_id LIMIT 1")
         await c.execute("UPDATE auth_user SET phone = $2, role_id = $3 WHERE user_id = $1",
                         uid, normalize_phone(TEST_PHONE), role_id)
-        user = types.SimpleNamespace(user_id=uid, role_name="admin", is_admin=True, full_name="R")
+        user = types.SimpleNamespace(user_id=uid, role_name="npd_team", is_admin=False, full_name="R")
+
+        # Recipients come from the DB: an npd_team member with a phone is included.
+        recips = await wa._resolve_recipients(c)
+        checks["DB resolves npd_team phone as recipient"] = wa._fmt_phone(TEST_PHONE) in recips
 
         # ── HOLD flow (text command) ──
         r1 = await _mk_submitted(c, user, "WA Hold Target")

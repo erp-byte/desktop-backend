@@ -100,8 +100,12 @@ TPL_ACCEPTED = os.environ.get("WHATSAPP_TPL_NPD_ACCEPTED", "npd_request_accepted
 TPL_HOLD = os.environ.get("WHATSAPP_TPL_NPD_HOLD", "npd_request_on_hold")
 # Verify token for the webhook GET handshake (set the same value in Meta).
 VERIFY_TOKEN = os.environ.get("WHATSAPP_VERIFY_TOKEN", "")
-# NPD roles permitted to act over WhatsApp.
+# NPD roles permitted to ACT over WhatsApp (inbound Accept/Hold).
 _NPD_ROLES = {"npd_team", "admin"}
+# Roles whose members RECEIVE the review / edit messages — resolved from
+# auth_user.phone, not a static list. CSV-overridable; defaults to npd_team.
+_REVIEW_ROLES = [r.strip() for r in
+                 os.environ.get("WHATSAPP_NPD_REVIEW_ROLES", "npd_team").split(",") if r.strip()]
 
 
 def _is_truthy(s: str | None) -> bool:
@@ -122,9 +126,40 @@ def _fmt_phone(raw: str) -> str:
 
 
 def npd_review_numbers() -> list[str]:
-    """NPD reviewer WhatsApp numbers (CSV in WHATSAPP_NPD_REVIEW_NUMBERS)."""
+    """Optional STATIC reviewer numbers (CSV in WHATSAPP_NPD_REVIEW_NUMBERS), added
+    on top of the role-resolved numbers. Usually empty — the DB drives recipients."""
     raw = os.environ.get("WHATSAPP_NPD_REVIEW_NUMBERS", "")
     return [_fmt_phone(n) for n in raw.split(",") if n.strip()]
+
+
+async def _db_review_numbers(conn) -> list[str]:
+    """NPD reviewer numbers resolved from the DB: every auth_user holding an NPD
+    review role (default npd_team) that has a phone on file."""
+    if not _REVIEW_ROLES:
+        return []
+    try:
+        rows = await conn.fetch(
+            """SELECT u.phone
+                 FROM auth_user u
+                 JOIN auth_role r ON u.role_id = r.role_id
+                WHERE r.role_name = ANY($1::text[])
+                  AND u.phone IS NOT NULL AND btrim(u.phone) <> ''""",
+            _REVIEW_ROLES)
+    except Exception:  # noqa: BLE001 — a lookup error must never block the lifecycle
+        logger.exception("Failed to resolve NPD reviewer numbers from DB")
+        return []
+    return [_fmt_phone(r["phone"]) for r in rows]
+
+
+async def _resolve_recipients(conn) -> list[str]:
+    """Union of role-resolved (DB) + any static env numbers, de-duped, order-stable."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for n in (await _db_review_numbers(conn)) + npd_review_numbers():
+        if n and n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
 
 
 async def _post(payload: dict[str, Any]) -> dict[str, Any]:
@@ -270,9 +305,10 @@ async def _store_review_message(conn, wamid: str, req_id: int, kind: str, wa_pho
 
 async def _notify_reviewers(conn, req: dict, *, template: str, kind: str,
                             params: tuple[list[str], list[str]]) -> None:
-    nums = npd_review_numbers()
+    nums = await _resolve_recipients(conn)
     if not nums:
-        logger.info("No WHATSAPP_NPD_REVIEW_NUMBERS configured — skipping %s notify", kind)
+        logger.info("No NPD reviewers with a phone (roles=%s) — skipping %s notify",
+                    _REVIEW_ROLES, kind)
         return
     header, body = params
     req_id = req.get("id")
