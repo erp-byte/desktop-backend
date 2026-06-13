@@ -2,6 +2,7 @@
 email_notifier pattern onto Settings().SMTP_*. Best-effort: never raises into the
 lifecycle. Recipients resolve from auth_user (email + role), NOT the broken users join."""
 from __future__ import annotations
+import hashlib
 import html as _html
 import logging
 import smtplib
@@ -97,50 +98,62 @@ def _button_html(req: dict, reviewer_email: str) -> str:
     </div>"""
 
 
-async def _thread_anchor(conn, req_id) -> str | None:
-    return await conn.fetchval("SELECT email_thread_msgid FROM sample_requisitions WHERE id = $1", req_id)
+def _anchor_msgid(request_id, email: str) -> str:
+    """Deterministic Message-ID per (request, recipient). Because each reviewer gets
+    their OWN message (the Accept link embeds their email), a single stored anchor
+    only threaded the first reviewer's mailbox. Deriving the anchor from
+    (request_id, email) instead lets every later mail (reminder / outcome reply /
+    informative) reply into the right thread in EACH recipient's mailbox — with no
+    per-recipient anchor storage. Stable across sends; RFC-safe local part."""
+    h = hashlib.sha1(f"{request_id}:{(email or '').strip().lower()}".encode()).hexdigest()[:16]
+    return f"<npd-req-{request_id}-{h}@candorfoods.in>"
 
 
 async def notify_npd_review_email(conn, req: dict) -> None:
-    """On NPD/TRIAL submit — email npd_team the request with Accept/Hold buttons. Stores
-    the anchor Message-ID on the requisition for threading. Best-effort, never raises."""
+    """On NPD/TRIAL submit — email npd_team the request with Accept/Hold buttons. Each
+    reviewer's message is rooted at a deterministic per-recipient Message-ID so the
+    reminders + outcome reply thread under it in THEIR mailbox. Best-effort, never raises."""
+    rid = req.get("request_id")
     recips = await _emails_for_role(conn, "npd_team")
     if not recips:
         logger.warning("[sample-mail] no npd_team emails — skipping review email for req %s", req.get("id"))
         return
-    anchor = None
     for em in recips:
-        mid = _send(f"NPD sample request {req.get('request_id')} — action needed",
-                    _button_html(req, em), [em])
-        anchor = anchor or mid
-    if anchor and req.get("id"):
-        await conn.execute(
-            "UPDATE sample_requisitions SET email_thread_msgid = COALESCE(email_thread_msgid, $2) WHERE id = $1",
-            req["id"], anchor)
+        _send(f"NPD sample request {rid} — action needed",
+              _button_html(req, em), [em], msgid=_anchor_msgid(rid, em))
 
 
 async def notify_inventory_informative(conn, req: dict, *, event: str) -> None:
-    """Informative (no-button) mail to inventory_manager on create/accept/hold, threaded."""
+    """Informative (no-button) mail to each inventory_manager on create/accept/hold. The
+    'created' mail roots a per-recipient thread; later events reply into it."""
+    rid = req.get("request_id")
     recips = await _emails_for_role(conn, "inventory_manager")
     if not recips:
         return
-    anchor = await _thread_anchor(conn, req["id"]) if req.get("id") else None
     target = _html.escape(str(req.get("npd_target_name") or "—"))
-    html = (f"<div style='font-family:Arial,sans-serif'><h3>Sample request {req.get('request_id')} — {event}</h3>"
+    html = (f"<div style='font-family:Arial,sans-serif'><h3>Sample request {rid} — {event}</h3>"
             f"<p>Target: {target}</p></div>")
-    _send(f"Sample request {req.get('request_id')} — {event}", html, recips, in_reply_to=anchor)
+    is_root = event == "created"
+    for em in recips:
+        anchor = _anchor_msgid(rid, em)
+        _send(f"Sample request {rid} — {event}", html, [em],
+              msgid=anchor if is_root else None,
+              in_reply_to=None if is_root else anchor)
 
 
 async def notify_requestor_email(conn, req: dict, *, action: str, reason: str | None = None) -> None:
-    """Reply on the thread when accepted/held — 'the request is updated'. Best-effort."""
-    anchor = await _thread_anchor(conn, req["id"]) if req.get("id") else None
+    """Closing reply on each reviewer's thread when accepted/held — 'the request is
+    updated'. Best-effort."""
+    rid = req.get("request_id")
     recips = await _emails_for_role(conn, "npd_team")
+    if not recips:
+        return
     verb = "ACCEPTED" if (action or "").upper() in ("ACCEPT", "APPROVE") else "ON HOLD"
     reason_html = f"<p>Reason: {_html.escape(str(reason))}</p>" if reason else ""
-    html = (f"<div style='font-family:Arial,sans-serif'><h3>Sample request {req.get('request_id')} {verb}</h3>"
+    html = (f"<div style='font-family:Arial,sans-serif'><h3>Sample request {rid} {verb}</h3>"
             + reason_html + "</div>")
-    if recips:
-        _send(f"Sample request {req.get('request_id')} {verb}", html, recips, in_reply_to=anchor)
+    for em in recips:
+        _send(f"Sample request {rid} {verb}", html, [em], in_reply_to=_anchor_msgid(rid, em))
 
 
 async def notify_inventory_promote_requested(conn, *, dev_jc_id, requestor_uid=None) -> None:
@@ -166,7 +179,7 @@ async def send_due_reminders(conn) -> int:
         if not got:
             return 0
         rows = await conn.fetch(
-            """SELECT id, request_id, npd_target_name, quantity, requestor_team, email_thread_msgid
+            """SELECT id, request_id, npd_target_name, quantity, requestor_team
                  FROM sample_requisitions
                 WHERE deleted_at IS NULL AND sample_type IN ('NPD','TRIAL')
                   AND status IN ('SUBMITTED','ON_HOLD')
@@ -180,7 +193,7 @@ async def send_due_reminders(conn) -> int:
         for r in rows:
             for em in recips:
                 _send(f"Reminder: NPD sample request {r['request_id']} still needs a decision",
-                      _button_html(dict(r), em), [em], in_reply_to=r["email_thread_msgid"])
+                      _button_html(dict(r), em), [em], in_reply_to=_anchor_msgid(r["request_id"], em))
             await conn.execute(
                 "UPDATE sample_requisitions SET reminder_count = reminder_count + 1, last_reminder_at = NOW() WHERE id = $1",
                 r["id"])

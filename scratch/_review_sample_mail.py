@@ -9,9 +9,9 @@ stub that records every (subject, to, in_reply_to, html) call and returns a fake
 Message-ID (so the thread-anchor bookkeeping still exercises). Within one rolled-
 back transaction we:
   - seed an NPD requisition (known request_id) + an npd_team auth_user with an email
-  - notify_npd_review_email → assert the anchor msgid is stored on the row AND the
-    captured Accept URL carries the request_id + the reviewer email
-  - notify_requestor_email → assert the captured in_reply_to == the stored anchor
+  - notify_npd_review_email → assert each reviewer's mail is rooted at the
+    deterministic per-recipient anchor AND the Accept URL carries the request_id + email
+  - notify_requestor_email → assert the captured in_reply_to == that anchor
   - send_due_reminders twice → assert the 2nd call sends 0 (cadence guard)
 Rolls back so nothing persists."""
 import asyncio
@@ -82,10 +82,12 @@ async def main():
         req = await _mk_submitted(c, user, "Email Review Target")
         fresh = await rsvc.get_requisition(c, req["id"])
         await mail.notify_npd_review_email(c, fresh)
-        anchor = await c.fetchval(
-            "SELECT email_thread_msgid FROM sample_requisitions WHERE id = $1", req["id"])
+        # Threading is now a DETERMINISTIC per-(request, recipient) Message-ID — no
+        # stored anchor — so every reviewer's mailbox threads, not just the first.
+        anchor = mail._anchor_msgid(req["request_id"], TEST_EMAIL)
         review_mails = [m for m in captured if str(req["request_id"]) in (m["subject"] or "")]
-        checks["anchor email_thread_msgid stored on row"] = bool(anchor) and anchor == review_mails[0]["msgid"]
+        checks["review email rooted at deterministic per-recipient anchor"] = (
+            bool(review_mails) and review_mails[0]["msgid"] == anchor)
         accept_html = review_mails[0]["html"] if review_mails else ""
         checks["Accept URL carries request_id + reviewer email"] = (
             f"request_id={req['request_id']}" in accept_html
