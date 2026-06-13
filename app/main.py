@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -65,6 +66,17 @@ async def _wait_for_db(pool: asyncpg.Pool, *, attempts: int = 10, delay: float =
 async def lifespan(fastapi_app: FastAPI):
     settings = Settings()
     fastapi_app.state.settings = settings
+
+    # otp_service / whatsapp_service read the WhatsApp creds via os.environ at call
+    # time (so an ops flip takes effect without code changes), but pydantic-settings
+    # loads .env into the Settings OBJECT only — NOT into os.environ. Hydrate the creds
+    # here so .env-based deploys actually enable sending. A value already present in
+    # os.environ (real shell export / `uvicorn --env-file`) always wins.
+    for _k in ("WHATSAPP_ENABLED", "WHATSAPP_ACCESS_TOKEN", "WHATSAPP_PHONE_NUMBER_ID",
+               "WHATSAPP_GRAPH_BASE"):
+        _v = getattr(settings, _k, None)
+        if _v is not None and str(_v) != "" and not os.environ.get(_k, "").strip():
+            os.environ[_k] = str(_v)
 
     pool = await create_pool(settings)
     fastapi_app.state.db_pool = pool

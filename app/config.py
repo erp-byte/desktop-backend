@@ -60,12 +60,14 @@ class Settings(BaseSettings):
     VENDOR_DOC_MODEL: str = "claude-sonnet-4-6"  # Claude model used for vendor document extraction
 
     # ── WhatsApp Cloud API (password-reset OTP delivery) ─────────────────
-    # `otp_service` reads these via os.environ at call time so an ops flip
-    # of WHATSAPP_ENABLED takes effect without a restart. We still declare
-    # them here so pydantic-settings hydrates them from .env into the
-    # process environment + so they surface in any /healthz / admin debug
-    # view. Defaults mirror the working vms_referrence integration on the
-    # same WABA (`visitor_revisit_otp` / `en_US` / Graph v21.0).
+    # `otp_service` + `whatsapp_service` read these via os.environ at call time
+    # so an ops flip of WHATSAPP_ENABLED takes effect without a restart. NOTE:
+    # pydantic-settings loads .env into THIS object, NOT into os.environ — so the
+    # lifespan in app/main.py copies these creds from the Settings instance into
+    # os.environ at startup (a real shell / `--env-file` value wins). Without that
+    # hydration the os.environ reads would be blank and sending would no-op.
+    # Defaults mirror the working vms_referrence integration on the same WABA
+    # (`visitor_revisit_otp` / `en_US` / Graph v21.0).
     WHATSAPP_ENABLED: bool = True
     WHATSAPP_ACCESS_TOKEN: str = ""
     WHATSAPP_PHONE_NUMBER_ID: str = ""
