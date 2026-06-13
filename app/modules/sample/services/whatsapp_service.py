@@ -67,12 +67,20 @@ this order — keep the live template text aligned with the layouts below.
    BUTTONS: two QUICK REPLY buttons — "Accept" and "Hold".
 
 3. npd_request_accepted      (to the requestor, on accept)  — env WHATSAPP_TPL_NPD_ACCEPTED
-   "Good news — your sample request *{{1}}* ({{2}}) has been ACCEPTED by the NPD team.
-    Expected dispatch date: {{3}}."           [ 1=req no · 2=article · 3=expected date ]
+   HEADER (text): Sample request {{1}} approved            [ header {{1}} = request no ]
+   BODY:
+     NPD team has ACCEPTED your sample request.
+     Target NPD article: {{1}}                             [ body {{1}} = target article ]
+     Expected dispatch: {{2}}                              [ body {{2}} = expected date / TBC ]
+     <a closing line — body must not END on a variable>
 
 4. npd_request_on_hold       (to the requestor, on hold)    — env WHATSAPP_TPL_NPD_HOLD
-   "Update on your sample request *{{1}}* ({{2}}): the NPD team has placed it ON HOLD.
-    Reason: {{3}}."                           [ 1=req no · 2=article · 3=hold reason ]
+   HEADER (text): Sample request {{1}} on hold             [ header {{1}} = request no ]
+   BODY:
+     NPD team has placed your sample request ON HOLD.
+     Target NPD article: {{1}}                             [ body {{1}} = target article ]
+     Reason: {{2}}                                         [ body {{2}} = hold reason ]
+     <a closing line — body must not END on a variable>
 
 The reviewer-facing prompts/confirmations ("Please reply with the reason", "✓ Accepted")
 are sent as plain session text (no template — the reviewer just messaged us, so the
@@ -356,17 +364,21 @@ async def notify_requestor(conn, req: dict, *, action: str, reason: str | None =
     if not phone:
         logger.info("Requestor has no phone — skipping outcome notify for req %s", req.get("id"))
         return
-    req_no = req.get("requisition_number") or str(req.get("request_id") or req.get("id"))
-    target = req.get("npd_target_name") or "—"
+    # Layout: HEADER text var {{1}} = request no; BODY {{1}} = target article,
+    # {{2}} = expected dispatch (accepted) / hold reason (on-hold).
+    req_no = _txt(req.get("requisition_number") or req.get("request_id") or req.get("id"))
+    target = _txt(req.get("npd_target_name"))
     if action == "APPROVE":
         # At accept time the trial hasn't closed, so the confirmed dispatch date is
         # not known yet — show the BD team's EXPECTED dispatch date instead.
         disp = req.get("expected_dispatch_date")
         tpl = TPL_ACCEPTED
-        resp = await _send_template(phone, tpl, [req_no, target, str(disp)[:10] if disp else "TBC"])
+        resp = await _send_template(phone, tpl, [target, str(disp)[:10] if disp else "TBC"],
+                                    header_params=[req_no])
     elif action == "HOLD":
         tpl = TPL_HOLD
-        resp = await _send_template(phone, tpl, [req_no, target, reason or "—"])
+        resp = await _send_template(phone, tpl, [target, _txt(reason or "—")],
+                                    header_params=[req_no])
     else:
         return
     # Surface a missing/unapproved outcome template instead of swallowing it — these
