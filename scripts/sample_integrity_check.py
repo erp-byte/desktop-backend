@@ -38,7 +38,7 @@ async def main():
         else:
             logger.warning("%d drift finding(s):", len(drifts))
             for d in drifts:
-                logger.warning("  %s [%s] %s", d["requisition_number"], d["check"], d["detail"])
+                logger.warning("  %s [%s] %s", d["request_id"], d["check"], d["detail"])
     finally:
         await conn.close()
 

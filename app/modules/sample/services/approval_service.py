@@ -130,13 +130,13 @@ async def act_bh_approval(conn, req_id: int, *, action: str, user,
                 team = notification_service.TEAM_INVENTORY
             await notification_service.emit_alert(
                 conn, alert_type="sample_bh_approved", target_team=team,
-                message=f"Sample {locked['requisition_number']} approved by business head.",
+                message=f"Sample {locked['request_id']} approved by business head.",
                 related_id=req_id)
         else:
             await notification_service.emit_alert(
                 conn, alert_type="sample_bh_rejected",
                 target_team=notification_service.TEAM_BUSINESS,
-                message=f"Sample {locked['requisition_number']} rejected: {remarks}",
+                message=f"Sample {locked['request_id']} rejected: {remarks}",
                 related_id=req_id)
 
     return await req_svc.get_requisition(conn, req_id)
@@ -148,7 +148,8 @@ async def act_bh_approval(conn, req_id: int, *, action: str, user,
 # Each carries a reason (required for reject + hold). Applies to NPD / TRIAL only.
 # ---------------------------------------------------------------------------
 _NPD_REVIEW = {
-    "APPROVE": ("APPROVED", "BH_APPROVED"),
+    "ACCEPT":  ("APPROVED", "BH_APPROVED"),
+    "APPROVE": ("APPROVED", "BH_APPROVED"),   # legacy alias (WhatsApp/web)
     "REJECT":  ("REJECTED", "BH_REJECTED"),
     "HOLD":    ("HOLD",     "ON_HOLD"),
 }
@@ -165,7 +166,7 @@ async def act_npd_review(conn, req_id: int, *, action: str, user,
     if act not in _NPD_REVIEW:
         raise HTTPException(422, detail={
             "error": "invalid_action",
-            "message": "action must be APPROVE, REJECT or HOLD",
+            "message": "action must be ACCEPT, REJECT or HOLD",
             "details": {"action": action}})
     appr_action, target = _NPD_REVIEW[act]
 
@@ -202,7 +203,7 @@ async def act_npd_review(conn, req_id: int, *, action: str, user,
                 req_id, start_date)
 
         # Tell the business team the outcome.
-        msg = f"Sample {locked['requisition_number']} {appr_action.lower()} by NPD"
+        msg = f"Sample {locked['request_id']} {appr_action.lower()} by NPD"
         msg += f": {reason}" if (reason or "").strip() else "."
         await notification_service.emit_alert(
             conn, alert_type=f"sample_npd_{act.lower()}",
@@ -212,11 +213,19 @@ async def act_npd_review(conn, req_id: int, *, action: str, user,
     # WhatsApp the requestor the outcome (best-effort, after commit — a transport
     # failure must never roll back or block the review). The hold reason captured
     # via WhatsApp (or the web form) flows straight into the on-hold template.
-    if act in ("APPROVE", "HOLD"):
+    if act in ("ACCEPT", "APPROVE", "HOLD"):
         try:
             from app.modules.sample.services import whatsapp_service as wa
             await wa.notify_requestor(conn, dict(locked), action=act, reason=reason)
         except Exception:  # noqa: BLE001
             logger.exception("WhatsApp requestor notify failed for req %s", req_id)
+        try:
+            from app.modules.sample.services import sample_mail_service as mail
+            await mail.notify_requestor_email(conn, dict(locked), action=act, reason=reason)
+            await mail.notify_inventory_informative(
+                conn, dict(locked),
+                event=("accepted" if act in ("ACCEPT", "APPROVE") else "on hold"))
+        except Exception:  # noqa: BLE001
+            logger.exception("Sample outcome email failed for req %s", req_id)
 
     return await req_svc.get_requisition(conn, req_id)

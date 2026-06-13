@@ -263,7 +263,7 @@ async def _augment_requestor(conn, req: dict) -> None:
 
 
 def _req_no(req: dict) -> str:
-    return _txt(req.get("requisition_number") or req.get("request_id") or req.get("id"))
+    return _txt(req.get("request_id") or req.get("id"))
 
 
 def _common_body_tail(req: dict) -> list[str]:
@@ -359,16 +359,16 @@ async def _requestor_phone(conn, req: dict) -> str | None:
 
 
 async def notify_requestor(conn, req: dict, *, action: str, reason: str | None = None) -> None:
-    """Tell the requestor the outcome. action in {'APPROVE','HOLD'}."""
+    """Tell the requestor the outcome. action in {'APPROVE','ACCEPT','HOLD'}."""
     phone = await _requestor_phone(conn, req)
     if not phone:
         logger.info("Requestor has no phone — skipping outcome notify for req %s", req.get("id"))
         return
     # Layout: HEADER text var {{1}} = request no; BODY {{1}} = target article,
     # {{2}} = expected dispatch (accepted) / hold reason (on-hold).
-    req_no = _txt(req.get("requisition_number") or req.get("request_id") or req.get("id"))
+    req_no = _txt(req.get("request_id") or req.get("id"))
     target = _txt(req.get("npd_target_name"))
-    if action == "APPROVE":
+    if action in ("APPROVE", "ACCEPT"):
         # At accept time the trial hasn't closed, so the confirmed dispatch date is
         # not known yet — show the BD team's EXPECTED dispatch date instead.
         disp = req.get("expected_dispatch_date")
@@ -423,11 +423,11 @@ async def _resolve_reviewer(conn, wa_phone: str) -> dict | None:
 
 
 async def _find_req(conn, ref: str) -> dict | None:
-    """Resolve a request by its request_id (8-digit) or requisition_number (SMP-…)."""
+    """Resolve a request by its 8-digit request_id."""
     return await conn.fetchrow(
-        """SELECT id, status, sample_type, requisition_number
+        """SELECT id, status, sample_type, request_id
              FROM sample_requisitions
-            WHERE deleted_at IS NULL AND (request_id::text = $1 OR requisition_number = $1)
+            WHERE deleted_at IS NULL AND request_id::text = $1
             LIMIT 1""",
         ref.strip())
 
@@ -441,7 +441,7 @@ async def _req_for_wamid(conn, wamid: str | None) -> dict | None:
     if rid is None:
         return None
     return await conn.fetchrow(
-        """SELECT id, status, sample_type, requisition_number
+        """SELECT id, status, sample_type, request_id
              FROM sample_requisitions WHERE id = $1 AND deleted_at IS NULL""", rid)
 
 
@@ -517,7 +517,7 @@ async def handle_inbound(conn, *, from_phone: str, text: str, context_id: str | 
     if reason:
         return await _apply(conn, user, wa, req["id"], "HOLD", reason, approval_service)
     await _set_pending_hold(conn, wa, req["id"])
-    await _send_text(wa, f"Holding {req['requisition_number']}. Please reply with the reason.")
+    await _send_text(wa, f"Holding {req['request_id']}. Please reply with the reason.")
     return {"ok": True, "awaiting": "reason", "requisition_id": req["id"]}
 
 
@@ -573,7 +573,7 @@ async def _apply(conn, user, wa: str, req_id: int, action: str, reason, approval
         detail = e.detail if isinstance(e.detail, dict) else {"message": str(e.detail)}
         await _send_text(wa, f"Couldn't {action.lower()}: {detail.get('message', 'not allowed')}")
         return {"ok": False, "reason": detail.get("error", "error")}
-    no = updated.get("requisition_number")
+    no = updated.get("request_id")
     await _send_text(wa, f"✓ {no} {'accepted' if action == 'APPROVE' else 'put on hold'}."
                          + (f" Reason: {reason}" if action == "HOLD" else ""))
     return {"ok": True, "requisition_id": req_id, "action": action}

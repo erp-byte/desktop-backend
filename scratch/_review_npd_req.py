@@ -69,7 +69,7 @@ async def main():
 
         checks = {
             "request_id present": bool(res.get("request_id")),
-            "requisition_number SMP-": str(res.get("requisition_number", "")).startswith("SMP-"),
+            "request_id 8-digit": len(str(res.get("request_id") or "")) == 8,
             "status DRAFT": res.get("status") == "DRAFT",
             "sample_type NPD": res.get("sample_type") == "NPD",
             "npd_target_name": res.get("npd_target_name") == "PREMIA TRAIL MIX 200G" or res.get("npd_target_name") == "Premia Trail Mix 200g",
@@ -83,7 +83,7 @@ async def main():
         for k, v in checks.items():
             if not v:
                 fails.append(f"{k} -> {v} (got {res.get(k.split()[0]) if False else ''})")
-        print("created row:", {k: res.get(k) for k in ("request_id", "requisition_number", "status", "sample_type", "npd_target_name", "quantity", "description", "warehouse", "purpose_tag", "requestor_user_id")})
+        print("created row:", {k: res.get(k) for k in ("request_id", "status", "sample_type", "npd_target_name", "quantity", "description", "warehouse", "purpose_tag", "requestor_user_id")})
         print("checks:", {k: ("ok" if v else "FAIL") for k, v in checks.items()})
     finally:
         await tr.rollback()

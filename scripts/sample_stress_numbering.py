@@ -57,7 +57,7 @@ async def _one_requisition(pool, user, sku_id, sku_name):
             "sample_type": "BASIS_RM", "warehouse": WAREHOUSE,
             "articles": [{"sku_id": sku_id, "sku_name": sku_name, "required_qty": 1,
                           "uom": "kg", "article_role": "RM"}]}, user=user)
-        return req["requisition_number"]
+        return req["request_id"]
     finally:
         await tr.rollback()
         await pool.release(conn)

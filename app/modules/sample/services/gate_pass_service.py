@@ -54,7 +54,7 @@ async def inv_verify(conn, req_id: int, *, user, remarks: str | None = None) -> 
         await notification_service.emit_alert(
             conn, alert_type="sample_inv_mgr_verified",
             target_team=notification_service.TEAM_BUSINESS,
-            message=f"Sample {req['requisition_number']} verified by inventory manager.",
+            message=f"Sample {req['request_id']} verified by inventory manager.",
             related_id=req_id)
     return await req_svc.get_requisition(conn, req_id)
 
@@ -89,7 +89,7 @@ async def issue_gate_pass(conn, req_id: int, *, user, recipient_name: str | None
         await notification_service.emit_alert(
             conn, alert_type="sample_gate_pass_issued",
             target_team=notification_service.TEAM_BUSINESS,
-            message=f"Gate pass issued for sample {req['requisition_number']}.",
+            message=f"Gate pass issued for sample {req['request_id']}.",
             related_id=gp_id, related_type=notification_service.REL_SAMPLE_GATE_PASS)
     return await get_gate_pass(conn, gp_id)
 

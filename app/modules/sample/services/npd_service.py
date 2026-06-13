@@ -159,7 +159,7 @@ async def promote_draft(conn, draft_id: int, *, user) -> dict:
             RETURNING bom_id
             """,
             fg_name, None, next_ver, entity,
-            f"Promoted from NPD draft {draft_id} (requisition {req['requisition_number']}, v{next_ver})")
+            f"Promoted from NPD draft {draft_id} (requisition {req['request_id']}, v{next_ver})")
         for i, ln in enumerate(lines, 1):
             await conn.execute(
                 """

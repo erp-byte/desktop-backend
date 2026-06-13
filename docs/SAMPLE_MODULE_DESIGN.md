@@ -169,8 +169,8 @@ All new tables go in **one migration**: `app/db/031_sample_module.sql`.
 
 ```sql
 CREATE TABLE sample_requisitions (
-  id                        SERIAL PRIMARY KEY,
-  requisition_number        TEXT UNIQUE NOT NULL,            -- SMP-YYYY-NNNN, via sequence
+  id                        SERIAL UNIQUE NOT NULL,          -- internal FK target
+  request_id                BIGINT PRIMARY KEY,              -- 8-digit app-supplied id (new_short_time_id); the surfaced identifier (migrations 055/057). The SMP-YYYY-NNNN requisition_number was dropped in migration 068.
   sample_type               TEXT NOT NULL
                             CHECK (sample_type IN ('BASIS_RM','BASIS_FG','NPD','INTERNAL')),
   status                    TEXT NOT NULL DEFAULT 'DRAFT'

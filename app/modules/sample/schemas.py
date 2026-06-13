@@ -115,7 +115,7 @@ class NpdReviewBody(BaseModel):
     # NPD team's verdict on a BH-sent request. Reason required for reject + hold
     # (enforced in the service). start_date is the date the hold takes effect —
     # only meaningful for HOLD; ignored otherwise.
-    action: Literal["APPROVE", "REJECT", "HOLD"]
+    action: Literal["ACCEPT", "APPROVE", "REJECT", "HOLD"]
     reason: Optional[str] = None
     start_date: Optional[date] = None
 
@@ -205,6 +205,14 @@ class DevJobCardClose(BaseModel):
     wastage_qty: Optional[float] = Field(default=None, ge=0)
     extra_give_away_qty: Optional[float] = Field(default=None, ge=0)
     output_notes: Optional[str] = None
+
+
+class PromoteApprovalBody(BaseModel):
+    action: Literal["ACCEPT", "REJECT"]
+    remarks: Optional[str] = None
+    # Only needed when one user holds BOTH gates (inventory_manager who is also the
+    # requestor) — names which gate this action applies to so each is actioned once.
+    approver_kind: Optional[Literal["INV_MGR", "REQUESTOR_BH"]] = None
 
 
 class DevDispatchBody(BaseModel):
