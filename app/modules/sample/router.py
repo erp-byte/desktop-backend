@@ -60,6 +60,18 @@ async def whatsapp_webhook_receive(request: Request):
     except ValueError:
         payload = {}
     messages = whatsapp_service.extract_messages(payload)
+    if messages:
+        logger.info("WhatsApp inbound %d msg(s): %s", len(messages),
+                    [{"from": m.get("from"), "type": m.get("type"),
+                      "text": (m.get("text") or "")[:60], "ctx": m.get("context_id")}
+                     for m in messages])
+    else:
+        # No messages parsed → almost always a delivery/read STATUS callback (value
+        # carries `statuses`, not `messages`), or a payload shape we don't parse.
+        # Log the value keys so a real button tap can be told apart from a status ping.
+        shapes = [list((c.get("value") or {}).keys())
+                  for e in (payload.get("entry") or []) for c in (e.get("changes") or [])]
+        logger.info("WhatsApp webhook, no messages; value keys=%s", shapes)
     results = []
     if messages:
         pool = request.app.state.db_pool
@@ -71,6 +83,7 @@ async def whatsapp_webhook_receive(request: Request):
                         context_id=m.get("context_id")))
                 except Exception:  # noqa: BLE001 — always 200 so Meta doesn't retry-storm
                     logger.exception("WhatsApp inbound handling failed")
+        logger.info("WhatsApp inbound results: %s", results)
     return {"received": len(messages), "results": results}
 
 
