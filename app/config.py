@@ -54,6 +54,8 @@ class Settings(BaseSettings):
     SMTP_PASSWORD: str = ""
     SMTP_USE_TLS: bool = True
     SMTP_FROM: str = "noreply@candorfoods.in"
+    PUBLIC_BACKEND_URL: str = "https://erpcf.netlify.app"   # base for email action links (reaches FastAPI via the Netlify /api proxy)
+    WEB_APP_URL: str = "https://erpcf.in"                    # web app base for the Hold redirect
 
     # ── Vendor module (S3-only + Claude extraction) ───────────────────────
     VENDOR_S3_BUCKET: str = ""                  # required for vendor doc uploads; falls back to RECEIPT_S3_BUCKET

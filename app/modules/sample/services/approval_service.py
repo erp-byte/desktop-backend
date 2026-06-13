@@ -219,5 +219,13 @@ async def act_npd_review(conn, req_id: int, *, action: str, user,
             await wa.notify_requestor(conn, dict(locked), action=act, reason=reason)
         except Exception:  # noqa: BLE001
             logger.exception("WhatsApp requestor notify failed for req %s", req_id)
+        try:
+            from app.modules.sample.services import sample_mail_service as mail
+            await mail.notify_requestor_email(conn, dict(locked), action=act, reason=reason)
+            await mail.notify_inventory_informative(
+                conn, dict(locked),
+                event=("accepted" if act in ("ACCEPT", "APPROVE") else "on hold"))
+        except Exception:  # noqa: BLE001
+            logger.exception("Sample outcome email failed for req %s", req_id)
 
     return await req_svc.get_requisition(conn, req_id)

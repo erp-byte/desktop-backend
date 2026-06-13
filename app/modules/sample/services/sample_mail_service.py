@@ -1,0 +1,173 @@
+"""Threaded review email for the NPD sample flow — ports transfer_backend_reference's
+email_notifier pattern onto Settings().SMTP_*. Best-effort: never raises into the
+lifecycle. Recipients resolve from auth_user (email + role), NOT the broken users join."""
+from __future__ import annotations
+import logging
+import smtplib
+import ssl
+import threading
+from email.message import EmailMessage
+from email.utils import make_msgid
+from urllib.parse import quote
+
+from app.config import Settings
+
+logger = logging.getLogger(__name__)
+
+REMINDER_MIN_HOURS = 24
+REMINDER_MAX = 5
+
+
+async def _emails_for_role(conn, role: str) -> list[str]:
+    rows = await conn.fetch(
+        """SELECT a.email FROM auth_user a JOIN auth_role r ON a.role_id = r.role_id
+            WHERE r.role_name = $1 AND COALESCE(a.is_active, TRUE)
+              AND a.email IS NOT NULL AND btrim(a.email) <> ''""", role)
+    return [r["email"] for r in rows]
+
+
+async def _email_for_user(conn, uid) -> str | None:
+    if not uid:
+        return None
+    return await conn.fetchval("SELECT email FROM auth_user WHERE user_id = $1", uid)
+
+
+def _send(subject, html, to_addrs, *, cc=None, msgid=None, in_reply_to=None):
+    """Send one HTML email on a background thread. Returns the Message-ID used (so the
+    caller can store it as the thread anchor), or None when SMTP is unconfigured / no
+    recipients. Never raises."""
+    s = Settings()
+    if not s.SMTP_HOST or not to_addrs:
+        logger.info("[sample-mail] skip (host=%s to=%s) subject=%s", bool(s.SMTP_HOST), to_addrs, subject)
+        return None
+    msg = EmailMessage()
+    msg["From"] = s.SMTP_FROM
+    msg["To"] = ", ".join(to_addrs)
+    if cc:
+        msg["Cc"] = ", ".join(cc)
+    msg["Subject"] = subject
+    mid = msgid or make_msgid(domain="candorfoods.in")
+    msg["Message-ID"] = mid
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+        msg["References"] = in_reply_to
+    msg.set_content("This message requires an HTML-capable mail client.")
+    msg.add_alternative(html, subtype="html")
+    rcpts = list(dict.fromkeys([*to_addrs, *(cc or [])]))
+
+    def _go():
+        try:
+            with smtplib.SMTP(s.SMTP_HOST, s.SMTP_PORT, timeout=15) as srv:
+                if s.SMTP_USE_TLS:
+                    srv.starttls(context=ssl.create_default_context())
+                if s.SMTP_USERNAME:
+                    srv.login(s.SMTP_USERNAME, s.SMTP_PASSWORD)
+                srv.send_message(msg, from_addr=s.SMTP_FROM, to_addrs=rcpts)
+            logger.info("[sample-mail] sent subject=%r to=%s", subject, to_addrs)
+        except Exception:  # noqa: BLE001 — best-effort; transport failure must not break the request
+            logger.exception("[sample-mail] send failed subject=%r", subject)
+
+    threading.Thread(target=_go, daemon=True).start()
+    return mid
+
+
+def _accept_url(request_id, email: str) -> str:
+    base = Settings().PUBLIC_BACKEND_URL.rstrip("/")
+    return f"{base}/api/v1/sample/email/npd-accept?request_id={request_id}&email={quote(email)}&status=accept"
+
+
+def _hold_url(request_id) -> str:
+    base = Settings().PUBLIC_BACKEND_URL.rstrip("/")
+    return f"{base}/api/v1/sample/email/npd-hold?request_id={request_id}"
+
+
+def _button_html(req: dict, reviewer_email: str) -> str:
+    rid = req.get("request_id")
+    a, h = _accept_url(rid, reviewer_email), _hold_url(rid)
+    return f"""<div style="font-family:Arial,sans-serif">
+      <h2>NPD sample request {rid}</h2>
+      <p>Target: {req.get('npd_target_name') or '—'} &middot; Qty: {req.get('quantity') or '—'} &middot; Requestor: {req.get('requestor_team') or '—'}</p>
+      <p><a href="{a}" style="background:#16a34a;color:#fff;padding:10px 18px;border-radius:4px;text-decoration:none">&#10003; Accept</a>
+         &nbsp;<a href="{h}" style="background:#f59e0b;color:#fff;padding:10px 18px;border-radius:4px;text-decoration:none">&#9208; Hold</a></p>
+    </div>"""
+
+
+async def _thread_anchor(conn, req_id) -> str | None:
+    return await conn.fetchval("SELECT email_thread_msgid FROM sample_requisitions WHERE id = $1", req_id)
+
+
+async def notify_npd_review_email(conn, req: dict) -> None:
+    """On NPD/TRIAL submit — email npd_team the request with Accept/Hold buttons. Stores
+    the anchor Message-ID on the requisition for threading. Best-effort, never raises."""
+    recips = await _emails_for_role(conn, "npd_team")
+    if not recips:
+        logger.warning("[sample-mail] no npd_team emails — skipping review email for req %s", req.get("id"))
+        return
+    anchor = None
+    for em in recips:
+        mid = _send(f"NPD sample request {req.get('request_id')} — action needed",
+                    _button_html(req, em), [em])
+        anchor = anchor or mid
+    if anchor and req.get("id"):
+        await conn.execute(
+            "UPDATE sample_requisitions SET email_thread_msgid = COALESCE(email_thread_msgid, $2) WHERE id = $1",
+            req["id"], anchor)
+
+
+async def notify_inventory_informative(conn, req: dict, *, event: str) -> None:
+    """Informative (no-button) mail to inventory_manager on create/accept/hold, threaded."""
+    recips = await _emails_for_role(conn, "inventory_manager")
+    if not recips:
+        return
+    anchor = await _thread_anchor(conn, req["id"]) if req.get("id") else None
+    html = (f"<div style='font-family:Arial,sans-serif'><h3>Sample request {req.get('request_id')} — {event}</h3>"
+            f"<p>Target: {req.get('npd_target_name') or '—'}</p></div>")
+    _send(f"Sample request {req.get('request_id')} — {event}", html, recips, in_reply_to=anchor)
+
+
+async def notify_requestor_email(conn, req: dict, *, action: str, reason: str | None = None) -> None:
+    """Reply on the thread when accepted/held — 'the request is updated'. Best-effort."""
+    anchor = await _thread_anchor(conn, req["id"]) if req.get("id") else None
+    recips = await _emails_for_role(conn, "npd_team")
+    verb = "ACCEPTED" if (action or "").upper() in ("ACCEPT", "APPROVE") else "ON HOLD"
+    html = (f"<div style='font-family:Arial,sans-serif'><h3>Sample request {req.get('request_id')} {verb}</h3>"
+            + (f"<p>Reason: {reason}</p>" if reason else "") + "</div>")
+    if recips:
+        _send(f"Sample request {req.get('request_id')} {verb}", html, recips, in_reply_to=anchor)
+
+
+async def notify_inventory_promote_requested(conn, *, dev_jc_id, requestor_uid=None) -> None:
+    """Informative mail to inventory_manager when a dev-JC promote is requested."""
+    recips = await _emails_for_role(conn, "inventory_manager")
+    if not recips:
+        return
+    html = (f"<div style='font-family:Arial,sans-serif'><h3>Dev job card {dev_jc_id}: "
+            f"promote awaiting your acceptance</h3></div>")
+    _send(f"Dev job card {dev_jc_id} — promote approval needed", html, recips)
+
+
+async def send_due_reminders(conn) -> int:
+    """Reminder reply on the thread for NPD/TRIAL requests still SUBMITTED/ON_HOLD, capped
+    at REMINDER_MAX and no sooner than REMINDER_MIN_HOURS apart. Returns # requests nudged.
+    Meant to be run on a cron (the cadence guards make frequent calls safe no-ops)."""
+    rows = await conn.fetch(
+        """SELECT id, request_id, npd_target_name, quantity, requestor_team, email_thread_msgid
+             FROM sample_requisitions
+            WHERE deleted_at IS NULL AND sample_type IN ('NPD','TRIAL')
+              AND status IN ('SUBMITTED','ON_HOLD')
+              AND reminder_count < $1
+              AND (last_reminder_at IS NULL OR last_reminder_at < NOW() - make_interval(hours => $2))""",
+        REMINDER_MAX, REMINDER_MIN_HOURS)
+    recips = await _emails_for_role(conn, "npd_team")
+    if not recips:
+        return 0
+    sent = 0
+    for r in rows:
+        for em in recips:
+            _send(f"Reminder: NPD sample request {r['request_id']} still needs a decision",
+                  _button_html(dict(r), em), [em], in_reply_to=r["email_thread_msgid"])
+        await conn.execute(
+            "UPDATE sample_requisitions SET reminder_count = reminder_count + 1, last_reminder_at = NOW() WHERE id = $1",
+            r["id"])
+        sent += 1
+    return sent

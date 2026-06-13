@@ -150,7 +150,13 @@ async def create_requisition(conn, *, payload: dict, user) -> dict:
             actor_user_id=user.user_id, actor_role=user.role_name,
             remarks="Requisition created",
         )
-    return await get_requisition(conn, req_id)
+    created = await get_requisition(conn, req_id)
+    try:
+        from app.modules.sample.services import sample_mail_service as mail
+        await mail.notify_inventory_informative(conn, created, event="created")
+    except Exception:  # noqa: BLE001
+        logger.exception("Inventory informative email failed for req %s", req_id)
+    return created
 
 
 async def _insert_articles(conn, req_id: int, articles: list[dict]) -> None:
@@ -393,6 +399,11 @@ async def submit_requisition(conn, req_id: int, *, user) -> dict:
             await wa.notify_npd_review(conn, req)
         except Exception:  # noqa: BLE001
             logger.exception("WhatsApp NPD review notify failed for req %s", req_id)
+        try:
+            from app.modules.sample.services import sample_mail_service as mail
+            await mail.notify_npd_review_email(conn, req)
+        except Exception:  # noqa: BLE001
+            logger.exception("Sample review email failed for req %s", req_id)
 
     return await get_requisition(conn, req_id)
 
