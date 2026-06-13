@@ -470,7 +470,20 @@ async def close_dev_job_card(
 ):
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
-        return await npd_dev_service.close_dev_job_card(conn, dev_jc_id, payload=body.model_dump(), user=user)
+        return await npd_dev_service.request_promote(conn, dev_jc_id, payload=body.model_dump(), user=user)
+
+
+@router.post("/npd-dev-job-cards/{dev_jc_id}/promote-approval")
+async def promote_approval(
+    request: Request,
+    dev_jc_id: int,
+    body: schemas.PromoteApprovalBody,
+    user: AuthUser = Depends(require_permission("sample", "npd", action="create")),
+):
+    from app.modules.sample.services import promote_approval_service as pas
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await pas.act_promote_approval(conn, dev_jc_id, action=body.action, user=user, remarks=body.remarks)
 
 
 @router.post("/npd-dev-job-cards/{dev_jc_id}/dispatch")

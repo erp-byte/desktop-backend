@@ -207,6 +207,11 @@ class DevJobCardClose(BaseModel):
     output_notes: Optional[str] = None
 
 
+class PromoteApprovalBody(BaseModel):
+    action: Literal["ACCEPT", "REJECT"]
+    remarks: Optional[str] = None
+
+
 class DevDispatchBody(BaseModel):
     recipient: Optional[str] = None
     qty: Optional[float] = Field(default=None, ge=0)

@@ -166,6 +166,20 @@ async def get_dev_job_card(conn, dev_jc_id: int) -> dict:
     jc["base_bom_name"] = (
         await conn.fetchval("SELECT fg_sku_name FROM bom_header WHERE bom_id = $1", jc["base_bom_id"])
         if jc.get("base_bom_id") else None)
+    # Pending dual-approval promote gate (None if no live request). Lets the
+    # frontend render the two gate rows + their statuses. Best-effort: a couple
+    # of SELECTs against the 069/070 tables.
+    gate = None
+    pr = await conn.fetchrow(
+        "SELECT id, status, created_at FROM npd_dev_promote_request "
+        "WHERE dev_jc_id = $1 AND status = 'PENDING'", dev_jc_id)
+    if pr:
+        appr = await conn.fetch(
+            "SELECT approver_kind, approver_user_id, status FROM npd_dev_promote_approval "
+            "WHERE promote_request_id = $1 ORDER BY approver_kind", pr["id"])
+        gate = {"id": pr["id"], "status": pr["status"], "created_at": pr["created_at"],
+                "approvals": [dict(r) for r in appr]}
+    jc["promote_gate"] = gate
     return jc
 
 
@@ -486,24 +500,23 @@ async def delete_phase(conn, dev_jc_id: int, phase_id: int, *, user) -> dict:
     return await get_dev_job_card(conn, dev_jc_id)
 
 
-async def close_dev_job_card(conn, dev_jc_id: int, *, payload: dict, user) -> dict:
+async def _finalize_promote(conn, dev_jc_id, *, promote_phase_id, close_payload: dict, user) -> dict:
     """IN_DEVELOPMENT -> CLOSED: record the trial output AND promote the recipe
     into a live bom_header + bom_line. Returns the closed job card with its
-    promoted_bom_id set."""
+    promoted_bom_id set.
+
+    This is the real promote body, run only once the dual-approval gate clears
+    (see promote_approval_service.finalize_if_ready). It assumes it is authorized
+    to run: the IN_DEVELOPMENT gate + CLOSE auth live in request_promote, which is
+    what the operator hits first. promote_phase_id comes from the arg and the
+    output/accounting fields come from close_payload (the stashed close dict)."""
     jc = await _fetch(conn, dev_jc_id)
-    if jc["status"] != "IN_DEVELOPMENT":
-        raise HTTPException(409, detail={"error": "wrong_status",
-                                         "message": "Only a job card that is IN_DEVELOPMENT can be closed",
-                                         "details": {"status": jc["status"]}})
-    # Close both records output and promotes the recipe → gate on CLOSE.
-    await npd_auth.require_npd_authorized(conn, user, "CLOSE")
     # Promote the recipe of the operator-chosen FINAL-TRIAL phase; fall back to
     # the card base recipe (phase_id IS NULL) when no phase is given (a legacy /
     # no-phase card). When a phase is chosen the card's output + accounting are
     # INHERITED from that phase (already recorded when it was completed) — the
     # close is a "pick the final trial and finish" step, not a second accounting
     # entry. The card-level payload accounting is only used for no-phase cards.
-    promote_phase_id = payload.get("promote_phase_id")
     phase = None
     if promote_phase_id is not None:
         phase = await _fetch_phase(conn, dev_jc_id, promote_phase_id)   # 404 if not on this card
@@ -533,17 +546,17 @@ async def close_dev_job_card(conn, dev_jc_id: int, *, payload: dict, user) -> di
         ega = phase["extra_give_away_qty"]
         yield_pct = phase["yield_pct"]
     else:
-        # Legacy no-phase card — accounting comes from the payload. Auto yield % =
-        # FG output / RM consumed × 100; falls back to the supplied yield_pct.
-        out_qty = payload.get("output_qty")
-        out_uom = payload.get("output_uom")
-        rm_consumed = payload.get("rm_consumed_qty")
-        wastage = payload.get("wastage_qty")
-        ega = payload.get("extra_give_away_qty")
-        yield_pct = payload.get("yield_pct")
+        # Legacy no-phase card — accounting comes from the close payload. Auto
+        # yield % = FG output / RM consumed × 100; falls back to supplied yield_pct.
+        out_qty = close_payload.get("output_qty")
+        out_uom = close_payload.get("output_uom")
+        rm_consumed = close_payload.get("rm_consumed_qty")
+        wastage = close_payload.get("wastage_qty")
+        ega = close_payload.get("extra_give_away_qty")
+        yield_pct = close_payload.get("yield_pct")
         if out_qty is not None and rm_consumed not in (None, 0) and float(rm_consumed) > 0:
             yield_pct = round(float(out_qty) / float(rm_consumed) * 100, 2)
-    out_notes = payload.get("output_notes")
+    out_notes = close_payload.get("output_notes")
     async with conn.transaction():
         # Promote the trial recipe into a live BOM. Only ONE active BOM is allowed
         # per fg_sku_name (uq_bom_header_active_fg), and (fg_sku_name, version) is
@@ -611,6 +624,23 @@ async def close_dev_job_card(conn, dev_jc_id: int, *, payload: dict, user) -> di
                 "UPDATE sample_requisitions SET confirmed_dispatch_date = CURRENT_DATE, "
                 "updated_at = NOW() WHERE id = $1", jc["source_requisition_id"])
     return await get_dev_job_card(conn, dev_jc_id)
+
+
+async def request_promote(conn, dev_jc_id, *, payload: dict, user) -> dict:
+    """'Record output & promote' — instead of promoting now, open a pending promote
+    request + two gate approvals (inventory_manager + requestor BH). Promote runs
+    only once both accept (promote_approval_service.finalize_if_ready)."""
+    from app.modules.sample.services import promote_approval_service as pas
+    jc = await _fetch(conn, dev_jc_id)
+    if jc["status"] != "IN_DEVELOPMENT":
+        raise HTTPException(409, detail={"error": "wrong_status",
+            "message": "Only a job card that is IN_DEVELOPMENT can be promoted",
+            "details": {"status": jc["status"]}})
+    await npd_auth.require_npd_authorized(conn, user, "CLOSE")
+    promote_phase_id = payload.get("promote_phase_id")
+    if promote_phase_id is not None:
+        await _fetch_phase(conn, dev_jc_id, promote_phase_id)   # 404 if not on this card
+    return await pas.open_promote_request(conn, dev_jc_id, payload=payload, user=user)
 
 
 async def dispatch_dev_sample(conn, dev_jc_id: int, *, recipient: str | None, qty, user) -> dict:
