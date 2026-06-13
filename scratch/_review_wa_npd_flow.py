@@ -142,6 +142,21 @@ async def main():
                ORDER BY sequence_no DESC LIMIT 1""", r5["id"])
         checks["Hold button → reason → ON_HOLD"] = armed and st5 == "ON_HOLD" and rem5 == "Awaiting customer sign-off"
 
+        # ── stale Hold prompt must NOT swallow a later Accept button tap ──
+        rA = await _mk_submitted(c, user, "WA Stale Hold A")
+        rB = await _mk_submitted(c, user, "WA Stale Accept B")
+        await wa._store_review_message(c, "wamid.STALE_A", rA["id"], "REVIEW", wa._fmt_phone(TEST_PHONE))
+        await wa._store_review_message(c, "wamid.STALE_B", rB["id"], "REVIEW", wa._fmt_phone(TEST_PHONE))
+        await wa.handle_inbound(c, from_phone=TEST_PHONE, text="Hold", context_id="wamid.STALE_A")  # arm pending on A
+        out = await wa.handle_inbound(c, from_phone=TEST_PHONE, text="Accept", context_id="wamid.STALE_B")  # NEW action
+        stA = await c.fetchval("SELECT status FROM sample_requisitions WHERE id = $1", rA["id"])
+        stB = await c.fetchval("SELECT status FROM sample_requisitions WHERE id = $1", rB["id"])
+        pend_left = await c.fetchval("SELECT COUNT(*) FROM wa_pending_action WHERE wa_phone = $1",
+                                     wa._fmt_phone(TEST_PHONE))
+        checks["Accept tap not swallowed as hold reason"] = (
+            out.get("ok") and out.get("action") == "APPROVE"
+            and stB == "BH_APPROVED" and stA == "SUBMITTED" and pend_left == 0)
+
         # ── bare button with NO known context → friendly not_found (no crash) ──
         out = await wa.handle_inbound(c, from_phone=TEST_PHONE, text="Accept", context_id="wamid.UNKNOWN")
         checks["unknown button context → not_found"] = out.get("ok") is False and out.get("reason") == "not_found"

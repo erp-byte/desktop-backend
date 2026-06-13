@@ -83,6 +83,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any
 
 import httpx
@@ -143,6 +144,7 @@ async def _db_review_numbers(conn) -> list[str]:
                  FROM auth_user u
                  JOIN auth_role r ON u.role_id = r.role_id
                 WHERE r.role_name = ANY($1::text[])
+                  AND COALESCE(u.is_active, TRUE)
                   AND u.phone IS NOT NULL AND btrim(u.phone) <> ''""",
             _REVIEW_ROLES)
     except Exception:  # noqa: BLE001 — a lookup error must never block the lifecycle
@@ -224,15 +226,17 @@ def _num(v: Any) -> str:
     try:
         f = float(v)
     except (TypeError, ValueError):
-        return str(v)
+        return _txt(v)          # blank / non-numeric → em-dash (never an empty param)
     if f == int(f):
         return str(int(f))
     return ("%.3f" % f).rstrip("0").rstrip(".")
 
 
 def _txt(v: Any, dash: str = "—") -> str:
-    """Non-empty single-line text (Meta rejects empty / newline-bearing params)."""
-    s = ("" if v is None else str(v)).replace("\n", " ").replace("\t", " ").strip()
+    """Non-empty single-line text. Meta rejects a body param that is empty or that
+    contains a newline, a tab, or a run of >4 spaces — so collapse ALL whitespace
+    runs to a single space and fall back to an em-dash when blank."""
+    s = re.sub(r"\s+", " ", "" if v is None else str(v)).strip()
     return s or dash
 
 
@@ -307,8 +311,11 @@ async def _notify_reviewers(conn, req: dict, *, template: str, kind: str,
                             params: tuple[list[str], list[str]]) -> None:
     nums = await _resolve_recipients(conn)
     if not nums:
-        logger.info("No NPD reviewers with a phone (roles=%s) — skipping %s notify",
-                    _REVIEW_ROLES, kind)
+        # WARNING (not INFO): a silent "0 delivered" almost always traces here —
+        # no user in these roles has a phone on file.
+        logger.warning("No NPD reviewers with a phone (roles=%s) — skipping %s notify; "
+                       "assign the role + a phone on auth_user, or set "
+                       "WHATSAPP_NPD_REVIEW_NUMBERS", _REVIEW_ROLES, kind)
         return
     header, body = params
     req_id = req.get("id")
@@ -317,6 +324,9 @@ async def _notify_reviewers(conn, req: dict, *, template: str, kind: str,
         wamid = _wamid(resp)
         if wamid and req_id is not None:
             await _store_review_message(conn, wamid, req_id, kind, n)
+        elif isinstance(resp, dict) and resp.get("error"):
+            logger.warning("%s notify to %s failed: %s (template %s — check it is "
+                           "Approved in WhatsApp Manager)", kind, n, resp.get("error"), template)
 
 
 async def notify_npd_review(conn, req: dict) -> None:
@@ -352,9 +362,20 @@ async def notify_requestor(conn, req: dict, *, action: str, reason: str | None =
         # At accept time the trial hasn't closed, so the confirmed dispatch date is
         # not known yet — show the BD team's EXPECTED dispatch date instead.
         disp = req.get("expected_dispatch_date")
-        await _send_template(phone, TPL_ACCEPTED, [req_no, target, str(disp)[:10] if disp else "TBC"])
+        tpl = TPL_ACCEPTED
+        resp = await _send_template(phone, tpl, [req_no, target, str(disp)[:10] if disp else "TBC"])
     elif action == "HOLD":
-        await _send_template(phone, TPL_HOLD, [req_no, target, reason or "—"])
+        tpl = TPL_HOLD
+        resp = await _send_template(phone, tpl, [req_no, target, reason or "—"])
+    else:
+        return
+    # Surface a missing/unapproved outcome template instead of swallowing it — these
+    # two templates (npd_request_accepted / npd_request_on_hold) must exist in
+    # WhatsApp Manager or the requestor silently gets nothing.
+    if isinstance(resp, dict) and resp.get("error"):
+        logger.warning("Requestor %s notify failed for req %s: %s — is template '%s' "
+                       "registered + Approved (lang %s)?",
+                       action, req.get("id"), resp.get("error"), tpl, TEMPLATE_LANG)
 
 
 # ── inbound: pending-reason state ───────────────────────────────────────────
@@ -439,9 +460,16 @@ async def handle_inbound(conn, *, from_phone: str, text: str, context_id: str | 
         return {"ok": False, "reason": "unauthorised"}
     user = _WaUser(reviewer["user_id"], reviewer["role_name"])
 
-    # 1) Awaiting a hold reason from a prior "HOLD"? Capture this reply as it.
+    # A button tap (context_id present) or an explicit ACCEPT/APPROVE/HOLD verb is a
+    # NEW action — never a hold reason — even while a hold-reason prompt is open.
+    first = body.split(maxsplit=1)[0].upper() if body else ""
+    is_new_action = bool(context_id) or first in ("ACCEPT", "APPROVE", "HOLD")
+
+    # 1) Awaiting a hold reason from a prior "HOLD"? A plain free-text reply IS the
+    #    reason. But if the reviewer instead taps a button or sends a command, drop
+    #    the stale prompt and handle that action — don't swallow it as the reason.
     pending = await _pop_pending(conn, wa)
-    if pending:
+    if pending and not is_new_action:
         if not body:
             await _set_pending_hold(conn, wa, pending["requisition_id"])  # re-arm
             await _send_text(wa, "Please send the hold reason as a text message.")
