@@ -166,7 +166,7 @@ async def act_npd_review(conn, req_id: int, *, action: str, user,
     if act not in _NPD_REVIEW:
         raise HTTPException(422, detail={
             "error": "invalid_action",
-            "message": "action must be APPROVE, REJECT or HOLD",
+            "message": "action must be ACCEPT, REJECT or HOLD",
             "details": {"action": action}})
     appr_action, target = _NPD_REVIEW[act]
 
