@@ -39,11 +39,14 @@ def _send(subject, html, to_addrs, *, cc=None, msgid=None, in_reply_to=None):
     caller can store it as the thread anchor), or None when SMTP is unconfigured / no
     recipients. Never raises."""
     s = Settings()
-    if not s.SMTP_HOST or not to_addrs:
-        logger.info("[sample-mail] skip (host=%s to=%s) subject=%s", bool(s.SMTP_HOST), to_addrs, subject)
+    host = (s.SMTP_HOST or "").strip()
+    sender = (s.SMTP_EMAIL or "").strip()
+    pw = (s.SMTP_APP_PASSWORD or "").strip()
+    if not host or not to_addrs:
+        logger.info("[sample-mail] skip (host=%s to=%s) subject=%s", bool(host), to_addrs, subject)
         return None
     msg = EmailMessage()
-    msg["From"] = s.SMTP_FROM
+    msg["From"] = sender
     msg["To"] = ", ".join(to_addrs)
     if cc:
         msg["Cc"] = ", ".join(cc)
@@ -59,12 +62,11 @@ def _send(subject, html, to_addrs, *, cc=None, msgid=None, in_reply_to=None):
 
     def _go():
         try:
-            with smtplib.SMTP(s.SMTP_HOST, s.SMTP_PORT, timeout=15) as srv:
-                if s.SMTP_USE_TLS:
-                    srv.starttls(context=ssl.create_default_context())
-                if s.SMTP_USERNAME:
-                    srv.login(s.SMTP_USERNAME, s.SMTP_PASSWORD)
-                srv.send_message(msg, from_addr=s.SMTP_FROM, to_addrs=rcpts)
+            with smtplib.SMTP(host, s.SMTP_PORT, timeout=15) as srv:
+                srv.starttls(context=ssl.create_default_context())
+                if sender:
+                    srv.login(sender, pw)
+                srv.send_message(msg, from_addr=sender, to_addrs=rcpts)
             logger.info("[sample-mail] sent subject=%r to=%s", subject, to_addrs)
         except Exception:  # noqa: BLE001 — best-effort; transport failure must not break the request
             logger.exception("[sample-mail] send failed subject=%r", subject)

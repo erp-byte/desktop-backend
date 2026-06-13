@@ -50,10 +50,8 @@ class Settings(BaseSettings):
     # ── SMTP (notification mail; best-effort) ─────────────────────────────
     SMTP_HOST: str = ""                         # empty → mail send is a no-op
     SMTP_PORT: int = 587
-    SMTP_USERNAME: str = ""
-    SMTP_PASSWORD: str = ""
-    SMTP_USE_TLS: bool = True
-    SMTP_FROM: str = "noreply@candorfoods.in"
+    SMTP_EMAIL: str = ""                        # sender address + STARTTLS login (Gmail app password)
+    SMTP_APP_PASSWORD: str = ""                 # app password for SMTP_EMAIL
     PUBLIC_BACKEND_URL: str = "https://erpcf.netlify.app"   # base for email action links (reaches FastAPI via the Netlify /api proxy)
     WEB_APP_URL: str = "https://erpcf.in"                    # web app base for the Hold redirect
 
