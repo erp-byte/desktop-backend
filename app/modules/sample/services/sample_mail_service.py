@@ -2,6 +2,7 @@
 email_notifier pattern onto Settings().SMTP_*. Best-effort: never raises into the
 lifecycle. Recipients resolve from auth_user (email + role), NOT the broken users join."""
 from __future__ import annotations
+import html as _html
 import logging
 import smtplib
 import ssl
@@ -84,9 +85,13 @@ def _hold_url(request_id) -> str:
 def _button_html(req: dict, reviewer_email: str) -> str:
     rid = req.get("request_id")
     a, h = _accept_url(rid, reviewer_email), _hold_url(rid)
+    # rid is an int (safe); the free-text fields are user-controlled → HTML-escape.
+    target = _html.escape(str(req.get("npd_target_name") or "—"))
+    qty = _html.escape(str(req.get("quantity") or "—"))
+    requestor = _html.escape(str(req.get("requestor_team") or "—"))
     return f"""<div style="font-family:Arial,sans-serif">
       <h2>NPD sample request {rid}</h2>
-      <p>Target: {req.get('npd_target_name') or '—'} &middot; Qty: {req.get('quantity') or '—'} &middot; Requestor: {req.get('requestor_team') or '—'}</p>
+      <p>Target: {target} &middot; Qty: {qty} &middot; Requestor: {requestor}</p>
       <p><a href="{a}" style="background:#16a34a;color:#fff;padding:10px 18px;border-radius:4px;text-decoration:none">&#10003; Accept</a>
          &nbsp;<a href="{h}" style="background:#f59e0b;color:#fff;padding:10px 18px;border-radius:4px;text-decoration:none">&#9208; Hold</a></p>
     </div>"""
@@ -120,8 +125,9 @@ async def notify_inventory_informative(conn, req: dict, *, event: str) -> None:
     if not recips:
         return
     anchor = await _thread_anchor(conn, req["id"]) if req.get("id") else None
+    target = _html.escape(str(req.get("npd_target_name") or "—"))
     html = (f"<div style='font-family:Arial,sans-serif'><h3>Sample request {req.get('request_id')} — {event}</h3>"
-            f"<p>Target: {req.get('npd_target_name') or '—'}</p></div>")
+            f"<p>Target: {target}</p></div>")
     _send(f"Sample request {req.get('request_id')} — {event}", html, recips, in_reply_to=anchor)
 
 
@@ -130,8 +136,9 @@ async def notify_requestor_email(conn, req: dict, *, action: str, reason: str | 
     anchor = await _thread_anchor(conn, req["id"]) if req.get("id") else None
     recips = await _emails_for_role(conn, "npd_team")
     verb = "ACCEPTED" if (action or "").upper() in ("ACCEPT", "APPROVE") else "ON HOLD"
+    reason_html = f"<p>Reason: {_html.escape(str(reason))}</p>" if reason else ""
     html = (f"<div style='font-family:Arial,sans-serif'><h3>Sample request {req.get('request_id')} {verb}</h3>"
-            + (f"<p>Reason: {reason}</p>" if reason else "") + "</div>")
+            + reason_html + "</div>")
     if recips:
         _send(f"Sample request {req.get('request_id')} {verb}", html, recips, in_reply_to=anchor)
 
