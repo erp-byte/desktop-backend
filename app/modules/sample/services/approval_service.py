@@ -148,7 +148,8 @@ async def act_bh_approval(conn, req_id: int, *, action: str, user,
 # Each carries a reason (required for reject + hold). Applies to NPD / TRIAL only.
 # ---------------------------------------------------------------------------
 _NPD_REVIEW = {
-    "APPROVE": ("APPROVED", "BH_APPROVED"),
+    "ACCEPT":  ("APPROVED", "BH_APPROVED"),
+    "APPROVE": ("APPROVED", "BH_APPROVED"),   # legacy alias (WhatsApp/web)
     "REJECT":  ("REJECTED", "BH_REJECTED"),
     "HOLD":    ("HOLD",     "ON_HOLD"),
 }
@@ -212,7 +213,7 @@ async def act_npd_review(conn, req_id: int, *, action: str, user,
     # WhatsApp the requestor the outcome (best-effort, after commit — a transport
     # failure must never roll back or block the review). The hold reason captured
     # via WhatsApp (or the web form) flows straight into the on-hold template.
-    if act in ("APPROVE", "HOLD"):
+    if act in ("ACCEPT", "APPROVE", "HOLD"):
         try:
             from app.modules.sample.services import whatsapp_service as wa
             await wa.notify_requestor(conn, dict(locked), action=act, reason=reason)

@@ -115,7 +115,7 @@ class NpdReviewBody(BaseModel):
     # NPD team's verdict on a BH-sent request. Reason required for reject + hold
     # (enforced in the service). start_date is the date the hold takes effect —
     # only meaningful for HOLD; ignored otherwise.
-    action: Literal["APPROVE", "REJECT", "HOLD"]
+    action: Literal["ACCEPT", "APPROVE", "REJECT", "HOLD"]
     reason: Optional[str] = None
     start_date: Optional[date] = None
 
