@@ -210,6 +210,9 @@ class DevJobCardClose(BaseModel):
 class PromoteApprovalBody(BaseModel):
     action: Literal["ACCEPT", "REJECT"]
     remarks: Optional[str] = None
+    # Only needed when one user holds BOTH gates (inventory_manager who is also the
+    # requestor) — names which gate this action applies to so each is actioned once.
+    approver_kind: Optional[Literal["INV_MGR", "REQUESTOR_BH"]] = None
 
 
 class DevDispatchBody(BaseModel):

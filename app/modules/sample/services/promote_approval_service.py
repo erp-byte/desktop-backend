@@ -17,22 +17,37 @@ from app.modules.sample.services import notification_service
 
 
 async def _insert_8d(conn, sql: str, *params):
+    """Insert with an app-supplied 8-digit id, retrying ONLY on a primary-key
+    collision (a freshly minted id may clash). Any OTHER unique violation (e.g. a
+    real business constraint like uq_promote_req_live) is re-raised so the caller
+    can map it — mirroring the house insert_with_pk_retry contract, which never
+    silently swallows non-PK conflicts."""
     for _ in range(5):
         rid = new_short_time_id()
         try:
             async with conn.transaction():
                 return await conn.fetchval(sql, rid, *params)
-        except asyncpg.UniqueViolationError:
+        except asyncpg.UniqueViolationError as e:
+            if not (e.constraint_name or "").endswith("_pkey"):
+                raise
             continue
     raise HTTPException(500, detail={"error": "id_alloc", "message": "could not allocate id"})
 
 
 async def open_promote_request(conn, dev_jc_id: int, *, payload: dict, user) -> dict:
     async with conn.transaction():
-        req_id = await _insert_8d(conn,
-            """INSERT INTO npd_dev_promote_request (id, dev_jc_id, promote_phase_id, close_payload, created_by)
-               VALUES ($1,$2,$3,$4::jsonb,$5) RETURNING id""",
-            dev_jc_id, payload.get("promote_phase_id"), json.dumps(payload), user.user_id)
+        # Only one live promote per job card (uq_promote_req_live, partial unique on
+        # dev_jc_id WHERE status='PENDING'). A second open — sequential OR a race that
+        # slips past — surfaces as a clean 409, never a confusing id-alloc 500.
+        try:
+            req_id = await _insert_8d(conn,
+                """INSERT INTO npd_dev_promote_request (id, dev_jc_id, promote_phase_id, close_payload, created_by)
+                   VALUES ($1,$2,$3,$4::jsonb,$5) RETURNING id""",
+                dev_jc_id, payload.get("promote_phase_id"), json.dumps(payload), user.user_id)
+        except asyncpg.UniqueViolationError:
+            raise HTTPException(409, detail={"error": "promote_already_pending",
+                "message": "A promote is already awaiting approval for this job card",
+                "details": {"dev_jc_id": dev_jc_id}})
         src_req = await conn.fetchval(
             "SELECT source_requisition_id FROM npd_dev_job_cards WHERE id = $1", dev_jc_id)
         requestor_uid = None
@@ -58,7 +73,8 @@ async def open_promote_request(conn, dev_jc_id: int, *, payload: dict, user) -> 
     return {"ok": True, "promote_request_id": req_id, "status": "PENDING_APPROVAL"}
 
 
-async def act_promote_approval(conn, dev_jc_id: int, *, action: str, user, remarks: str | None = None) -> dict:
+async def act_promote_approval(conn, dev_jc_id: int, *, action: str, user,
+                               remarks: str | None = None, approver_kind: str | None = None) -> dict:
     act = (action or "").upper()
     if act not in ("ACCEPT", "REJECT"):
         raise HTTPException(422, detail={"error": "invalid_action", "message": "action must be ACCEPT or REJECT"})
@@ -68,22 +84,47 @@ async def act_promote_approval(conn, dev_jc_id: int, *, action: str, user, remar
         if pr is None:
             raise HTTPException(409, detail={"error": "no_pending_promote",
                 "message": "No pending promote request for this job card"})
-        kinds = []
+        # Which gate(s) may this user act on? inventory_manager → INV_MGR; the
+        # requisition's requestor → REQUESTOR_BH (a user can, in rare configs, be both).
+        eligible: set[str] = set()
         if getattr(user, "role_name", "") == "inventory_manager":
-            kinds.append("INV_MGR")
+            eligible.add("INV_MGR")
         bh_row = await conn.fetchrow(
             "SELECT id FROM npd_dev_promote_approval WHERE promote_request_id=$1 AND approver_kind='REQUESTOR_BH' AND approver_user_id=$2",
             pr["id"], user.user_id)
         if bh_row:
-            kinds.append("REQUESTOR_BH")
-        if not kinds:
+            eligible.add("REQUESTOR_BH")
+        if not eligible:
             raise HTTPException(403, detail={"error": "not_an_approver",
                 "message": "You are not an approver on this promote"})
+        # Restrict to the eligible gates that are still PENDING.
+        rows = await conn.fetch(
+            "SELECT approver_kind FROM npd_dev_promote_approval "
+            "WHERE promote_request_id=$1 AND status='PENDING' AND approver_kind = ANY($2::text[])",
+            pr["id"], list(eligible))
+        pending_kinds = [r["approver_kind"] for r in rows]
+        if not pending_kinds:
+            raise HTTPException(409, detail={"error": "already_actioned",
+                "message": "Your approval on this promote is already recorded"})
+        # Act on EXACTLY ONE gate — a single user holding both gates must still act
+        # on each separately (preserves the two-person control), so disambiguate.
+        if approver_kind:
+            target = approver_kind.upper()
+            if target not in pending_kinds:
+                raise HTTPException(409, detail={"error": "gate_not_actionable",
+                    "message": "That approval gate is not yours or is already actioned",
+                    "details": {"approver_kind": target, "pending": pending_kinds}})
+        elif len(pending_kinds) == 1:
+            target = pending_kinds[0]
+        else:
+            raise HTTPException(422, detail={"error": "specify_gate",
+                "message": "You hold both gates — specify approver_kind (INV_MGR or REQUESTOR_BH)",
+                "details": {"pending": pending_kinds}})
         new_status = "ACCEPTED" if act == "ACCEPT" else "REJECTED"
         await conn.execute(
             "UPDATE npd_dev_promote_approval SET status=$3, remarks=$4, decided_at=NOW() "
-            "WHERE promote_request_id=$1 AND approver_kind = ANY($2::text[]) AND status='PENDING'",
-            pr["id"], kinds, new_status, remarks)
+            "WHERE promote_request_id=$1 AND approver_kind=$2 AND status='PENDING'",
+            pr["id"], target, new_status, remarks)
         if act == "REJECT":
             await conn.execute("UPDATE npd_dev_promote_request SET status='VOID', decided_at=NOW() WHERE id=$1", pr["id"])
             return {"ok": True, "status": "REJECTED"}

@@ -483,7 +483,8 @@ async def promote_approval(
     from app.modules.sample.services import promote_approval_service as pas
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
-        return await pas.act_promote_approval(conn, dev_jc_id, action=body.action, user=user, remarks=body.remarks)
+        return await pas.act_promote_approval(conn, dev_jc_id, action=body.action, user=user,
+                                              remarks=body.remarks, approver_kind=body.approver_kind)
 
 
 @router.post("/npd-dev-job-cards/{dev_jc_id}/dispatch")
