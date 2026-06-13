@@ -21,6 +21,7 @@ import types
 import asyncpg
 from dotenv import load_dotenv
 
+from app.core.helpers import new_short_time_id
 from app.modules.sample.services import npd_dev_service as svc
 from app.modules.sample.services import promote_approval_service as pas
 
@@ -45,14 +46,15 @@ async def main():
         await c.execute("UPDATE auth_user SET role_id = $2 WHERE user_id = $1", inv_uid, inv_role)
 
         # A source requisition whose requestor is req_uid (its BH gate approver).
+        # request_id is the app-minted 8-digit PK (requisition_number was dropped in
+        # migration 068) — mirror requisition_service's INSERT.
         src_req = await c.fetchval(
             """INSERT INTO sample_requisitions
-                   (requisition_number, sample_type, status, requestor_user_id, entity, created_by)
+                   (request_id, sample_type, status, requestor_user_id, entity, created_by)
                VALUES ($1, 'NPD', 'BH_APPROVED', $2, 'cfpl', $2) RETURNING id""",
-            f"SMP-PROMOTEGATE-{os.getpid()}", req_uid)
+            new_short_time_id(), req_uid)
 
         # An IN_DEVELOPMENT dev JC linked to that requisition, with a base recipe.
-        from app.core.helpers import new_short_time_id
         dev_jc_id = new_short_time_id()
         await c.execute(
             """INSERT INTO npd_dev_job_cards

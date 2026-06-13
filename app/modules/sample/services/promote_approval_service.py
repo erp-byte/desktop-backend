@@ -57,9 +57,13 @@ async def open_promote_request(conn, dev_jc_id: int, *, payload: dict, user) -> 
         await _insert_8d(conn,
             """INSERT INTO npd_dev_promote_approval (id, promote_request_id, approver_kind, approver_user_id)
                VALUES ($1,$2,'INV_MGR',NULL) RETURNING id""", req_id)
-        await _insert_8d(conn,
-            """INSERT INTO npd_dev_promote_approval (id, promote_request_id, approver_kind, approver_user_id)
-               VALUES ($1,$2,'REQUESTOR_BH',$3) RETURNING id""", req_id, requestor_uid)
+        # A sourceless standalone dev JC (no requisition → no requestor) raises ONLY
+        # the INV_MGR gate; a REQUESTOR_BH gate with a NULL approver could never be
+        # accepted (no one is bound to it), wedging the promote in a dead-lock.
+        if requestor_uid is not None:
+            await _insert_8d(conn,
+                """INSERT INTO npd_dev_promote_approval (id, promote_request_id, approver_kind, approver_user_id)
+                   VALUES ($1,$2,'REQUESTOR_BH',$3) RETURNING id""", req_id, requestor_uid)
         await notification_service.emit_alert(
             conn, alert_type="npd_promote_requested",
             target_team=notification_service.TEAM_INVENTORY,
@@ -94,6 +98,9 @@ async def act_promote_approval(conn, dev_jc_id: int, *, action: str, user,
             pr["id"], user.user_id)
         if bh_row:
             eligible.add("REQUESTOR_BH")
+        # An admin can act on any gate (mirrors the house admin bypass elsewhere).
+        if getattr(user, "is_admin", False):
+            eligible.update({"INV_MGR", "REQUESTOR_BH"})
         if not eligible:
             raise HTTPException(403, detail={"error": "not_an_approver",
                 "message": "You are not an approver on this promote"})
@@ -121,14 +128,21 @@ async def act_promote_approval(conn, dev_jc_id: int, *, action: str, user,
                 "message": "You hold both gates — specify approver_kind (INV_MGR or REQUESTOR_BH)",
                 "details": {"pending": pending_kinds}})
         new_status = "ACCEPTED" if act == "ACCEPT" else "REJECTED"
+        # Stamp WHICH user acted (records the specific inventory_manager who
+        # accepted; harmless for REQUESTOR_BH, whose approver is already bound).
         await conn.execute(
-            "UPDATE npd_dev_promote_approval SET status=$3, remarks=$4, decided_at=NOW() "
+            "UPDATE npd_dev_promote_approval SET status=$3, remarks=$4, decided_at=NOW(), approver_user_id=$5 "
             "WHERE promote_request_id=$1 AND approver_kind=$2 AND status='PENDING'",
-            pr["id"], target, new_status, remarks)
+            pr["id"], target, new_status, remarks, user.user_id)
         if act == "REJECT":
             await conn.execute("UPDATE npd_dev_promote_request SET status='VOID', decided_at=NOW() WHERE id=$1", pr["id"])
             return {"ok": True, "status": "REJECTED"}
-    return await finalize_if_ready(conn, dev_jc_id)
+        # Finalize INSIDE this transaction so a promote failure rolls the gate
+        # accept back (retryable). finalize_if_ready opens its own transaction,
+        # which nests as a savepoint here — if _finalize_promote raises, the whole
+        # outer transaction (including this gate flip) rolls back.
+        result = await finalize_if_ready(conn, dev_jc_id)
+    return result
 
 
 async def finalize_if_ready(conn, dev_jc_id: int) -> dict:

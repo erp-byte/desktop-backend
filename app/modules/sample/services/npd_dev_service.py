@@ -511,6 +511,13 @@ async def _finalize_promote(conn, dev_jc_id, *, promote_phase_id, close_payload:
     what the operator hits first. promote_phase_id comes from the arg and the
     output/accounting fields come from close_payload (the stashed close dict)."""
     jc = await _fetch(conn, dev_jc_id)
+    # Guard: the card may have been cancelled (or already closed) between the
+    # promote request opening and both gates clearing — never promote a card that
+    # is no longer IN_DEVELOPMENT (the gate accept rolls back via the outer txn).
+    if jc["status"] != "IN_DEVELOPMENT":
+        raise HTTPException(409, detail={"error": "wrong_status",
+                                         "message": "Job card is no longer IN_DEVELOPMENT",
+                                         "details": {"status": jc["status"]}})
     # Promote the recipe of the operator-chosen FINAL-TRIAL phase; fall back to
     # the card base recipe (phase_id IS NULL) when no phase is given (a legacy /
     # no-phase card). When a phase is chosen the card's output + accounting are
@@ -612,7 +619,7 @@ async def _finalize_promote(conn, dev_jc_id, *, promote_phase_id, close_payload:
                    -- Confirmed dispatch date (By NPD) = the job card's closing date.
                    confirmed_dispatch_date = CURRENT_DATE,
                    closed_by = $10, closed_at = NOW(), updated_at = NOW()
-             WHERE id = $11
+             WHERE id = $11 AND status = 'IN_DEVELOPMENT'
             """,
             new_bom_id, out_qty, out_uom, yield_pct, out_notes,
             rm_consumed, wastage, ega, fg_batch_id,
@@ -681,9 +688,15 @@ async def cancel_dev_job_card(conn, dev_jc_id: int, *, reason: str, user) -> dic
         raise HTTPException(409, detail={"error": "wrong_status",
                                          "message": "Job card is already finalised",
                                          "details": {"status": jc["status"]}})
-    await conn.execute(
-        """UPDATE npd_dev_job_cards
-              SET status = 'CANCELLED', cancellation_reason = $1, updated_at = NOW()
-            WHERE id = $2""",
-        reason, dev_jc_id)
+    async with conn.transaction():
+        await conn.execute(
+            """UPDATE npd_dev_job_cards
+                  SET status = 'CANCELLED', cancellation_reason = $1, updated_at = NOW()
+                WHERE id = $2""",
+            reason, dev_jc_id)
+        # Void any pending promote request so it can never later finalize against a
+        # cancelled card (the dual-approval gate would otherwise still be clearable).
+        await conn.execute(
+            "UPDATE npd_dev_promote_request SET status='VOID', decided_at=NOW() "
+            "WHERE dev_jc_id=$1 AND status='PENDING'", dev_jc_id)
     return await get_dev_job_card(conn, dev_jc_id)

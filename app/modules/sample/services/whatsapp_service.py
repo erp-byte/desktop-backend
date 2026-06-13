@@ -359,7 +359,7 @@ async def _requestor_phone(conn, req: dict) -> str | None:
 
 
 async def notify_requestor(conn, req: dict, *, action: str, reason: str | None = None) -> None:
-    """Tell the requestor the outcome. action in {'APPROVE','HOLD'}."""
+    """Tell the requestor the outcome. action in {'APPROVE','ACCEPT','HOLD'}."""
     phone = await _requestor_phone(conn, req)
     if not phone:
         logger.info("Requestor has no phone — skipping outcome notify for req %s", req.get("id"))
@@ -368,7 +368,7 @@ async def notify_requestor(conn, req: dict, *, action: str, reason: str | None =
     # {{2}} = expected dispatch (accepted) / hold reason (on-hold).
     req_no = _txt(req.get("request_id") or req.get("id"))
     target = _txt(req.get("npd_target_name"))
-    if action == "APPROVE":
+    if action in ("APPROVE", "ACCEPT"):
         # At accept time the trial hasn't closed, so the confirmed dispatch date is
         # not known yet — show the BD team's EXPECTED dispatch date instead.
         disp = req.get("expected_dispatch_date")

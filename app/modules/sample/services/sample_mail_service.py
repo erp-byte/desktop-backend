@@ -156,25 +156,33 @@ async def notify_inventory_promote_requested(conn, *, dev_jc_id, requestor_uid=N
 async def send_due_reminders(conn) -> int:
     """Reminder reply on the thread for NPD/TRIAL requests still SUBMITTED/ON_HOLD, capped
     at REMINDER_MAX and no sooner than REMINDER_MIN_HOURS apart. Returns # requests nudged.
-    Meant to be run on a cron (the cadence guards make frequent calls safe no-ops)."""
-    rows = await conn.fetch(
-        """SELECT id, request_id, npd_target_name, quantity, requestor_team, email_thread_msgid
-             FROM sample_requisitions
-            WHERE deleted_at IS NULL AND sample_type IN ('NPD','TRIAL')
-              AND status IN ('SUBMITTED','ON_HOLD')
-              AND reminder_count < $1
-              AND (last_reminder_at IS NULL OR last_reminder_at < NOW() - make_interval(hours => $2))""",
-        REMINDER_MAX, REMINDER_MIN_HOURS)
-    recips = await _emails_for_role(conn, "npd_team")
-    if not recips:
-        return 0
-    sent = 0
-    for r in rows:
-        for em in recips:
-            _send(f"Reminder: NPD sample request {r['request_id']} still needs a decision",
-                  _button_html(dict(r), em), [em], in_reply_to=r["email_thread_msgid"])
-        await conn.execute(
-            "UPDATE sample_requisitions SET reminder_count = reminder_count + 1, last_reminder_at = NOW() WHERE id = $1",
-            r["id"])
-        sent += 1
-    return sent
+    Meant to be run on a cron (the cadence guards make frequent calls safe no-ops).
+
+    A transaction-scoped advisory lock makes two concurrent sweeps mutually
+    exclusive: a second caller that can't grab the lock returns 0 immediately,
+    so the reminder_count never gets double-incremented by overlapping runs."""
+    async with conn.transaction():
+        got = await conn.fetchval("SELECT pg_try_advisory_xact_lock($1)", 8472013)
+        if not got:
+            return 0
+        rows = await conn.fetch(
+            """SELECT id, request_id, npd_target_name, quantity, requestor_team, email_thread_msgid
+                 FROM sample_requisitions
+                WHERE deleted_at IS NULL AND sample_type IN ('NPD','TRIAL')
+                  AND status IN ('SUBMITTED','ON_HOLD')
+                  AND reminder_count < $1
+                  AND (last_reminder_at IS NULL OR last_reminder_at < NOW() - make_interval(hours => $2))""",
+            REMINDER_MAX, REMINDER_MIN_HOURS)
+        recips = await _emails_for_role(conn, "npd_team")
+        if not recips:
+            return 0
+        sent = 0
+        for r in rows:
+            for em in recips:
+                _send(f"Reminder: NPD sample request {r['request_id']} still needs a decision",
+                      _button_html(dict(r), em), [em], in_reply_to=r["email_thread_msgid"])
+            await conn.execute(
+                "UPDATE sample_requisitions SET reminder_count = reminder_count + 1, last_reminder_at = NOW() WHERE id = $1",
+                r["id"])
+            sent += 1
+        return sent
