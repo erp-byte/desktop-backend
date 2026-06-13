@@ -2972,6 +2972,52 @@ async def get_job_card(conn, job_card_id: int) -> dict | None:
         job_card_id,
     )
 
+    # Accounting summary (job_card_accounting_v2). The JC detail GET was
+    # historically silent about this row — the Output & Accounting tab's
+    # Summary Card relied on the post-save GET /accounting refetch to
+    # populate it, so a page refresh after a save showed all zeros and the
+    # operator read it as "accounting got lost". Surface the row here so the
+    # Summary Card hydrates on every detail fetch. Mirrors the shape that
+    # jc_accounting_v2.get_accounting returns under the same key, including
+    # the derived rejection_pct / offgrade_pct and the bom-driven
+    # allowed_balance_tolerance_pct.
+    accounting_row = await conn.fetchrow(
+        "SELECT * FROM job_card_accounting_v2 WHERE job_card_id = $1",
+        job_card_id,
+    )
+    accounting_payload = _serialize(accounting_row) if accounting_row else None
+    if accounting_payload is not None:
+        def _accf(v):
+            if v is None or v == "":
+                return 0.0
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return 0.0
+
+        out_qty = _accf(accounting_payload.get("output_qty"))
+        if out_qty > 0:
+            rejection_qty = _accf(accounting_payload.get("rejection_qty"))
+            offgrade_qty  = _accf(accounting_payload.get("offgrade_total_qty"))
+            accounting_payload["rejection_pct"] = round((rejection_qty / out_qty) * 100, 3)
+            accounting_payload["offgrade_pct"]  = round((offgrade_qty  / out_qty) * 100, 3)
+        else:
+            accounting_payload["rejection_pct"] = None
+            accounting_payload["offgrade_pct"]  = None
+
+        tolerance_pct = None
+        if h.get("bom_id") is not None:
+            tolerance_pct = await conn.fetchval(
+                "SELECT allowed_balance_tolerance_pct FROM bom_header WHERE bom_id = $1",
+                h["bom_id"],
+            )
+        # Canonical default kept in sync with jc_accounting_v2.BALANCE_TOLERANCE_PCT_DEF;
+        # inlined here to avoid a circular import (jc_accounting_v2 already
+        # depends on job_card_v2 for assert_not_locked).
+        accounting_payload["allowed_balance_tolerance_pct"] = (
+            float(tolerance_pct) if tolerance_pct is not None else 0.001
+        )
+
     # ─── FG per-unit kg from all_sku (R2 canonical source) ───────────────
     # all_sku.uom is the per-unit kg multiplier (NUMERIC(15,3)) per
     # schema.sql:54 — single source of truth. bom_header.pack_size_kg is a
@@ -3109,6 +3155,11 @@ async def get_job_card(conn, job_card_id: int) -> dict | None:
         # future iterations).
         "additives": await _list_additives_local(conn, job_card_id),
         "qc":                             _serialize(qc_row) if qc_row else None,
+        # R10/B4 — accounting summary so the Output tab's Summary Card
+        # hydrates on every detail fetch instead of only after the
+        # operator presses Save Output (which fires a separate GET
+        # /accounting refetch). See the fetch + post-process block above.
+        "accounting":                     accounting_payload,
         "store_allocations":              [],          # see /allocations endpoint (TODO)
         # total_stages for the chain progress bar.
         "total_stages": await conn.fetchval(

@@ -44,6 +44,8 @@ import logging
 from datetime import datetime
 from decimal import Decimal
 
+from asyncpg.exceptions import UndefinedColumnError
+
 from app.core.helpers import insert_with_pk_retry, new_short_time_id
 from app.modules.production.services.job_card_v2 import (
     assert_not_locked,
@@ -311,9 +313,17 @@ def _f(v) -> float:
 # Read
 # ---------------------------------------------------------------------------
 
-async def get_accounting(conn, job_card_id: int) -> dict:
+async def get_accounting(conn, job_card_id: int, *, batch_id: int | None = None) -> dict:
     """Return the full accounting view for a v2 JC:
         consumption rows + byproducts rows + summary + JC stage context.
+
+    When ``batch_id`` is supplied, ``consumption`` and ``byproducts`` are
+    restricted to that batch (rows still carrying NULL batch_id are also
+    included — they're legacy / record_output-pre-batch_id_fix rows that
+    should still surface under the current batch instead of vanishing).
+    The ``accounting`` summary row is JC-level (one per JC); it's returned
+    unchanged. ``consumption_variance`` is also JC-level by design — it
+    aggregates BOM vs actual across the whole JC.
     """
     jc = await conn.fetchrow(
         """
@@ -341,14 +351,50 @@ async def get_accounting(conn, job_card_id: int) -> dict:
     is_first = jc["prev_job_card_id"] is None
     is_last  = jc["next_job_card_id"] is None
 
-    consumption = await conn.fetch(
-        """
-        SELECT * FROM job_card_material_consumption_v2
-        WHERE  job_card_id=$1
-        ORDER  BY consumption_id
-        """,
-        job_card_id,
-    )
+    # batch_id filter: NULL → include all (legacy + every batch).
+    # int → match that batch_id OR rows still carrying NULL (defensive
+    # parity with the frontend's matchesBatch helper, which keeps
+    # NULL-batch rows visible under the currently picked batch so legacy
+    # data doesn't silently vanish from the operator's view).
+    #
+    # Pre-migration-038 environments don't have a batch_id column on the
+    # accounting tables. Catch UndefinedColumnError and fall back to the
+    # unfiltered query (per-batch filtering is impossible on that schema
+    # anyway — the caller will see the same JC-wide rows the old endpoint
+    # returned). Mirrors the fallback pattern in job_card_v2.get_job_card.
+    if batch_id is None:
+        consumption = await conn.fetch(
+            """
+            SELECT * FROM job_card_material_consumption_v2
+            WHERE  job_card_id=$1
+            ORDER  BY consumption_id
+            """,
+            job_card_id,
+        )
+    else:
+        try:
+            consumption = await conn.fetch(
+                """
+                SELECT * FROM job_card_material_consumption_v2
+                WHERE  job_card_id=$1
+                  AND  (batch_id = $2 OR batch_id IS NULL)
+                ORDER  BY consumption_id
+                """,
+                job_card_id, batch_id,
+            )
+        except UndefinedColumnError:
+            logger.warning(
+                "get_accounting: job_card_material_consumption_v2.batch_id "
+                "missing — falling back to unfiltered SELECT. Apply migration 038."
+            )
+            consumption = await conn.fetch(
+                """
+                SELECT * FROM job_card_material_consumption_v2
+                WHERE  job_card_id=$1
+                ORDER  BY consumption_id
+                """,
+                job_card_id,
+            )
     # fe-H1 / web-C3-CRIT-2: surface every persisted BOM-vs-actual variance
     # row so the Accounting tab can render the variance table without a
     # separate round-trip. Cost columns on this table (unit_cost_at_consumption,
@@ -366,14 +412,39 @@ async def get_accounting(conn, job_card_id: int) -> dict:
         """,
         job_card_id,
     )
-    byproducts = await conn.fetch(
-        """
-        SELECT * FROM job_card_byproducts_v2
-        WHERE  job_card_id=$1
-        ORDER  BY byproduct_id
-        """,
-        job_card_id,
-    )
+    if batch_id is None:
+        byproducts = await conn.fetch(
+            """
+            SELECT * FROM job_card_byproducts_v2
+            WHERE  job_card_id=$1
+            ORDER  BY byproduct_id
+            """,
+            job_card_id,
+        )
+    else:
+        try:
+            byproducts = await conn.fetch(
+                """
+                SELECT * FROM job_card_byproducts_v2
+                WHERE  job_card_id=$1
+                  AND  (batch_id = $2 OR batch_id IS NULL)
+                ORDER  BY byproduct_id
+                """,
+                job_card_id, batch_id,
+            )
+        except UndefinedColumnError:
+            logger.warning(
+                "get_accounting: job_card_byproducts_v2.batch_id "
+                "missing — falling back to unfiltered SELECT. Apply migration 038."
+            )
+            byproducts = await conn.fetch(
+                """
+                SELECT * FROM job_card_byproducts_v2
+                WHERE  job_card_id=$1
+                ORDER  BY byproduct_id
+                """,
+                job_card_id,
+            )
     accounting = await conn.fetchrow(
         "SELECT * FROM job_card_accounting_v2 WHERE job_card_id=$1",
         job_card_id,

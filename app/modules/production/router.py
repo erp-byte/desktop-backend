@@ -5329,11 +5329,19 @@ class AccountingSummaryRequest(BaseModel):
 async def get_accounting_v2(
     request: Request,
     job_card_id: int,
+    batch_id: int | None = Query(None),
     user=Depends(get_current_user),
 ):
     """Full accounting view for a v2 JC. Includes:
        stage context (step number, position, prev/next IDs, carried qty),
        consumption rows, byproduct rows, accounting summary.
+
+    When `batch_id` is supplied, consumption + byproducts are filtered to
+    rows tagged with that batch (and rows still carrying NULL batch_id are
+    surfaced as well — defensive parity with the frontend's matchesBatch
+    helper, which keeps legacy rows visible under the picked batch instead
+    of vanishing). The accounting summary row is JC-level (one row per JC)
+    and is returned as-is regardless of the batch filter.
 
     B13 cost-metric gate: strips currency-bearing fields from the
     response when the caller's role is in the deny list. Qty / yield /
@@ -5342,7 +5350,7 @@ async def get_accounting_v2(
     from app.modules.production.services.jc_accounting_v2 import get_accounting
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
-        result = await get_accounting(conn, job_card_id)
+        result = await get_accounting(conn, job_card_id, batch_id=batch_id)
     if result.get("error") == "job_card_not_found":
         raise HTTPException(status_code=404, detail="Job card not found")
     return strip_cost_fields(
