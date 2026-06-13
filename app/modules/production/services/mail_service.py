@@ -49,13 +49,16 @@ async def _lookup_user_email(conn, identifier: str | None) -> str | None:
 
 def _send(subject: str, body: str, to_addrs: list[str], cc_addrs: list[str]) -> None:
     settings = Settings()
-    if not settings.SMTP_HOST:
+    host = (settings.SMTP_HOST or "").strip()
+    sender = (settings.SMTP_EMAIL or "").strip()
+    pw = (settings.SMTP_APP_PASSWORD or "").strip()
+    if not host:
         logger.info("[mail] SMTP_HOST not configured — skipping send (to=%s cc=%s subject=%s)",
                     to_addrs, cc_addrs, subject)
         return
 
     msg = EmailMessage()
-    msg["From"] = settings.SMTP_FROM
+    msg["From"] = sender
     msg["To"] = ", ".join(to_addrs)
     if cc_addrs:
         msg["Cc"] = ", ".join(cc_addrs)
@@ -65,12 +68,11 @@ def _send(subject: str, body: str, to_addrs: list[str], cc_addrs: list[str]) -> 
     recipients = list(dict.fromkeys([*to_addrs, *cc_addrs]))
 
     try:
-        with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT, timeout=15) as s:
-            if settings.SMTP_USE_TLS:
-                s.starttls(context=ssl.create_default_context())
-            if settings.SMTP_USERNAME:
-                s.login(settings.SMTP_USERNAME, settings.SMTP_PASSWORD)
-            s.send_message(msg, from_addr=settings.SMTP_FROM, to_addrs=recipients)
+        with smtplib.SMTP(host, settings.SMTP_PORT, timeout=15) as s:
+            s.starttls(context=ssl.create_default_context())
+            if sender:
+                s.login(sender, pw)
+            s.send_message(msg, from_addr=sender, to_addrs=recipients)
         logger.info("[mail] sent subject=%r to=%s cc=%s", subject, to_addrs, cc_addrs)
     except Exception:
         logger.exception("[mail] failed subject=%r to=%s cc=%s", subject, to_addrs, cc_addrs)
