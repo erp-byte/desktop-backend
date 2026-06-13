@@ -104,7 +104,7 @@ async def flow_basis_rm(conn):
 
     req = await req_svc.create_requisition(conn, payload={
         "sample_type": "BASIS_RM", "warehouse": WAREHOUSE, "articles": _articles(sku_id, sku_name)}, user=requestor)
-    assert req["status"] == "DRAFT" and req["requisition_number"].startswith("SMP-"), req["status"]
+    assert req["status"] == "DRAFT" and req.get("request_id"), req["status"]
     rid = req["id"]
 
     await req_svc.submit_requisition(conn, rid, user=requestor)

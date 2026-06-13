@@ -15,8 +15,10 @@ A fresh CONVERSION_APPROVAL row is always written, even same-day / same-approver
 """
 from __future__ import annotations
 
+import asyncpg
 from fastapi import HTTPException
 
+from app.core.helpers import new_short_time_id
 from app.modules.production.services.material_document_service import MVT_GI_SAMPLE
 from app.modules.sample.services import audit_service, notification_service
 from app.modules.sample.services import approval_service as appr
@@ -70,7 +72,7 @@ async def convert_full(conn, req_id: int, *, user, payload: dict | None = None) 
         await notification_service.emit_alert(
             conn, alert_type="sample_conversion_approved",
             target_team=notification_service.TEAM_INVENTORY,
-            message=f"Sample {req['requisition_number']} converted to external gate pass.",
+            message=f"Sample {req['request_id']} converted to external gate pass.",
             related_id=gp_id, related_type=notification_service.REL_SAMPLE_GATE_PASS)
     return await gp_svc.get_gate_pass(conn, gp_id)
 
@@ -103,21 +105,30 @@ async def convert_partial(conn, req_id: int, *, qty: float, user,
         await appr.record_action(conn, req_id, approval_stage=appr.CONVERSION_APPROVAL,
                                  action="APPROVED", user=user, remarks=payload.get("remarks"))
 
-        # Child requisition carrying the converted portion.
-        seq = await conn.fetchval("SELECT nextval('seq_sample_req')")
-        number = req_svc._gen_requisition_number(seq)
-        child_id = await conn.fetchval(
-            """
-            INSERT INTO sample_requisitions
-                (requisition_number, sample_type, status, requestor_user_id,
-                 requestor_team, purpose_tag, purpose_note, warehouse,
-                 converted_from_id, converted_to_external, created_by, updated_by)
-            VALUES ($1, $2, 'READY_FOR_DISPATCH', $3, $4, $5, $6, $7, $8, TRUE, $9, $9)
-            RETURNING id
-            """,
-            number, parent["sample_type"], parent["requestor_user_id"],
-            parent["requestor_team"], parent["purpose_tag"], parent["purpose_note"],
-            parent["warehouse"], req_id, user.user_id)
+        # Child requisition carrying the converted portion. request_id is the
+        # app-supplied 8-digit time-based BIGINT PK (new_short_time_id) — retry on
+        # the rare unique collision via a per-attempt savepoint.
+        child_id = None
+        for _attempt in range(5):
+            child_request_id = new_short_time_id()
+            try:
+                async with conn.transaction():
+                    child_id = await conn.fetchval(
+                        """
+                        INSERT INTO sample_requisitions
+                            (request_id, sample_type, status, requestor_user_id,
+                             requestor_team, purpose_tag, purpose_note, warehouse,
+                             converted_from_id, converted_to_external, created_by, updated_by)
+                        VALUES ($1, $2, 'READY_FOR_DISPATCH', $3, $4, $5, $6, $7, $8, TRUE, $9, $9)
+                        RETURNING id
+                        """,
+                        child_request_id, parent["sample_type"], parent["requestor_user_id"],
+                        parent["requestor_team"], parent["purpose_tag"], parent["purpose_note"],
+                        parent["warehouse"], req_id, user.user_id)
+                break
+            except asyncpg.UniqueViolationError:
+                if _attempt == 4:
+                    raise
         await audit_service.write_audit(
             conn, child_id, audit_service.EV_CONVERSION,
             new_value={"mode": "partial_child", "parent": req_id, "qty": qty},
@@ -136,10 +147,10 @@ async def convert_partial(conn, req_id: int, *, qty: float, user,
         # Parent -> PARTIALLY_CONVERTED
         await req_svc.transition_status(
             conn, req_id, target="PARTIALLY_CONVERTED", user=user,
-            remarks=f"Partial conversion of {qty} to {number}")
+            remarks=f"Partial conversion of {qty} to {child_request_id}")
         await notification_service.emit_alert(
             conn, alert_type="sample_conversion_initiated",
             target_team=notification_service.TEAM_INVENTORY,
-            message=f"Partial conversion of {parent['requisition_number']} ({qty}) -> {number}.",
+            message=f"Partial conversion of {parent['request_id']} ({qty}) -> {child_request_id}.",
             related_id=gp_id, related_type=notification_service.REL_SAMPLE_GATE_PASS)
     return await req_svc.get_requisition(conn, req_id)

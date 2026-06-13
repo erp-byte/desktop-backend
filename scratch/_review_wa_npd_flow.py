@@ -87,7 +87,7 @@ async def main():
 
         # ── HOLD flow (text command) ──
         r1 = await _mk_submitted(c, user, "WA Hold Target")
-        no1 = r1["requisition_number"]
+        no1 = str(r1["request_id"])
         out = await wa.handle_inbound(c, from_phone=TEST_PHONE, text=f"HOLD {no1}")
         pend = await c.fetchval("SELECT requisition_id FROM wa_pending_action WHERE wa_phone = $1",
                                 wa._fmt_phone(TEST_PHONE))
@@ -106,7 +106,7 @@ async def main():
 
         # ── inline-reason HOLD (text command) ──
         r2 = await _mk_submitted(c, user, "WA Inline Hold")
-        out = await wa.handle_inbound(c, from_phone=TEST_PHONE, text=f"HOLD {r2['requisition_number']} : pending lab result")
+        out = await wa.handle_inbound(c, from_phone=TEST_PHONE, text=f"HOLD {r2['request_id']} : pending lab result")
         st2 = await c.fetchval("SELECT status FROM sample_requisitions WHERE id = $1", r2["id"])
         rem2 = await c.fetchval(
             """SELECT remarks FROM sample_approvals WHERE requisition_id = $1 AND action = 'HOLD'
@@ -115,7 +115,7 @@ async def main():
 
         # ── ACCEPT flow (text command) ──
         r3 = await _mk_submitted(c, user, "WA Accept Target")
-        out = await wa.handle_inbound(c, from_phone=TEST_PHONE, text=f"ACCEPT {r3['requisition_number']}")
+        out = await wa.handle_inbound(c, from_phone=TEST_PHONE, text=f"ACCEPT {r3['request_id']}")
         st3 = await c.fetchval("SELECT status FROM sample_requisitions WHERE id = $1", r3["id"])
         checks["ACCEPT → BH_APPROVED"] = out.get("ok") and st3 == "BH_APPROVED"
 

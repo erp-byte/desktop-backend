@@ -130,13 +130,13 @@ async def act_bh_approval(conn, req_id: int, *, action: str, user,
                 team = notification_service.TEAM_INVENTORY
             await notification_service.emit_alert(
                 conn, alert_type="sample_bh_approved", target_team=team,
-                message=f"Sample {locked['requisition_number']} approved by business head.",
+                message=f"Sample {locked['request_id']} approved by business head.",
                 related_id=req_id)
         else:
             await notification_service.emit_alert(
                 conn, alert_type="sample_bh_rejected",
                 target_team=notification_service.TEAM_BUSINESS,
-                message=f"Sample {locked['requisition_number']} rejected: {remarks}",
+                message=f"Sample {locked['request_id']} rejected: {remarks}",
                 related_id=req_id)
 
     return await req_svc.get_requisition(conn, req_id)
@@ -202,7 +202,7 @@ async def act_npd_review(conn, req_id: int, *, action: str, user,
                 req_id, start_date)
 
         # Tell the business team the outcome.
-        msg = f"Sample {locked['requisition_number']} {appr_action.lower()} by NPD"
+        msg = f"Sample {locked['request_id']} {appr_action.lower()} by NPD"
         msg += f": {reason}" if (reason or "").strip() else "."
         await notification_service.emit_alert(
             conn, alert_type=f"sample_npd_{act.lower()}",

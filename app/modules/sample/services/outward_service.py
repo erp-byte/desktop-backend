@@ -71,7 +71,7 @@ async def issue_outward(conn, req_id: int, *, user,
             conn, movement_type=MVT_GI_SAMPLE, reference_type=REF_SAMPLE_REQ,
             reference_id=str(req_id), created_by=user.full_name or str(user.user_id),
             lines=lines,
-            notes=f"Sample outward for {req['requisition_number']}")
+            notes=f"Sample outward for {req['request_id']}")
         # Stamp the new sample linkage column (create_material_document is generic)
         await conn.execute(
             "UPDATE material_document SET sample_requisition_id = $1 WHERE mat_doc_id = $2",
@@ -92,7 +92,7 @@ async def issue_outward(conn, req_id: int, *, user,
         await notification_service.emit_alert(
             conn, alert_type="sample_rm_outward_done",
             target_team=notification_service.TEAM_INVENTORY,
-            message=f"Sample {req['requisition_number']} material issued (265).",
+            message=f"Sample {req['request_id']} material issued (265).",
             related_id=req_id)
 
     return await req_svc.get_requisition(conn, req_id)
@@ -113,6 +113,6 @@ async def dispatch_internal(conn, req_id: int, *, user) -> dict:
         await notification_service.emit_alert(
             conn, alert_type="sample_internally_dispatched",
             target_team=notification_service.TEAM_INVENTORY,
-            message=f"Sample {req['requisition_number']} dispatched internally.",
+            message=f"Sample {req['request_id']} dispatched internally.",
             related_id=req_id)
     return await req_svc.get_requisition(conn, req_id)

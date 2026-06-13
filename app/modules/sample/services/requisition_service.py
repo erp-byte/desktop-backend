@@ -4,13 +4,13 @@ Owns the requisition record + its article lines and the guarded status state
 machine. Approvals, outward movements, job cards, gate passes and conversions
 live in sibling services and call transition_status() here to move the record.
 
-Numbering follows the house _gen_id pattern (PREFIX-YYYYMMDD-NNNN via a
-dedicated sequence) — see material_document_service._gen_id.
+Each requisition is identified by request_id — an app-supplied 8-digit time-based
+BIGINT (new_short_time_id, the house id pattern shared with job_card_id / plan_id)
+and the PRIMARY KEY since migration 057. It is the sole surfaced identifier.
 """
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
 
 import asyncpg
 from fastapi import HTTPException
@@ -41,11 +41,6 @@ TRANSITIONS: dict[str, set[str]] = {
     "CLOSED":                set(),
     "CANCELLED":             set(),
 }
-
-
-def _gen_requisition_number(seq_val: int) -> str:
-    d = datetime.now(timezone.utc).strftime("%Y%m%d")
-    return f"SMP-{d}-{seq_val:04d}"
 
 
 def _assert_transition(current: str, target: str) -> None:
@@ -107,12 +102,10 @@ async def create_requisition(conn, *, payload: dict, user) -> dict:
         quantity = round(float(pcs) * float(wpp), 3)
 
     async with conn.transaction():
-        seq = await conn.fetchval("SELECT nextval('seq_sample_req')")
-        number = _gen_requisition_number(seq)
         # request_id is an app-supplied 8-digit time-based BIGINT (new_short_time_id,
-        # the same pattern as job_card_id / plan_id). It carries a UNIQUE index but
-        # is NOT the PK, so the house insert_with_pk_retry (which only retries on
-        # '_pkey' collisions) doesn't apply — retry on the unique violation here.
+        # the same pattern as job_card_id / plan_id) and the surfaced identifier. It
+        # is the PRIMARY KEY (migration 057); retry on the rare unique collision via
+        # a per-attempt savepoint.
         req_id = None
         for _attempt in range(5):
             request_id = new_short_time_id()
@@ -121,7 +114,7 @@ async def create_requisition(conn, *, payload: dict, user) -> dict:
                     req_id = await conn.fetchval(
                         """
                         INSERT INTO sample_requisitions
-                            (request_id, requisition_number, sample_type, status, requestor_user_id,
+                            (request_id, sample_type, status, requestor_user_id,
                              requestor_team, purpose_tag, purpose_note, base_bom_id,
                              internal_override, warehouse, transporter_name, vehicle_number,
                              npd_target_name, quantity, description,
@@ -129,11 +122,11 @@ async def create_requisition(conn, *, payload: dict, user) -> dict:
                              mode_of_transport, expected_dispatch_date, confirmed_dispatch_date,
                              pcs, weight_per_piece,
                              created_by, updated_by)
-                        VALUES ($1, $2, $3, 'DRAFT', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-                                $16, $17, $18, $19, $20, $21, $22, $23, $24, $4, $4)
+                        VALUES ($1, $2, 'DRAFT', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                                $15, $16, $17, $18, $19, $20, $21, $22, $23, $3, $3)
                         RETURNING id
                         """,
-                        request_id, number, sample_type, user.user_id,
+                        request_id, sample_type, user.user_id,
                         payload.get("requestor_team"), payload.get("purpose_tag"),
                         payload.get("purpose_note"), payload.get("base_bom_id"),
                         bool(payload.get("internal_override", False)), warehouse,
@@ -153,7 +146,7 @@ async def create_requisition(conn, *, payload: dict, user) -> dict:
         await _insert_articles(conn, req_id, articles)
         await audit_service.write_audit(
             conn, req_id, audit_service.EV_STATUS_CHANGE,
-            new_value={"status": "DRAFT", "requisition_number": number},
+            new_value={"status": "DRAFT", "request_id": request_id},
             actor_user_id=user.user_id, actor_role=user.role_name,
             remarks="Requisition created",
         )
@@ -217,8 +210,8 @@ async def list_requisitions(conn, *, status: str | None = None,
     `sample_type` keeps the legacy single-type filter; `sample_types` narrows to a
     set (the NPD queue passes NPD/TRIAL). `statuses` filters to a set of statuses
     (the NPD queue maps its 3 review buckets — Pending/Hold/Accepted — onto the
-    underlying lifecycle states). `q` is a free-text search across the number,
-    request_id, target article, description and requestor. `date_from` / `date_to`
+    underlying lifecycle states). `q` is a free-text search across request_id,
+    target article, description and requestor. `date_from` / `date_to`
     bound created_at (inclusive, by calendar date). Each row carries `hold_reason`
     — the most recent HOLD remark — so the queue can surface it on the Hold pill.
     """
@@ -239,8 +232,7 @@ async def list_requisitions(conn, *, status: str | None = None,
           AND ($6::date   IS NULL OR sr.created_at::date >= $6)
           AND ($7::date   IS NULL OR sr.created_at::date <= $7)
           AND ($8::text   IS NULL OR (
-                sr.requisition_number              ILIKE '%' || $8 || '%'
-             OR sr.request_id::text                ILIKE '%' || $8 || '%'
+                sr.request_id::text                ILIKE '%' || $8 || '%'
              OR COALESCE(sr.npd_target_name, '')   ILIKE '%' || $8 || '%'
              OR COALESCE(sr.description, '')        ILIKE '%' || $8 || '%'
              OR COALESCE(sr.requestor_team, '')     ILIKE '%' || $8 || '%'
@@ -389,7 +381,7 @@ async def submit_requisition(conn, req_id: int, *, user) -> dict:
             await notification_service.emit_alert(
                 conn, alert_type="sample_npd_requested",
                 target_team=notification_service.TEAM_NPD,
-                message=(f"New {req['sample_type']} request {req['requisition_number']} "
+                message=(f"New {req['sample_type']} request {req['request_id']} "
                          f"raised for development" + (f": {tgt}." if tgt else ".")),
                 related_id=req_id)
 

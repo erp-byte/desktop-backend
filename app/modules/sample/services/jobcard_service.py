@@ -101,7 +101,7 @@ async def start_production(conn, req_id: int, *, user) -> dict:
         await notification_service.emit_alert(
             conn, alert_type="sample_jobcard_created",
             target_team=notification_service.TEAM_PRODUCTION,
-            message=f"Sample {req['requisition_number']} job cards issued ({po['prod_order_number']}).",
+            message=f"Sample {req['request_id']} job cards issued ({po['prod_order_number']}).",
             related_id=req_id)
     return await req_svc.get_requisition(conn, req_id)
 
@@ -115,7 +115,7 @@ async def mark_packing(conn, req_id: int, *, user) -> dict:
         await notification_service.emit_alert(
             conn, alert_type="sample_jobcard_completed",
             target_team=notification_service.TEAM_INVENTORY,
-            message=f"Sample {req['requisition_number']} production complete — packing.",
+            message=f"Sample {req['request_id']} production complete — packing.",
             related_id=req_id)
     return await req_svc.get_requisition(conn, req_id)
 
