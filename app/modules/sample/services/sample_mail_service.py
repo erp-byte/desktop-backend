@@ -217,15 +217,29 @@ def _informative_html(req: dict, event: str) -> str:
 </body></html>"""
 
 
-def _anchor_msgid(request_id, email: str) -> str:
-    """Deterministic Message-ID per (request, recipient). Because each reviewer gets
-    their OWN message (the Accept link embeds their email), a single stored anchor
-    only threaded the first reviewer's mailbox. Deriving the anchor from
-    (request_id, email) instead lets every later mail (reminder / outcome reply /
-    informative) reply into the right thread in EACH recipient's mailbox — with no
-    per-recipient anchor storage. Stable across sends; RFC-safe local part."""
-    h = hashlib.sha1(f"{request_id}:{(email or '').strip().lower()}".encode()).hexdigest()[:16]
-    return f"<npd-req-{request_id}-{h}@candorfoods.in>"
+def _anchor_msgid(request_id, email: str, scope: str = "npd") -> str:
+    """Deterministic Message-ID per (request, recipient, scope). Each reviewer gets their
+    OWN message (the Accept link embeds their email), so deriving the anchor from
+    (request_id, email) lets every later mail reply into the right thread in EACH
+    recipient's mailbox — no stored anchor. `scope` separates the npd_team review thread
+    from the inventory_manager notice thread, so a person holding BOTH roles doesn't get
+    two different messages colliding on one Message-ID. The default 'npd' keeps the
+    original anchor (`<npd-req-…>`, hash of request:email) byte-for-byte stable."""
+    base = f"{request_id}:{(email or '').strip().lower()}"
+    if scope != "npd":
+        base = f"{scope}:{base}"
+    h = hashlib.sha1(base.encode()).hexdigest()[:16]
+    tag = "req" if scope == "npd" else scope
+    return f"<npd-{tag}-{request_id}-{h}@candorfoods.in>"
+
+
+def _thread_subject(request_id) -> str:
+    """The ONE constant subject for the whole npd_team trail. Gmail breaks a conversation
+    when the subject changes — even with a correct In-Reply-To/References chain — so every
+    mail in the thread (review, reminder, hold re-offer, outcome) MUST share this exact
+    string; the action/status is conveyed in the body, not the subject. Mirrors the
+    reference job-work mail pattern (constant `Job Work Challan: {id}`)."""
+    return f"NPD Sample Request {request_id}"
 
 
 async def notify_npd_review_email(conn, req: dict, *, threaded: bool = False) -> None:
@@ -245,36 +259,30 @@ async def notify_npd_review_email(conn, req: dict, *, threaded: bool = False) ->
     if not recips:
         logger.warning("[sample-mail] no npd_team emails — skipping review email for req %s", req.get("id"))
         return
+    subject = _thread_subject(rid)
     for em in recips:
         anchor = _anchor_msgid(rid, em)
         if threaded:
-            _send(f"Re: NPD sample request {rid} — on hold, still needs a decision",
-                  _review_html(req, em), [em], in_reply_to=anchor)
+            _send(subject, _review_html(req, em), [em], in_reply_to=anchor)
         else:
-            _send(f"NPD sample request {rid} — action needed",
-                  _review_html(req, em), [em], msgid=anchor)
-
-
-_INV_SUBJECT = {
-    "created": "logged",
-    "accepted": "accepted by NPD",
-    "on hold": "placed on hold by NPD",
-}
+            _send(subject, _review_html(req, em), [em], msgid=anchor)
 
 
 async def notify_inventory_informative(conn, req: dict, *, event: str) -> None:
     """Informative (no-button) mail to each inventory_manager on create/accept/hold —
     the polished detail card (see _informative_html), buttons deliberately omitted. The
-    'created' mail roots a per-recipient thread; later events reply into it."""
+    'created' mail roots a per-recipient thread; later events reply into it. Constant
+    subject across the trail (status is in the body) so Gmail keeps it one conversation;
+    a distinct subject + 'inv' anchor scope keep it separate from the npd_team thread."""
     rid = req.get("request_id")
     recips = await _emails_for_role(conn, "inventory_manager")
     if not recips:
         return
     html = _informative_html(req, event)
-    subject = f"Sample request {rid} — {_INV_SUBJECT.get(event, event)}"
+    subject = f"Sample Request {rid} — Inventory Notice"
     is_root = event == "created"
     for em in recips:
-        anchor = _anchor_msgid(rid, em)
+        anchor = _anchor_msgid(rid, em, scope="inv")
         _send(subject, html, [em],
               msgid=anchor if is_root else None,
               in_reply_to=None if is_root else anchor)
@@ -282,17 +290,25 @@ async def notify_inventory_informative(conn, req: dict, *, event: str) -> None:
 
 async def notify_requestor_email(conn, req: dict, *, action: str, reason: str | None = None) -> None:
     """Closing reply on each reviewer's thread when accepted/held — 'the request is
-    updated'. Best-effort."""
+    updated'. Replies into the npd_team thread (same constant subject), so it lands in
+    the existing conversation rather than a new mail trail. Best-effort."""
     rid = req.get("request_id")
     recips = await _emails_for_role(conn, "npd_team")
     if not recips:
         return
-    verb = "ACCEPTED" if (action or "").upper() in ("ACCEPT", "APPROVE") else "ON HOLD"
-    reason_html = f"<p>Reason: {_html.escape(str(reason))}</p>" if reason else ""
-    html = (f"<div style='font-family:Arial,sans-serif'><h3>Sample request {rid} {verb}</h3>"
-            + reason_html + "</div>")
+    accepted = (action or "").upper() in ("ACCEPT", "APPROVE")
+    verb = "ACCEPTED" if accepted else "ON HOLD"
+    colour = "#16a34a" if accepted else "#f59e0b"
+    reason_html = (f'<p style="margin:10px 0 0;font-size:13px;color:#374151">Reason: '
+                   f'{_html.escape(str(reason))}</p>') if reason else ""
+    html = (f'<div style="font-family:-apple-system,\'Segoe UI\',Roboto,Arial,sans-serif;'
+            f'font-size:14px;color:#374151;line-height:1.5">'
+            f'<p style="margin:0">Sample request <b>{rid}</b> is now '
+            f'<span style="color:{colour};font-weight:700">{verb}</span>.</p>'
+            f'{reason_html}</div>')
+    subject = _thread_subject(rid)
     for em in recips:
-        _send(f"Sample request {rid} {verb}", html, [em], in_reply_to=_anchor_msgid(rid, em))
+        _send(subject, html, [em], in_reply_to=_anchor_msgid(rid, em))
 
 
 async def notify_inventory_promote_requested(conn, *, dev_jc_id, requestor_uid=None) -> None:
@@ -330,9 +346,10 @@ async def send_due_reminders(conn) -> int:
             return 0
         sent = 0
         for r in rows:
+            subject = _thread_subject(r["request_id"])
             for em in recips:
-                _send(f"Reminder: NPD sample request {r['request_id']} still needs a decision",
-                      _review_html(dict(r), em), [em], in_reply_to=_anchor_msgid(r["request_id"], em))
+                _send(subject, _review_html(dict(r), em), [em],
+                      in_reply_to=_anchor_msgid(r["request_id"], em))
             await conn.execute(
                 "UPDATE sample_requisitions SET reminder_count = reminder_count + 1, last_reminder_at = NOW() WHERE id = $1",
                 r["id"])

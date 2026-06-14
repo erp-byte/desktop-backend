@@ -85,7 +85,9 @@ async def main():
         # Threading is now a DETERMINISTIC per-(request, recipient) Message-ID — no
         # stored anchor — so every reviewer's mailbox threads, not just the first.
         anchor = mail._anchor_msgid(req["request_id"], TEST_EMAIL)
-        review_mails = [m for m in captured if str(req["request_id"]) in (m["subject"] or "")]
+        subject = mail._thread_subject(req["request_id"])
+        review_mails = [m for m in captured if m["subject"] == subject]
+        checks["review email uses the ONE constant thread subject"] = bool(review_mails)
         checks["review email rooted at deterministic per-recipient anchor"] = (
             bool(review_mails) and review_mails[0]["msgid"] == anchor)
         accept_html = review_mails[0]["html"] if review_mails else ""
@@ -95,11 +97,22 @@ async def main():
             and "status=accept" in accept_html
             and "npd.reviewer.test%40candorfoods.in" in accept_html)
 
-        # ── outcome reply threads onto the stored anchor ──
+        # ── hold re-offer threads as a REPLY (no new root) into the same trail ──
+        captured.clear()
+        await mail.notify_npd_review_email(c, fresh, threaded=True)
+        reoffer = captured[0] if captured else None
+        checks["hold re-offer replies on the same subject + anchor"] = (
+            reoffer is not None and reoffer["subject"] == subject
+            and reoffer["in_reply_to"] == anchor and reoffer["msgid"] != anchor
+            and "status=accept" in (reoffer["html"] or ""))
+
+        # ── outcome reply: same constant subject, threads onto the anchor ──
         captured.clear()
         await mail.notify_requestor_email(c, fresh, action="ACCEPT", reason=None)
-        reply = next((m for m in captured if "ACCEPTED" in (m["subject"] or "")), None)
-        checks["requestor reply in_reply_to == anchor"] = reply is not None and reply["in_reply_to"] == anchor
+        reply = captured[0] if captured else None
+        checks["requestor reply uses constant subject + in_reply_to == anchor"] = (
+            reply is not None and reply["subject"] == subject
+            and reply["in_reply_to"] == anchor and "ACCEPTED" in (reply["html"] or ""))
 
         # ── reminder cadence guard: first sweep nudges, second is a no-op ──
         captured.clear()

@@ -217,6 +217,12 @@ async def act_npd_review(conn, req_id: int, *, action: str, user,
         try:
             from app.modules.sample.services import whatsapp_service as wa
             await wa.notify_requestor(conn, dict(locked), action=act, reason=reason)
+            # Hold loop (WhatsApp mirror of the email re-offer): re-send the review
+            # message with Accept/Hold buttons to the NPD reviewers, so a held request can
+            # be accepted (ends the loop) or held again. Human-driven (one re-send per
+            # recorded hold) — fires here so it covers web, email-redirect and WhatsApp holds.
+            if act == "HOLD":
+                await wa.notify_npd_review(conn, dict(locked))
         except Exception:  # noqa: BLE001
             logger.exception("WhatsApp requestor notify failed for req %s", req_id)
         try:
