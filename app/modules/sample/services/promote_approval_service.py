@@ -71,8 +71,8 @@ async def open_promote_request(conn, dev_jc_id: int, *, payload: dict, user) -> 
             related_id=dev_jc_id)
     try:
         from app.modules.sample.services import sample_mail_service as mail
-        await mail.notify_inventory_promote_requested(conn, dev_jc_id=dev_jc_id, requestor_uid=requestor_uid)
-    except Exception:  # noqa: BLE001 — sample_mail_service arrives in Part 3; best-effort
+        await mail.notify_promote_review_email(conn, dev_jc_id=dev_jc_id, requestor_uid=requestor_uid)
+    except Exception:  # noqa: BLE001 — best-effort; a mail failure must not break the request
         pass
     return {"ok": True, "promote_request_id": req_id, "status": "PENDING_APPROVAL"}
 

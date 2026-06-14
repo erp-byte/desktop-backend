@@ -95,6 +95,30 @@ def _fmt(v, dash: str = "—") -> str:
     return _html.escape(s) if s else dash
 
 
+def _kv_rows(fields) -> str:
+    """Render a list of (label, value) pairs as the label/value <tr> rows used by every
+    detail card. Values must already be _fmt()-escaped by the caller."""
+    return "".join(
+        '<tr>'
+        f'<td style="padding:7px 14px 7px 0;color:#6b7280;font-size:13px;width:42%;vertical-align:top;border-bottom:1px solid #f1f2f4">{label}</td>'
+        f'<td style="padding:7px 0;color:#111827;font-size:13px;font-weight:600;border-bottom:1px solid #f1f2f4">{value}</td>'
+        '</tr>'
+        for label, value in fields
+    )
+
+
+def _desc_block(text) -> str:
+    """The optional 'Description' panel row appended under a detail grid. Empty when blank."""
+    if not (text and str(text).strip()):
+        return ""
+    return (
+        '<tr><td colspan="2" style="padding-top:14px">'
+        '<div style="font-size:11px;color:#9ca3af;text-transform:uppercase;letter-spacing:.07em;margin-bottom:5px">Description</div>'
+        '<div style="font-size:13px;color:#374151;line-height:1.55;background:#f9fafb;border:1px solid #eef0f3;'
+        f'border-radius:6px;padding:10px 12px">{_fmt(text)}</div>'
+        '</td></tr>')
+
+
 def _detail_table(req: dict) -> str:
     """The request-detail field grid + optional description block — shared verbatim by
     the reviewer mail and the informative inventory mail so the two never drift. Returns
@@ -116,22 +140,8 @@ def _detail_table(req: dict) -> str:
         ("Expected dispatch", _fmt(exp)),
         ("Requestor", _fmt(req.get("requestor_team"))),
     ]
-    rows = "".join(
-        '<tr>'
-        f'<td style="padding:7px 14px 7px 0;color:#6b7280;font-size:13px;width:42%;vertical-align:top;border-bottom:1px solid #f1f2f4">{label}</td>'
-        f'<td style="padding:7px 0;color:#111827;font-size:13px;font-weight:600;border-bottom:1px solid #f1f2f4">{value}</td>'
-        '</tr>'
-        for label, value in fields
-    )
-    desc = req.get("description")
-    desc_block = (
-        '<tr><td colspan="2" style="padding-top:14px">'
-        '<div style="font-size:11px;color:#9ca3af;text-transform:uppercase;letter-spacing:.07em;margin-bottom:5px">Description</div>'
-        '<div style="font-size:13px;color:#374151;line-height:1.55;background:#f9fafb;border:1px solid #eef0f3;'
-        f'border-radius:6px;padding:10px 12px">{_fmt(desc)}</div>'
-        '</td></tr>'
-    ) if (desc and str(desc).strip()) else ""
-    return f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0">{rows}{desc_block}</table>'
+    return (f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0">'
+            f'{_kv_rows(fields)}{_desc_block(req.get("description"))}</table>')
 
 
 def _review_html(req: dict, reviewer_email: str) -> str:
@@ -311,14 +321,111 @@ async def notify_requestor_email(conn, req: dict, *, action: str, reason: str | 
         _send(subject, html, [em], in_reply_to=_anchor_msgid(rid, em))
 
 
-async def notify_inventory_promote_requested(conn, *, dev_jc_id, requestor_uid=None) -> None:
-    """Informative mail to inventory_manager when a dev-JC promote is requested."""
-    recips = await _emails_for_role(conn, "inventory_manager")
-    if not recips:
+# ── Promote dual-approval gate — buttoned mail to INV_MGR + REQUESTOR_BH ──────
+# Both buttons hit GET /email/promote-action?dev_jc_id&approver_kind&status&email.
+# Approve carries the recipient's email for the gate-match auth; Reject just needs
+# the dev_jc_id (it redirects to the portal job-card page to capture a reason).
+def _promote_approve_url(dev_jc_id, approver_kind: str, email: str) -> str:
+    base = Settings().PUBLIC_BACKEND_URL.rstrip("/")
+    return (f"{base}/api/v1/sample/email/promote-action?dev_jc_id={dev_jc_id}"
+            f"&approver_kind={approver_kind}&status=approve&email={quote(email)}")
+
+
+def _promote_reject_url(dev_jc_id, approver_kind: str) -> str:
+    base = Settings().PUBLIC_BACKEND_URL.rstrip("/")
+    return (f"{base}/api/v1/sample/email/promote-action?dev_jc_id={dev_jc_id}"
+            f"&approver_kind={approver_kind}&status=reject")
+
+
+def _promote_subject(jc: dict) -> str:
+    """One constant subject for the whole promote-gate thread (status in the body)."""
+    return f"NPD Promote Approval — Dev JC {jc.get('dev_jc_number') or jc.get('id')}"
+
+
+def _promote_detail_table(jc: dict) -> str:
+    """Dev-JC detail grid for the promote mail (mirrors _detail_table's look)."""
+    exp = jc.get("expected_dispatch_date")
+    exp = str(exp)[:10] if exp else "TBC"
+    tq, uom = jc.get("target_qty"), (jc.get("uom") or "kg")
+    fields = [
+        ("Dev job card", _fmt(jc.get("dev_jc_number"))),
+        ("Title", _fmt(jc.get("title"))),
+        ("Target FG article", _fmt(jc.get("fg_sku_name") or jc.get("title"))),
+        ("Target qty", f"{_fmt(tq)} {_fmt(uom)}" if tq is not None else "—"),
+        ("Warehouse", _fmt(jc.get("warehouse"))),
+        ("Company", _fmt(jc.get("company_name"))),
+        ("Customer", _fmt(jc.get("customer_name"))),
+        ("Customer contact", _fmt(jc.get("customer_contact"))),
+        ("Expected dispatch", _fmt(exp)),
+    ]
+    return (f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0">'
+            f'{_kv_rows(fields)}{_desc_block(jc.get("description"))}</table>')
+
+
+def _promote_html(jc: dict, approver_label: str, approve_url: str, reject_url: str) -> str:
+    """Polished, email-client-safe promote-approval notice — the dev-JC detail card +
+    Approve / Reject buttons. The Approve link embeds this approver's email for the
+    gate-match auth; Reject opens the job card on the portal to record a reason."""
+    number = _fmt(jc.get("dev_jc_number") or jc.get("id"))
+    return f"""<!doctype html><html><body style="margin:0;padding:0;background:#f4f5f7">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f5f7;padding:24px 12px">
+ <tr><td align="center">
+  <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background:#ffffff;border:1px solid #e5e7eb;border-radius:10px;overflow:hidden;font-family:-apple-system,'Segoe UI',Roboto,Arial,sans-serif">
+   <tr><td style="background:#4f46e5;padding:18px 24px">
+     <div style="color:#ffffff;font-size:12px;opacity:.92;letter-spacing:.05em">PROMOTE APPROVAL NEEDED</div>
+     <div style="color:#ffffff;font-size:24px;font-weight:700;margin-top:3px">Dev JC {number}</div>
+   </td></tr>
+   <tr><td style="padding:22px 24px 4px">
+     <div style="margin:0 0 14px">
+       <span style="display:inline-block;background:#eef2ff;color:#4338ca;font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;padding:4px 12px;border-radius:999px">Your gate: {_fmt(approver_label)}</span>
+     </div>
+     <p style="margin:0 0 16px;font-size:14px;color:#374151;line-height:1.5">A developed recipe is ready to be promoted into a live BOM. <b>Both</b> gates — Inventory manager and Requestor (business head) — must approve before it goes live. Tap <b>Approve</b> to clear your gate, or <b>Reject</b> to open the job card on the portal and record a reason.</p>
+     {_promote_detail_table(jc)}
+   </td></tr>
+   <tr><td style="padding:18px 24px 26px">
+     <table role="presentation" cellpadding="0" cellspacing="0"><tr>
+       <td style="padding-right:12px">
+         <a href="{approve_url}" style="display:inline-block;background:#16a34a;color:#ffffff;font-size:14px;font-weight:600;text-decoration:none;padding:12px 30px;border-radius:6px">&#10003;&nbsp; Approve</a>
+       </td>
+       <td>
+         <a href="{reject_url}" style="display:inline-block;background:#dc2626;color:#ffffff;font-size:14px;font-weight:600;text-decoration:none;padding:12px 30px;border-radius:6px">&#10007;&nbsp; Reject</a>
+       </td>
+     </tr></table>
+   </td></tr>
+   <tr><td style="padding:14px 24px;background:#f9fafb;border-top:1px solid #eef0f3">
+     <p style="margin:0;font-size:11px;color:#9ca3af;line-height:1.5">&ldquo;Approve&rdquo; clears your gate immediately; the recipe is promoted once both gates approve. &ldquo;Reject&rdquo; opens the job card on the portal to capture a reason.</p>
+   </td></tr>
+  </table>
+ </td></tr>
+</table>
+</body></html>"""
+
+
+async def notify_promote_review_email(conn, *, dev_jc_id, requestor_uid=None) -> None:
+    """On a dev-JC promote request — email the two approval gates a polished card with
+    Approve / Reject buttons: the inventory_manager(s) (INV_MGR gate) and, when the card
+    came from a requisition, its requestor BH (REQUESTOR_BH gate). Each recipient's
+    Approve link carries their own email + gate. Constant subject so each mailbox threads.
+    Best-effort, never raises."""
+    jc = await conn.fetchrow("SELECT * FROM npd_dev_job_cards WHERE id = $1", dev_jc_id)
+    if jc is None:
         return
-    html = (f"<div style='font-family:Arial,sans-serif'><h3>Dev job card {dev_jc_id}: "
-            f"promote awaiting your acceptance</h3></div>")
-    _send(f"Dev job card {dev_jc_id} — promote approval needed", html, recips)
+    jc = dict(jc)
+    subject = _promote_subject(jc)
+    # Per-gate anchor scope so a person who somehow holds BOTH gates gets two
+    # distinct Message-IDs (no collision that would hide one mail).
+    for em in await _emails_for_role(conn, "inventory_manager"):
+        _send(subject, _promote_html(jc, "Inventory manager",
+                                     _promote_approve_url(dev_jc_id, "INV_MGR", em),
+                                     _promote_reject_url(dev_jc_id, "INV_MGR")),
+              [em], msgid=_anchor_msgid(dev_jc_id, em, scope="promote-inv"))
+    if requestor_uid:
+        bh = await _email_for_user(conn, requestor_uid)
+        if bh:
+            _send(subject, _promote_html(jc, "Requestor (business head)",
+                                         _promote_approve_url(dev_jc_id, "REQUESTOR_BH", bh),
+                                         _promote_reject_url(dev_jc_id, "REQUESTOR_BH")),
+                  [bh], msgid=_anchor_msgid(dev_jc_id, bh, scope="promote-bh"))
 
 
 async def send_due_reminders(conn) -> int:

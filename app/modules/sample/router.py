@@ -11,7 +11,7 @@ import json
 import logging
 from datetime import date
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, Response
 
 from app.modules.auth.middleware import AuthUser, require_permission
 from app.modules.sample import schemas
@@ -87,14 +87,38 @@ async def whatsapp_webhook_receive(request: Request):
     return {"received": len(messages), "results": results}
 
 
-# ── Email accept/hold — single action endpoint behind the review-mail buttons ──
-# PUBLIC (no auth dep). Params: request_id (8-digit), status ('accept'|'hold'),
-# email (the reviewer the link was sent to — used to authenticate ACCEPT).
-#   • status=accept → verify `email` is an ACTIVE npd_team reviewer on file; if so
-#     accept the request (idempotent: only acts on SUBMITTED/ON_HOLD). Auth fail /
-#     wrong state / unknown status → no mutation, the call is ignored.
-#   • status=hold   → redirect to the portal request page; the hold is recorded there
-#     (the web app enforces its own login).
+def _confirm_page(*, heading: str, summary: str, action_url: str, hidden: dict,
+                  button_label: str, button_color: str = "#16a34a") -> Response:
+    """A tiny POST-confirm landing page for the email action buttons. The mutating
+    endpoints below are POST-only; the mail buttons GET this page, which carries the
+    action behind an explicit Confirm submit — so a mailbox link-scanner / prefetch
+    (which only issues GETs) can never auto-trigger the accept/approve. Nothing mutates
+    until the human clicks Confirm."""
+    from html import escape
+    inputs = "".join(
+        f'<input type="hidden" name="{escape(str(k))}" value="{escape(str(v))}">'
+        for k, v in hidden.items())
+    html = (
+        '<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">'
+        '<meta name="robots" content="noindex,nofollow"></head>'
+        '<body style="margin:0;background:#f4f5f7;font-family:-apple-system,\'Segoe UI\',Roboto,Arial,sans-serif">'
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="padding:48px 12px"><tr><td align="center">'
+        '<table role="presentation" width="440" cellpadding="0" cellspacing="0" style="max-width:440px;width:100%;background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:28px 26px;text-align:center"><tr><td>'
+        f'<div style="font-size:18px;font-weight:700;color:#111827;margin-bottom:6px">{escape(heading)}</div>'
+        f'<div style="font-size:13px;color:#6b7280;margin-bottom:22px">{escape(summary)}</div>'
+        f'<form method="post" action="{escape(action_url)}">{inputs}'
+        f'<button type="submit" style="background:{button_color};color:#fff;font-size:14px;font-weight:600;border:0;border-radius:6px;padding:12px 34px;cursor:pointer">{escape(button_label)}</button>'
+        '</form>'
+        '<div style="font-size:11px;color:#9ca3af;margin-top:16px">You can close this tab to cancel — nothing changes until you confirm.</div>'
+        '</td></tr></table></td></tr></table></body></html>')
+    return Response(html, media_type="text/html")
+
+
+# ── Email accept/hold — review-mail buttons ───────────────────────────────────
+# PUBLIC (no auth dep). The mail buttons GET this; ACCEPT renders a POST-confirm page
+# (so a link-scanner's GET can't auto-accept) and the POST below does the real work.
+#   • status=accept → render the confirm page (no mutation here).
+#   • status=hold   → redirect to the portal request page; the hold is recorded there.
 @router.get("/email/npd-action")
 async def email_npd_action(
     request: Request,
@@ -104,22 +128,47 @@ async def email_npd_action(
 ):
     from app.config import Settings
     st = (status or "").strip().lower()
-    pool = request.app.state.db_pool
     web = Settings().WEB_APP_URL.rstrip("/")
+
+    # HOLD → send the reviewer to the request page; held from there.
+    if st == "hold":
+        pool = request.app.state.db_pool
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT id FROM sample_requisitions WHERE request_id = $1 AND deleted_at IS NULL", request_id)
+        target = f"{web}/modules/sample/{row['id']}" if row else f"{web}/modules/sample"
+        return Response(status_code=302, headers={"Location": target})
+
+    if st != "accept":
+        return Response("<h3>Unknown action.</h3>", media_type="text/html", status_code=400)
+    if not (email or "").strip():  # never auth a blank identifier
+        return Response("<h3>This link is not authorised.</h3>", media_type="text/html", status_code=403)
+
+    base = Settings().PUBLIC_BACKEND_URL.rstrip("/")
+    return _confirm_page(
+        heading="Accept this NPD sample request?",
+        summary=f"Request {request_id}",
+        action_url=f"{base}/api/v1/sample/email/npd-action",
+        hidden={"request_id": request_id, "email": email},
+        button_label="✓ Confirm accept")
+
+
+@router.post("/email/npd-action")
+async def email_npd_action_confirm(
+    request: Request,
+    request_id: int = Form(...),
+    email: str = Form(""),
+):
+    """The real accept — POST-only, behind the confirm button. Verify `email` is an
+    ACTIVE npd_team reviewer, then accept (idempotent: only SUBMITTED/ON_HOLD). Auth
+    fail / wrong state → no mutation, the call is ignored."""
+    if not (email or "").strip():
+        return Response("<h3>This link is not authorised.</h3>", media_type="text/html", status_code=403)
+    pool = request.app.state.db_pool
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT id, status FROM sample_requisitions WHERE request_id = $1 AND deleted_at IS NULL",
             request_id)
-
-        # HOLD → send the reviewer to the request page; held from there.
-        if st == "hold":
-            target = f"{web}/modules/sample/{row['id']}" if row else f"{web}/modules/sample"
-            return Response(status_code=302, headers={"Location": target})
-
-        if st != "accept":
-            return Response("<h3>Unknown action.</h3>", media_type="text/html", status_code=400)
-
-        # ACCEPT → authenticate by recipient email, then act (or ignore).
         if row is None:
             return Response("<h3>Request not found.</h3>", media_type="text/html", status_code=404)
         urow = await conn.fetchrow(
@@ -127,7 +176,6 @@ async def email_npd_action(
                 WHERE r.role_name = 'npd_team' AND lower(a.email) = lower($1)
                   AND COALESCE(a.is_active, TRUE) ORDER BY a.user_id LIMIT 1""", email)
         if urow is None:
-            # Not an authorised reviewer → ignore the call, change nothing.
             return Response("<h3>This link is not authorised.</h3>", media_type="text/html", status_code=403)
         if row["status"] not in ("SUBMITTED", "ON_HOLD"):
             return Response(f"<h3>Already actioned (status {row['status']}).</h3>", media_type="text/html")
@@ -138,10 +186,105 @@ async def email_npd_action(
         try:
             await approval_service.act_npd_review(conn, row["id"], action="ACCEPT", user=user)
         except HTTPException:
-            # Lost a race (state changed underneath) — friendly HTML, never raw JSON.
             return Response("<h3>Could not accept — it may already have been actioned.</h3>",
                             media_type="text/html")
         return Response("<h3>&#10003; Accepted. You can close this tab.</h3>"
+                        "<script>setTimeout(function(){try{window.close()}catch(e){}},400)</script>",
+                        media_type="text/html")
+
+
+# ── Email approve/reject — promote dual-approval gate buttons ─────────────────
+# PUBLIC (no auth dep). The mail buttons GET this; APPROVE renders a POST-confirm page
+# (so a link-scanner's GET can't auto-approve a gate) and the POST below does the work.
+#   • status=approve → render the confirm page (no mutation here).
+#   • status=reject  → redirect to the job-card page; the reject + reason is recorded there.
+@router.get("/email/promote-action")
+async def email_promote_action(
+    request: Request,
+    dev_jc_id: int = Query(...),
+    approver_kind: str = Query(...),
+    status: str = Query(...),
+    email: str = Query(""),
+):
+    from app.config import Settings
+    st = (status or "").strip().lower()
+    kind = (approver_kind or "").strip().upper()
+    web = Settings().WEB_APP_URL.rstrip("/")
+
+    # REJECT → open the job card on the portal; the reason is captured there.
+    if st == "reject":
+        return Response(status_code=302,
+                        headers={"Location": f"{web}/modules/npd-development/job-cards/{dev_jc_id}"})
+    if st != "approve":
+        return Response("<h3>Unknown action.</h3>", media_type="text/html", status_code=400)
+    if kind not in ("INV_MGR", "REQUESTOR_BH"):
+        return Response("<h3>Unknown approval gate.</h3>", media_type="text/html", status_code=400)
+    if not (email or "").strip():  # never auth a blank identifier
+        return Response("<h3>This link is not authorised.</h3>", media_type="text/html", status_code=403)
+
+    base = Settings().PUBLIC_BACKEND_URL.rstrip("/")
+    gate_label = "Inventory manager" if kind == "INV_MGR" else "Requestor (business head)"
+    return _confirm_page(
+        heading="Approve recipe promotion?",
+        summary=f"Dev JC {dev_jc_id} · your gate: {gate_label}",
+        action_url=f"{base}/api/v1/sample/email/promote-action",
+        hidden={"dev_jc_id": dev_jc_id, "approver_kind": kind, "email": email},
+        button_label="✓ Confirm approve")
+
+
+@router.post("/email/promote-action")
+async def email_promote_action_confirm(
+    request: Request,
+    dev_jc_id: int = Form(...),
+    approver_kind: str = Form(...),
+    email: str = Form(""),
+):
+    """The real approve — POST-only, behind the confirm button. Verify `email` owns the
+    gate (an ACTIVE inventory_manager for INV_MGR; the user bound to this JC's BH gate for
+    REQUESTOR_BH), then accept that one gate (idempotent; promotes once BOTH gates clear).
+    Auth fail / wrong state → no mutation, the call is ignored."""
+    kind = (approver_kind or "").strip().upper()
+    if kind not in ("INV_MGR", "REQUESTOR_BH"):
+        return Response("<h3>Unknown approval gate.</h3>", media_type="text/html", status_code=400)
+    if not (email or "").strip():
+        return Response("<h3>This link is not authorised.</h3>", media_type="text/html", status_code=403)
+
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        # Authenticate the link's email against the gate it claims.
+        if kind == "INV_MGR":
+            urow = await conn.fetchrow(
+                """SELECT a.user_id, r.role_name FROM auth_user a JOIN auth_role r ON a.role_id = r.role_id
+                    WHERE r.role_name = 'inventory_manager' AND lower(a.email) = lower($1)
+                      AND COALESCE(a.is_active, TRUE) ORDER BY a.user_id LIMIT 1""", email)
+        else:  # REQUESTOR_BH — the email must be the user bound to this JC's BH gate.
+            # Match against the LATEST promote request (not only a PENDING one): the BH
+            # binding is the same user across requests, so a late click after the promote
+            # already resolved still authenticates and falls through to the idempotent
+            # "already actioned" message below, instead of a misleading "not authorised".
+            urow = await conn.fetchrow(
+                """SELECT a.user_id, COALESCE(r.role_name, '') AS role_name
+                     FROM npd_dev_promote_request pr
+                     JOIN npd_dev_promote_approval ap
+                       ON ap.promote_request_id = pr.id AND ap.approver_kind = 'REQUESTOR_BH'
+                     JOIN auth_user a ON a.user_id = ap.approver_user_id
+                     LEFT JOIN auth_role r ON a.role_id = r.role_id
+                    WHERE pr.dev_jc_id = $1
+                      AND lower(a.email) = lower($2) AND COALESCE(a.is_active, TRUE)
+                    ORDER BY pr.created_at DESC LIMIT 1""", dev_jc_id, email)
+        if urow is None:
+            return Response("<h3>This link is not authorised.</h3>", media_type="text/html", status_code=403)
+
+        import types as _t
+        from app.modules.sample.services import promote_approval_service as pas
+        user = _t.SimpleNamespace(user_id=urow["user_id"], role_name=urow["role_name"],
+                                  is_admin=False, full_name="email")
+        try:
+            await pas.act_promote_approval(conn, dev_jc_id, action="ACCEPT", user=user, approver_kind=kind)
+        except HTTPException:
+            return Response("<h3>Could not approve — it may already have been actioned.</h3>",
+                            media_type="text/html")
+        return Response("<h3>&#10003; Approved. You can close this tab.</h3>"
                         "<script>setTimeout(function(){try{window.close()}catch(e){}},400)</script>",
                         media_type="text/html")
 
