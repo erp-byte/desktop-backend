@@ -89,9 +89,10 @@ async def main():
         checks["review email rooted at deterministic per-recipient anchor"] = (
             bool(review_mails) and review_mails[0]["msgid"] == anchor)
         accept_html = review_mails[0]["html"] if review_mails else ""
-        checks["Accept URL carries request_id + reviewer email"] = (
+        checks["Accept URL carries request_id + status + reviewer email"] = (
             f"request_id={req['request_id']}" in accept_html
-            and "npd-accept" in accept_html
+            and "npd-action" in accept_html
+            and "status=accept" in accept_html
             and "npd.reviewer.test%40candorfoods.in" in accept_html)
 
         # ── outcome reply threads onto the stored anchor ──

@@ -75,14 +75,17 @@ def _send(subject, html, to_addrs, *, cc=None, msgid=None, in_reply_to=None):
     return mid
 
 
+# Both buttons hit one endpoint: GET /email/npd-action?request_id&status&email.
+# Accept carries the reviewer's email for the recipient-match auth; Hold just needs
+# the request_id (it redirects to the portal).
 def _accept_url(request_id, email: str) -> str:
     base = Settings().PUBLIC_BACKEND_URL.rstrip("/")
-    return f"{base}/api/v1/sample/email/npd-accept?request_id={request_id}&email={quote(email)}&status=accept"
+    return f"{base}/api/v1/sample/email/npd-action?request_id={request_id}&status=accept&email={quote(email)}"
 
 
 def _hold_url(request_id) -> str:
     base = Settings().PUBLIC_BACKEND_URL.rstrip("/")
-    return f"{base}/api/v1/sample/email/npd-hold?request_id={request_id}"
+    return f"{base}/api/v1/sample/email/npd-action?request_id={request_id}&status=hold"
 
 
 def _fmt(v, dash: str = "—") -> str:

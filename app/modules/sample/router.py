@@ -11,7 +11,7 @@ import json
 import logging
 from datetime import date
 
-from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 
 from app.modules.auth.middleware import AuthUser, require_permission
 from app.modules.sample import schemas
@@ -87,85 +87,63 @@ async def whatsapp_webhook_receive(request: Request):
     return {"received": len(messages), "results": results}
 
 
-# ── Email accept/hold (review-mail buttons) ────────────────────────────────
-@router.get("/email/npd-accept")
-async def email_npd_accept(request: Request, request_id: int = Query(...), email: str = Query(...), status: str = Query("accept")):
-    """PUBLIC email-button target. Non-mutating confirmation interstitial: shows a
-    form that POSTs back to actually accept. A bare GET must NEVER mutate — email
-    SafeLinks / inbox prefetchers issue GETs and would otherwise auto-accept the
-    request. The real work happens in the POST handler below."""
-    import html as _html
-    rid = _html.escape(str(request_id))
-    em = _html.escape(email, quote=True)
-    body = (
-        "<!doctype html><meta charset='utf-8'>"
-        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
-        "<div style='font-family:sans-serif;max-width:420px;margin:48px auto;text-align:center'>"
-        f"<h3>Accept sample request {rid}?</h3>"
-        "<p style='color:#555'>Click the button below to confirm.</p>"
-        "<form method='POST' action='/api/v1/sample/email/npd-accept'>"
-        f"<input type='hidden' name='request_id' value='{rid}'>"
-        f"<input type='hidden' name='email' value='{em}'>"
-        "<button type='submit' style='font-size:15px;padding:10px 22px;border:0;"
-        "border-radius:4px;background:#ec7211;color:#fff;cursor:pointer'>Confirm accept</button>"
-        "</form></div>"
-    )
-    return Response(body, media_type="text/html")
-
-
-@router.post("/email/npd-accept")
-async def email_npd_accept_confirm(request: Request,
-                                   request_id: int = Form(...), email: str = Form(...)):
-    """PUBLIC — performs the accept the GET interstitial confirms. Recipient-email-match
-    auth: the `email` must be an ACTIVE npd_team reviewer on file. Idempotent — only
-    acts on SUBMITTED/ON_HOLD; a failed action renders friendly HTML, never raw JSON."""
-    from fastapi import HTTPException as _HTTPException
+# ── Email accept/hold — single action endpoint behind the review-mail buttons ──
+# PUBLIC (no auth dep). Params: request_id (8-digit), status ('accept'|'hold'),
+# email (the reviewer the link was sent to — used to authenticate ACCEPT).
+#   • status=accept → verify `email` is an ACTIVE npd_team reviewer on file; if so
+#     accept the request (idempotent: only acts on SUBMITTED/ON_HOLD). Auth fail /
+#     wrong state / unknown status → no mutation, the call is ignored.
+#   • status=hold   → redirect to the portal request page; the hold is recorded there
+#     (the web app enforces its own login).
+@router.get("/email/npd-action")
+async def email_npd_action(
+    request: Request,
+    request_id: int = Query(...),
+    status: str = Query(...),
+    email: str = Query(""),
+):
+    from app.config import Settings
+    st = (status or "").strip().lower()
     pool = request.app.state.db_pool
+    web = Settings().WEB_APP_URL.rstrip("/")
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id, status FROM sample_requisitions WHERE request_id = $1 AND deleted_at IS NULL", request_id)
+            "SELECT id, status FROM sample_requisitions WHERE request_id = $1 AND deleted_at IS NULL",
+            request_id)
+
+        # HOLD → send the reviewer to the request page; held from there.
+        if st == "hold":
+            target = f"{web}/modules/sample/{row['id']}" if row else f"{web}/modules/sample"
+            return Response(status_code=302, headers={"Location": target})
+
+        if st != "accept":
+            return Response("<h3>Unknown action.</h3>", media_type="text/html", status_code=400)
+
+        # ACCEPT → authenticate by recipient email, then act (or ignore).
         if row is None:
             return Response("<h3>Request not found.</h3>", media_type="text/html", status_code=404)
-        ok_email = await conn.fetchval(
-            """SELECT TRUE FROM auth_user a JOIN auth_role r ON a.role_id = r.role_id
+        urow = await conn.fetchrow(
+            """SELECT a.user_id, r.role_name FROM auth_user a JOIN auth_role r ON a.role_id = r.role_id
                 WHERE r.role_name = 'npd_team' AND lower(a.email) = lower($1)
-                  AND COALESCE(a.is_active, TRUE) LIMIT 1""", email)
-        if not ok_email:
+                  AND COALESCE(a.is_active, TRUE) ORDER BY a.user_id LIMIT 1""", email)
+        if urow is None:
+            # Not an authorised reviewer → ignore the call, change nothing.
             return Response("<h3>This link is not authorised.</h3>", media_type="text/html", status_code=403)
         if row["status"] not in ("SUBMITTED", "ON_HOLD"):
             return Response(f"<h3>Already actioned (status {row['status']}).</h3>", media_type="text/html")
         import types as _t
         from app.modules.sample.services import approval_service
-        urow = await conn.fetchrow(
-            "SELECT a.user_id, r.role_name FROM auth_user a JOIN auth_role r ON a.role_id = r.role_id "
-            "WHERE lower(a.email) = lower($1) AND COALESCE(a.is_active, TRUE) ORDER BY a.user_id LIMIT 1", email)
-        if urow is None:
-            return Response("<h3>This link is not authorised.</h3>", media_type="text/html", status_code=403)
-        user = _t.SimpleNamespace(user_id=urow["user_id"], role_name=urow["role_name"], is_admin=False, full_name="email")
+        user = _t.SimpleNamespace(user_id=urow["user_id"], role_name=urow["role_name"],
+                                  is_admin=False, full_name="email")
         try:
             await approval_service.act_npd_review(conn, row["id"], action="ACCEPT", user=user)
-        except _HTTPException:
-            # A race / state change between the interstitial and the POST — render a
-            # friendly message (status 200) rather than letting raw JSON propagate.
+        except HTTPException:
+            # Lost a race (state changed underneath) — friendly HTML, never raw JSON.
             return Response("<h3>Could not accept — it may already have been actioned.</h3>",
                             media_type="text/html")
         return Response("<h3>&#10003; Accepted. You can close this tab.</h3>"
                         "<script>setTimeout(function(){try{window.close()}catch(e){}},400)</script>",
                         media_type="text/html")
-
-
-@router.get("/email/npd-hold")
-async def email_npd_hold(request: Request, request_id: int = Query(...)):
-    """PUBLIC email-button target for Hold — redirect to the authenticated web app so the
-    reviewer records the hold reason there (the web app enforces its own login)."""
-    pool = request.app.state.db_pool
-    async with pool.acquire() as conn:
-        rid = await conn.fetchval(
-            "SELECT id FROM sample_requisitions WHERE request_id = $1 AND deleted_at IS NULL", request_id)
-    from app.config import Settings
-    base = Settings().WEB_APP_URL.rstrip("/")
-    target = f"{base}/modules/sample/{rid}" if rid else f"{base}/modules/sample"
-    return Response(status_code=302, headers={"Location": target})
 
 
 @router.post("/email/run-reminders")
