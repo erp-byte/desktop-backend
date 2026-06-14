@@ -85,19 +85,83 @@ def _hold_url(request_id) -> str:
     return f"{base}/api/v1/sample/email/npd-hold?request_id={request_id}"
 
 
-def _button_html(req: dict, reviewer_email: str) -> str:
+def _fmt(v, dash: str = "—") -> str:
+    """HTML-escaped single-line value; em-dash when blank. All values rendered into
+    the email pass through here (free-text fields are user-controlled)."""
+    s = "" if v is None else str(v).strip()
+    return _html.escape(s) if s else dash
+
+
+def _review_html(req: dict, reviewer_email: str) -> str:
+    """Polished, email-client-safe HTML review notice — mirrors the WhatsApp review
+    template (full request detail) + Accept / Hold action buttons. Table-based layout
+    with inline styles for Gmail/Outlook compatibility. The Accept link embeds this
+    reviewer's email for the recipient-match auth check."""
     rid = req.get("request_id")
-    a, h = _accept_url(rid, reviewer_email), _hold_url(rid)
-    # rid is an int (safe); the free-text fields are user-controlled → HTML-escape.
-    target = _html.escape(str(req.get("npd_target_name") or "—"))
-    qty = _html.escape(str(req.get("quantity") or "—"))
-    requestor = _html.escape(str(req.get("requestor_team") or "—"))
-    return f"""<div style="font-family:Arial,sans-serif">
-      <h2>NPD sample request {rid}</h2>
-      <p>Target: {target} &middot; Qty: {qty} &middot; Requestor: {requestor}</p>
-      <p><a href="{a}" style="background:#16a34a;color:#fff;padding:10px 18px;border-radius:4px;text-decoration:none">&#10003; Accept</a>
-         &nbsp;<a href="{h}" style="background:#f59e0b;color:#fff;padding:10px 18px;border-radius:4px;text-decoration:none">&#9208; Hold</a></p>
-    </div>"""
+    accept, hold = _accept_url(rid, reviewer_email), _hold_url(rid)
+    type_label = "Customer trial" if req.get("sample_type") == "TRIAL" else "NPD"
+    exp = req.get("expected_dispatch_date")
+    exp = str(exp)[:10] if exp else "TBC"
+    wpp, qty = req.get("weight_per_piece"), req.get("quantity")
+    fields = [
+        ("Company", _fmt(req.get("company_name"))),
+        ("Customer", _fmt(req.get("customer_name"))),
+        ("Customer contact", _fmt(req.get("customer_contact"))),
+        ("Target NPD article", _fmt(req.get("npd_target_name"))),
+        ("Pcs", _fmt(req.get("pcs"))),
+        ("Weight per piece", f"{_fmt(wpp)} kg" if wpp is not None else "—"),
+        ("Quantity", f"{_fmt(qty)} kg" if qty is not None else "—"),
+        ("Warehouse", _fmt(req.get("warehouse"))),
+        ("Purpose", _fmt(req.get("purpose_tag") or req.get("purpose_note"))),
+        ("Mode of transport", _fmt(req.get("mode_of_transport"))),
+        ("Expected dispatch", _fmt(exp)),
+        ("Requestor", _fmt(req.get("requestor_team"))),
+    ]
+    rows = "".join(
+        '<tr>'
+        f'<td style="padding:7px 14px 7px 0;color:#6b7280;font-size:13px;width:42%;vertical-align:top;border-bottom:1px solid #f1f2f4">{label}</td>'
+        f'<td style="padding:7px 0;color:#111827;font-size:13px;font-weight:600;border-bottom:1px solid #f1f2f4">{value}</td>'
+        '</tr>'
+        for label, value in fields
+    )
+    desc = req.get("description")
+    desc_block = (
+        '<tr><td colspan="2" style="padding-top:14px">'
+        '<div style="font-size:11px;color:#9ca3af;text-transform:uppercase;letter-spacing:.07em;margin-bottom:5px">Description</div>'
+        '<div style="font-size:13px;color:#374151;line-height:1.55;background:#f9fafb;border:1px solid #eef0f3;'
+        f'border-radius:6px;padding:10px 12px">{_fmt(desc)}</div>'
+        '</td></tr>'
+    ) if (desc and str(desc).strip()) else ""
+
+    return f"""<!doctype html><html><body style="margin:0;padding:0;background:#f4f5f7">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f5f7;padding:24px 12px">
+ <tr><td align="center">
+  <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background:#ffffff;border:1px solid #e5e7eb;border-radius:10px;overflow:hidden;font-family:-apple-system,'Segoe UI',Roboto,Arial,sans-serif">
+   <tr><td style="background:#ec7211;padding:18px 24px">
+     <div style="color:#ffffff;font-size:12px;opacity:.92;letter-spacing:.05em">NEW {type_label.upper()} SAMPLE REQUEST</div>
+     <div style="color:#ffffff;font-size:24px;font-weight:700;margin-top:3px">{rid}</div>
+   </td></tr>
+   <tr><td style="padding:22px 24px 4px">
+     <p style="margin:0 0 16px;font-size:14px;color:#374151;line-height:1.5">A new {type_label} sample request needs your review. Tap <b>Accept</b> to approve, or <b>Hold</b> to open it on the portal and record a reason.</p>
+     <table role="presentation" width="100%" cellpadding="0" cellspacing="0">{rows}{desc_block}</table>
+   </td></tr>
+   <tr><td style="padding:18px 24px 26px">
+     <table role="presentation" cellpadding="0" cellspacing="0"><tr>
+       <td style="padding-right:12px">
+         <a href="{accept}" style="display:inline-block;background:#16a34a;color:#ffffff;font-size:14px;font-weight:600;text-decoration:none;padding:12px 30px;border-radius:6px">&#10003;&nbsp; Accept</a>
+       </td>
+       <td>
+         <a href="{hold}" style="display:inline-block;background:#f59e0b;color:#ffffff;font-size:14px;font-weight:600;text-decoration:none;padding:12px 30px;border-radius:6px">&#9208;&nbsp; Hold</a>
+       </td>
+     </tr></table>
+   </td></tr>
+   <tr><td style="padding:14px 24px;background:#f9fafb;border-top:1px solid #eef0f3">
+     <p style="margin:0;font-size:11px;color:#9ca3af;line-height:1.5">You're receiving this as an NPD reviewer. &ldquo;Accept&rdquo; approves the request; &ldquo;Hold&rdquo; opens it on the portal to capture a reason.</p>
+   </td></tr>
+  </table>
+ </td></tr>
+</table>
+</body></html>"""
 
 
 def _anchor_msgid(request_id, email: str) -> str:
@@ -122,7 +186,7 @@ async def notify_npd_review_email(conn, req: dict) -> None:
         return
     for em in recips:
         _send(f"NPD sample request {rid} — action needed",
-              _button_html(req, em), [em], msgid=_anchor_msgid(rid, em))
+              _review_html(req, em), [em], msgid=_anchor_msgid(rid, em))
 
 
 async def notify_inventory_informative(conn, req: dict, *, event: str) -> None:
@@ -181,7 +245,7 @@ async def send_due_reminders(conn) -> int:
         if not got:
             return 0
         rows = await conn.fetch(
-            """SELECT id, request_id, npd_target_name, quantity, requestor_team
+            """SELECT *
                  FROM sample_requisitions
                 WHERE deleted_at IS NULL AND sample_type IN ('NPD','TRIAL')
                   AND status IN ('SUBMITTED','ON_HOLD')
@@ -195,7 +259,7 @@ async def send_due_reminders(conn) -> int:
         for r in rows:
             for em in recips:
                 _send(f"Reminder: NPD sample request {r['request_id']} still needs a decision",
-                      _button_html(dict(r), em), [em], in_reply_to=_anchor_msgid(r["request_id"], em))
+                      _review_html(dict(r), em), [em], in_reply_to=_anchor_msgid(r["request_id"], em))
             await conn.execute(
                 "UPDATE sample_requisitions SET reminder_count = reminder_count + 1, last_reminder_at = NOW() WHERE id = $1",
                 r["id"])
