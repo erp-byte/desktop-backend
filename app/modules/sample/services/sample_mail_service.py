@@ -95,14 +95,10 @@ def _fmt(v, dash: str = "—") -> str:
     return _html.escape(s) if s else dash
 
 
-def _review_html(req: dict, reviewer_email: str) -> str:
-    """Polished, email-client-safe HTML review notice — mirrors the WhatsApp review
-    template (full request detail) + Accept / Hold action buttons. Table-based layout
-    with inline styles for Gmail/Outlook compatibility. The Accept link embeds this
-    reviewer's email for the recipient-match auth check."""
-    rid = req.get("request_id")
-    accept, hold = _accept_url(rid, reviewer_email), _hold_url(rid)
-    type_label = "Customer trial" if req.get("sample_type") == "TRIAL" else "NPD"
+def _detail_table(req: dict) -> str:
+    """The request-detail field grid + optional description block — shared verbatim by
+    the reviewer mail and the informative inventory mail so the two never drift. Returns
+    the inner <table> markup (table-based + inline styles for Gmail/Outlook safety)."""
     exp = req.get("expected_dispatch_date")
     exp = str(exp)[:10] if exp else "TBC"
     wpp, qty = req.get("weight_per_piece"), req.get("quantity")
@@ -135,6 +131,16 @@ def _review_html(req: dict, reviewer_email: str) -> str:
         f'border-radius:6px;padding:10px 12px">{_fmt(desc)}</div>'
         '</td></tr>'
     ) if (desc and str(desc).strip()) else ""
+    return f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0">{rows}{desc_block}</table>'
+
+
+def _review_html(req: dict, reviewer_email: str) -> str:
+    """Polished, email-client-safe HTML review notice — mirrors the WhatsApp review
+    template (full request detail) + Accept / Hold action buttons. The Accept link
+    embeds this reviewer's email for the recipient-match auth check."""
+    rid = req.get("request_id")
+    accept, hold = _accept_url(rid, reviewer_email), _hold_url(rid)
+    type_label = "Customer trial" if req.get("sample_type") == "TRIAL" else "NPD"
 
     return f"""<!doctype html><html><body style="margin:0;padding:0;background:#f4f5f7">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f5f7;padding:24px 12px">
@@ -146,7 +152,7 @@ def _review_html(req: dict, reviewer_email: str) -> str:
    </td></tr>
    <tr><td style="padding:22px 24px 4px">
      <p style="margin:0 0 16px;font-size:14px;color:#374151;line-height:1.5">A new {type_label} sample request needs your review. Tap <b>Accept</b> to approve, or <b>Hold</b> to open it on the portal and record a reason.</p>
-     <table role="presentation" width="100%" cellpadding="0" cellspacing="0">{rows}{desc_block}</table>
+     {_detail_table(req)}
    </td></tr>
    <tr><td style="padding:18px 24px 26px">
      <table role="presentation" cellpadding="0" cellspacing="0"><tr>
@@ -167,6 +173,50 @@ def _review_html(req: dict, reviewer_email: str) -> str:
 </body></html>"""
 
 
+# event -> (header colour, header eyebrow, intro line, status-pill label/colour).
+# Drives the informative inventory mail; "created" is the neutral logged notice, the
+# others mirror the NPD outcome.
+_INV_EVENT = {
+    "created":  ("#ec7211", "SAMPLE REQUEST LOGGED",   "A new sample request has been logged in the ERP. This notice is for your visibility — no action is required from inventory at this stage.", "Logged",   "#ec7211"),
+    "accepted": ("#16a34a", "SAMPLE REQUEST ACCEPTED", "The NPD team has accepted this sample request. Sharing the details for your visibility.", "Accepted", "#16a34a"),
+    "on hold":  ("#f59e0b", "SAMPLE REQUEST ON HOLD",  "The NPD team has placed this sample request on hold. Sharing the details for your visibility.", "On hold", "#b45309"),
+}
+
+
+def _informative_html(req: dict, event: str) -> str:
+    """Polished, email-client-safe HTML notice for inventory_manager — same detail card
+    as the reviewer mail but with NO action buttons (informational only). The header
+    colour, eyebrow and status pill reflect the event (created / accepted / on hold)."""
+    rid = req.get("request_id")
+    hdr, eyebrow, intro, pill, pill_bg = _INV_EVENT.get(
+        event, ("#6b7280", f"SAMPLE REQUEST {(event or '').upper()}",
+                "Sharing the details of this sample request for your visibility.",
+                _fmt(event).upper() if event else "Update", "#6b7280"))
+
+    return f"""<!doctype html><html><body style="margin:0;padding:0;background:#f4f5f7">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f5f7;padding:24px 12px">
+ <tr><td align="center">
+  <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background:#ffffff;border:1px solid #e5e7eb;border-radius:10px;overflow:hidden;font-family:-apple-system,'Segoe UI',Roboto,Arial,sans-serif">
+   <tr><td style="background:{hdr};padding:18px 24px">
+     <div style="color:#ffffff;font-size:12px;opacity:.92;letter-spacing:.05em">{eyebrow}</div>
+     <div style="color:#ffffff;font-size:24px;font-weight:700;margin-top:3px">{rid}</div>
+   </td></tr>
+   <tr><td style="padding:22px 24px 4px">
+     <div style="margin:0 0 14px">
+       <span style="display:inline-block;background:{pill_bg};color:#ffffff;font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;padding:4px 12px;border-radius:999px">{pill}</span>
+     </div>
+     <p style="margin:0 0 16px;font-size:14px;color:#374151;line-height:1.5">{intro}</p>
+     {_detail_table(req)}
+   </td></tr>
+   <tr><td style="padding:14px 24px 24px;background:#f9fafb;border-top:1px solid #eef0f3">
+     <p style="margin:0;font-size:11px;color:#9ca3af;line-height:1.5">You're receiving this as an inventory manager, for visibility. This is an informational notice — no action is required from you here.</p>
+   </td></tr>
+  </table>
+ </td></tr>
+</table>
+</body></html>"""
+
+
 def _anchor_msgid(request_id, email: str) -> str:
     """Deterministic Message-ID per (request, recipient). Because each reviewer gets
     their OWN message (the Accept link embeds their email), a single stored anchor
@@ -178,34 +228,54 @@ def _anchor_msgid(request_id, email: str) -> str:
     return f"<npd-req-{request_id}-{h}@candorfoods.in>"
 
 
-async def notify_npd_review_email(conn, req: dict) -> None:
-    """On NPD/TRIAL submit — email npd_team the request with Accept/Hold buttons. Each
-    reviewer's message is rooted at a deterministic per-recipient Message-ID so the
-    reminders + outcome reply thread under it in THEIR mailbox. Best-effort, never raises."""
+async def notify_npd_review_email(conn, req: dict, *, threaded: bool = False) -> None:
+    """Email npd_team the request with Accept/Hold buttons.
+
+    threaded=False (initial submit): each reviewer's message is ROOTED at the
+    deterministic per-recipient Message-ID, so reminders / outcome replies thread under
+    it in THEIR mailbox.
+
+    threaded=True (re-prompt after a HOLD): the SAME buttoned card is sent again as a
+    REPLY into that existing thread (In-Reply-To the anchor, fresh Message-ID) — no new
+    mail trail. This is the hold→re-offer loop: the reviewer can Accept to end it or Hold
+    again to be re-prompted. It's human-driven (one re-send per recorded hold), so there
+    is no runaway loop. Best-effort, never raises."""
     rid = req.get("request_id")
     recips = await _emails_for_role(conn, "npd_team")
     if not recips:
         logger.warning("[sample-mail] no npd_team emails — skipping review email for req %s", req.get("id"))
         return
     for em in recips:
-        _send(f"NPD sample request {rid} — action needed",
-              _review_html(req, em), [em], msgid=_anchor_msgid(rid, em))
+        anchor = _anchor_msgid(rid, em)
+        if threaded:
+            _send(f"Re: NPD sample request {rid} — on hold, still needs a decision",
+                  _review_html(req, em), [em], in_reply_to=anchor)
+        else:
+            _send(f"NPD sample request {rid} — action needed",
+                  _review_html(req, em), [em], msgid=anchor)
+
+
+_INV_SUBJECT = {
+    "created": "logged",
+    "accepted": "accepted by NPD",
+    "on hold": "placed on hold by NPD",
+}
 
 
 async def notify_inventory_informative(conn, req: dict, *, event: str) -> None:
-    """Informative (no-button) mail to each inventory_manager on create/accept/hold. The
+    """Informative (no-button) mail to each inventory_manager on create/accept/hold —
+    the polished detail card (see _informative_html), buttons deliberately omitted. The
     'created' mail roots a per-recipient thread; later events reply into it."""
     rid = req.get("request_id")
     recips = await _emails_for_role(conn, "inventory_manager")
     if not recips:
         return
-    target = _html.escape(str(req.get("npd_target_name") or "—"))
-    html = (f"<div style='font-family:Arial,sans-serif'><h3>Sample request {rid} — {event}</h3>"
-            f"<p>Target: {target}</p></div>")
+    html = _informative_html(req, event)
+    subject = f"Sample request {rid} — {_INV_SUBJECT.get(event, event)}"
     is_root = event == "created"
     for em in recips:
         anchor = _anchor_msgid(rid, em)
-        _send(f"Sample request {rid} — {event}", html, [em],
+        _send(subject, html, [em],
               msgid=anchor if is_root else None,
               in_reply_to=None if is_root else anchor)
 

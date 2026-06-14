@@ -225,6 +225,10 @@ async def act_npd_review(conn, req_id: int, *, action: str, user,
             await mail.notify_inventory_informative(
                 conn, dict(locked),
                 event=("accepted" if act in ("ACCEPT", "APPROVE") else "on hold"))
+            # Hold loop: re-offer the buttoned review card to npd_team as a reply into the
+            # same thread, so a held request can be accepted (ends the loop) or held again.
+            if act == "HOLD":
+                await mail.notify_npd_review_email(conn, dict(locked), threaded=True)
         except Exception:  # noqa: BLE001
             logger.exception("Sample outcome email failed for req %s", req_id)
 
