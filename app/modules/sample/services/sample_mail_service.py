@@ -75,17 +75,17 @@ def _send(subject, html, to_addrs, *, cc=None, msgid=None, in_reply_to=None):
     return mid
 
 
-# Both buttons hit one endpoint: GET /email/npd-action?request_id&status&email.
-# Accept carries the reviewer's email for the recipient-match auth; Hold just needs
-# the request_id (it redirects to the portal).
+# Accept hits the backend (GET confirm page → POST) carrying the reviewer's email for
+# the recipient-match auth. Hold links STRAIGHT to the sample page on the web app (no
+# backend hop) — the reviewer records the hold there, same as the in-app flow.
 def _accept_url(request_id, email: str) -> str:
     base = Settings().PUBLIC_BACKEND_URL.rstrip("/")
     return f"{base}/api/v1/sample/email/npd-action?request_id={request_id}&status=accept&email={quote(email)}"
 
 
-def _hold_url(request_id) -> str:
-    base = Settings().PUBLIC_BACKEND_URL.rstrip("/")
-    return f"{base}/api/v1/sample/email/npd-action?request_id={request_id}&status=hold"
+def _hold_url(pk_id) -> str:
+    web = Settings().WEB_APP_URL.rstrip("/")
+    return f"{web}/modules/sample/{pk_id}"
 
 
 def _fmt(v, dash: str = "—") -> str:
@@ -149,7 +149,7 @@ def _review_html(req: dict, reviewer_email: str) -> str:
     template (full request detail) + Accept / Hold action buttons. The Accept link
     embeds this reviewer's email for the recipient-match auth check."""
     rid = req.get("request_id")
-    accept, hold = _accept_url(rid, reviewer_email), _hold_url(rid)
+    accept, hold = _accept_url(rid, reviewer_email), _hold_url(req.get("id"))
     type_label = "Customer trial" if req.get("sample_type") == "TRIAL" else "NPD"
 
     return f"""<!doctype html><html><body style="margin:0;padding:0;background:#f4f5f7">
@@ -331,10 +331,13 @@ def _promote_approve_url(dev_jc_id, approver_kind: str, email: str) -> str:
             f"&approver_kind={approver_kind}&status=approve&email={quote(email)}")
 
 
-def _promote_reject_url(dev_jc_id, approver_kind: str) -> str:
-    base = Settings().PUBLIC_BACKEND_URL.rstrip("/")
-    return (f"{base}/api/v1/sample/email/promote-action?dev_jc_id={dev_jc_id}"
-            f"&approver_kind={approver_kind}&status=reject")
+def _promote_reject_url(dev_jc_id, approver_kind: str, email: str) -> str:
+    # Reject opens the job-card page on the web app, which pops a reason dialog and
+    # submits the reject through the email-authenticated endpoint (the email is carried
+    # so the submit can be authenticated — checking is mandatory).
+    web = Settings().WEB_APP_URL.rstrip("/")
+    return (f"{web}/modules/npd-development/job-cards/{dev_jc_id}"
+            f"?promote_reject={approver_kind}&email={quote(email)}")
 
 
 def _promote_subject(jc: dict) -> str:
@@ -417,14 +420,14 @@ async def notify_promote_review_email(conn, *, dev_jc_id, requestor_uid=None) ->
     for em in await _emails_for_role(conn, "inventory_manager"):
         _send(subject, _promote_html(jc, "Inventory manager",
                                      _promote_approve_url(dev_jc_id, "INV_MGR", em),
-                                     _promote_reject_url(dev_jc_id, "INV_MGR")),
+                                     _promote_reject_url(dev_jc_id, "INV_MGR", em)),
               [em], msgid=_anchor_msgid(dev_jc_id, em, scope="promote-inv"))
     if requestor_uid:
         bh = await _email_for_user(conn, requestor_uid)
         if bh:
             _send(subject, _promote_html(jc, "Requestor (business head)",
                                          _promote_approve_url(dev_jc_id, "REQUESTOR_BH", bh),
-                                         _promote_reject_url(dev_jc_id, "REQUESTOR_BH")),
+                                         _promote_reject_url(dev_jc_id, "REQUESTOR_BH", bh)),
                   [bh], msgid=_anchor_msgid(dev_jc_id, bh, scope="promote-bh"))
 
 

@@ -215,6 +215,16 @@ class PromoteApprovalBody(BaseModel):
     approver_kind: Optional[Literal["INV_MGR", "REQUESTOR_BH"]] = None
 
 
+class PromoteEmailReject(BaseModel):
+    """Reject a promote gate from the email-driven reason dialog on the web app. PUBLIC
+    (no session) — authenticated by the recipient `email` owning the gate; a reason is
+    required."""
+    dev_jc_id: int
+    approver_kind: Literal["INV_MGR", "REQUESTOR_BH"]
+    email: str
+    remarks: str
+
+
 class DevDispatchBody(BaseModel):
     recipient: Optional[str] = None
     qty: Optional[float] = Field(default=None, ge=0)

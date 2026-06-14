@@ -193,11 +193,34 @@ async def email_npd_action_confirm(
                         media_type="text/html")
 
 
+async def _resolve_promote_approver(conn, dev_jc_id: int, kind: str, email: str):
+    """Authenticate an email-link approver against the gate it claims (mandatory check):
+    INV_MGR → an ACTIVE inventory_manager with that email; REQUESTOR_BH → the user bound
+    to this JC's BH gate with that email (matched on the LATEST promote request, so a late
+    click still resolves). Returns the auth_user row (user_id, role_name) or None."""
+    if kind == "INV_MGR":
+        return await conn.fetchrow(
+            """SELECT a.user_id, r.role_name FROM auth_user a JOIN auth_role r ON a.role_id = r.role_id
+                WHERE r.role_name = 'inventory_manager' AND lower(a.email) = lower($1)
+                  AND COALESCE(a.is_active, TRUE) ORDER BY a.user_id LIMIT 1""", email)
+    return await conn.fetchrow(
+        """SELECT a.user_id, COALESCE(r.role_name, '') AS role_name
+             FROM npd_dev_promote_request pr
+             JOIN npd_dev_promote_approval ap
+               ON ap.promote_request_id = pr.id AND ap.approver_kind = 'REQUESTOR_BH'
+             JOIN auth_user a ON a.user_id = ap.approver_user_id
+             LEFT JOIN auth_role r ON a.role_id = r.role_id
+            WHERE pr.dev_jc_id = $1
+              AND lower(a.email) = lower($2) AND COALESCE(a.is_active, TRUE)
+            ORDER BY pr.created_at DESC LIMIT 1""", dev_jc_id, email)
+
+
 # ── Email approve/reject — promote dual-approval gate buttons ─────────────────
-# PUBLIC (no auth dep). The mail buttons GET this; APPROVE renders a POST-confirm page
-# (so a link-scanner's GET can't auto-approve a gate) and the POST below does the work.
-#   • status=approve → render the confirm page (no mutation here).
-#   • status=reject  → redirect to the job-card page; the reject + reason is recorded there.
+# PUBLIC (no auth dep). The mail buttons GET this.
+#   • status=approve → render a POST-confirm page (a link-scanner's GET can't auto-act);
+#     the POST below does the real approve.
+#   • status=reject  → redirect to the web app's job-card page, which pops a reason dialog
+#     and submits the reject through POST /email/promote-reject (email-authenticated).
 @router.get("/email/promote-action")
 async def email_promote_action(
     request: Request,
@@ -207,14 +230,19 @@ async def email_promote_action(
     email: str = Query(""),
 ):
     from app.config import Settings
+    from urllib.parse import quote
     st = (status or "").strip().lower()
     kind = (approver_kind or "").strip().upper()
-    web = Settings().WEB_APP_URL.rstrip("/")
 
-    # REJECT → open the job card on the portal; the reason is captured there.
+    # REJECT → web app job-card page, carrying the gate + email so it can pop the reason
+    # dialog and authenticate the submit. (The mail's Reject button links here directly;
+    # this remains as a defensive fallback for the backend URL form.)
     if st == "reject":
+        web = Settings().WEB_APP_URL.rstrip("/")
+        q = (f"?promote_reject={kind}&email={quote(email)}"
+             if kind in ("INV_MGR", "REQUESTOR_BH") and (email or "").strip() else "")
         return Response(status_code=302,
-                        headers={"Location": f"{web}/modules/npd-development/job-cards/{dev_jc_id}"})
+                        headers={"Location": f"{web}/modules/npd-development/job-cards/{dev_jc_id}{q}"})
     if st != "approve":
         return Response("<h3>Unknown action.</h3>", media_type="text/html", status_code=400)
     if kind not in ("INV_MGR", "REQUESTOR_BH"):
@@ -240,9 +268,8 @@ async def email_promote_action_confirm(
     email: str = Form(""),
 ):
     """The real approve — POST-only, behind the confirm button. Verify `email` owns the
-    gate (an ACTIVE inventory_manager for INV_MGR; the user bound to this JC's BH gate for
-    REQUESTOR_BH), then accept that one gate (idempotent; promotes once BOTH gates clear).
-    Auth fail / wrong state → no mutation, the call is ignored."""
+    gate, then accept it (idempotent; promotes once BOTH gates clear). Auth fail / wrong
+    state → no mutation, the call is ignored."""
     kind = (approver_kind or "").strip().upper()
     if kind not in ("INV_MGR", "REQUESTOR_BH"):
         return Response("<h3>Unknown approval gate.</h3>", media_type="text/html", status_code=400)
@@ -251,30 +278,9 @@ async def email_promote_action_confirm(
 
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
-        # Authenticate the link's email against the gate it claims.
-        if kind == "INV_MGR":
-            urow = await conn.fetchrow(
-                """SELECT a.user_id, r.role_name FROM auth_user a JOIN auth_role r ON a.role_id = r.role_id
-                    WHERE r.role_name = 'inventory_manager' AND lower(a.email) = lower($1)
-                      AND COALESCE(a.is_active, TRUE) ORDER BY a.user_id LIMIT 1""", email)
-        else:  # REQUESTOR_BH — the email must be the user bound to this JC's BH gate.
-            # Match against the LATEST promote request (not only a PENDING one): the BH
-            # binding is the same user across requests, so a late click after the promote
-            # already resolved still authenticates and falls through to the idempotent
-            # "already actioned" message below, instead of a misleading "not authorised".
-            urow = await conn.fetchrow(
-                """SELECT a.user_id, COALESCE(r.role_name, '') AS role_name
-                     FROM npd_dev_promote_request pr
-                     JOIN npd_dev_promote_approval ap
-                       ON ap.promote_request_id = pr.id AND ap.approver_kind = 'REQUESTOR_BH'
-                     JOIN auth_user a ON a.user_id = ap.approver_user_id
-                     LEFT JOIN auth_role r ON a.role_id = r.role_id
-                    WHERE pr.dev_jc_id = $1
-                      AND lower(a.email) = lower($2) AND COALESCE(a.is_active, TRUE)
-                    ORDER BY pr.created_at DESC LIMIT 1""", dev_jc_id, email)
+        urow = await _resolve_promote_approver(conn, dev_jc_id, kind, email)
         if urow is None:
             return Response("<h3>This link is not authorised.</h3>", media_type="text/html", status_code=403)
-
         import types as _t
         from app.modules.sample.services import promote_approval_service as pas
         user = _t.SimpleNamespace(user_id=urow["user_id"], role_name=urow["role_name"],
@@ -287,6 +293,31 @@ async def email_promote_action_confirm(
         return Response("<h3>&#10003; Approved. You can close this tab.</h3>"
                         "<script>setTimeout(function(){try{window.close()}catch(e){}},400)</script>",
                         media_type="text/html")
+
+
+@router.post("/email/promote-reject")
+async def email_promote_reject(request: Request, body: schemas.PromoteEmailReject):
+    """Reject a promote gate from the web app's email-driven reason dialog. PUBLIC — the
+    submit is authenticated by the recipient `email` OWNING the gate (mandatory), and a
+    reason is required. Returns the act_promote_approval result as JSON."""
+    kind = body.approver_kind
+    email = (body.email or "").strip()
+    remarks = (body.remarks or "").strip()
+    if not email:
+        raise HTTPException(403, detail={"error": "unauthorised", "message": "This link is not authorised"})
+    if not remarks:
+        raise HTTPException(422, detail={"error": "reason_required", "message": "A reason is required to reject"})
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        urow = await _resolve_promote_approver(conn, body.dev_jc_id, kind, email)
+        if urow is None:
+            raise HTTPException(403, detail={"error": "not_an_approver", "message": "This link is not authorised"})
+        import types as _t
+        from app.modules.sample.services import promote_approval_service as pas
+        user = _t.SimpleNamespace(user_id=urow["user_id"], role_name=urow["role_name"],
+                                  is_admin=False, full_name="email")
+        return await pas.act_promote_approval(conn, body.dev_jc_id, action="REJECT",
+                                              user=user, remarks=remarks, approver_kind=kind)
 
 
 @router.post("/email/run-reminders")

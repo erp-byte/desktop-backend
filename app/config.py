@@ -52,8 +52,8 @@ class Settings(BaseSettings):
     SMTP_PORT: int = 587
     SMTP_EMAIL: str = ""                        # sender address + STARTTLS login (Gmail app password)
     SMTP_APP_PASSWORD: str = ""                 # app password for SMTP_EMAIL
-    PUBLIC_BACKEND_URL: str = "https://erpcf.netlify.app"   # base for email action links (reaches FastAPI via the Netlify /api proxy)
-    WEB_APP_URL: str = "https://erpcf.in"                    # web app base for the Hold redirect
+    PUBLIC_BACKEND_URL: str = "http://65.0.86.156"          # base for email action links — hits the FastAPI backend directly (email clicks are top-level navigations, so plain HTTP is fine, not mixed-content)
+    WEB_APP_URL: str = "https://erpcf.in"                    # web app base for the Hold / Reject redirects
 
     # ── Vendor module (S3-only + Claude extraction) ───────────────────────
     VENDOR_S3_BUCKET: str = ""                  # required for vendor doc uploads; falls back to RECEIPT_S3_BUCKET
