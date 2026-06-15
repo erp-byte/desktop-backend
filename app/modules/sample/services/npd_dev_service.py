@@ -79,7 +79,8 @@ async def create_dev_job_card(conn, *, payload: dict, user) -> dict:
         # field from the source requisition (the explicit payload value wins) so a
         # card developed from a request carries its company / customer / dispatch
         # plan automatically.
-        inherit_cols = _DISPATCH_FIELDS + ("pcs", "weight_per_piece")
+        inherit_cols = _DISPATCH_FIELDS + ("pcs", "weight_per_piece",
+                                           "returnable", "non_returnable", "paid", "amount")
         cust = {k: payload.get(k) for k in inherit_cols}
         if src_req:
             rq = await conn.fetchrow(
@@ -105,9 +106,10 @@ async def create_dev_job_card(conn, *, payload: dict, user) -> dict:
                              company_name, customer_name, customer_contact, customer_ship_to_address,
                              mode_of_transport, expected_dispatch_date, confirmed_dispatch_date,
                              pcs, weight_per_piece,
+                             returnable, non_returnable, paid, amount,
                              status, created_by)
                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                                $12, $13, $14, $15, $16, $17, $18, $19, $20, 'DRAFT', $21)
+                                $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, 'DRAFT', $25)
                         """,
                         cand, number, payload["title"], payload.get("description"),
                         payload.get("warehouse"), base_bom_id, payload.get("fg_sku_id"),
@@ -117,6 +119,9 @@ async def create_dev_job_card(conn, *, payload: dict, user) -> dict:
                         cust["customer_ship_to_address"], cust["mode_of_transport"],
                         cust["expected_dispatch_date"], cust["confirmed_dispatch_date"],
                         cust["pcs"], cust["weight_per_piece"],
+                        # Billing inherited from the source requisition (NULL for a
+                        # standalone/sourceless card — read-only copy, 072 is the source of truth).
+                        cust["returnable"], cust["non_returnable"], cust["paid"], cust["amount"],
                         user.user_id)
                 dev_jc_id = cand
                 break

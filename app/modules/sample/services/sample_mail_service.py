@@ -139,6 +139,11 @@ def _detail_table(req: dict) -> str:
         ("Mode of transport", _fmt(req.get("mode_of_transport"))),
         ("Expected dispatch", _fmt(exp)),
         ("Requestor", _fmt(req.get("requestor_team"))),
+        ("Return type", "Returnable" if req.get("returnable")
+                        else "Non-returnable" if req.get("non_returnable") else "—"),
+        ("Paid", "Yes" if req.get("paid") else "No"),
+        ("Amount", f"{float(req.get('amount')):,.2f}"
+                   if (req.get("paid") and req.get("amount") is not None) else "—"),
     ]
     return (f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0">'
             f'{_kv_rows(fields)}{_desc_block(req.get("description"))}</table>')
@@ -360,6 +365,11 @@ def _promote_detail_table(jc: dict) -> str:
         ("Customer", _fmt(jc.get("customer_name"))),
         ("Customer contact", _fmt(jc.get("customer_contact"))),
         ("Expected dispatch", _fmt(exp)),
+        ("Return type", "Returnable" if jc.get("returnable")
+                        else "Non-returnable" if jc.get("non_returnable") else "—"),
+        ("Paid", "Yes" if jc.get("paid") else "No"),
+        ("Amount", f"{float(jc.get('amount')):,.2f}"
+                   if (jc.get("paid") and jc.get("amount") is not None) else "—"),
     ]
     return (f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0">'
             f'{_kv_rows(fields)}{_desc_block(jc.get("description"))}</table>')

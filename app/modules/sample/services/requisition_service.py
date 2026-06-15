@@ -121,9 +121,10 @@ async def create_requisition(conn, *, payload: dict, user) -> dict:
                              company_name, customer_name, customer_contact, customer_ship_to_address,
                              mode_of_transport, expected_dispatch_date, confirmed_dispatch_date,
                              pcs, weight_per_piece,
+                             returnable, non_returnable, paid, amount,
                              created_by, updated_by)
                         VALUES ($1, $2, 'DRAFT', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                                $15, $16, $17, $18, $19, $20, $21, $22, $23, $3, $3)
+                                $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $3, $3)
                         RETURNING id
                         """,
                         request_id, sample_type, user.user_id,
@@ -138,6 +139,12 @@ async def create_requisition(conn, *, payload: dict, user) -> dict:
                         payload.get("mode_of_transport"), payload.get("expected_dispatch_date"),
                         payload.get("confirmed_dispatch_date"),
                         pcs, wpp,
+                        # Billing checklist — coerce to non-null (columns are NOT NULL);
+                        # NpdRequisitionCreate has already normalised amount to 0 when
+                        # not paid. A non-billing create (generic RM/FG/INTERNAL) sends
+                        # nothing → (FALSE, FALSE, FALSE, 0).
+                        bool(payload.get("returnable")), bool(payload.get("non_returnable")),
+                        bool(payload.get("paid")), payload.get("amount") or 0,
                     )
                 break
             except asyncpg.UniqueViolationError:
@@ -291,6 +298,23 @@ async def update_requisition(conn, req_id: int, *, payload: dict, user) -> dict:
     quantity = payload.get("quantity")
     if eff_pcs is not None and eff_wpp is not None:
         quantity = round(float(eff_pcs) * float(eff_wpp), 3)
+    # Billing invariants on the MERGED state (patch over existing) so a partial PATCH
+    # can't drive the row into a state the DB CHECK rejects — surface a clean 422
+    # instead of an IntegrityError. (A False patch value must win, so test `is not None`.)
+    eff_returnable = payload["returnable"] if payload.get("returnable") is not None else req.get("returnable")
+    eff_non_returnable = payload["non_returnable"] if payload.get("non_returnable") is not None else req.get("non_returnable")
+    eff_paid = payload["paid"] if payload.get("paid") is not None else req.get("paid")
+    eff_amount = 0 if payload.get("paid") is False else (
+        payload["amount"] if payload.get("amount") is not None else req.get("amount"))
+    if eff_returnable and eff_non_returnable:
+        raise HTTPException(422, detail={"error": "invalid_billing",
+                                         "message": "returnable and non_returnable cannot both be selected"})
+    if eff_paid and not (eff_amount and float(eff_amount) > 0):
+        raise HTTPException(422, detail={"error": "invalid_billing",
+                                         "message": "amount is required and must be greater than 0 when paid"})
+    if not eff_paid and eff_amount and float(eff_amount) > 0:
+        raise HTTPException(422, detail={"error": "invalid_billing",
+                                         "message": "amount must be 0 unless paid"})
     async with conn.transaction():
         await conn.execute(
             """
@@ -314,6 +338,10 @@ async def update_requisition(conn, req_id: int, *, payload: dict, user) -> dict:
                    confirmed_dispatch_date  = COALESCE($19, confirmed_dispatch_date),
                    pcs              = COALESCE($20, pcs),
                    weight_per_piece = COALESCE($21, weight_per_piece),
+                   returnable       = COALESCE($22, returnable),
+                   non_returnable   = COALESCE($23, non_returnable),
+                   paid             = COALESCE($24, paid),
+                   amount           = COALESCE($25, amount),
                    updated_at = NOW(), updated_by = $6
              WHERE id = $1
             """,
@@ -326,7 +354,11 @@ async def update_requisition(conn, req_id: int, *, payload: dict, user) -> dict:
             payload.get("customer_contact"), payload.get("customer_ship_to_address"),
             payload.get("mode_of_transport"), payload.get("expected_dispatch_date"),
             payload.get("confirmed_dispatch_date"),
-            payload.get("pcs"), payload.get("weight_per_piece"))
+            payload.get("pcs"), payload.get("weight_per_piece"),
+            payload.get("returnable"), payload.get("non_returnable"), payload.get("paid"),
+            # paid explicitly unticked → force amount 0 (keeps the DB CHECK satisfied
+            # even if the client omitted amount); else use the sent amount (or keep).
+            (0 if payload.get("paid") is False else payload.get("amount")))
         if payload.get("articles") is not None:
             await conn.execute(
                 "DELETE FROM sample_requisition_articles WHERE requisition_id = $1", req_id)

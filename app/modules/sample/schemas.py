@@ -10,7 +10,9 @@ from __future__ import annotations
 from datetime import date
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+from app.core.types import Amount2
 
 SampleType = Literal["BASIS_RM", "BASIS_FG", "NPD", "INTERNAL", "TRIAL"]
 ArticleRole = Literal["RM", "FG", "NPD_INPUT", "NPD_OUTPUT"]
@@ -78,6 +80,23 @@ class RequisitionUpdate(BaseModel):
     expected_dispatch_date: Optional[date] = None
     confirmed_dispatch_date: Optional[date] = None
     articles: Optional[list[ArticleIn]] = None
+    # Billing checklist (NPD/TRIAL): returnable XOR non_returnable; amount is 0
+    # unless paid, else > 0 with at most 2 decimals (Amount2 rejects >2dp).
+    returnable: Optional[bool] = None
+    non_returnable: Optional[bool] = None
+    paid: Optional[bool] = None
+    amount: Amount2 = None
+
+    @model_validator(mode="after")
+    def _check_billing(self):
+        if self.returnable and self.non_returnable:
+            raise ValueError("returnable and non_returnable cannot both be selected")
+        if self.paid is True:
+            if not self.amount or self.amount <= 0:
+                raise ValueError("amount is required and must be greater than 0 when paid")
+        elif self.paid is False:
+            self.amount = 0   # paid unticked → amount locked to 0
+        return self
 
 
 # ── NPD sample requisition (the NPD-first create form) ─────────────────────
@@ -104,6 +123,23 @@ class NpdRequisitionCreate(BaseModel):
     description: Optional[str] = None                        # nullable
     purpose_tag: Optional[PurposeTag] = None                 # nullable
     requestor_team: Optional[str] = None                     # nullable
+    # Billing checklist: returnable XOR non_returnable (both optional); amount is
+    # 0 unless paid, else mandatory > 0 with at most 2 decimals (Amount2 is strict).
+    returnable: bool = False
+    non_returnable: bool = False
+    paid: bool = False
+    amount: Amount2 = 0
+
+    @model_validator(mode="after")
+    def _check_billing(self):
+        if self.returnable and self.non_returnable:
+            raise ValueError("returnable and non_returnable cannot both be selected")
+        if self.paid:
+            if not self.amount or self.amount <= 0:
+                raise ValueError("amount is required and must be greater than 0 when paid")
+        else:
+            self.amount = 0   # not paid → amount locked to 0
+        return self
 
 
 class ApprovalAction(BaseModel):
