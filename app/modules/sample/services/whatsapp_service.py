@@ -82,6 +82,19 @@ this order — keep the live template text aligned with the layouts below.
      Reason: {{2}}                                         [ body {{2}} = hold reason ]
      <a closing line — body must not END on a variable>
 
+5. npd_promote_approval      (to the promote approvers)     — env WHATSAPP_TPL_NPD_PROMOTE
+   The NPD dev-JC promote dual-approval gate. Sent to every inventory_manager (INV_MGR
+   gate) + the requestor BH (REQUESTOR_BH gate). Two QUICK REPLY buttons — "Approve"
+   and "Reject" (Reject → we ask for the reason in the next reply).
+   HEADER (text): New promote approval — Dev JC {{1}}     [ {{1}} = dev_jc_number ]
+   BODY ({{1}}..{{9}}):
+     Your gate: {{1}}                                      [ "Inventory manager" / "Requestor (business head)" ]
+     Dev job card: {{2}}                                   [ dev_jc_number ]
+     Target FG article: {{3}}   Target quantity: {{4}}
+     Company: {{5}}   Customer: {{6}}
+     Return type: {{7}}   Paid: {{8}}   Amount: {{9}}
+     <a closing "Tap *Approve* … or *Reject* …" line — body must not END on a variable>
+
 The reviewer-facing prompts/confirmations ("Please reply with the reason", "✓ Accepted")
 are sent as plain session text (no template — the reviewer just messaged us, so the
 24-hour customer-service window is open).
@@ -107,6 +120,9 @@ TPL_REVIEW = os.environ.get("WHATSAPP_TPL_NPD_REVIEW", "npd_request_review")
 TPL_UPDATED = os.environ.get("WHATSAPP_TPL_NPD_UPDATED", "npd_request_updated")
 TPL_ACCEPTED = os.environ.get("WHATSAPP_TPL_NPD_ACCEPTED", "npd_request_accepted")
 TPL_HOLD = os.environ.get("WHATSAPP_TPL_NPD_HOLD", "npd_request_on_hold")
+# Promote dual-approval gate (NPD dev job card): Approve / Reject quick replies.
+TPL_PROMOTE = os.environ.get("WHATSAPP_TPL_NPD_PROMOTE", "npd_promote_approval")
+_PROMOTE_GATE_LABEL = {"INV_MGR": "Inventory manager", "REQUESTOR_BH": "Requestor (business head)"}
 # Verify token for the webhook GET handshake (set the same value in Meta).
 VERIFY_TOKEN = os.environ.get("WHATSAPP_VERIFY_TOKEN", "")
 # NPD roles permitted to ACT over WhatsApp (inbound Accept/Hold).
@@ -390,6 +406,141 @@ async def notify_requestor(conn, req: dict, *, action: str, reason: str | None =
                        action, req.get("id"), resp.get("error"), tpl, TEMPLATE_LANG)
 
 
+# ── promote dual-approval gate (job-card approval) ───────────────────────────
+async def _phones_for_role(conn, role: str) -> list[str]:
+    """Active auth_user phones for a role (E.164, no '+'), empty if none."""
+    rows = await conn.fetch(
+        """SELECT u.phone FROM auth_user u JOIN auth_role r ON u.role_id = r.role_id
+            WHERE r.role_name = $1 AND COALESCE(u.is_active, TRUE)
+              AND u.phone IS NOT NULL AND btrim(u.phone) <> ''""", role)
+    return [_fmt_phone(r["phone"]) for r in rows]
+
+
+async def _phone_for_user(conn, uid) -> str | None:
+    if not uid:
+        return None
+    p = await conn.fetchval("SELECT phone FROM auth_user WHERE user_id = $1", uid)
+    return _fmt_phone(p) if p else None
+
+
+def _promote_params(jc: dict, gate_label: str) -> tuple[list[str], list[str]]:
+    """(header, body) for npd_promote_approval. HEADER {{1}} = dev_jc_number; BODY
+    {{1}} = gate label, {{2}} = dev_jc_number, {{3}} = target FG, {{4}} = qty,
+    {{5}} = company, {{6}} = customer, {{7}} = return type, {{8}} = paid, {{9}} = amount."""
+    number = _txt(jc.get("dev_jc_number") or jc.get("id"))
+    tq, uom = jc.get("target_qty"), (jc.get("uom") or "kg")
+    qty = f"{_num(tq)} {_txt(uom)}" if tq is not None else "—"
+    rtype = ("Returnable" if jc.get("returnable")
+             else "Non-returnable" if jc.get("non_returnable") else "—")
+    amt = jc.get("amount")
+    amount = "—"
+    if jc.get("paid") and amt is not None:
+        try:                                  # NUMERIC(12,2) → Decimal; defensive anyway
+            amount = f"{float(amt):,.2f}"
+        except (TypeError, ValueError):
+            amount = _txt(amt)
+    body = [gate_label, number, _txt(jc.get("fg_sku_name") or jc.get("title")), qty,
+            _txt(jc.get("company_name")), _txt(jc.get("customer_name")),
+            rtype, ("Yes" if jc.get("paid") else "No"), amount]
+    return [number], body
+
+
+async def _store_promote_message(conn, wamid: str, dev_jc_id: int, approver_kind: str, wa_phone: str) -> None:
+    """Remember which (dev JC, gate) a sent promote template was about, so a later
+    Approve/Reject button tap (context.id = this wamid) resolves back. Best-effort."""
+    try:
+        await conn.execute(
+            """INSERT INTO wa_promote_message (wamid, dev_jc_id, approver_kind, wa_phone)
+               VALUES ($1, $2, $3, $4)
+               ON CONFLICT (wamid) DO UPDATE
+                 SET dev_jc_id = EXCLUDED.dev_jc_id, approver_kind = EXCLUDED.approver_kind,
+                     wa_phone = EXCLUDED.wa_phone""",
+            wamid, dev_jc_id, approver_kind, wa_phone)
+    except Exception:  # noqa: BLE001 — mapping is a convenience; the flow still works without it
+        logger.exception("Failed to store wa_promote_message for wamid %s", wamid)
+
+
+async def notify_promote_review(conn, *, dev_jc_id, requestor_uid=None) -> None:
+    """Message the promote approvers with Approve / Reject buttons: every
+    inventory_manager (INV_MGR gate) + the source requisition's requestor BH
+    (REQUESTOR_BH gate; skipped when sourceless / no phone). Best-effort, never raises."""
+    jc = await conn.fetchrow("SELECT * FROM npd_dev_job_cards WHERE id = $1", dev_jc_id)
+    if jc is None:
+        return
+    jc = dict(jc)
+    targets = [(p, "INV_MGR") for p in await _phones_for_role(conn, "inventory_manager")]
+    if requestor_uid:
+        bh = await _phone_for_user(conn, requestor_uid)
+        if bh:
+            targets.append((bh, "REQUESTOR_BH"))
+    if not targets:
+        logger.warning("No promote approvers with a phone for dev JC %s — skipping WhatsApp "
+                       "(assign a phone to the inventory_manager / requestor on auth_user)", dev_jc_id)
+        return
+    for phone, kind in targets:
+        try:
+            header, body = _promote_params(jc, _PROMOTE_GATE_LABEL[kind])
+            resp = await _send_template(phone, TPL_PROMOTE, body, header_params=header)
+        except Exception:  # noqa: BLE001 — one bad recipient must not abort the rest
+            logger.exception("Promote notify build/send failed for %s (dev JC %s)", phone, dev_jc_id)
+            continue
+        wamid = _wamid(resp)
+        if wamid:
+            await _store_promote_message(conn, wamid, dev_jc_id, kind, phone)
+        elif isinstance(resp, dict) and resp.get("error"):
+            logger.warning("Promote notify to %s failed: %s (template %s — Approved in "
+                           "WhatsApp Manager?)", phone, resp.get("error"), TPL_PROMOTE)
+
+
+async def _promote_for_wamid(conn, wamid: str | None) -> dict | None:
+    """(dev_jc_id, approver_kind) for a tapped promote button's quoted message id."""
+    if not wamid:
+        return None
+    row = await conn.fetchrow(
+        "SELECT dev_jc_id, approver_kind FROM wa_promote_message WHERE wamid = $1", wamid)
+    return dict(row) if row else None
+
+
+async def _set_pending_promote_reject(conn, wa_phone: str, dev_jc_id: int, approver_kind: str) -> None:
+    await conn.execute(
+        """INSERT INTO wa_promote_pending (wa_phone, dev_jc_id, approver_kind)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (wa_phone) DO UPDATE
+             SET dev_jc_id = EXCLUDED.dev_jc_id, approver_kind = EXCLUDED.approver_kind,
+                 created_at = NOW()""",
+        wa_phone, dev_jc_id, approver_kind)
+
+
+async def _pop_promote_pending(conn, wa_phone: str) -> dict | None:
+    row = await conn.fetchrow(
+        "DELETE FROM wa_promote_pending WHERE wa_phone = $1 RETURNING dev_jc_id, approver_kind", wa_phone)
+    return dict(row) if row else None
+
+
+async def _apply_promote(conn, user, wa: str, dev_jc_id: int, approver_kind: str,
+                         action: str, reason, pas) -> dict:
+    """Run act_promote_approval and reply with the outcome. Translates the service's
+    HTTPException into a friendly WhatsApp message (idempotent: a stale re-tap just
+    reports 'already actioned')."""
+    from fastapi import HTTPException
+    try:
+        result = await pas.act_promote_approval(
+            conn, dev_jc_id, action=action, user=user, remarks=reason, approver_kind=approver_kind)
+    except HTTPException as e:
+        detail = e.detail if isinstance(e.detail, dict) else {"message": str(e.detail)}
+        await _send_text(wa, f"Couldn't {action.lower()} — {detail.get('message', 'it may already have been actioned')}.")
+        return {"ok": False, "reason": detail.get("error", "error")}
+    status = (result or {}).get("status")
+    if action == "REJECT":
+        msg = "✗ Rejected — the promote was voided." + (f" Reason: {reason}" if reason else "")
+    elif status == "PROMOTED":
+        msg = "✓ Approved — both gates cleared; the recipe is now a live BOM."
+    else:
+        msg = "✓ Approved — your gate is cleared. Waiting on the other approver."
+    await _send_text(wa, msg)
+    return {"ok": True, "dev_jc_id": dev_jc_id, "approver_kind": approver_kind, "action": action, "status": status}
+
+
 # ── inbound: pending-reason state ───────────────────────────────────────────
 async def _set_pending_hold(conn, wa_phone: str, req_id: int) -> None:
     await conn.execute(
@@ -420,6 +571,19 @@ async def _resolve_reviewer(conn, wa_phone: str) -> dict | None:
     if row["role_name"] not in _NPD_ROLES:
         return None
     return dict(row)
+
+
+async def _resolve_user(conn, wa_phone: str) -> dict | None:
+    """Map an inbound number to ANY active auth_user (no role gate) — the promote
+    flow uses this and lets act_promote_approval enforce per-gate authorization."""
+    row = await conn.fetchrow(
+        """SELECT u.user_id, COALESCE(r.role_name, '') AS role_name
+             FROM auth_user u
+             LEFT JOIN auth_role r ON u.role_id = r.role_id
+            WHERE u.phone = ANY($1::text[])
+            ORDER BY u.user_id LIMIT 1""",
+        lookup_keys(wa_phone))
+    return dict(row) if row else None
 
 
 async def _find_req(conn, ref: str) -> dict | None:
@@ -463,9 +627,46 @@ async def handle_inbound(conn, *, from_phone: str, text: str, context_id: str | 
     reviewer taps an Accept/Hold quick-reply button — and is how a button tap (which
     carries no request number) is mapped back to its request."""
     from app.modules.sample.services import approval_service  # lazy: avoid import cycle
+    from app.modules.sample.services import promote_approval_service as pas
 
     wa = _fmt_phone(from_phone)
     body = (text or "").strip()
+    first = body.split(maxsplit=1)[0].upper() if body else ""
+
+    # ── PROMOTE gate (job-card approval) — resolved BEFORE the NPD review flow, since
+    #    its approvers (inventory_manager / requestor BH) are NOT npd_team reviewers. ──
+    # (a) Approve / Reject button tap quoting a promote message (context.id → wa_promote_message).
+    pm = await _promote_for_wamid(conn, context_id) if context_id else None
+    if pm:
+        u = await _resolve_user(conn, wa)
+        if u is None:
+            await _send_text(wa, "Sorry, this number isn't recognised.")
+            return {"ok": False, "reason": "unauthorised"}
+        user = _WaUser(u["user_id"], u["role_name"])
+        if first == "REJECT":
+            # Capture a reason first (next reply), like the NPD Hold flow.
+            await _set_pending_promote_reject(conn, wa, pm["dev_jc_id"], pm["approver_kind"])
+            await _send_text(wa, "Rejecting the promote — please reply with the reason.")
+            return {"ok": True, "awaiting": "promote_reason", "dev_jc_id": pm["dev_jc_id"]}
+        return await _apply_promote(conn, user, wa, pm["dev_jc_id"], pm["approver_kind"], "ACCEPT", None, pas)
+    # (b) A reply with NO quoted button, while a promote reject is armed, IS the reason.
+    #     Promote has no typed commands, so any non-button reply is captured (even one
+    #     starting with "reject…"); an empty reply re-arms and re-asks.
+    if not context_id:
+        pp = await _pop_promote_pending(conn, wa)
+        if pp:
+            if not body:
+                await _set_pending_promote_reject(conn, wa, pp["dev_jc_id"], pp["approver_kind"])
+                await _send_text(wa, "Please send the reject reason as a text message.")
+                return {"ok": False, "reason": "empty_reason"}
+            u = await _resolve_user(conn, wa)
+            if u is None:
+                await _send_text(wa, "Sorry, this number isn't recognised.")
+                return {"ok": False, "reason": "unauthorised"}
+            return await _apply_promote(conn, _WaUser(u["user_id"], u["role_name"]), wa,
+                                        pp["dev_jc_id"], pp["approver_kind"], "REJECT", body, pas)
+
+    # ── NPD review flow (unchanged) ──
     reviewer = await _resolve_reviewer(conn, wa)
     if reviewer is None:
         await _send_text(wa, "Sorry, this number isn't recognised as an NPD reviewer.")

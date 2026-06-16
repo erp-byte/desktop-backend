@@ -185,6 +185,23 @@ async def get_dev_job_card(conn, dev_jc_id: int) -> dict:
         gate = {"id": pr["id"], "status": pr["status"], "created_at": pr["created_at"],
                 "approvals": [dict(r) for r in appr]}
     jc["promote_gate"] = gate
+    # Gate-pass digital signatures: the promote-gate approvers (name + decided date)
+    # from the LATEST promote request regardless of status — so a CLOSED/promoted card
+    # still shows who digitally approved (Business head = REQUESTOR_BH, Inventory
+    # manager = INV_MGR). Empty {} when no promote was ever raised. Best-effort.
+    sigs: dict = {}
+    pr_latest = await conn.fetchrow(
+        "SELECT id FROM npd_dev_promote_request WHERE dev_jc_id = $1 ORDER BY created_at DESC LIMIT 1",
+        dev_jc_id)
+    if pr_latest:
+        for r in await conn.fetch(
+            """SELECT ap.approver_kind, ap.status, ap.decided_at, u.full_name
+                 FROM npd_dev_promote_approval ap
+                 LEFT JOIN auth_user u ON u.user_id = ap.approver_user_id
+                WHERE ap.promote_request_id = $1""", pr_latest["id"]):
+            sigs[r["approver_kind"]] = {"name": r["full_name"], "status": r["status"],
+                                        "decided_at": r["decided_at"]}
+    jc["gate_signatures"] = sigs
     return jc
 
 

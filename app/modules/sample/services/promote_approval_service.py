@@ -74,6 +74,11 @@ async def open_promote_request(conn, dev_jc_id: int, *, payload: dict, user) -> 
         await mail.notify_promote_review_email(conn, dev_jc_id=dev_jc_id, requestor_uid=requestor_uid)
     except Exception:  # noqa: BLE001 — best-effort; a mail failure must not break the request
         pass
+    try:
+        from app.modules.sample.services import whatsapp_service as wa
+        await wa.notify_promote_review(conn, dev_jc_id=dev_jc_id, requestor_uid=requestor_uid)
+    except Exception:  # noqa: BLE001 — best-effort; a WhatsApp failure must not break the request
+        pass
     return {"ok": True, "promote_request_id": req_id, "status": "PENDING_APPROVAL"}
 
 
