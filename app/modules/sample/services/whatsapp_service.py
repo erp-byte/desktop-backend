@@ -86,10 +86,10 @@ this order — keep the live template text aligned with the layouts below.
    The NPD dev-JC promote dual-approval gate. Sent to every inventory_manager (INV_MGR
    gate) + the requestor BH (REQUESTOR_BH gate). Two QUICK REPLY buttons — "Approve"
    and "Reject" (Reject → we ask for the reason in the next reply).
-   HEADER (text): New promote approval — Dev JC {{1}}     [ {{1}} = dev_jc_number ]
+   HEADER (text): New promote approval — Dev JC {{1}}     [ {{1}} = dev JC id (8-digit) ]
    BODY ({{1}}..{{9}}):
      Your gate: {{1}}                                      [ "Inventory manager" / "Requestor (business head)" ]
-     Dev job card: {{2}}                                   [ dev_jc_number ]
+     Dev job card: {{2}}                                   [ dev JC id (8-digit) ]
      Target FG article: {{3}}   Target quantity: {{4}}
      Company: {{5}}   Customer: {{6}}
      Return type: {{7}}   Paid: {{8}}   Amount: {{9}}
@@ -424,10 +424,10 @@ async def _phone_for_user(conn, uid) -> str | None:
 
 
 def _promote_params(jc: dict, gate_label: str) -> tuple[list[str], list[str]]:
-    """(header, body) for npd_promote_approval. HEADER {{1}} = dev_jc_number; BODY
-    {{1}} = gate label, {{2}} = dev_jc_number, {{3}} = target FG, {{4}} = qty,
+    """(header, body) for npd_promote_approval. HEADER {{1}} = dev JC id; BODY
+    {{1}} = gate label, {{2}} = dev JC id, {{3}} = target FG, {{4}} = qty,
     {{5}} = company, {{6}} = customer, {{7}} = return type, {{8}} = paid, {{9}} = amount."""
-    number = _txt(jc.get("dev_jc_number") or jc.get("id"))
+    number = _txt(jc.get("id"))
     tq, uom = jc.get("target_qty"), (jc.get("uom") or "kg")
     qty = f"{_num(tq)} {_txt(uom)}" if tq is not None else "—"
     rtype = ("Returnable" if jc.get("returnable")
@@ -541,6 +541,67 @@ async def _apply_promote(conn, user, wa: str, dev_jc_id: int, approver_kind: str
     return {"ok": True, "dev_jc_id": dev_jc_id, "approver_kind": approver_kind, "action": action, "status": status}
 
 
+# ── promote resolution when the quoted-message id doesn't map ───────────────
+# Promote quick-reply buttons are "Approve"/"Reject" (NPD review uses "Accept"/"Hold"),
+# so these verbs route to the promote gate. A tap that DOESN'T carry a usable context.id
+# (Meta omits it, or quotes a message we never stored) would otherwise dead-end in the
+# NPD-review path ("not recognised as an NPD reviewer"); these helpers let us instead
+# resolve the gate from the sender's own PENDING promote(s) or a typed job-card number.
+_PROMOTE_APPROVE_WORDS = {"APPROVE", "APPROVED"}
+_PROMOTE_REJECT_WORDS = {"REJECT", "REJECTED", "DECLINE", "DECLINED"}
+_PROMOTE_VERBS = _PROMOTE_APPROVE_WORDS | _PROMOTE_REJECT_WORDS
+
+
+async def _resolve_jc_ref(conn, ref: str | None):
+    """Resolve a dev-JC reference to its 8-digit id. The 8-digit id is the only
+    identifier, so the reference must be that id. None if unresolved."""
+    ref = (ref or "").strip()
+    if not ref or not ref.isdigit():
+        return None
+    return await conn.fetchval("SELECT id FROM npd_dev_job_cards WHERE id = $1", int(ref))
+
+
+async def _eligible_pending_gates(conn, user) -> list[dict]:
+    """PENDING promote gates this user may act on — mirrors act_promote_approval's
+    eligibility so routing matches what the action will actually allow: admin → any;
+    inventory_manager → INV_MGR gates; the bound requestor → their REQUESTOR_BH gate.
+    Returns [{dev_jc_id, approver_kind}], oldest first."""
+    rows = await conn.fetch(
+        """SELECT pr.dev_jc_id, a.approver_kind
+             FROM npd_dev_promote_approval a
+             JOIN npd_dev_promote_request pr ON a.promote_request_id = pr.id
+            WHERE pr.status = 'PENDING' AND a.status = 'PENDING'
+              AND ( $2::boolean
+                 OR (a.approver_kind = 'INV_MGR' AND $3::boolean)
+                 OR (a.approver_kind = 'REQUESTOR_BH' AND a.approver_user_id = $1) )
+            ORDER BY pr.created_at""",
+        user.user_id, bool(getattr(user, "is_admin", False)),
+        getattr(user, "role_name", "") == "inventory_manager")
+    return [dict(r) for r in rows]
+
+
+async def _resolve_promote_target(conn, user, *, jc_ref: str | None) -> dict:
+    """Pick the promote gate a sender's Approve/Reject should act on when there is no
+    usable quoted-message id. status ∈ {ok, none, ambiguous, jc_not_found, jc_not_eligible}."""
+    gates = await _eligible_pending_gates(conn, user)
+    if jc_ref:
+        dev_jc_id = await _resolve_jc_ref(conn, jc_ref)
+        if dev_jc_id is None:
+            return {"status": "jc_not_found", "ref": jc_ref}
+        forjc = [g for g in gates if g["dev_jc_id"] == dev_jc_id]
+        if not forjc:
+            return {"status": "jc_not_eligible", "dev_jc_id": dev_jc_id}
+        if len(forjc) > 1:                       # sender holds BOTH gates on one JC (rare)
+            return {"status": "ambiguous", "options": forjc}
+        return {"status": "ok", "dev_jc_id": dev_jc_id, "approver_kind": forjc[0]["approver_kind"]}
+    if not gates:
+        return {"status": "none"}
+    if len(gates) == 1:
+        return {"status": "ok", "dev_jc_id": gates[0]["dev_jc_id"],
+                "approver_kind": gates[0]["approver_kind"]}
+    return {"status": "ambiguous", "options": gates}
+
+
 # ── inbound: pending-reason state ───────────────────────────────────────────
 async def _set_pending_hold(conn, wa_phone: str, req_id: int) -> None:
     await conn.execute(
@@ -650,8 +711,8 @@ async def handle_inbound(conn, *, from_phone: str, text: str, context_id: str | 
             return {"ok": True, "awaiting": "promote_reason", "dev_jc_id": pm["dev_jc_id"]}
         return await _apply_promote(conn, user, wa, pm["dev_jc_id"], pm["approver_kind"], "ACCEPT", None, pas)
     # (b) A reply with NO quoted button, while a promote reject is armed, IS the reason.
-    #     Promote has no typed commands, so any non-button reply is captured (even one
-    #     starting with "reject…"); an empty reply re-arms and re-asks.
+    #     A reject prompt takes priority over re-parsing the reply, so any non-button reply
+    #     is captured as the reason (even one starting with "reject…"); empty → re-arm + re-ask.
     if not context_id:
         pp = await _pop_promote_pending(conn, wa)
         if pp:
@@ -665,6 +726,51 @@ async def handle_inbound(conn, *, from_phone: str, text: str, context_id: str | 
                 return {"ok": False, "reason": "unauthorised"}
             return await _apply_promote(conn, _WaUser(u["user_id"], u["role_name"]), wa,
                                         pp["dev_jc_id"], pp["approver_kind"], "REJECT", body, pas)
+
+    # (c) Approve / Reject that DIDN'T resolve via a quoted promote message — Meta
+    #     omitted context.id, or quoted a message we never stored. Rather than dead-end
+    #     in the NPD-review path, resolve the gate from the sender's OWN pending
+    #     promote(s): a bare button tap acts on their single pending gate; "APPROVE/
+    #     REJECT <job card no>" targets a specific one; several pending → ask for the no.
+    #     Only engages when the sender actually has a promote to act on, so real NPD-review
+    #     traffic still falls through unchanged.
+    first = body.split(maxsplit=1)[0].upper() if body else ""
+    if first in _PROMOTE_VERBS:
+        # A tap quoting a known NPD-REVIEW message is review traffic — leave it alone.
+        review_ctx = bool(context_id) and await conn.fetchval(
+            "SELECT 1 FROM wa_review_message WHERE wamid = $1", context_id)
+        if not review_ctx:
+            u = await _resolve_user(conn, wa)
+            if u is not None:
+                user = _WaUser(u["user_id"], u["role_name"])
+                parts = body.split(maxsplit=2)
+                jc_ref = parts[1] if len(parts) >= 2 else None
+                tgt = await _resolve_promote_target(conn, user, jc_ref=jc_ref)
+                if tgt["status"] == "ok":
+                    dev_jc_id, kind = tgt["dev_jc_id"], tgt["approver_kind"]
+                    if first in _PROMOTE_REJECT_WORDS:
+                        inline = (parts[2].strip().lstrip(":-").strip()
+                                  if jc_ref and len(parts) >= 3 else "")
+                        if inline:
+                            return await _apply_promote(conn, user, wa, dev_jc_id, kind, "REJECT", inline, pas)
+                        await _set_pending_promote_reject(conn, wa, dev_jc_id, kind)
+                        await _send_text(wa, "Rejecting the promote — please reply with the reason.")
+                        return {"ok": True, "awaiting": "promote_reason", "dev_jc_id": dev_jc_id}
+                    return await _apply_promote(conn, user, wa, dev_jc_id, kind, "ACCEPT", None, pas)
+                if tgt["status"] == "ambiguous":
+                    opts = "\n".join(f"• {o['dev_jc_id']}" for o in tgt["options"])
+                    await _send_text(wa, "You have more than one promote awaiting approval. "
+                                         f"Reply  {first} <job card no>  for one of:\n{opts}")
+                    return {"ok": False, "reason": "ambiguous_promote",
+                            "dev_jc_ids": [o["dev_jc_id"] for o in tgt["options"]]}
+                if tgt["status"] == "jc_not_found":
+                    await _send_text(wa, f"Couldn't find dev job card {tgt['ref']}.")
+                    return {"ok": False, "reason": "jc_not_found"}
+                if tgt["status"] == "jc_not_eligible":
+                    await _send_text(wa, "That promote isn't awaiting your approval "
+                                         "(it may already be actioned).")
+                    return {"ok": False, "reason": "jc_not_eligible"}
+                # status == "none" → sender has no pending promote; fall through to NPD review.
 
     # ── NPD review flow (unchanged) ──
     reviewer = await _resolve_reviewer(conn, wa)

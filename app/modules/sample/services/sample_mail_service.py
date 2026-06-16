@@ -347,7 +347,7 @@ def _promote_reject_url(dev_jc_id, approver_kind: str, email: str) -> str:
 
 def _promote_subject(jc: dict) -> str:
     """One constant subject for the whole promote-gate thread (status in the body)."""
-    return f"NPD Promote Approval — Dev JC {jc.get('dev_jc_number') or jc.get('id')}"
+    return f"NPD Promote Approval — Dev JC {jc.get('id')}"
 
 
 def _promote_detail_table(jc: dict) -> str:
@@ -356,7 +356,7 @@ def _promote_detail_table(jc: dict) -> str:
     exp = str(exp)[:10] if exp else "TBC"
     tq, uom = jc.get("target_qty"), (jc.get("uom") or "kg")
     fields = [
-        ("Dev job card", _fmt(jc.get("dev_jc_number"))),
+        ("Dev job card", _fmt(jc.get("id"))),
         ("Title", _fmt(jc.get("title"))),
         ("Target FG article", _fmt(jc.get("fg_sku_name") or jc.get("title"))),
         ("Target qty", f"{_fmt(tq)} {_fmt(uom)}" if tq is not None else "—"),
@@ -379,7 +379,7 @@ def _promote_html(jc: dict, approver_label: str, approve_url: str, reject_url: s
     """Polished, email-client-safe promote-approval notice — the dev-JC detail card +
     Approve / Reject buttons. The Approve link embeds this approver's email for the
     gate-match auth; Reject opens the job card on the portal to record a reason."""
-    number = _fmt(jc.get("dev_jc_number") or jc.get("id"))
+    number = _fmt(jc.get("id"))
     return f"""<!doctype html><html><body style="margin:0;padding:0;background:#f4f5f7">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f5f7;padding:24px 12px">
  <tr><td align="center">

@@ -11,11 +11,10 @@ State machine:  DRAFT --start--> IN_DEVELOPMENT --close--> CLOSED
                   └────────────── cancel ──────────────> CANCELLED
 Recipe lines are editable only while DRAFT.
 
-Numbering follows the house _gen_id pattern (NPDJC-YYYYMMDD-NNNN via seq_npd_dev_jc).
+The single identifier is the 8-digit time-based BIGINT id (new_short_time_id),
+surfaced everywhere — there is no separate house number.
 """
 from __future__ import annotations
-
-from datetime import datetime, timezone
 
 import asyncpg
 from fastapi import HTTPException
@@ -34,11 +33,6 @@ _DISPATCH_FIELDS = (
     "company_name", "customer_name", "customer_contact", "customer_ship_to_address",
     "mode_of_transport", "expected_dispatch_date", "confirmed_dispatch_date",
 )
-
-
-def _gen_dev_jc_number(seq_val: int) -> str:
-    d = datetime.now(timezone.utc).strftime("%Y%m%d")
-    return f"NPDJC-{d}-{seq_val:04d}"
 
 
 async def _fetch(conn, dev_jc_id: int) -> dict:
@@ -72,8 +66,6 @@ async def create_dev_job_card(conn, *, payload: dict, user) -> dict:
     await npd_auth.require_npd_authorized(conn, user, "AUTHOR")
     base_bom_id = payload.get("base_bom_id")
     async with conn.transaction():
-        seq = await conn.fetchval("SELECT nextval('seq_npd_dev_jc')")
-        number = _gen_dev_jc_number(seq)
         src_req = payload.get("source_requisition_id")
         # Customer + dispatch planning is attached to the job card: inherit each
         # field from the source requisition (the explicit payload value wins) so a
@@ -101,17 +93,17 @@ async def create_dev_job_card(conn, *, payload: dict, user) -> dict:
                     await conn.execute(
                         """
                         INSERT INTO npd_dev_job_cards
-                            (id, dev_jc_number, title, description, warehouse, base_bom_id,
+                            (id, title, description, warehouse, base_bom_id,
                              fg_sku_id, fg_sku_name, target_qty, uom, source_requisition_id,
                              company_name, customer_name, customer_contact, customer_ship_to_address,
                              mode_of_transport, expected_dispatch_date, confirmed_dispatch_date,
                              pcs, weight_per_piece,
                              returnable, non_returnable, paid, amount,
                              status, created_by)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                                $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, 'DRAFT', $25)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                                $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, 'DRAFT', $24)
                         """,
-                        cand, number, payload["title"], payload.get("description"),
+                        cand, payload["title"], payload.get("description"),
                         payload.get("warehouse"), base_bom_id, payload.get("fg_sku_id"),
                         payload.get("fg_sku_name"), payload.get("target_qty"),
                         payload.get("uom"), src_req,
@@ -604,7 +596,7 @@ async def _finalize_promote(conn, dev_jc_id, *, promote_phase_id, close_payload:
                 RETURNING bom_id
                 """,
                 fg_name, next_ver, _BOM_ENTITY,
-                f"Promoted from NPD development job card {jc['dev_jc_number']} (v{next_ver})")
+                f"Promoted from NPD development job card {jc['id']} (v{next_ver})")
         except asyncpg.UniqueViolationError as e:
             raise HTTPException(409, detail={
                 "error": "bom_conflict",
@@ -628,7 +620,7 @@ async def _finalize_promote(conn, dev_jc_id, *, promote_phase_id, close_payload:
                 conn, sku_name=fg_name, qty_kg=float(out_qty),
                 reference_type="NPD_DEV_JC", reference_id=dev_jc_id, entity=_BOM_ENTITY,
                 uom=(out_uom or jc["uom"] or "kg"),
-                lot_number=jc["dev_jc_number"], user=user)
+                lot_number=str(jc["id"]), user=user)
             fg_batch_id = recv["batch_id"]
 
         await conn.execute(
@@ -694,7 +686,7 @@ async def dispatch_dev_sample(conn, dev_jc_id: int, *, recipient: str | None, qt
             conn, batch_id=jc["fg_sample_batch_id"], sku_name=(jc["fg_sku_name"] or jc["title"]),
             qty_kg=q, reference_id=dev_jc_id, reference_type="NPD_DEV_JC", entity=_BOM_ENTITY,
             uom=(jc["uom"] or "kg"), to_location=(recipient or "SAMPLE_OUT"), user=user,
-            notes=f"Dev sample dispatch ({jc['dev_jc_number']}) to {recipient or '-'}")
+            notes=f"Dev sample dispatch ({jc['id']}) to {recipient or '-'}")
         await conn.execute(
             """UPDATE npd_dev_job_cards
                   SET dispatched_at = NOW(), dispatched_by = $1, dispatch_recipient = $2,
