@@ -61,10 +61,10 @@ async def _allowed_entities_for(request: Request, user: AuthUser,
             SELECT rp.allowed_entities
               FROM auth_role_permission rp
               JOIN auth_permission p ON rp.permission_id = p.permission_id
-             WHERE rp.role_id = $1
+             WHERE rp.role_id = ANY($1)
                AND p.module = 'ncr' AND p.sub_module = $2
             """,
-            user.role_id, sub_module,
+            user.role_ids, sub_module,
         )
     if any(r["allowed_entities"] is None for r in rows):
         return None

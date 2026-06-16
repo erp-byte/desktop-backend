@@ -898,7 +898,7 @@ async def revise_plan_with_ai(
         # check at the top sees no entity for this endpoint and so cannot enforce
         # allowed_entities scoping). Admin bypasses inside check_permission.
         scope_ok = await check_permission(
-            conn, user.role_id, user.is_admin,
+            conn, user.role_ids, user.is_admin,
             "production", "plans", "revise", "create",
             entity=plan['entity'],
         )

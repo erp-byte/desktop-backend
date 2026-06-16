@@ -65,10 +65,10 @@ async def _allowed_entities_for(request: Request, user: AuthUser) -> list[str] |
             SELECT rp.allowed_entities
               FROM auth_role_permission rp
               JOIN auth_permission p ON rp.permission_id = p.permission_id
-             WHERE rp.role_id = $1
+             WHERE rp.role_id = ANY($1)
                AND p.module = 'purchase' AND p.sub_module = 'po'
             """,
-            user.role_id,
+            user.role_ids,
         )
     # CR-01: mirror permission_service.check_permission's NULL-means-all-entities
     # convention. If ANY matching role-permission row has NULL allowed_entities,

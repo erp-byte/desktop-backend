@@ -320,7 +320,12 @@ class CreateUserRequest(BaseModel):
 class EditUserRequest(BaseModel):
     full_name: str | None = None
     email: str | None = None
+    # Single primary role (legacy). For multi-role assignment send `role_ids`
+    # (int FKs) and/or `role_codes` (role names) — the endpoint replaces the
+    # user's whole role set and the first becomes the primary/display role.
     role_id: int | None = None
+    role_ids:   list[int] | None = None
+    role_codes: list[str] | None = None
     entity: str | None = None
     is_active: bool | None = None
     # Admin-controlled soft-ban toggle. The auth_user.status CHECK constraint
@@ -459,13 +464,15 @@ async def create_user(request: Request, body: CreateUserRequest):
     from app.modules.auth.services.auth_service import create_user as _create
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
-        # Resolve role_codes -> role_id when the friendly shape was sent.
-        # auth_user is single-role, so we take the FIRST matching code
-        # (admin UI sends `["admin"]` for the admin role). Unknown codes
-        # surface as 400 with the offending names so the operator can
-        # see what didn't match.
-        role_id = body.role_id
-        if role_id is None and body.role_codes:
+        # Resolve role_codes -> role_ids (multi-role). ALL supplied codes are
+        # honoured: the FIRST resolved one becomes the primary/display role
+        # (auth_user.role_id), the rest are stored in auth_user_role. A direct
+        # body.role_id (legacy FK shape) is treated as the primary. Unknown
+        # codes are skipped; only an all-empty result surfaces a 400.
+        role_ids_all: list[int] = []
+        if body.role_id is not None:
+            role_ids_all.append(body.role_id)
+        if body.role_codes:
             wanted = [c.strip().lower() for c in body.role_codes if c and c.strip()]
             if wanted:
                 rows = await conn.fetch(
@@ -474,13 +481,11 @@ async def create_user(request: Request, body: CreateUserRequest):
                     wanted,
                 )
                 resolved = {r["role_name"]: r["role_id"] for r in rows}
-                # First wanted that resolves wins — deterministic and
-                # mirrors the order the operator selected in the UI.
+                # Preserve the operator's selection order.
                 for code in wanted:
                     if code in resolved:
-                        role_id = resolved[code]
-                        break
-                if role_id is None:
+                        role_ids_all.append(resolved[code])
+                if not role_ids_all:
                     raise HTTPException(
                         status_code=400,
                         detail={
@@ -489,7 +494,9 @@ async def create_user(request: Request, body: CreateUserRequest):
                             "role_codes": body.role_codes,
                         },
                     )
-        if role_id is None:
+        # Dedup, keep order; the first is the primary role.
+        role_ids_all = list(dict.fromkeys(role_ids_all))
+        if not role_ids_all:
             # Model validator already gates this, but defend in depth in
             # case the validator is relaxed later.
             raise HTTPException(
@@ -497,6 +504,7 @@ async def create_user(request: Request, body: CreateUserRequest):
                 detail={"error": "missing_role",
                         "message": "role_id or role_codes is required"},
             )
+        role_id = role_ids_all[0]
 
         try:
             return await _create(
@@ -505,6 +513,7 @@ async def create_user(request: Request, body: CreateUserRequest):
                 body.allowed_warehouses, body.allowed_floors,
                 body.allowed_entities,
                 must_change_password=body.must_change_password,
+                role_ids=role_ids_all,
             )
         except asyncpg.UniqueViolationError as e:
             # `constraint_name` is real on PostgresError at runtime but
@@ -535,9 +544,23 @@ async def list_users(request: Request):
                    -- next successful login clears it; admin unlock does
                    -- so immediately).
                    u.locked_until, u.failed_login_count,
-                   r.role_id, r.role_name, r.is_admin
+                   r.role_id, r.role_name, r.is_admin,
+                   -- Multi-role: full set the user holds + aggregated admin
+                   -- flag. Falls back to the primary role when the user has no
+                   -- auth_user_role rows (pre-backfill records).
+                   COALESCE(ur.role_codes,
+                            CASE WHEN r.role_name IS NULL THEN ARRAY[]::text[]
+                                 ELSE ARRAY[r.role_name] END) AS role_codes,
+                   COALESCE(ur.any_admin, r.is_admin, FALSE)  AS roles_is_admin
             FROM auth_user u
             LEFT JOIN auth_role r ON u.role_id = r.role_id
+            LEFT JOIN LATERAL (
+                SELECT array_agg(x.role_name ORDER BY x.role_id) AS role_codes,
+                       bool_or(x.is_admin)                        AS any_admin
+                  FROM auth_user_role uur
+                  JOIN auth_role x ON uur.role_id = x.role_id
+                 WHERE uur.user_id = u.user_id
+            ) ur ON TRUE
             ORDER BY u.created_at DESC
             """
         )
@@ -550,6 +573,11 @@ async def list_users(request: Request):
                              or ([d["entity"]] if d.get("entity") else []))
         d["warehouses"] = list(d.get("allowed_warehouses") or [])
         d["floors"]     = list(d.get("allowed_floors")     or [])
+        d["role_codes"] = list(d.get("role_codes") or [])
+        # Surface the aggregated multi-role admin flag as `is_admin` (matches
+        # /me / get_user), keeping the primary role's flag available too.
+        d["primary_is_admin"] = d.get("is_admin")
+        d["is_admin"] = bool(d.pop("roles_is_admin", d.get("is_admin")))
         out.append(d)
     return out
 
@@ -557,11 +585,17 @@ async def list_users(request: Request):
 @router.put("/users/{user_id}")
 async def edit_user(request: Request, user_id: int, body: EditUserRequest):
     """HI-04: only fields in `_EDITABLE_USER_COLUMNS` can be set; identifier
-    quoting is defensive — values come from the allowlist, not user input."""
+    quoting is defensive — values come from the allowlist, not user input.
+
+    Multi-role: when `role_ids` / `role_codes` are sent, the user's whole role
+    set in auth_user_role is replaced and the first becomes the primary/display
+    role (auth_user.role_id)."""
     await _require_admin(request)
     pool = request.app.state.db_pool
 
     sent = body.model_fields_set
+    roles_sent = ("role_ids" in sent) or ("role_codes" in sent)
+
     updates: list[str] = []
     params: list = []
     idx = 1
@@ -569,21 +603,79 @@ async def edit_user(request: Request, user_id: int, body: EditUserRequest):
         if field not in _EDITABLE_USER_COLUMNS:
             # Silently ignore unknown / disallowed fields (e.g. password_encrypted)
             continue
+        if field == "role_id" and roles_sent:
+            # Primary role is derived from role_ids/role_codes below — don't
+            # also set it here (would duplicate the SET clause).
+            continue
         updates.append(f'"{field}" = ${idx}')
         params.append(getattr(body, field))
         idx += 1
 
-    if not updates:
+    if not updates and not roles_sent:
         raise HTTPException(status_code=400, detail="No editable fields supplied")
 
-    params.append(user_id)
-    sql = f'UPDATE auth_user SET {", ".join(updates)} WHERE user_id = ${idx}'
     async with pool.acquire() as conn:
-        result = await conn.execute(sql, *params)
-        if result == 'UPDATE 0':
-            raise HTTPException(status_code=404, detail="User not found")
+        # Resolve the full role set first so a bad request fails before any write.
+        full_role_ids: list[int] = []
+        if roles_sent:
+            if body.role_ids:
+                full_role_ids.extend([r for r in body.role_ids if r is not None])
+            if body.role_codes:
+                wanted = [c.strip().lower() for c in body.role_codes if c and c.strip()]
+                if wanted:
+                    rows = await conn.fetch(
+                        "SELECT role_id, lower(role_name) AS role_name "
+                        "FROM auth_role WHERE lower(role_name) = ANY($1::text[])",
+                        wanted,
+                    )
+                    resolved = {r["role_name"]: r["role_id"] for r in rows}
+                    for code in wanted:
+                        if code in resolved:
+                            full_role_ids.append(resolved[code])
+            full_role_ids = list(dict.fromkeys(full_role_ids))
+            if not full_role_ids:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error": "missing_role",
+                            "message": "role_ids or role_codes resolved to no known role"},
+                )
+            # `role_ids` can arrive directly via the API (not just via name
+            # resolution), so validate existence up-front — otherwise a bad id
+            # surfaces as an FK-violation 500 mid-transaction instead of a 400.
+            known = {r["role_id"] for r in await conn.fetch(
+                "SELECT role_id FROM auth_role WHERE role_id = ANY($1)", full_role_ids)}
+            unknown = [r for r in full_role_ids if r not in known]
+            if unknown:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error": "unknown_role_ids",
+                            "message": "one or more role_ids do not exist",
+                            "role_ids": unknown},
+                )
+            # Keep the primary/display column in sync with the first role.
+            updates.append(f'"role_id" = ${idx}')
+            params.append(full_role_ids[0])
+            idx += 1
 
-    return {"user_id": user_id, "updated": True}
+        async with conn.transaction():
+            params.append(user_id)
+            sql = f'UPDATE auth_user SET {", ".join(updates)} WHERE user_id = ${idx}'
+            result = await conn.execute(sql, *params)
+            if result == 'UPDATE 0':
+                raise HTTPException(status_code=404, detail="User not found")
+
+            if roles_sent:
+                await conn.execute(
+                    "DELETE FROM auth_user_role WHERE user_id = $1", user_id)
+                for rid in full_role_ids:
+                    await conn.execute(
+                        "INSERT INTO auth_user_role (user_id, role_id) "
+                        "VALUES ($1, $2) ON CONFLICT (user_id, role_id) DO NOTHING",
+                        user_id, rid,
+                    )
+
+    return {"user_id": user_id, "updated": True,
+            "role_ids": full_role_ids if roles_sent else None}
 
 
 @router.get("/users/{user_id}")
@@ -610,8 +702,18 @@ async def get_user(request: Request, user_id: int):
             """,
             user_id,
         )
-    if not row:
-        raise HTTPException(status_code=404, detail="User not found")
+        if not row:
+            raise HTTPException(status_code=404, detail="User not found")
+        # Multi-role: the full set the user holds (primary first). Falls back to
+        # the single primary role for users not represented in auth_user_role.
+        role_rows = await conn.fetch(
+            """
+            SELECT r.role_id, r.role_name, r.is_admin
+              FROM auth_user_role ur JOIN auth_role r ON ur.role_id = r.role_id
+             WHERE ur.user_id = $1
+            """,
+            user_id,
+        )
     out = dict(row)
     # Mirror keys the admin UI uses interchangeably with the /me payload.
     # Fall back to [entity] when allowed_entities is NULL so users created
@@ -620,6 +722,18 @@ async def get_user(request: Request, user_id: int):
                              or ([out["entity"]] if out.get("entity") else []))
     out["warehouses"] = list(out.get("allowed_warehouses") or [])
     out["floors"]     = list(out.get("allowed_floors")     or [])
+    roles = [dict(r) for r in role_rows]
+    if not roles and row["role_id"] is not None:
+        roles = [{"role_id": row["role_id"], "role_name": row["role_name"],
+                  "is_admin": row["is_admin"]}]
+    pid = row["role_id"]
+    roles.sort(key=lambda x: (x["role_id"] != pid, x["role_id"]))
+    out["roles"]      = [{"role_id": str(r["role_id"]), "code": r["role_name"],
+                          "is_admin": bool(r["is_admin"])} for r in roles]
+    out["role_ids"]   = [r["role_id"] for r in roles]
+    out["role_codes"] = [r["role_name"] for r in roles]
+    # Aggregate admin flag (any role admin) so the detail view matches /me.
+    out["is_admin"]   = any(r["is_admin"] for r in roles)
     return out
 
 

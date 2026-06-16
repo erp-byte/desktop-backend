@@ -156,12 +156,49 @@ def _role_payload(role: dict | None) -> list[dict]:
     today the user table has a single role_id FK so this returns 0-or-1 element."""
     if not role:
         return []
+    return _roles_payload([role])
+
+
+def _roles_payload(roles: list[dict]) -> list[dict]:
+    """Spec-shaped `roles` list for an arbitrary set of roles (multi-role).
+
+    Each element mirrors `_role_payload`'s single-role shape. Order is
+    caller-controlled (callers put the primary role first)."""
     return [{
-        "role_id": str(role["role_id"]),
-        "code": role["role_name"],
-        "label": (role.get("description") or role["role_name"]).strip() or role["role_name"],
-        "is_admin": bool(role.get("is_admin")),
-    }]
+        "role_id": str(r["role_id"]),
+        "code": r["role_name"],
+        "label": (r.get("description") or r["role_name"]).strip() or r["role_name"],
+        "is_admin": bool(r.get("is_admin")),
+    } for r in roles]
+
+
+async def _effective_roles(conn, user_id: int, primary_role: dict | None = None) -> list[dict]:
+    """Every role a user holds (multi-role), primary role first.
+
+    `auth_user_role` is the source of truth; we fall back to the user's single
+    primary role (`auth_user.role_id`) for accounts not yet represented there
+    so resolution never returns empty for a user who has a role. Each dict has
+    role_id / role_name / description / is_admin.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT r.role_id, r.role_name, r.description, r.is_admin
+          FROM auth_user_role ur
+          JOIN auth_role r ON ur.role_id = r.role_id
+         WHERE ur.user_id = $1
+        """,
+        user_id,
+    )
+    roles = [dict(r) for r in rows]
+    if not roles and primary_role:
+        roles = [dict(primary_role)]
+    if primary_role is not None:
+        pid = primary_role.get("role_id")
+        # Stable order: primary role first, then the rest by role_id.
+        roles.sort(key=lambda x: (x["role_id"] != pid, x["role_id"]))
+    else:
+        roles.sort(key=lambda x: x["role_id"])
+    return roles
 
 
 def _json_or_none(d: dict | None) -> str | None:
@@ -291,9 +328,13 @@ async def login(
         )
 
     role = await _load_role(conn, user.get("role_id"))
+    # Multi-role: a user can hold several roles. is_admin is TRUE if ANY of
+    # them is admin; `roles` lists them all (primary first). The access token's
+    # is_admin claim is advisory — validate_session re-derives it per request.
+    roles = await _effective_roles(conn, user["user_id"], role)
 
     must_change = bool(user.get("must_change_password"))
-    is_admin = bool(role and role.get("is_admin"))
+    is_admin = any(r.get("is_admin") for r in roles)
     access_jwt, _access_jti, access_ttl = jwt_service.issue_access_token(
         user_id=user["user_id"],
         parent_jti=refresh_jti,
@@ -326,7 +367,7 @@ async def login(
             "full_name": user.get("full_name"),
             "email": user.get("email"),
             "is_admin": is_admin,
-            "roles": _role_payload(role),
+            "roles": _roles_payload(roles),
             "entities":   entities,
             "warehouses": warehouses,
             "floors":     floors,
@@ -552,7 +593,10 @@ async def refresh(conn, *, refresh_jwt: str, ip: str | None, user_agent: str | N
     # tempted to short-circuit by reading user["is_admin"] — that column
     # does not exist on auth_user; the role row is the source of truth.
     role = await _load_role(conn, user["role_id"])
-    is_admin = bool(role and role.get("is_admin"))
+    # Multi-role: is_admin is advisory on the access token (validate_session
+    # re-derives per request), but keep it consistent — TRUE if ANY role admin.
+    roles = await _effective_roles(conn, user_id, role)
+    is_admin = any(r.get("is_admin") for r in roles)
     access_jwt, _, access_ttl = jwt_service.issue_access_token(
         user_id=user_id,
         parent_jti=new_jti,
@@ -660,19 +704,24 @@ async def me(conn, *, user_id: int) -> dict:
         raise AuthError("unauthorized", "User no longer exists", 401)
 
     role = await _load_role(conn, user["role_id"])
-    is_admin = bool(role and role.get("is_admin"))
+    # Multi-role: aggregate across every role the user holds. is_admin is TRUE
+    # if ANY role is admin; `permissions` is the UNION across all roles; `roles`
+    # lists them all (primary first).
+    roles = await _effective_roles(conn, user_id, role)
+    is_admin = any(r.get("is_admin") for r in roles)
+    role_ids = [r["role_id"] for r in roles]
 
     perms_rows = []
-    if role:
+    if role_ids:
         perms_rows = await conn.fetch(
             """
-            SELECT p.module, p.sub_module, p.action
+            SELECT DISTINCT p.module, p.sub_module, p.action
               FROM auth_role_permission rp
               JOIN auth_permission p ON rp.permission_id = p.permission_id
-             WHERE rp.role_id = $1
+             WHERE rp.role_id = ANY($1)
              ORDER BY p.module, p.sub_module, p.action
             """,
-            role["role_id"],
+            role_ids,
         )
 
     # Multi-entity assignment lives in allowed_entities (TEXT[]). Fall back
@@ -694,7 +743,7 @@ async def me(conn, *, user_id: int) -> dict:
                    ("active" if user.get("is_active", True) else "disabled")),
         "must_change_password": bool(user.get("must_change_password") or False),
         "is_admin": is_admin,
-        "roles": _role_payload(role),
+        "roles": _roles_payload(roles),
         "permissions": [
             {"module": r["module"], "sub_module": r["sub_module"], "action": r["action"]}
             for r in perms_rows
@@ -874,6 +923,20 @@ async def validate_session(conn, token: str) -> dict | None:
     if row["status"] and row["status"] != "active":
         return None
 
+    # Multi-role: a user can hold several roles at once. The full set lives in
+    # auth_user_role; auth_user.role_id is the primary/display role. is_admin
+    # is TRUE if ANY assigned role is admin, and `role_ids` carries the whole
+    # set so the permission layer can grant on ANY role. Resolved here (not in
+    # the JWT) so role changes take effect immediately — same HI-05 rationale.
+    primary_role = (
+        {"role_id": row["role_id"], "role_name": row["role_name"],
+         "is_admin": row["is_admin"], "description": None}
+        if row["role_id"] is not None else None
+    )
+    roles = await _effective_roles(conn, row["user_id"], primary_role)
+    role_ids = [r["role_id"] for r in roles]
+    is_admin = any(r["is_admin"] for r in roles) or bool(row["is_admin"])
+
     return {
         "user_id": row["user_id"],
         "phone": row["phone"],
@@ -882,7 +945,10 @@ async def validate_session(conn, token: str) -> dict | None:
         "entity": row["entity"],
         "role_id": row["role_id"],
         "role_name": row["role_name"],
-        "is_admin": row["is_admin"],
+        # Full role set (multi-role) + aggregated admin flag. Middleware /
+        # permission_service gate on `role_ids` (grant if ANY role allows).
+        "role_ids": role_ids,
+        "is_admin": is_admin,
         # User-level scope defaults. Middleware uses these to gate any
         # request that carries an ?entity= / ?warehouse= / ?floor= query param.
         # `allowed_entities` falls back to [entity] for users created before
@@ -924,7 +990,8 @@ async def create_user(conn, phone: str, password: str, full_name: str,
                       allowed_warehouses: list[str] | None = None,
                       allowed_floors:     list[str] | None = None,
                       allowed_entities:   list[str] | None = None,
-                      must_change_password: bool = False) -> dict:
+                      must_change_password: bool = False,
+                      role_ids: list[int] | None = None) -> dict:
     """Create a user with a bcrypt-hashed password, normalized phone.
 
     HI-06: callers MUST validate `password` via `password_rules.evaluate`
@@ -945,22 +1012,38 @@ async def create_user(conn, phone: str, password: str, full_name: str,
     effective_entity = entity
     if allowed_entities:
         effective_entity = allowed_entities[0]
-    user_id = await conn.fetchval(
-        """
-        INSERT INTO auth_user
-            (phone, password_encrypted, full_name, email, role_id, entity,
-             allowed_warehouses, allowed_floors, allowed_entities,
-             must_change_password, password_changed_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
-        RETURNING user_id
-        """,
-        norm, hashed, full_name, email, role_id, effective_entity,
-        allowed_warehouses, allowed_floors, allowed_entities,
-        must_change_password,
-    )
+    # Multi-role: `role_id` is the primary/display role; `role_ids` is the full
+    # set to mirror into auth_user_role. Default the set to just the primary so
+    # single-role callers (seed tooling) populate the join consistently. Filter
+    # None (incl. a None primary) so a role-less user still creates cleanly —
+    # auth_user_role.role_id is NOT NULL.
+    full_role_ids = list(dict.fromkeys(
+        r for r in ([role_id, *(role_ids or [])]) if r is not None
+    ))
+    async with conn.transaction():
+        user_id = await conn.fetchval(
+            """
+            INSERT INTO auth_user
+                (phone, password_encrypted, full_name, email, role_id, entity,
+                 allowed_warehouses, allowed_floors, allowed_entities,
+                 must_change_password, password_changed_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+            RETURNING user_id
+            """,
+            norm, hashed, full_name, email, role_id, effective_entity,
+            allowed_warehouses, allowed_floors, allowed_entities,
+            must_change_password,
+        )
+        for rid in full_role_ids:
+            await conn.execute(
+                "INSERT INTO auth_user_role (user_id, role_id) VALUES ($1, $2) "
+                "ON CONFLICT (user_id, role_id) DO NOTHING",
+                user_id, rid,
+            )
     return {
         "user_id": user_id, "phone": norm, "full_name": full_name,
-        "role_id": role_id, "must_change_password": must_change_password,
+        "role_id": role_id, "role_ids": full_role_ids,
+        "must_change_password": must_change_password,
     }
 
 

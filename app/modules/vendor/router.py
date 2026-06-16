@@ -459,7 +459,7 @@ async def create_vendor_with_documents(
     if files:
         async with pool.acquire() as conn:
             doc_allowed = await check_permission(
-                conn, user.role_id, user.is_admin,
+                conn, user.role_ids, user.is_admin,
                 "vendor", "document", action="create",
                 entity=user.entity or None,
             )

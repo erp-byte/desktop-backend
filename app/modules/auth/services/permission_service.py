@@ -5,12 +5,15 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-async def check_permission(conn, role_id: int, is_admin: bool,
+async def check_permission(conn, role_id, is_admin: bool,
                             module: str, sub_module: str | None = None,
                             sub_sub_module: str | None = None, action: str = "view",
                             entity: str | None = None, warehouse: str | None = None,
                             floor: str | None = None) -> bool:
-    """Check if a role has permission for a specific action.
+    """Check if a user (one or MORE roles) has permission for a specific action.
+
+    Multi-role: `role_id` accepts either a single int (legacy callers) or a
+    list of int role-ids. Permission is granted if ANY of the roles grants it.
 
     Permission matching is hierarchical:
     - Exact match on (module, sub_module, sub_sub_module, action) checked first
@@ -24,6 +27,12 @@ async def check_permission(conn, role_id: int, is_admin: bool,
     if is_admin:
         return True
 
+    # Normalise to a list of role-ids (back-compat with single-int callers).
+    role_ids = list(role_id) if isinstance(role_id, (list, tuple, set)) else [role_id]
+    role_ids = [r for r in role_ids if r is not None]
+    if not role_ids:
+        return False
+
     # Try exact match first, then progressively broader
     queries = []
     if sub_sub_module:
@@ -33,36 +42,37 @@ async def check_permission(conn, role_id: int, is_admin: bool,
     queries.append((module, None, None, action))
 
     for mod, sub, subsub, act in queries:
-        result = await conn.fetchrow(
+        # ANY($1): match the permission across ALL the user's roles at this
+        # hierarchy level. A user with two roles may have a row from either.
+        results = await conn.fetch(
             """
             SELECT rp.allowed_entities, rp.allowed_warehouses, rp.allowed_floors
             FROM auth_role_permission rp
             JOIN auth_permission p ON rp.permission_id = p.permission_id
-            WHERE rp.role_id = $1
+            WHERE rp.role_id = ANY($1)
               AND p.module = $2
               AND p.sub_module IS NOT DISTINCT FROM $3
               AND p.sub_sub_module IS NOT DISTINCT FROM $4
               AND p.action = $5
             """,
-            role_id, mod, sub, subsub, act,
+            role_ids, mod, sub, subsub, act,
         )
 
-        if result:
-            # HIGH-5: on a scope mismatch, return False immediately. Falling
-            # through to broader permission rows is wrong because a broader row
-            # with allowed_entities=NULL means "all entities" and is STRICTLY
-            # MORE privileged, not less — so it would silently override the
-            # narrower scoped restriction.
-            if entity and result['allowed_entities']:
-                if entity not in result['allowed_entities']:
-                    return False
-            if warehouse and result['allowed_warehouses']:
-                if warehouse not in result['allowed_warehouses']:
-                    return False
-            if floor and result['allowed_floors']:
-                if floor not in result['allowed_floors']:
-                    return False
-            return True
+        if results:
+            # Multi-role scope-OR: if ANY matching row (across the user's roles)
+            # satisfies the requested scope, grant. HIGH-5 still holds — a row
+            # matched at THIS level, so we never fall through to a broader,
+            # more-privileged level; if every matching row fails scope we deny
+            # here rather than letting a broader NULL-scope row override.
+            for result in results:
+                if entity and result['allowed_entities'] and entity not in result['allowed_entities']:
+                    continue
+                if warehouse and result['allowed_warehouses'] and warehouse not in result['allowed_warehouses']:
+                    continue
+                if floor and result['allowed_floors'] and floor not in result['allowed_floors']:
+                    continue
+                return True
+            return False
 
     return False
 

@@ -131,6 +131,11 @@ SQL_FILES = [
     # save with a Wastage row 400'd invalid_category. Idempotent (drops
     # + re-adds the CHECK with the extended list).
     DB_DIR / "047_byproducts_wastage_category.sql",
+    # 048 adds auth_user_role — a person can hold multiple roles at once
+    # (admin + business_head, etc.). Join table is the source of truth for the
+    # full role set; auth_user.role_id stays the primary/display role. Backfills
+    # each user's current single role. See app/modules/auth for the resolution.
+    DB_DIR / "048_auth_user_role.sql",
     # 040 (samples/) renames entity -> warehouse on sample_requisitions /
     # gate_passes (new CHECK = warehouse codes) + transporter_name + vehicle_number.
     DB_DIR / "samples" / "040_sample_warehouse.sql",

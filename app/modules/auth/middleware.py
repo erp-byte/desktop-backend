@@ -52,6 +52,7 @@ class AuthUser:
         allowed_entities:   list[str] | None = None,
         allowed_warehouses: list[str] | None = None,
         allowed_floors:     list[str] | None = None,
+        role_ids: list[int] | None = None,
     ):
         self.user_id = user_id
         self.phone = phone
@@ -61,6 +62,12 @@ class AuthUser:
         self.role_id = role_id
         self.role_name = role_name
         self.is_admin = is_admin
+        # Multi-role: the FULL set of roles this user holds. `role_id` above is
+        # the primary/display role; permission checks gate on `role_ids`
+        # (grant if ANY role allows). Falls back to [role_id] when the session
+        # predates the multi-role field so legacy callers stay correct.
+        self.role_ids = list(role_ids) if role_ids else (
+            [role_id] if role_id is not None else [])
         # User-level scope. Empty list means "no restriction at the user
         # level"; non-empty means the user is locked to those values
         # regardless of what their role-permission row allows.
@@ -87,6 +94,7 @@ def _authuser_from_session(session: dict) -> AuthUser:
         allowed_entities=session.get("allowed_entities"),
         allowed_warehouses=session.get("allowed_warehouses"),
         allowed_floors=session.get("allowed_floors"),
+        role_ids=session.get("role_ids"),
     )
 
 
@@ -192,7 +200,7 @@ def require_permission(
 
         async with pool.acquire() as conn:
             allowed = await check_permission(
-                conn, user.role_id, user.is_admin,
+                conn, user.role_ids, user.is_admin,
                 module, sub_module, sub_sub_module, action,
                 entity=entity, warehouse=warehouse, floor=floor,
             )
