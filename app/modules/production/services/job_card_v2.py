@@ -2242,17 +2242,40 @@ async def complete_job_card(conn, *, job_card_id: int,
     # canonical truth from the most recent accounting summary save (B4).
     # If no accounting row exists yet, treat as unbalanced (operator
     # must save accounting before close).
-    # FOR UPDATE locks the accounting row so a concurrent B4 save can't
+    # FOR UPDATE locks the accounting rows so a concurrent B4 save can't
     # flip is_balanced between this read and the JC status UPDATE below.
+    #
+    # Migration 049: job_card_accounting_v2 is now per-(JC, batch). A JC
+    # is closeable iff EVERY existing row reads is_balanced = true.
+    # bool_and short-circuits in PG so an unbalanced batch fails the
+    # aggregate; SUM(diff) surfaces the cumulative variance for the
+    # error envelope. NULL is_balanced (legacy rows pre-B4) treated as
+    # FALSE conservatively — must save accounting once before closing.
+    # When no rows exist (fresh JC, COUNT(*)=0), trip the self-heal path.
+    #
+    # PG quirk: `FOR UPDATE` and aggregate functions can't appear in the
+    # same query (PG errors with "FOR UPDATE is not allowed with
+    # aggregate functions"). Lock the rows in a CTE first, then
+    # aggregate over the CTE result — the row-locks acquired in the CTE
+    # carry through to the outer query.
     acct = await conn.fetchrow(
         """
-        SELECT is_balanced, balance_difference_qty
-        FROM   job_card_accounting_v2
-        WHERE  job_card_id = $1
-        FOR    UPDATE
+        WITH locked AS (
+            SELECT is_balanced, balance_difference_qty
+            FROM   job_card_accounting_v2
+            WHERE  job_card_id = $1
+            FOR    UPDATE
+        )
+        SELECT BOOL_AND(COALESCE(is_balanced, FALSE)) AS is_balanced,
+               COALESCE(SUM(balance_difference_qty), 0) AS balance_difference_qty,
+               COUNT(*) AS row_count
+        FROM   locked
         """,
         job_card_id,
     )
+    # COUNT(*) = 0 means no rows yet — trip the self-heal path below.
+    if acct is not None and acct["row_count"] == 0:
+        acct = None
     if acct is None:
         # Self-heal: derive an accounting payload from the persisted raw
         # data (outputs + consumption + byproducts + balance_materials)
@@ -2281,16 +2304,27 @@ async def complete_job_card(conn, *, job_card_id: int,
                 "underlying": save_result,
             }
         # Re-read the now-saved row with FOR UPDATE so the rest of the
-        # gate runs on a stable snapshot.
+        # gate runs on a stable snapshot. Same CTE-then-aggregate pattern
+        # as above — PG forbids FOR UPDATE alongside aggregates in one
+        # query, so the lock lives in a CTE and the aggregation happens
+        # over the locked snapshot.
         acct = await conn.fetchrow(
             """
-            SELECT is_balanced, balance_difference_qty
-            FROM   job_card_accounting_v2
-            WHERE  job_card_id = $1
-            FOR    UPDATE
+            WITH locked AS (
+                SELECT is_balanced, balance_difference_qty
+                FROM   job_card_accounting_v2
+                WHERE  job_card_id = $1
+                FOR    UPDATE
+            )
+            SELECT BOOL_AND(COALESCE(is_balanced, FALSE)) AS is_balanced,
+                   COALESCE(SUM(balance_difference_qty), 0) AS balance_difference_qty,
+                   COUNT(*) AS row_count
+            FROM   locked
             """,
             job_card_id,
         )
+        if acct is not None and acct["row_count"] == 0:
+            acct = None
         if acct is None:
             return {
                 "error": "no_accounting",
@@ -2976,47 +3010,152 @@ async def get_job_card(conn, job_card_id: int) -> dict | None:
     # historically silent about this row — the Output & Accounting tab's
     # Summary Card relied on the post-save GET /accounting refetch to
     # populate it, so a page refresh after a save showed all zeros and the
-    # operator read it as "accounting got lost". Surface the row here so the
-    # Summary Card hydrates on every detail fetch. Mirrors the shape that
-    # jc_accounting_v2.get_accounting returns under the same key, including
-    # the derived rejection_pct / offgrade_pct and the bom-driven
-    # allowed_balance_tolerance_pct.
-    accounting_row = await conn.fetchrow(
-        "SELECT * FROM job_card_accounting_v2 WHERE job_card_id = $1",
-        job_card_id,
-    )
-    accounting_payload = _serialize(accounting_row) if accounting_row else None
-    if accounting_payload is not None:
-        def _accf(v):
-            if v is None or v == "":
-                return 0.0
-            try:
-                return float(v)
-            except (TypeError, ValueError):
-                return 0.0
+    # operator read it as "accounting got lost".
+    #
+    # Migration 049 made the row per-(JC, batch). Surface BOTH:
+    #   * accounting_per_batch: list of per-batch rows so the
+    #     SummaryCard's per-batch collapsibles render the saved
+    #     IS_BALANCED / percentages for each batch directly.
+    #   * accounting: JC-wide roll-up (SUM of kg columns, AND of
+    #     is_balanced, recomputed percentages). Backward-compat with
+    #     clients that read the single field; also feeds the TOTAL
+    #     header chip on the SummaryCard.
+    #
+    # Pre-049 environments don't have a batch_id column on the table;
+    # UndefinedColumnError → fall back to the JC-level single row.
+    def _accf(v):
+        if v is None or v == "":
+            return 0.0
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
 
-        out_qty = _accf(accounting_payload.get("output_qty"))
-        if out_qty > 0:
-            rejection_qty = _accf(accounting_payload.get("rejection_qty"))
-            offgrade_qty  = _accf(accounting_payload.get("offgrade_total_qty"))
-            accounting_payload["rejection_pct"] = round((rejection_qty / out_qty) * 100, 3)
-            accounting_payload["offgrade_pct"]  = round((offgrade_qty  / out_qty) * 100, 3)
-        else:
-            accounting_payload["rejection_pct"] = None
-            accounting_payload["offgrade_pct"]  = None
-
-        tolerance_pct = None
-        if h.get("bom_id") is not None:
-            tolerance_pct = await conn.fetchval(
-                "SELECT allowed_balance_tolerance_pct FROM bom_header WHERE bom_id = $1",
-                h["bom_id"],
-            )
-        # Canonical default kept in sync with jc_accounting_v2.BALANCE_TOLERANCE_PCT_DEF;
-        # inlined here to avoid a circular import (jc_accounting_v2 already
-        # depends on job_card_v2 for assert_not_locked).
-        accounting_payload["allowed_balance_tolerance_pct"] = (
-            float(tolerance_pct) if tolerance_pct is not None else 0.001
+    tolerance_pct_raw = None
+    if h.get("bom_id") is not None:
+        tolerance_pct_raw = await conn.fetchval(
+            "SELECT allowed_balance_tolerance_pct FROM bom_header WHERE bom_id = $1",
+            h["bom_id"],
         )
+    # Canonical default kept in sync with jc_accounting_v2.BALANCE_TOLERANCE_PCT_DEF;
+    # inlined here to avoid a circular import (jc_accounting_v2 already
+    # depends on job_card_v2 for assert_not_locked).
+    tolerance_pct_val = float(tolerance_pct_raw) if tolerance_pct_raw is not None else 0.001
+
+    try:
+        accounting_rows = await conn.fetch(
+            "SELECT * FROM job_card_accounting_v2 WHERE job_card_id = $1 "
+            "ORDER BY COALESCE(batch_id, 0)",
+            job_card_id,
+        )
+    except UndefinedColumnError:
+        _warn_batch_id_missing_once("job_card_accounting_v2")
+        # Pre-049 schema — the table has no batch_id. Fall back to the
+        # JC-level single-row read. The per-batch list collapses to a
+        # one-entry list with batch_id NULL so the frontend's
+        # accounting-per-batch code path still works (NULL batch_id is
+        # treated as "the JC-wide row" by the SummaryCard).
+        legacy_row = await conn.fetchrow(
+            "SELECT * FROM job_card_accounting_v2 WHERE job_card_id = $1",
+            job_card_id,
+        )
+        accounting_rows = [legacy_row] if legacy_row else []
+
+    def _decorate(row_payload: dict) -> dict:
+        """Add derived rejection_pct / offgrade_pct + tolerance to a serialized row."""
+        out_qty = _accf(row_payload.get("output_qty"))
+        if out_qty > 0:
+            rejection_qty = _accf(row_payload.get("rejection_qty"))
+            offgrade_qty  = _accf(row_payload.get("offgrade_total_qty"))
+            row_payload["rejection_pct"] = round((rejection_qty / out_qty) * 100, 3)
+            row_payload["offgrade_pct"]  = round((offgrade_qty  / out_qty) * 100, 3)
+        else:
+            row_payload["rejection_pct"] = None
+            row_payload["offgrade_pct"]  = None
+        row_payload["allowed_balance_tolerance_pct"] = tolerance_pct_val
+        return row_payload
+
+    accounting_per_batch = [_decorate(_serialize(r)) for r in accounting_rows]
+
+    # JC-wide roll-up. SUM additive columns, AND is_balanced, recompute
+    # percentages from aggregated kg values. None when no rows exist
+    # (fresh JC; frontend treats that the same as the legacy null).
+    if accounting_per_batch:
+        agg_total_input    = sum(_accf(r.get("total_input_qty"))    for r in accounting_per_batch)
+        agg_output_qty     = sum(_accf(r.get("output_qty"))         for r in accounting_per_batch)
+        agg_output_units   = sum(_accf(r.get("output_qty_units"))   for r in accounting_per_batch)
+        agg_carried_in     = sum(_accf(r.get("carried_in_qty"))     for r in accounting_per_batch)
+        agg_dispatched_out = sum(_accf(r.get("dispatched_out_qty")) for r in accounting_per_batch)
+        agg_process_loss   = sum(_accf(r.get("process_loss_qty"))   for r in accounting_per_batch)
+        agg_extra_give     = sum(_accf(r.get("extra_give_away_qty"))for r in accounting_per_batch)
+        agg_balance_mat    = sum(_accf(r.get("balance_material_qty"))for r in accounting_per_batch)
+        agg_offgrade       = sum(_accf(r.get("offgrade_total_qty")) for r in accounting_per_batch)
+        agg_rejection      = sum(_accf(r.get("rejection_qty"))      for r in accounting_per_batch)
+        agg_wastage        = sum(_accf(r.get("wastage_qty"))        for r in accounting_per_batch)
+        agg_control_sample = sum(_accf(r.get("control_sample_qty")) for r in accounting_per_batch)
+        agg_total_accounted= sum(_accf(r.get("total_accounted_qty"))for r in accounting_per_batch)
+        agg_balance_diff   = sum(_accf(r.get("balance_difference_qty")) for r in accounting_per_batch)
+        # All batches must be balanced for the JC roll-up to read balanced.
+        # A NULL is_balanced (legacy row before B4 was wired) is treated as
+        # False to keep close-gate semantics conservative.
+        agg_is_balanced = all(bool(r.get("is_balanced")) for r in accounting_per_batch)
+
+        # Recompute percentages from aggregated kg buckets so the roll-up
+        # is internally consistent (not just SUM of per-batch percentages,
+        # which doesn't aggregate when each batch has a different output).
+        effective_process_loss = agg_process_loss + agg_wastage
+        if agg_output_qty > 0:
+            roll_process_loss_pct   = round((effective_process_loss      / agg_output_qty) * 100, 3)
+            roll_ega_loss_pct       = round((agg_extra_give               / agg_output_qty) * 100, 3)
+            roll_invisible_loss_pct = round(roll_process_loss_pct + roll_ega_loss_pct, 3)
+            roll_total_loss_pct     = round(
+                ((effective_process_loss + agg_extra_give + agg_offgrade) / agg_output_qty) * 100, 3,
+            )
+            roll_rejection_pct      = round((agg_rejection / agg_output_qty) * 100, 3)
+            roll_offgrade_pct       = round((agg_offgrade  / agg_output_qty) * 100, 3)
+        else:
+            roll_process_loss_pct = roll_ega_loss_pct = None
+            roll_invisible_loss_pct = roll_total_loss_pct = None
+            roll_rejection_pct = roll_offgrade_pct = None
+
+        accounting_payload = {
+            # Identity — accounting_id absent because the roll-up isn't a
+            # single row. batch_id null so the frontend knows this is the
+            # aggregate, not a single batch row.
+            "job_card_id":            job_card_id,
+            "batch_id":               None,
+            # Aggregate kg buckets
+            "total_input_qty":        agg_total_input,
+            "output_qty":             agg_output_qty,
+            "output_qty_units":       agg_output_units if agg_output_units > 0 else None,
+            "carried_in_qty":         agg_carried_in,
+            "dispatched_out_qty":     agg_dispatched_out,
+            "process_loss_qty":       agg_process_loss,
+            "extra_give_away_qty":    agg_extra_give,
+            "balance_material_qty":   agg_balance_mat,
+            "offgrade_total_qty":     agg_offgrade,
+            "rejection_qty":          agg_rejection,
+            "wastage_qty":            agg_wastage,
+            "control_sample_qty":     agg_control_sample,
+            "total_accounted_qty":    agg_total_accounted,
+            "balance_difference_qty": agg_balance_diff,
+            "is_balanced":            agg_is_balanced,
+            # Recomputed percentages
+            "process_loss_pct":       roll_process_loss_pct,
+            "ega_loss_pct":           roll_ega_loss_pct,
+            "invisible_loss_pct":     roll_invisible_loss_pct,
+            "total_loss_pct":         roll_total_loss_pct,
+            "rejection_pct":          roll_rejection_pct,
+            "offgrade_pct":           roll_offgrade_pct,
+            # UOM — carry forward from the first row (all batches share JC UOM)
+            "input_uom":              accounting_per_batch[0].get("input_uom"),
+            "output_uom":             accounting_per_batch[0].get("output_uom"),
+            "output_kind":            accounting_per_batch[0].get("output_kind"),
+            # Tolerance from BOM
+            "allowed_balance_tolerance_pct": tolerance_pct_val,
+        }
+    else:
+        accounting_payload = None
 
     # ─── FG per-unit kg from all_sku (R2 canonical source) ───────────────
     # all_sku.uom is the per-unit kg multiplier (NUMERIC(15,3)) per
@@ -3159,7 +3298,14 @@ async def get_job_card(conn, job_card_id: int) -> dict | None:
         # hydrates on every detail fetch instead of only after the
         # operator presses Save Output (which fires a separate GET
         # /accounting refetch). See the fetch + post-process block above.
+        #
+        # Migration 049 made the underlying table per-(JC, batch).
+        # `accounting` is the JC-wide roll-up (sum of kg, AND of
+        # is_balanced) for backward compat with clients that read the
+        # single field. `accounting_per_batch` is the array of per-batch
+        # rows the SummaryCard's per-batch collapsibles render directly.
         "accounting":                     accounting_payload,
+        "accounting_per_batch":           accounting_per_batch,
         "store_allocations":              [],          # see /allocations endpoint (TODO)
         # total_stages for the chain progress bar.
         "total_stages": await conn.fetchval(

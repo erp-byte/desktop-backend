@@ -445,10 +445,44 @@ async def get_accounting(conn, job_card_id: int, *, batch_id: int | None = None)
                 """,
                 job_card_id,
             )
-    accounting = await conn.fetchrow(
-        "SELECT * FROM job_card_accounting_v2 WHERE job_card_id=$1",
-        job_card_id,
-    )
+    # Migration 049: job_card_accounting_v2 became per-(JC, batch). When
+    # the caller asked for a specific batch, return that batch's row. The
+    # COALESCE-0 sentinel matches the legacy "one row per JC" path that
+    # older callers (no batch_id passed to the PUT) wrote into. Pre-049
+    # databases that don't have the batch_id column raise
+    # UndefinedColumnError → fall back to the JC-level fetch so this
+    # endpoint stays loadable until psql runs.
+    if batch_id is None:
+        # No batch filter: return the most recently saved row. Multiple
+        # rows exist post-049 (one per batch); picking the latest is the
+        # closest match to the old "single JC row" contract that historic
+        # callers expected. The accounting object on the JC detail GET
+        # uses the SUM/BOOL_AND roll-up instead — this endpoint stays a
+        # single-row contract for back-compat.
+        accounting = await conn.fetchrow(
+            "SELECT * FROM job_card_accounting_v2 WHERE job_card_id=$1 "
+            "ORDER BY saved_at DESC LIMIT 1",
+            job_card_id,
+        )
+    else:
+        try:
+            accounting = await conn.fetchrow(
+                """
+                SELECT * FROM job_card_accounting_v2
+                WHERE  job_card_id = $1
+                  AND  COALESCE(batch_id, 0) = COALESCE($2, 0)
+                """,
+                job_card_id, batch_id,
+            )
+        except UndefinedColumnError:
+            logger.warning(
+                "get_accounting: job_card_accounting_v2.batch_id "
+                "missing — falling back to JC-level SELECT. Apply migration 049."
+            )
+            accounting = await conn.fetchrow(
+                "SELECT * FROM job_card_accounting_v2 WHERE job_card_id=$1",
+                job_card_id,
+            )
 
     # rejection_pct / offgrade_pct now anchor on FG actual output_qty
     # instead of total_input_qty — matches the operator-stated rule
@@ -758,8 +792,15 @@ async def save_byproducts(conn, *, job_card_id: int,
 
 async def save_accounting(conn, *, job_card_id: int,
                           payload: dict,
-                          saved_by: str | None = None) -> dict:
+                          saved_by: str | None = None,
+                          batch_id: int | None = None) -> dict:
     """Save the summary row and compute is_balanced + percentages.
+
+    Migration 049 made the row per-(JC, batch). When ``batch_id`` is
+    passed, the upsert keys on (job_card_id, COALESCE(batch_id, 0)) so
+    each batch keeps its own summary. ``batch_id=None`` upserts the
+    legacy JC-level row (still keyed at the COALESCE sentinel 0), which
+    older clients hit when they don't know about batches.
 
     `payload` shape:
         {
@@ -907,12 +948,16 @@ async def save_accounting(conn, *, job_card_id: int,
     # schema default '{}'::jsonb seeds the column on first INSERT, and
     # the ON CONFLICT path doesn't touch it - so a PM variance written
     # by save_byproducts is preserved across a subsequent summary save.
+    # ON CONFLICT key matches migration 049's uq_jca_v2_jc_batch
+    # (job_card_id, COALESCE(batch_id, 0)). Postgres's ON CONFLICT
+    # accepts the unique-index expression list directly — same trick
+    # used on consumption / byproducts / balance_materials.
     async def _insert():
         return await conn.fetchrow(
             """
             INSERT INTO job_card_accounting_v2 (
                 accounting_id,
-                job_card_id,
+                job_card_id, batch_id,
                 total_input_qty, input_uom,
                 output_qty, output_uom, output_qty_units, output_kind,
                 carried_in_qty, dispatched_out_qty,
@@ -925,19 +970,20 @@ async def save_accounting(conn, *, job_card_id: int,
                 saved_by
             ) VALUES (
                 $1,
-                $2,
-                $3, $4,
-                $5, $6, $7, $8,
-                $9, $10,
-                $11, $12::jsonb,
-                $13, $14,
-                $15, $16, $17, $18,
-                $19, $20, $21,
-                $22, $23, $24,
-                $25,
-                $26
+                $2, $3,
+                $4, $5,
+                $6, $7, $8, $9,
+                $10, $11,
+                $12, $13::jsonb,
+                $14, $15,
+                $16, $17, $18, $19,
+                $20, $21, $22,
+                $23, $24, $25,
+                $26,
+                $27
             )
-            ON CONFLICT (job_card_id) DO UPDATE SET
+            ON CONFLICT (job_card_id, COALESCE(batch_id, 0)) DO UPDATE SET
+                batch_id               = EXCLUDED.batch_id,
                 total_input_qty        = EXCLUDED.total_input_qty,
                 input_uom              = EXCLUDED.input_uom,
                 output_qty             = EXCLUDED.output_qty,
@@ -966,7 +1012,7 @@ async def save_accounting(conn, *, job_card_id: int,
             RETURNING *
             """,
             new_short_time_id(),
-            job_card_id,
+            job_card_id, batch_id,
             total_input, input_uom,
             output_qty, output_uom, output_units, output_kind,
             carried_in, dispatched_out,

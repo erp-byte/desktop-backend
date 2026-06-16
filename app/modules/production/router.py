@@ -5323,6 +5323,12 @@ class AccountingSummaryRequest(BaseModel):
     rejection_qty:          float = 0
     wastage_qty:            float = 0
     control_sample_qty:     float = 0
+    # Migration 049: per-batch accounting. When set, the upsert keys on
+    # (job_card_id, COALESCE(batch_id, 0)) so each batch keeps its own
+    # IS_BALANCED + percentages instead of all batches stomping a single
+    # JC-level row. Older clients that omit this hit the COALESCE
+    # sentinel 0 — backward-compat with pre-049 single-row-per-JC saves.
+    batch_id:               int | None = None
 
 
 @router.get("/job-cards-v2/{job_card_id}/accounting")
@@ -5424,6 +5430,10 @@ async def save_accounting_summary_v2(
                 conn, job_card_id=job_card_id,
                 payload=body.model_dump(),
                 saved_by=user.full_name or user.phone,
+                # Migration 049: tag the summary row with the batch the
+                # operator was looking at. None falls back to the legacy
+                # COALESCE-0 sentinel (one row per JC) for older clients.
+                batch_id=body.batch_id,
             )
     _raise_if_locked(result)
     if result.get("error") == "job_card_not_found":
