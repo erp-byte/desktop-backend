@@ -948,82 +948,184 @@ async def save_accounting(conn, *, job_card_id: int,
     # schema default '{}'::jsonb seeds the column on first INSERT, and
     # the ON CONFLICT path doesn't touch it - so a PM variance written
     # by save_byproducts is preserved across a subsequent summary save.
+    #
     # ON CONFLICT key matches migration 049's uq_jca_v2_jc_batch
     # (job_card_id, COALESCE(batch_id, 0)). Postgres's ON CONFLICT
     # accepts the unique-index expression list directly — same trick
     # used on consumption / byproducts / balance_materials.
-    async def _insert():
-        return await conn.fetchrow(
-            """
-            INSERT INTO job_card_accounting_v2 (
-                accounting_id,
+    #
+    # Pre-049 environments don't have the batch_id column. Detect that
+    # at runtime (cheap: one fetchval against information_schema) and
+    # dispatch to the legacy single-row INSERT instead. We CANNOT rely
+    # on try/except UndefinedColumnError here because save_accounting
+    # often runs inside a caller transaction (close_job_card,
+    # save_accounting_summary_v2 route): once asyncpg raises inside
+    # that transaction, PG flips the txn to aborted state and any
+    # subsequent statement in the same txn errors out. Pre-check
+    # avoids the failed-statement-in-txn trap.
+    has_batch_col = await conn.fetchval(
+        """
+        SELECT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name  = 'job_card_accounting_v2'
+              AND column_name = 'batch_id'
+        )
+        """
+    )
+
+    if has_batch_col:
+        async def _insert():
+            return await conn.fetchrow(
+                """
+                INSERT INTO job_card_accounting_v2 (
+                    accounting_id,
+                    job_card_id, batch_id,
+                    total_input_qty, input_uom,
+                    output_qty, output_uom, output_qty_units, output_kind,
+                    carried_in_qty, dispatched_out_qty,
+                    process_loss_qty, process_loss_breakdown,
+                    extra_give_away_qty, balance_material_qty,
+                    offgrade_total_qty, rejection_qty, wastage_qty, control_sample_qty,
+                    total_accounted_qty, balance_difference_qty, is_balanced,
+                    process_loss_pct, other_loss_pct, total_loss_pct,
+                    invisible_loss_pct,
+                    saved_by
+                ) VALUES (
+                    $1,
+                    $2, $3,
+                    $4, $5,
+                    $6, $7, $8, $9,
+                    $10, $11,
+                    $12, $13::jsonb,
+                    $14, $15,
+                    $16, $17, $18, $19,
+                    $20, $21, $22,
+                    $23, $24, $25,
+                    $26,
+                    $27
+                )
+                ON CONFLICT (job_card_id, COALESCE(batch_id, 0)) DO UPDATE SET
+                    batch_id               = EXCLUDED.batch_id,
+                    total_input_qty        = EXCLUDED.total_input_qty,
+                    input_uom              = EXCLUDED.input_uom,
+                    output_qty             = EXCLUDED.output_qty,
+                    output_uom             = EXCLUDED.output_uom,
+                    output_qty_units       = EXCLUDED.output_qty_units,
+                    output_kind            = EXCLUDED.output_kind,
+                    carried_in_qty         = EXCLUDED.carried_in_qty,
+                    dispatched_out_qty     = EXCLUDED.dispatched_out_qty,
+                    process_loss_qty       = EXCLUDED.process_loss_qty,
+                    process_loss_breakdown = EXCLUDED.process_loss_breakdown,
+                    extra_give_away_qty    = EXCLUDED.extra_give_away_qty,
+                    balance_material_qty   = EXCLUDED.balance_material_qty,
+                    offgrade_total_qty     = EXCLUDED.offgrade_total_qty,
+                    rejection_qty          = EXCLUDED.rejection_qty,
+                    wastage_qty            = EXCLUDED.wastage_qty,
+                    control_sample_qty     = EXCLUDED.control_sample_qty,
+                    total_accounted_qty    = EXCLUDED.total_accounted_qty,
+                    balance_difference_qty = EXCLUDED.balance_difference_qty,
+                    is_balanced            = EXCLUDED.is_balanced,
+                    process_loss_pct       = EXCLUDED.process_loss_pct,
+                    other_loss_pct         = EXCLUDED.other_loss_pct,
+                    total_loss_pct         = EXCLUDED.total_loss_pct,
+                    invisible_loss_pct     = EXCLUDED.invisible_loss_pct,
+                    saved_by               = EXCLUDED.saved_by,
+                    saved_at               = NOW()
+                RETURNING *
+                """,
+                new_short_time_id(),
                 job_card_id, batch_id,
-                total_input_qty, input_uom,
-                output_qty, output_uom, output_qty_units, output_kind,
-                carried_in_qty, dispatched_out_qty,
-                process_loss_qty, process_loss_breakdown,
-                extra_give_away_qty, balance_material_qty,
-                offgrade_total_qty, rejection_qty, wastage_qty, control_sample_qty,
-                total_accounted_qty, balance_difference_qty, is_balanced,
+                total_input, input_uom,
+                output_qty, output_uom, output_units, output_kind,
+                carried_in, dispatched_out,
+                process_loss, json.dumps(process_loss_breakdown),
+                extra_give, balance_mat,
+                offgrade, rejection, wastage, control_sample,
+                total_accounted, diff, is_balanced,
                 process_loss_pct, other_loss_pct, total_loss_pct,
                 invisible_loss_pct,
-                saved_by
-            ) VALUES (
-                $1,
-                $2, $3,
-                $4, $5,
-                $6, $7, $8, $9,
-                $10, $11,
-                $12, $13::jsonb,
-                $14, $15,
-                $16, $17, $18, $19,
-                $20, $21, $22,
-                $23, $24, $25,
-                $26,
-                $27
+                saved_by,
             )
-            ON CONFLICT (job_card_id, COALESCE(batch_id, 0)) DO UPDATE SET
-                batch_id               = EXCLUDED.batch_id,
-                total_input_qty        = EXCLUDED.total_input_qty,
-                input_uom              = EXCLUDED.input_uom,
-                output_qty             = EXCLUDED.output_qty,
-                output_uom             = EXCLUDED.output_uom,
-                output_qty_units       = EXCLUDED.output_qty_units,
-                output_kind            = EXCLUDED.output_kind,
-                carried_in_qty         = EXCLUDED.carried_in_qty,
-                dispatched_out_qty     = EXCLUDED.dispatched_out_qty,
-                process_loss_qty       = EXCLUDED.process_loss_qty,
-                process_loss_breakdown = EXCLUDED.process_loss_breakdown,
-                extra_give_away_qty    = EXCLUDED.extra_give_away_qty,
-                balance_material_qty   = EXCLUDED.balance_material_qty,
-                offgrade_total_qty     = EXCLUDED.offgrade_total_qty,
-                rejection_qty          = EXCLUDED.rejection_qty,
-                wastage_qty            = EXCLUDED.wastage_qty,
-                control_sample_qty     = EXCLUDED.control_sample_qty,
-                total_accounted_qty    = EXCLUDED.total_accounted_qty,
-                balance_difference_qty = EXCLUDED.balance_difference_qty,
-                is_balanced            = EXCLUDED.is_balanced,
-                process_loss_pct       = EXCLUDED.process_loss_pct,
-                other_loss_pct         = EXCLUDED.other_loss_pct,
-                total_loss_pct         = EXCLUDED.total_loss_pct,
-                invisible_loss_pct     = EXCLUDED.invisible_loss_pct,
-                saved_by               = EXCLUDED.saved_by,
-                saved_at               = NOW()
-            RETURNING *
-            """,
-            new_short_time_id(),
-            job_card_id, batch_id,
-            total_input, input_uom,
-            output_qty, output_uom, output_units, output_kind,
-            carried_in, dispatched_out,
-            process_loss, json.dumps(process_loss_breakdown),
-            extra_give, balance_mat,
-            offgrade, rejection, wastage, control_sample,
-            total_accounted, diff, is_balanced,
-            process_loss_pct, other_loss_pct, total_loss_pct,
-            invisible_loss_pct,
-            saved_by,
+    else:
+        # Pre-049 fallback: legacy single-row-per-JC INSERT. Apply
+        # migration 049 to enable per-batch accounting; this branch only
+        # exists so a not-yet-migrated environment doesn't 500 on
+        # Save Output / Complete.
+        logger.warning(
+            "save_accounting: job_card_accounting_v2.batch_id missing — "
+            "writing legacy single-row-per-JC schema. Apply migration 049."
         )
+        async def _insert():
+            return await conn.fetchrow(
+                """
+                INSERT INTO job_card_accounting_v2 (
+                    accounting_id,
+                    job_card_id,
+                    total_input_qty, input_uom,
+                    output_qty, output_uom, output_qty_units, output_kind,
+                    carried_in_qty, dispatched_out_qty,
+                    process_loss_qty, process_loss_breakdown,
+                    extra_give_away_qty, balance_material_qty,
+                    offgrade_total_qty, rejection_qty, wastage_qty, control_sample_qty,
+                    total_accounted_qty, balance_difference_qty, is_balanced,
+                    process_loss_pct, other_loss_pct, total_loss_pct,
+                    invisible_loss_pct,
+                    saved_by
+                ) VALUES (
+                    $1,
+                    $2,
+                    $3, $4,
+                    $5, $6, $7, $8,
+                    $9, $10,
+                    $11, $12::jsonb,
+                    $13, $14,
+                    $15, $16, $17, $18,
+                    $19, $20, $21,
+                    $22, $23, $24,
+                    $25,
+                    $26
+                )
+                ON CONFLICT (job_card_id) DO UPDATE SET
+                    total_input_qty        = EXCLUDED.total_input_qty,
+                    input_uom              = EXCLUDED.input_uom,
+                    output_qty             = EXCLUDED.output_qty,
+                    output_uom             = EXCLUDED.output_uom,
+                    output_qty_units       = EXCLUDED.output_qty_units,
+                    output_kind            = EXCLUDED.output_kind,
+                    carried_in_qty         = EXCLUDED.carried_in_qty,
+                    dispatched_out_qty     = EXCLUDED.dispatched_out_qty,
+                    process_loss_qty       = EXCLUDED.process_loss_qty,
+                    process_loss_breakdown = EXCLUDED.process_loss_breakdown,
+                    extra_give_away_qty    = EXCLUDED.extra_give_away_qty,
+                    balance_material_qty   = EXCLUDED.balance_material_qty,
+                    offgrade_total_qty     = EXCLUDED.offgrade_total_qty,
+                    rejection_qty          = EXCLUDED.rejection_qty,
+                    wastage_qty            = EXCLUDED.wastage_qty,
+                    control_sample_qty     = EXCLUDED.control_sample_qty,
+                    total_accounted_qty    = EXCLUDED.total_accounted_qty,
+                    balance_difference_qty = EXCLUDED.balance_difference_qty,
+                    is_balanced            = EXCLUDED.is_balanced,
+                    process_loss_pct       = EXCLUDED.process_loss_pct,
+                    other_loss_pct         = EXCLUDED.other_loss_pct,
+                    total_loss_pct         = EXCLUDED.total_loss_pct,
+                    invisible_loss_pct     = EXCLUDED.invisible_loss_pct,
+                    saved_by               = EXCLUDED.saved_by,
+                    saved_at               = NOW()
+                RETURNING *
+                """,
+                new_short_time_id(),
+                job_card_id,
+                total_input, input_uom,
+                output_qty, output_uom, output_units, output_kind,
+                carried_in, dispatched_out,
+                process_loss, json.dumps(process_loss_breakdown),
+                extra_give, balance_mat,
+                offgrade, rejection, wastage, control_sample,
+                total_accounted, diff, is_balanced,
+                process_loss_pct, other_loss_pct, total_loss_pct,
+                invisible_loss_pct,
+                saved_by,
+            )
     row = await insert_with_pk_retry(conn, _insert)
     # B12: silent variance capture after summary save. Variance values
     # may have shifted if the operator adjusted consumption rows since
