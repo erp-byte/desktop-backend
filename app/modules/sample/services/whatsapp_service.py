@@ -125,6 +125,16 @@ TPL_PROMOTE = os.environ.get("WHATSAPP_TPL_NPD_PROMOTE", "npd_promote_approval")
 _PROMOTE_GATE_LABEL = {"INV_MGR": "Inventory manager", "REQUESTOR_BH": "Requestor (business head)"}
 # Verify token for the webhook GET handshake (set the same value in Meta).
 VERIFY_TOKEN = os.environ.get("WHATSAPP_VERIFY_TOKEN", "")
+# This WABA is shared with the standalone Visitor Management system, which sends its own
+# approval templates with quick-reply payloads "approve_<id>" / "reject_<id>". Meta allows
+# ONE webhook URL per app, so those taps land here. When this URL is set we forward them to
+# the visitor webhook and skip NPD handling for them; left empty, this whole feature is a
+# no-op and the webhook behaves exactly as before (opt-in for ops). See
+# docs: 2026-06-18-whatsapp-visitor-approval-forwarding-design.md.
+VISITOR_APPROVAL_FORWARD_URL = os.environ.get("VISITOR_APPROVAL_FORWARD_URL", "").strip()
+# Visitor quick-reply payloads are "<verb>_<numeric id>"; NPD/promote replies carry the
+# button TEXT ("Approve"/"Reject") with no "_<digits>", so this never matches NPD traffic.
+_VISITOR_APPROVAL_RE = re.compile(r"^(?:approve|reject)_\d+$", re.IGNORECASE)
 # NPD roles permitted to ACT over WhatsApp (inbound Accept/Hold).
 _NPD_ROLES = {"npd_team", "admin"}
 # Roles whose members RECEIVE the review / edit messages — resolved from
@@ -851,8 +861,63 @@ def extract_messages(payload: dict) -> list[dict]:
                     text = ""
                 if frm:
                     out.append({"from": frm, "text": text, "type": t,
+                                "id": m.get("id"),
                                 "context_id": (m.get("context") or {}).get("id")})
     return out
+
+
+# ── visitor-management approval forwarding (shared WABA) ─────────────────────
+def is_visitor_approval_payload(payload_str: str | None) -> bool:
+    """True for a Visitor Management quick-reply payload (approve_<id>/reject_<id>)."""
+    return bool(payload_str and _VISITOR_APPROVAL_RE.match(payload_str.strip()))
+
+
+def visitor_approval_messages(payload: dict) -> list[dict]:
+    """Raw Meta message objects that are Visitor Management approve/reject taps. These
+    belong to the separate visitor system sharing this WABA, not NPD — the webhook
+    forwards them to the visitor backend and skips NPD handling for them."""
+    out: list[dict] = []
+    for entry in (payload or {}).get("entry", []):
+        for change in entry.get("changes", []):
+            for m in (change.get("value") or {}).get("messages", []):
+                if m.get("type") == "button" and is_visitor_approval_payload(
+                        (m.get("button") or {}).get("payload")):
+                    out.append(m)
+    return out
+
+
+async def forward_visitor_approvals(messages: list[dict],
+                                    signature: str | None = None) -> int:
+    """Forward visitor approve/reject taps to the Visitor Management webhook. Each message
+    is wrapped in a minimal valid Meta envelope so the visitor backend parses it with its
+    existing handler. Best-effort and config-gated (no URL → no-op): a forwarding failure
+    must never break this ERP webhook, so this never raises. Returns the count accepted."""
+    if not VISITOR_APPROVAL_FORWARD_URL or not messages:
+        return 0
+    headers = {"Content-Type": "application/json"}
+    if signature:
+        headers["X-Hub-Signature-256"] = signature  # pass through in case the target verifies
+    ok = 0
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            for m in messages:
+                envelope = {
+                    "object": "whatsapp_business_account",
+                    "entry": [{"changes": [{"field": "messages", "value": {
+                        "messaging_product": "whatsapp", "messages": [m]}}]}],
+                }
+                try:
+                    resp = await client.post(VISITOR_APPROVAL_FORWARD_URL, json=envelope, headers=headers)
+                    if resp.status_code < 400:
+                        ok += 1
+                    else:
+                        logger.warning("Visitor-approval forward rejected: status=%s body=%s",
+                                       resp.status_code, resp.text[:300])
+                except httpx.HTTPError:
+                    logger.exception("Visitor-approval forward failed for message %s", m.get("id"))
+    except Exception:  # noqa: BLE001 — forwarding must never break the ERP webhook
+        logger.exception("Visitor-approval forwarding aborted unexpectedly")
+    return ok
 
 
 def verify_signature(raw_body: bytes, signature_header: str | None) -> bool:
