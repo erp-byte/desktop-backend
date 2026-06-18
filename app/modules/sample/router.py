@@ -59,7 +59,23 @@ async def whatsapp_webhook_receive(request: Request):
         payload = json.loads(raw or b"{}")
     except ValueError:
         payload = {}
-    messages = whatsapp_service.extract_messages(payload)
+
+    # Visitor Management approvals (approve_<id>/reject_<id>) share this WABA but belong to
+    # the separate visitor system. Forward them to its webhook and exclude them from the NPD
+    # loop, so an approver never gets an "NPD reviewer" reply. Entirely gated on
+    # VISITOR_APPROVAL_FORWARD_URL: when unset, none of this runs and behaviour is unchanged.
+    forwarded_ids: set[str] = set()
+    if whatsapp_service.VISITOR_APPROVAL_FORWARD_URL:
+        visitor_msgs = whatsapp_service.visitor_approval_messages(payload)
+        if visitor_msgs:
+            forwarded = await whatsapp_service.forward_visitor_approvals(
+                visitor_msgs, request.headers.get("X-Hub-Signature-256"))
+            forwarded_ids = {m.get("id") for m in visitor_msgs if m.get("id")}
+            logger.info("Forwarded %d/%d visitor-approval tap(s) to the visitor webhook",
+                        forwarded, len(visitor_msgs))
+
+    messages = [m for m in whatsapp_service.extract_messages(payload)
+                if m.get("id") not in forwarded_ids]
     if messages:
         logger.info("WhatsApp inbound %d msg(s): %s", len(messages),
                     [{"from": m.get("from"), "type": m.get("type"),
