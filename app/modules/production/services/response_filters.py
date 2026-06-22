@@ -107,6 +107,15 @@ COST_BEARING_FIELDS = frozenset({
     # can't reconstruct the line total from the per-component amounts.
     "igst_amount", "sgst_amount", "cgst_amount",
     "apmc_amount", "packing_amount", "freight_amount", "processing_amount",
+
+    # ── SFG / WIP valuation (RESERVED — Slice 1, enforced in Slice 5) ──────
+    # Reserved up front so the gate exists before any cost value flows on the
+    # SFG/WIP surface (WIP inventory materialisation + the sfg-inventory
+    # picker). Mirror EXACTLY in web_replica cost-gate.ts COST_BEARING_FIELDS.
+    "sfg_unit_cost", "wip_unit_cost",
+    "sfg_cost_per_kg", "wip_cost_per_kg",
+    "sfg_valuation", "wip_valuation",
+    "wip_stock_value", "wip_batch_value",
 })
 
 
@@ -167,6 +176,13 @@ def _strip_recursive(node: Any) -> Any:
         for i in range(len(node)):
             node[i] = _strip_recursive(node[i])
         return node
+    # Tuples (incl. asyncpg Record, which is tuple-like) are immutable: rebuild a
+    # scrubbed copy so a cost dict nested inside a tuple isn't passed through raw.
+    # NOTE: a tuple has no field NAMES, so a top-level Record's own cost columns
+    # can't be stripped by name — strip at the dict boundary (.model_dump() /
+    # dict(record)) as the existing call sites already do.
+    if isinstance(node, tuple):
+        return tuple(_strip_recursive(x) for x in node)
     return node
 
 

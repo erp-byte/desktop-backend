@@ -223,7 +223,102 @@ SQL_FILES = [
     # its requisition, so a reviewer's Accept/Hold quick-reply button tap resolves
     # the request via the button reply's context.id. Additive + idempotent.
     DB_DIR / "samples" / "067_wa_review_message.sql",
+    # ── SFG / Job-Card integration (promoted from app/db/test_db) ───────
+    # 050 SFG foundation: widen the item_type comment (no CHECK exists), add the
+    # bom_process_route routing/seam columns + Option-B bom_line.consumed_at_stage,
+    # and (GUARDED via to_regclass, since 017_job_card_v2 is orphaned in this runner)
+    # the SFG#### chain-code columns job_card_v2.input_code/output_code. Idempotent.
+    DB_DIR / "050_sfg_foundation.sql",
+    # 051 SFG catalogue schema (Slice 1): widen all_sku.sku_id SERIAL->BIGINT
+    # (so new SFG rows can carry an 8-digit app-supplied PK; SERIAL default kept
+    # for every other insert site), add the all_sku.sfg_code business key + its
+    # partial unique index. Idempotent. The 343 SFG ROWS are loaded by
+    # master_ingest.ingest_sfg_master() at app startup (it mints each new row's
+    # 8-digit BIGINT id via new_short_time_id() + insert_with_pk_retry()), not
+    # here — a static SQL migration can't do time-id + collision retry.
+    DB_DIR / "051_sfg_seed_catalog.sql",
+    # 052 SFG routing (Slice 3): the 2-stage chain + SFG seam. Schema-support
+    # only (seam columns already added by 050) — documentary COMMENTs pinning the
+    # seam semantics; the reverse SFG#### indexes were deliberately deferred to
+    # 055 (the slice that adds the actual where-used query). The 1460 routing rows
+    # are loaded by master_ingest.ingest_jc_routing() at startup (needs
+    # name-normalise + article->bom_id resolve), not here.
+    DB_DIR / "052_sfg_routing_bom.sql",
+    # 053 sfg_box: physical SFG box/bag rows for WIP-completion QR labels (mirror of
+    # po_box); the box_id is the QR payload. Standalone, idempotent.
+    DB_DIR / "053_sfg_box.sql",
+    # 055 SFG catalogue layer: three DERIVED views (sfg_master, fg_sfg_binding,
+    # sfg_where_used) that give the design-ref §8.1/§9.2 "standalone catalogue
+    # artifacts" without duplicating data — projected from all_sku + the
+    # bom_process_route seam — plus the reverse SFG#### partial indexes deferred
+    # by 052. Reversible via app/db/rollback/sfg_integration_down.sql.
+    DB_DIR / "055_sfg_catalogue_views.sql",
+    # 056 SFG enrichment: backing tables for the 4 companion plug files that
+    # 050-055 left unused — sfg_attributes (JC_Stage1: base_recipe/operation/origin,
+    # NO shelf life), stage_catalog (ProcessCategory_to_Operation §6 config),
+    # fg_sfg_input_map (JC_Stage2 reconciliation), sfg_resolution_map (dedup
+    # provenance) — and re-defines sfg_master to surface base_recipe/operation.
+    # Rows loaded by master_ingest at startup. Reversible via the same down script.
+    DB_DIR / "056_sfg_master_enrichment.sql",
+    # 057 structural tightening: inventory_batch.sfg_code (canonical WIP key, so
+    # sku_name stops being overloaded with the code; existing WIP rows backfilled)
+    # + sfg_attributes.va_article/primary_bu readiness for the (absent) FINAL source,
+    # surfaced in a re-defined sfg_master. Reversible via the same down script.
+    DB_DIR / "057_sfg_inventory_key_and_attrs.sql",
+    # 058 Slice-7 data-quality: adds bom_header.promoted_from_gap — the audit
+    # marker the reconciliation gap promotion stamps on rows it creates/routes
+    # (the 403 CATALOG_FG_NOT_IN_FG_MASTER / 238 BOM_PARENT_NO_ROUTING articles).
+    # Schema only; the actual promotion is DATA, loaded by
+    # scripts/promote_fg_master_gaps.py (it needs the article list from the CSV).
+    # Additive + idempotent. Reversible via app/db/rollback/sfg_integration_down.sql.
+    DB_DIR / "058_fg_master_gap_promotion.sql",
+    # 059 SFG genealogy (Phase 7): activates the Slice-6-DEFERRED batch/lot
+    # traceability — adds the partial traversal indexes on sfg_box(parent_box_id)
+    # and sfg_box(lot_number) (the received_into_job_card_id index already exists
+    # from 053) + the sfg_genealogy VIEW that flattens each box to its provenance
+    # (producer/downstream JC, parent box, source WIP inventory_batch + lot).
+    # No new columns (053 already has them); indexes + view only. Idempotent.
+    # Reversible via app/db/rollback/sfg_integration_down.sql.
+    DB_DIR / "059_sfg_genealogy.sql",
+    # 060 Routing-Gap status: the live fg_routing_status VIEW — one row per FG
+    # bom_header with route_step_count + has_routing / needs_routing booleans
+    # (derived from a LEFT JOIN to bom_process_route). The DB-side complement to
+    # the offline Article_Master_FINAL.csv gap list, driving the Routing-Gap
+    # Resolution feature. No new columns/indexes (bom_process_route(bom_id) is
+    # already indexed); view only. Idempotent. Reversible via
+    # app/db/rollback/sfg_integration_down.sql.
+    DB_DIR / "060_routing_gap_status.sql",
+    # 061 Bar-Line Process override (G4): adds bom_header.bar_line_routed (audit
+    # marker the G4 override stamps on FGs whose bom_process_route it (re)builds
+    # from the richer bar_line_process string, mig 031) + its partial index, and
+    # the bar_line_fg VIEW listing the ~84 candidate FGs that carry a non-blank
+    # bar_line_process. Schema/audit only; the override itself is DATA (opt-in,
+    # idempotent script). Additive + idempotent. Reversible via
+    # app/db/rollback/sfg_integration_down.sql.
+    DB_DIR / "061_bar_line_routing.sql",
+    # 062 SFG seam minting (Phase 9): the sfg_seam_pending VIEW — one row per
+    # Create-WIP bom_process_route step that still lacks an SFG seam (output_code
+    # NULL/blank), the work-queue the opt-in minting script targets and the
+    # post-mint audit that drains to EMPTY once every transform chain is seamed,
+    # plus its partial index (NULL-side of output_code, not covered by 055's
+    # NOT-NULL index). Observability only; the minting is DATA (opt-in script). No
+    # new columns; view + index only. Additive + idempotent. Reversible via
+    # app/db/rollback/sfg_integration_down.sql.
+    DB_DIR / "062_sfg_seam_pending.sql",
 ]
+
+# ── Optional: drop the v1 legacy job-card stack (TEST / Supabase DB ONLY) ──────
+# This runner is also the PROD migrator (run before each Lambda deploy), and 4 of
+# the 5 v1 job-card tables (job_card, internal_job_card, job_card_byproduct,
+# job_card_process_step) are STILL on live HTTP paths in app/modules/production —
+# only job_card_material_accounting is dead. Dropping them unconditionally would
+# break prod, so the drop is opt-in: it fires ONLY when DROP_LEGACY_V1 is set, e.g.
+# when building the Supabase test DB that excludes the legacy stack:
+#     DROP_LEGACY_V1=1 uv run python scripts/migrate.py
+# Appended LAST so the tables exist (the migrations interleave them with current
+# tables and can't skip them at CREATE time) before being dropped.
+if os.environ.get("DROP_LEGACY_V1"):
+    SQL_FILES.append(DB_DIR / "054_drop_legacy_v1_job_cards.sql")
 
 
 async def main():

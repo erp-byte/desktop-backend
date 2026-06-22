@@ -16,7 +16,10 @@ class JobCardPDF(FPDF):
         self.cell(0, 4, 'Location # : Factory', 0, 1, 'C')
         # Production order info
         p = self.jc.get('section_1_product', {})
-        self.cell(0, 4, f"Production Order # : {self.jc.get('job_card_number', '')}  Date : {self.jc.get('created_at', '')[:10]}", 0, 1, 'C')
+        # `.get('created_at','')` only defaults when the key is ABSENT — a present
+        # but None value (e.g. a v1 detail dict) would make `[:10]` raise. Guard it.
+        created = (self.jc.get('created_at') or '')[:10]
+        self.cell(0, 4, f"Production Order # : {self.jc.get('job_card_number', '')}  Date : {created}", 0, 1, 'C')
         self.cell(0, 4, f"Sales Order # {p.get('sales_order_ref', '--')}", 0, 1, 'C')
         self.ln(2)
         self.set_font('Helvetica', '', 7)
@@ -100,8 +103,19 @@ def generate_job_card_pdf(jc_data: dict, mode: str = 'full') -> bytes:
     pdf.cell(0, 5, 'Bill Of Material', 0, 1)
 
     rm_lines = jc_data.get('section_2a_rm_indent', [])
-    consumption = jc_data.get('material_consumption', [])
+    # Consumption rows live under `consumption_lines` on the v2 detail dict
+    # (get_job_card) and under `material_consumption` on the v1 detail shape.
+    # Read both so the RM/PM actual-qty lookup AND the SFG/WIP input lines
+    # render regardless of which detail builder produced jc_data.
+    consumption = jc_data.get('consumption_lines') or jc_data.get('material_consumption') or []
     cons_map = {(c.get('material_sku_name', '')).lower(): c for c in consumption}
+    # Slice 7: downstream (Stage-2+) job cards consume an SFG/WIP input —
+    # surface those consumption rows as their own labelled lines so the
+    # printed BOM shows the SFGxxxx seam code + qty, not just RM/PM.
+    sfg_lines = [
+        c for c in consumption
+        if (c.get('input_kind') or '').upper() in ('SFG', 'WIP')
+    ]
 
     # Header
     pdf.set_font('Helvetica', 'B', 7)
@@ -142,6 +156,33 @@ def generate_job_card_pdf(jc_data: dict, mode: str = 'full') -> bytes:
             pdf.cell(30, 5, reqd, 1, 0, 'C')
             pdf.cell(30, 5, issued, 1, 0, 'C')
             pdf.cell(25, 5, pdf._safe(batch), 1, 0, 'C')
+            pdf.cell(15, 5, pdf._safe(uom), 1, 1, 'C')
+
+    # SFG / WIP input lines (Slice 7) — Stage-2+ job cards consume a
+    # semi-finished good (SFG####) carried from the previous stage. Print
+    # those as their own labelled rows so the BOM clearly shows the SFGxxxx
+    # seam code + the consumed/issued qty, instead of only RM/PM.
+    for c in sfg_lines:
+        kind = (c.get('input_kind') or 'SFG').upper()
+        code = c.get('material_sku_name', '')            # the SFGxxxx code
+        label = f"[{kind}] {code}"
+        reqd = _fmt_num(c.get('issued_qty'))
+        issued = _fmt_num(c.get('issued_qty'))
+        actual = _fmt_num(c.get('actual_consumed_qty'))
+        uom = c.get('uom', 'Kgs')
+
+        if mode == 'full':
+            pdf.cell(55, 5, pdf._safe(label), 1, 0)
+            pdf.cell(25, 5, reqd, 1, 0, 'C')
+            pdf.cell(25, 5, issued, 1, 0, 'C')
+            pdf.cell(25, 5, actual, 1, 0, 'C')
+            pdf.cell(20, 5, pdf._safe(kind), 1, 0, 'C')
+            pdf.cell(15, 5, pdf._safe(uom), 1, 1, 'C')
+        else:
+            pdf.cell(65, 5, pdf._safe(label), 1, 0)
+            pdf.cell(30, 5, reqd, 1, 0, 'C')
+            pdf.cell(30, 5, issued, 1, 0, 'C')
+            pdf.cell(25, 5, pdf._safe(kind), 1, 0, 'C')
             pdf.cell(15, 5, pdf._safe(uom), 1, 1, 'C')
 
     pdf.ln(3)

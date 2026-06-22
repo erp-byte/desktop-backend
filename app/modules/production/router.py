@@ -71,6 +71,12 @@ class FulfillmentV2SyncRequest(BaseModel):
     entity: str | None = None
 
 
+class FulfillmentBySoLinesRequest(BaseModel):
+    so_line_ids: list[int] = []
+    entity: str | None = None
+    financial_year: str | None = None
+
+
 class ReviseV2Request(BaseModel):
     new_qty: float | None = None
     new_units: float | None = None
@@ -99,6 +105,17 @@ class BomOverrideV2Request(BaseModel):
 class FloorStockV2Request(BaseModel):
     entries: list[dict] = []
     added_by: str = ""
+
+
+# ---- Routing-Gap Resolution request models ----
+class RoutingGapAssignment(BaseModel):
+    article: str
+    process_category: str  # may be blank -> skipped_no_pc
+
+
+class RoutingGapApplyRequest(BaseModel):
+    assignments: list[RoutingGapAssignment] = []
+    performed_by: str | None = None
 
 
 # ---- Plan v2 request models ----
@@ -549,6 +566,22 @@ async def sync_fulfillment_v2(request: Request, body: FulfillmentV2SyncRequest):
             async with conn.transaction():
                 result = await _sync(conn, body.entity)
     return result
+
+
+@router.post("/fulfillment-v2/by-so-lines")
+async def fulfillment_v2_by_so_lines(request: Request, body: FulfillmentBySoLinesRequest):
+    """Resolve SO line ids to their fulfillment rows (list shape).
+
+    Read-only. Backs the SO-Creation "Selected for Plan" panel: returns the
+    so_fulfillment_v2 rows for the given so_line_ids plus the so_line_ids that
+    have no fulfillment row yet (so the UI can prompt a Sync)."""
+    from app.modules.production.services.fulfillment_v2 import get_fulfillment_by_so_lines
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await get_fulfillment_by_so_lines(
+            conn, body.so_line_ids, entity=body.entity,
+            financial_year=body.financial_year,
+        )
 
 
 @router.get("/fulfillment-v2/demand-summary")
@@ -4726,6 +4759,124 @@ async def add_step_v2(
     return result
 
 
+# --- Create Job Card (per-article wizard) ---
+
+class JobCardLineCreateStep(BaseModel):
+    """One WIP process in the Create-Job-Card wizard."""
+    process: str
+    floor: str
+    sfg_output: str | None = None
+
+
+class JobCardLineCreate(BaseModel):
+    """POST /plans-v2/lines/{plan_line_id}/job-cards"""
+    qty_kg: float
+    qty_units: float | None = None
+    wip_steps: list[JobCardLineCreateStep]
+    pkg_floor: str
+
+
+@router.post("/plans-v2/lines/{plan_line_id}/job-cards")
+async def create_line_job_cards_v2(
+    request: Request,
+    plan_line_id: int,
+    body: JobCardLineCreate,
+    user=Depends(get_current_user),
+):
+    """Create the chained job cards for ONE plan line (the Plan-List
+    "Create Job Card" wizard) and dispatch each to its floor.
+
+    One job card per WIP process → a terminating Packaging card; stage-1 is
+    unlocked on its floor, the rest await the previous stage's handoff.
+    Enforces the user-level floor lock for every WIP + packaging floor (same
+    rule as add_step_v2), runs in one transaction, and is idempotent per line.
+    """
+    floors = [s.floor for s in body.wip_steps] + [body.pkg_floor]
+    if not user.is_admin and user.allowed_floors:
+        bad = sorted({f for f in floors if f and f not in user.allowed_floors})
+        if bad:
+            raise HTTPException(
+                status_code=403,
+                detail=f"User is not assigned to floor(s): {', '.join(bad)}",
+            )
+
+    from app.modules.production.services.job_card_v2 import create_job_cards_for_line
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await create_job_cards_for_line(
+                conn,
+                plan_line_id,
+                qty_kg=body.qty_kg,
+                qty_units=body.qty_units,
+                wip_steps=[s.model_dump() for s in body.wip_steps],
+                pkg_floor=body.pkg_floor,
+            )
+    err = result.get("error")
+    if err == "line_not_found":
+        raise HTTPException(status_code=404, detail="Plan line not found")
+    if err == "job_cards_already_exist":
+        raise HTTPException(
+            status_code=409,
+            detail=(f"This article already has {result.get('count')} job card(s). "
+                    "Cancel them before recreating."),
+        )
+    if err in ("invalid_qty", "no_wip_steps", "missing_pkg_floor"):
+        raise HTTPException(status_code=400, detail=result.get("message"))
+    return result
+
+
+@router.get("/plans-v2/lines/{plan_line_id}/job-cards")
+async def get_line_job_cards_v2(request: Request, plan_line_id: int):
+    """Return the current job-card config for a plan line, shaped to prefill the
+    Edit-Job-Card wizard ({exists, editable, qty_kg, qty_units, wip_steps, pkg_floor})."""
+    from app.modules.production.services.job_card_v2 import get_line_job_card_config
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await get_line_job_card_config(conn, plan_line_id)
+
+
+@router.put("/plans-v2/lines/{plan_line_id}/job-cards")
+async def replace_line_job_cards_v2(
+    request: Request,
+    plan_line_id: int,
+    body: JobCardLineCreate,
+    user=Depends(get_current_user),
+):
+    """Edit (replace) a plan line's job cards from the wizard. Deletes the
+    current chain and recreates it; refused once any stage has started. Same
+    floor-lock + transaction rules as the create endpoint."""
+    floors = [s.floor for s in body.wip_steps] + [body.pkg_floor]
+    if not user.is_admin and user.allowed_floors:
+        bad = sorted({f for f in floors if f and f not in user.allowed_floors})
+        if bad:
+            raise HTTPException(
+                status_code=403,
+                detail=f"User is not assigned to floor(s): {', '.join(bad)}",
+            )
+
+    from app.modules.production.services.job_card_v2 import replace_job_cards_for_line
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await replace_job_cards_for_line(
+                conn,
+                plan_line_id,
+                qty_kg=body.qty_kg,
+                qty_units=body.qty_units,
+                wip_steps=[s.model_dump() for s in body.wip_steps],
+                pkg_floor=body.pkg_floor,
+            )
+    err = result.get("error")
+    if err == "line_not_found":
+        raise HTTPException(status_code=404, detail="Plan line not found")
+    if err == "not_editable":
+        raise HTTPException(status_code=409, detail=result.get("message"))
+    if err in ("invalid_qty", "no_wip_steps", "missing_pkg_floor"):
+        raise HTTPException(status_code=400, detail=result.get("message"))
+    return result
+
+
 @router.put("/plans-v2/steps/{step_id}")
 async def update_step_v2(
     request: Request,
@@ -4785,12 +4936,16 @@ async def delete_step_v2(request: Request, step_id: int):
 
 
 @router.get("/plans-v2/bom/{bom_id}")
-async def get_bom_summary_v2(request: Request, bom_id: int):
+async def get_bom_summary_v2(request: Request, bom_id: int, full: bool = False):
     """Lightweight BOM summary intended for the Plan Detail BOM hover-card.
 
     Returns the header, a compact list of materials (truncated at 30 for the
     tooltip), and the ordered process route. Heavier reads should go through
     the existing fulfillment-detail endpoint.
+
+    ``full=true`` drops the 30-line tooltip cap so callers that need the
+    COMPLETE material list (e.g. the Create-Job-Card wizard's per-step
+    RM/PM breakdown) get every line; default stays capped for the hover-card.
     """
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -4824,8 +4979,7 @@ async def get_bom_summary_v2(request: Request, bom_id: int):
             FROM bom_line
             WHERE bom_id = $1
             ORDER BY line_number
-            LIMIT 30
-            """,
+            """ + ("" if full else "\n            LIMIT 30\n            "),
             bom_id,
         )
         steps = await conn.fetch(
@@ -5029,6 +5183,161 @@ async def search_job_cards_v2(
     )
 
 
+@router.get("/job-cards-v2/sfg-inventory")
+async def sfg_inventory_v2(
+    request: Request,
+    sku_name: str = Query(..., description="The SFG#### code to look up"),
+    entity: str = Query(...),
+    floor_id: str | None = Query(None),
+    user=Depends(get_current_user),
+):
+    """Slice 5 — Stage-2 SFG inventory picker source. Lists AVAILABLE WIP/SFG
+    batches (inventory_batch item_type='wip') for the given SFG#### code in FIFO
+    order, so the Final-FG stage can issue the semi-finished input materialised by
+    its upstream Create-WIP stage's close. Mirrors the RM/PM picker
+    (GET /inventory/batches) but scoped to item_type='wip'.
+
+    MUST be declared BEFORE /job-cards-v2/{job_card_id} so 'sfg-inventory' is not
+    captured as a job_card_id. Cost-gated (labels carry no cost, but the gate is
+    wired defensively so any future cost column is auto-stripped for deny-listed
+    roles)."""
+    # Entity/floor scope (Slice-5 review #6): a non-admin must not read another
+    # entity's (or floor's) WIP stock. Empty allowed list = wildcard.
+    if not getattr(user, "is_admin", False):
+        allowed_ent = getattr(user, "allowed_entities", []) or []
+        if allowed_ent and entity not in allowed_ent:
+            raise HTTPException(status_code=403, detail="Entity outside your scope")
+        allowed_fl = getattr(user, "allowed_floors", []) or []
+        if floor_id and allowed_fl and floor_id not in allowed_fl:
+            raise HTTPException(status_code=403, detail="Floor outside your scope")
+    from app.modules.production.services.inventory_service import get_available_batches
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        # by_sfg_code (PT1/057): match the canonical inventory_batch.sfg_code
+        # column (sku_name now holds the article name). exclude_expired: G3 strict.
+        batches = await get_available_batches(
+            conn, sku_name, entity, item_type='wip', floor_id=floor_id,
+            by_sfg_code=True, exclude_expired=True,
+        )
+    return strip_cost_fields(
+        {"batches": batches},
+        getattr(user, "role_name", None),
+        is_admin=getattr(user, "is_admin", False),
+    )
+
+
+@router.get("/job-cards-v2/sfg-master")
+async def sfg_master_v2(
+    request: Request,
+    search: str | None = Query(None, description="match SFG#### code or name"),
+    sfg_code: str | None = Query(None, description="exact SFG#### code"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=500),
+    user=Depends(get_current_user),
+):
+    """The dedicated SFG catalogue (design ref §8.1) — projected from the
+    sfg_master view over all_sku(item_type='sfg'). Entity-agnostic (the SFG
+    catalogue is shared across entities). Cost-gated defensively.
+
+    MUST be declared BEFORE /job-cards-v2/{job_card_id} so 'sfg-master' is not
+    captured as a job_card_id."""
+    from app.modules.production.services.sfg_catalog_service import list_sfg_master
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        result = await list_sfg_master(conn, search=search, sfg_code=sfg_code,
+                                       page=page, page_size=page_size)
+    return strip_cost_fields(
+        result, getattr(user, "role_name", None),
+        is_admin=getattr(user, "is_admin", False),
+    )
+
+
+@router.get("/job-cards-v2/sfg-where-used")
+async def sfg_where_used_v2(
+    request: Request,
+    sfg_code: str = Query(..., description="the SFG#### code to reverse-look-up"),
+    entity: str | None = Query(None),
+    user=Depends(get_current_user),
+):
+    """Reverse index (design ref §9.2): which FGs consume this SFG####.
+    Sourced from the sfg_where_used view. Entity-scoped for non-admins.
+
+    MUST be declared BEFORE /job-cards-v2/{job_card_id}."""
+    # Non-admin scope: restrict the where-used fan-out to the caller's entities.
+    if not getattr(user, "is_admin", False):
+        allowed_ent = getattr(user, "allowed_entities", []) or []
+        if entity and allowed_ent and entity not in allowed_ent:
+            raise HTTPException(status_code=403, detail="Entity outside your scope")
+        if not entity and len(allowed_ent) == 1:
+            entity = allowed_ent[0]
+    from app.modules.production.services.sfg_catalog_service import get_sfg_where_used
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        result = await get_sfg_where_used(conn, sfg_code, entity=entity)
+    return strip_cost_fields(
+        result, getattr(user, "role_name", None),
+        is_admin=getattr(user, "is_admin", False),
+    )
+
+
+@router.get("/job-cards-v2/sfg-wip-stock")
+async def sfg_wip_stock_v2(
+    request: Request,
+    entity: str = Query(...),
+    search: str | None = Query(None, description="match SFG#### code or name"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=500),
+    user=Depends(get_current_user),
+):
+    """WIP/SFG on-hand stock grouped by SFG#### (design ref §9.5 WIP-stock view),
+    from the inventory_batch item_type='wip' ledger. Entity-scoped for non-admins.
+
+    MUST be declared BEFORE /job-cards-v2/{job_card_id}."""
+    if not getattr(user, "is_admin", False):
+        allowed_ent = getattr(user, "allowed_entities", []) or []
+        if allowed_ent and entity not in allowed_ent:
+            raise HTTPException(status_code=403, detail="Entity outside your scope")
+    from app.modules.production.services.sfg_catalog_service import list_wip_stock
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        result = await list_wip_stock(conn, entity, search=search, page=page, page_size=page_size)
+    return strip_cost_fields(
+        result, getattr(user, "role_name", None),
+        is_admin=getattr(user, "is_admin", False),
+    )
+
+
+@router.get("/job-cards-v2/sfg-binding")
+async def sfg_binding_v2(
+    request: Request,
+    bom_id: int | None = Query(None),
+    fg_sku_name: str | None = Query(None),
+    sfg_code: str | None = Query(None),
+    entity: str | None = Query(None),
+    user=Depends(get_current_user),
+):
+    """FG↔stage↔SFG#### binding (design ref §9.2) from the fg_sfg_binding view.
+    Filter by FG (bom_id or name), SFG code, and/or entity. Entity-scoped for
+    non-admins.
+
+    MUST be declared BEFORE /job-cards-v2/{job_card_id}."""
+    if not getattr(user, "is_admin", False):
+        allowed_ent = getattr(user, "allowed_entities", []) or []
+        if entity and allowed_ent and entity not in allowed_ent:
+            raise HTTPException(status_code=403, detail="Entity outside your scope")
+        if not entity and len(allowed_ent) == 1:
+            entity = allowed_ent[0]
+    from app.modules.production.services.sfg_catalog_service import get_fg_sfg_binding
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        result = await get_fg_sfg_binding(conn, bom_id=bom_id, fg_sku_name=fg_sku_name,
+                                          sfg_code=sfg_code, entity=entity)
+    return strip_cost_fields(
+        result, getattr(user, "role_name", None),
+        is_admin=getattr(user, "is_admin", False),
+    )
+
+
 @router.get("/job-cards-v2/{job_card_id}")
 async def get_job_card_v2(
     request: Request,
@@ -5092,7 +5401,7 @@ async def job_card_chain_v2(
             SELECT job_card_id, job_card_number, step_number,
                    process_name, stage,
                    factory, floor, status,
-                   input_kind, output_kind,
+                   input_kind, output_kind, input_code, output_code,
                    planned_qty_kg, carried_qty_kg, dispatched_to_next_kg,
                    prev_job_card_id, next_job_card_id,
                    start_time, end_time
@@ -5115,6 +5424,8 @@ async def job_card_chain_v2(
                 "status":                r["status"],
                 "input_kind":            r["input_kind"],
                 "output_kind":           r["output_kind"],
+                "input_code":            r["input_code"],
+                "output_code":           r["output_code"],
                 "planned_qty_kg":        float(r["planned_qty_kg"])         if r["planned_qty_kg"]         is not None else None,
                 "carried_qty_kg":        float(r["carried_qty_kg"])         if r["carried_qty_kg"]         is not None else None,
                 "dispatched_to_next_kg": float(r["dispatched_to_next_kg"])  if r["dispatched_to_next_kg"]  is not None else None,
@@ -5506,6 +5817,11 @@ class ConsumedLineV2(BaseModel):
     material_sku_name: str | None = None
     consumed_qty:      float
     remarks:           str | None = None
+    # Slice 4: per-row opening-input kind (RM | PM | SFG | WIP). Defaults to the
+    # bucket kind in the handler when omitted; an SFG/WIP line sends its own so
+    # it persists as input_kind='SFG'/'WIP' (gate G1 Option B), not 'RM'.
+    input_kind:        str | None = None
+    source_dispatch_id: int | None = None
 
     @field_validator("consumed_qty", mode="before")
     @classmethod
@@ -7239,6 +7555,13 @@ async def job_card_pdf_v2(
         jc_data = await get_job_card(conn, job_card_id)
     if jc_data is None:
         raise HTTPException(status_code=404, detail="Job card not found")
+    # Enforce the SAME factory/floor scope as GET /job-cards-v2/{id} — otherwise a
+    # caller 403'd on the JSON detail could still pull the full JC via the PDF.
+    if not getattr(user, "is_admin", False):
+        if user.allowed_warehouses and not user_has_warehouse(user.allowed_warehouses, jc_data.get("factory")):
+            raise HTTPException(status_code=403, detail="JC outside your factory scope")
+        if user.allowed_floors and jc_data.get("floor") and jc_data["floor"] not in user.allowed_floors:
+            raise HTTPException(status_code=403, detail="JC outside your floor scope")
     # H1: strip cost fields before the renderer reads them. Deep-copies
     # the dict so callers (including the v1 fallback below) see an
     # untouched original.
@@ -7293,6 +7616,195 @@ async def job_card_pdf_v1(
         content=pdf_bytes,
         media_type="application/pdf",
         headers={"Content-Disposition": f'inline; filename="JC-{job_card_id}-{mode}.pdf"'},
+    )
+
+
+# ── SFG WIP boxes & QR labels (Slice 6) ──────────────────────────────────
+class WipBoxItem(BaseModel):
+    net_weight: float
+    gross_weight: float | None = None
+
+
+class CreateWipBoxesRequest(BaseModel):
+    boxes: list[WipBoxItem]
+    expected_net_kg: float | None = None
+
+
+class ScanSfgBoxesRequest(BaseModel):
+    box_ids: list[int]
+
+
+@router.post("/job-cards-v2/{job_card_id}/wip-boxes")
+async def create_wip_boxes_endpoint(
+    request: Request, job_card_id: int, body: CreateWipBoxesRequest,
+    user=Depends(get_current_user),
+):
+    """Split a WIP-stage JC's net SFG into weighed boxes; mint an 8-digit
+    box_id (the QR payload) per box. Print labels via …/wip-boxes/labels.pdf."""
+    from app.modules.production.services.sfg_box_service import create_wip_boxes
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await create_wip_boxes(
+                conn, job_card_id, [b.model_dump() for b in body.boxes],
+                expected_net_kg=body.expected_net_kg,
+            )
+    if "error" in result:
+        code = 404 if result["error"] == "not_found" else 400
+        raise HTTPException(status_code=code, detail=result.get("message", result["error"]))
+    return strip_cost_fields(
+        result, getattr(user, "role_name", None),
+        is_admin=getattr(user, "is_admin", False),
+    )
+
+
+@router.get("/job-cards-v2/{job_card_id}/wip-boxes")
+async def list_wip_boxes_endpoint(
+    request: Request, job_card_id: int, user=Depends(get_current_user),
+):
+    """List the boxes produced by a WIP-stage JC (+ Σ net weight)."""
+    from app.modules.production.services.sfg_box_service import get_boxes_for_jc
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        result = await get_boxes_for_jc(conn, job_card_id)
+    return strip_cost_fields(
+        result, getattr(user, "role_name", None),
+        is_admin=getattr(user, "is_admin", False),
+    )
+
+
+@router.get("/job-cards-v2/{job_card_id}/wip-boxes/labels.pdf")
+async def wip_box_labels_endpoint(
+    request: Request, job_card_id: int, user=Depends(get_current_user),
+):
+    """One QR label per box for a WIP-stage JC (labels carry no cost figures)."""
+    from app.modules.production.services.sfg_box_service import get_boxes_for_jc
+    from app.modules.production.services.label_service import wip_box_labels_pdf
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        result = await get_boxes_for_jc(conn, job_card_id)
+    if not result.get("boxes"):
+        raise HTTPException(status_code=404, detail="No boxes to label for this job card")
+    pdf_bytes = wip_box_labels_pdf(result.get("boxes", []))
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="SFG-boxes-{job_card_id}.pdf"'},
+    )
+
+
+@router.post("/job-cards-v2/{job_card_id}/scan-sfg-boxes")
+async def scan_sfg_boxes_endpoint(
+    request: Request, job_card_id: int, body: ScanSfgBoxesRequest,
+    user=Depends(get_current_user),
+):
+    """Scan SFG box QR ids into a downstream consuming JC (verify SFG + source)."""
+    from app.modules.production.services.sfg_box_service import scan_receive_sfg_box
+    pool = request.app.state.db_pool
+    scanned_by = getattr(user, "full_name", None) or getattr(user, "phone", None)
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await scan_receive_sfg_box(
+                conn, job_card_id, body.box_ids, scanned_by=scanned_by
+            )
+    if "error" in result:
+        code = 404 if result["error"] == "not_found" else 400
+        raise HTTPException(status_code=code, detail=result.get("message", result["error"]))
+    return strip_cost_fields(
+        result, getattr(user, "role_name", None),
+        is_admin=getattr(user, "is_admin", False),
+    )
+
+
+@router.get("/sfg-boxes/{box_id}")
+async def get_sfg_box_endpoint(
+    request: Request, box_id: int, user=Depends(get_current_user),
+):
+    """Single SFG box lookup (mirror of GET /boxes/{box_id} for po_box)."""
+    from app.modules.production.services.sfg_box_service import get_box
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        box = await get_box(conn, box_id)
+    if not box:
+        raise HTTPException(status_code=404, detail="Box not found")
+    # Entity scope: every sibling SFG read enforces it — a scoped caller must not
+    # read another entity's box by guessing its id. Admin / wildcard bypass.
+    if not getattr(user, "is_admin", False):
+        allowed_ent = getattr(user, "allowed_entities", []) or []
+        if box.get("entity") and allowed_ent and box["entity"] not in allowed_ent:
+            raise HTTPException(status_code=403, detail="Entity outside your scope")
+    return strip_cost_fields(
+        box, getattr(user, "role_name", None),
+        is_admin=getattr(user, "is_admin", False),
+    )
+
+
+# ── Phase 7: box→box→lot genealogy reads ────────────────────────────────────
+
+@router.get("/job-cards-v2/{job_card_id}/sfg-genealogy")
+async def jc_sfg_genealogy_endpoint(
+    request: Request, job_card_id: int, user=Depends(get_current_user),
+):
+    """Phase 7 — per-JC SFG box genealogy.
+
+    Returns ``{"job_card_id": id, "produced": [box...], "consumed": [box...]}``
+    where ``produced`` = boxes this JC minted (sfg_box.job_card_id) and
+    ``consumed`` = boxes scanned INTO this JC (sfg_box.received_into_job_card_id),
+    each consumed box also carrying ``source_job_card_id``. Cost-gated (labels
+    carry no cost, but stripped defensively). Entity scope is enforced for
+    non-admins (mirror of the sfg-inventory endpoint)."""
+    from app.modules.production.services.sfg_box_service import get_jc_genealogy
+    pool = request.app.state.db_pool
+    is_admin = getattr(user, "is_admin", False)
+    allowed_ent = [] if is_admin else (getattr(user, "allowed_entities", []) or [])
+    async with pool.acquire() as conn:
+        if not is_admin:
+            jc_ent = await conn.fetchval(
+                "SELECT entity FROM job_card_v2 WHERE job_card_id = $1", job_card_id
+            )
+            if jc_ent and allowed_ent and jc_ent not in allowed_ent:
+                raise HTTPException(status_code=403, detail="Entity outside your scope")
+        # Pass the scope so CONSUMED boxes from another entity are filtered out
+        # (the JC-entity check above only gates the JC itself, not its inputs).
+        result = await get_jc_genealogy(conn, job_card_id,
+                                        allowed_entities=allowed_ent or None)
+    return strip_cost_fields(
+        result, getattr(user, "role_name", None),
+        is_admin=getattr(user, "is_admin", False),
+    )
+
+
+@router.get("/sfg-boxes/{box_id}/genealogy")
+async def sfg_box_genealogy_endpoint(
+    request: Request, box_id: int, user=Depends(get_current_user),
+):
+    """Phase 7 — single-box upstream ancestry chain.
+
+    Returns ``{"box_id": id, "chain": [box+level...]}`` walking UPSTREAM:
+    parent_box_id (box→box) + source_inventory_batch_id → producer JC → that JC's
+    consumed boxes (lot/batch hop). ``level`` is 0 for this box and increases
+    upstream; recursion is depth-capped. Cost-gated defensively; entity scope
+    enforced for non-admins via the start box's entity."""
+    from app.modules.production.services.sfg_box_service import get_box_genealogy
+    pool = request.app.state.db_pool
+    is_admin = getattr(user, "is_admin", False)
+    allowed_ent = [] if is_admin else (getattr(user, "allowed_entities", []) or [])
+    async with pool.acquire() as conn:
+        if not is_admin:
+            box_ent = await conn.fetchval(
+                "SELECT entity FROM sfg_box WHERE box_id = $1", box_id
+            )
+            if box_ent and allowed_ent and box_ent not in allowed_ent:
+                raise HTTPException(status_code=403, detail="Entity outside your scope")
+        # Pass the scope so UPSTREAM ancestor boxes from another entity are not
+        # walked into (the start-box check above only gates the entry point).
+        result = await get_box_genealogy(conn, box_id,
+                                         allowed_entities=allowed_ent or None)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Box not found")
+    return strip_cost_fields(
+        result, getattr(user, "role_name", None),
+        is_admin=getattr(user, "is_admin", False),
     )
 
 
@@ -7534,3 +8046,88 @@ async def acknowledge_material_v2(
                     # ack itself is the operator's primary action.
                     logger.exception("ack-material: failed to persist notes as remark (jc_id=%d)", job_card_id)
     return {"acknowledged": True, "job_card_id": job_card_id}
+
+
+# ---------------------------------------------------------------------------
+# Routing-Gap Resolution — close the remaining ~342 unrouted gap FG articles
+# ---------------------------------------------------------------------------
+# Reads the offline reconciliation gap union (Article_Master_FINAL.csv, gap_flags
+# 403/238), excludes already-routed/promoted articles (the ~108 Slice-7 ones),
+# groups the rest by a heuristic family classifier with a suggested process
+# category, and applies production-confirmed assignments via the SAME promote_one
+# primitive scripts/promote_fg_master_gaps.py uses. Read endpoints are cost-gated
+# (master-data reads, like /job-cards-v2/sfg-master); apply is a planner/admin
+# master-data write (production/plans/create — admin bypasses).
+
+@router.get("/routing-gaps")
+async def routing_gaps(
+    request: Request,
+    entity: str | None = Query(None, description="filter by cfpl/cdpl"),
+    family: str | None = Query(None, description="filter by classify_family value"),
+    user=Depends(get_current_user),
+):
+    """Grouped list of FG articles still missing a routing (Process Category).
+
+    Shape: {"total": n, "families": [{"family", "suggested_process_category",
+    "count", "needs_review", "articles": [{"article", "in_all_sku",
+    "current_process_category", "suggested_process_category"}]}]}.
+    The ~108 Slice-7 promoted articles are excluded (they now have a route)."""
+    from app.modules.production.services.routing_gap_service import get_routing_gaps
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        result = await get_routing_gaps(conn, entity=entity, family=family)
+    return strip_cost_fields(
+        result, getattr(user, "role_name", None),
+        is_admin=getattr(user, "is_admin", False),
+    )
+
+
+@router.get("/routing-gaps/worksheet.csv")
+async def routing_gaps_worksheet(
+    request: Request,
+    entity: str | None = Query(None),
+    family: str | None = Query(None),
+    user=Depends(get_current_user),
+):
+    """Download the outstanding gap list as a CSV worksheet for production to
+    fill (columns: article, family, in_all_sku, suggested_process_category,
+    assigned_process_category[blank]). Fill assigned_process_category, then POST
+    the rows to /routing-gaps/apply."""
+    from app.modules.production.services.routing_gap_service import build_worksheet_csv
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        csv_text = await build_worksheet_csv(conn, entity=entity, family=family)
+    return Response(
+        content=csv_text,
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=routing_gaps_worksheet.csv"},
+    )
+
+
+@router.post("/routing-gaps/apply")
+async def routing_gaps_apply(
+    request: Request,
+    body: RoutingGapApplyRequest,
+    user: AuthUser = Depends(
+        require_permission("production", "plans", None, "create")
+    ),
+):
+    """Apply confirmed routing assignments — upsert bom_header + derive routes
+    (same primitive as the Slice-7 promotion). Idempotent + audited; one bad
+    assignment doesn't abort the rest (per-article savepoint).
+
+    Body: {"assignments": [{"article", "process_category"}], "performed_by"?}.
+    A blank process_category is skipped (status skipped_no_pc).
+    Returns: {"applied": n, "skipped": n, "results": [{"article", "status",
+    "bom_id", "detail"}]} where status is promoted|routed_existing|skipped_no_pc|error."""
+    from app.modules.production.services.routing_gap_service import promote_articles
+    assignments = [a.model_dump() for a in body.assignments]
+    performed_by = body.performed_by or getattr(user, "full_name", None) \
+        or getattr(user, "phone", None)
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await promote_articles(
+                conn, assignments, performed_by=performed_by,
+            )
+    return result

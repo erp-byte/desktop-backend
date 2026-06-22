@@ -547,13 +547,17 @@ async def get_accounting(conn, job_card_id: int, *, batch_id: int | None = None)
 
 async def save_consumption(conn, *, job_card_id: int,
                            rows: list[dict],
-                           recorded_by: str | None = None) -> dict:
+                           recorded_by: str | None = None,
+                           batch_id: int | None = None) -> dict:
     """Upsert consumption rows for this JC. Caller supplies a list of:
         { material_sku_name, input_kind, uom, issued_qty,
           actual_consumed_qty, return_qty?, remarks?,
           source_rm_indent_id?, source_dispatch_id? }
-    Rows are matched on (job_card_id, material_sku_name) via the table's
-    UNIQUE index — duplicates update in place.
+    Rows are matched on (job_card_id, COALESCE(batch_id,0), material_sku_name)
+    via uq_jcmc_v2_jc_batch_material (migration 044) — duplicates update in
+    place. `batch_id` tags every row with the batch it belongs to (NULL → the
+    legacy 0-bucket). The ON CONFLICT target MUST match that 3-col index exactly
+    or PG raises 'no unique or exclusion constraint matching'.
     """
     lock_err = await assert_not_locked(conn, job_card_id)
     if lock_err:
@@ -586,7 +590,7 @@ async def save_consumption(conn, *, job_card_id: int,
             _uom=uom, _issued=issued, _actual=actual, _ret=ret,
             _variance=variance, _src_rm=r.get("source_rm_indent_id"),
             _src_dispatch=r.get("source_dispatch_id"),
-            _remarks=r.get("remarks"), _recorded_by=recorded_by,
+            _remarks=r.get("remarks"), _recorded_by=recorded_by, _batch=batch_id,
         ):
             return await conn.fetchrow(
                 """
@@ -594,9 +598,11 @@ async def save_consumption(conn, *, job_card_id: int,
                     (consumption_id, job_card_id, material_sku_name, input_kind, uom,
                      issued_qty, actual_consumed_qty, return_qty, variance,
                      source_rm_indent_id, source_dispatch_id,
-                     remarks, recorded_by)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-                ON CONFLICT (job_card_id, material_sku_name) DO UPDATE SET
+                     remarks, recorded_by, batch_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                ON CONFLICT (job_card_id, COALESCE(batch_id, 0), material_sku_name)
+                DO UPDATE SET
+                    batch_id            = EXCLUDED.batch_id,
                     input_kind          = EXCLUDED.input_kind,
                     uom                 = EXCLUDED.uom,
                     issued_qty          = EXCLUDED.issued_qty,
@@ -604,7 +610,8 @@ async def save_consumption(conn, *, job_card_id: int,
                     return_qty          = EXCLUDED.return_qty,
                     variance            = EXCLUDED.variance,
                     source_rm_indent_id = EXCLUDED.source_rm_indent_id,
-                    source_dispatch_id  = EXCLUDED.source_dispatch_id,
+                    source_dispatch_id  = COALESCE(EXCLUDED.source_dispatch_id,
+                                                   job_card_material_consumption_v2.source_dispatch_id),
                     remarks             = EXCLUDED.remarks,
                     recorded_by         = EXCLUDED.recorded_by,
                     recorded_at         = NOW()
@@ -613,7 +620,7 @@ async def save_consumption(conn, *, job_card_id: int,
                 new_short_time_id(),
                 _job_card_id, _material, _input_kind, _uom,
                 _issued, _actual, _ret, _variance,
-                _src_rm, _src_dispatch, _remarks, _recorded_by,
+                _src_rm, _src_dispatch, _remarks, _recorded_by, _batch,
             )
         row = await insert_with_pk_retry(conn, _insert)
         saved.append(_serialize(row))

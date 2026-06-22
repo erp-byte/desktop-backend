@@ -41,6 +41,9 @@ class FilterOptions(BaseModel):
     voucher_types: list[str]
     customer_names: list[str]
     common_customer_names: list[str]
+    # Distinct SO numbers — backs the "All SOs" multi-select on the listing
+    # toolbar (planning parity). Defaulted for safety, always populated by /view.
+    so_numbers: list[str] = []
     # SO line level
     item_categories: list[str]
     sub_categories: list[str]
@@ -51,6 +54,10 @@ class FilterOptions(BaseModel):
     sales_groups: list[str]
     match_sources: list[str]
     statuses: list[str]
+    # Distinct SO-line article names (sku_name) — backs the "All Articles"
+    # multi-select on the listing toolbar. Defaulted so any other caller that
+    # builds FilterOptions without it stays valid.
+    articles: list[str] = []
 
 
 class SOViewResponse(BaseModel):

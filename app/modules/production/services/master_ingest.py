@@ -9,15 +9,39 @@ Reads three Excel files at startup and populates:
 Idempotent: skips if bom_header already has data.
 """
 
+import csv
 import logging
 import re
 from pathlib import Path
 
 import openpyxl
 
+from app.core.helpers import (
+    PROCESS_CLASS_LOCK,
+    ROUTING_LOCK,
+    SFG_CODE_LOCK,
+    insert_with_pk_retry,
+    new_short_time_id,
+    normalise_key,
+)
 from app.modules.so.services.item_matcher import MasterItem, match_sku
 
 logger = logging.getLogger(__name__)
+
+# Plug CSVs live under the repo's docs/ tree, NOT under app/data — resolve them
+# by ABSOLUTE path off the repo root so a Workspace-subfolder CWD can't break
+# the lookup. master_ingest.py is at app/modules/production/services/, so
+# parents[4] is the server_replica root.
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+_SFG_PLUG_DIR = _REPO_ROOT / "docs" / "flows" / "Candor_SFG_JobCard_Integration_2026-06-14"
+SFG_CATALOG_PLUG = _SFG_PLUG_DIR / "SFG_Catalog_Plug.csv"
+JC_ROUTING_PLUG = _SFG_PLUG_DIR / "JC_Routing_Plug.csv"
+JC_BOM_PLUG = _SFG_PLUG_DIR / "JC_BOM_Plug.csv"
+# 056 enrichment / reconciliation plug files (companion set, same 2026-06-17 gen).
+JC_STAGE1_MASTER = _SFG_PLUG_DIR / "JC_Stage1_Create_WIP_Master.csv"
+PROCESS_CATEGORY_MAP = _SFG_PLUG_DIR / "ProcessCategory_to_Operation.csv"
+JC_STAGE2_PACKING = _SFG_PLUG_DIR / "JC_Stage2_Final_FG_Packing.csv"
+SFG_RESOLUTION_MAP = _SFG_PLUG_DIR / "SFG_Resolution_Map.csv"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -177,6 +201,649 @@ async def ingest_fg_master(conn, file_path: Path, master_items: list[MasterItem]
     wb.close()
     logger.info("FG Master: %d headers, %d routes, %d skipped", headers_created, routes_created, skipped)
     return header_map
+
+
+# ---------------------------------------------------------------------------
+# 1b. SFG catalogue → all_sku (item_type='sfg')
+# ---------------------------------------------------------------------------
+
+async def _all_sku_has_sfg_code(conn) -> bool:
+    """True if the all_sku.sfg_code column (added by 051) exists."""
+    return bool(await conn.fetchval(
+        """
+        SELECT EXISTS (
+            SELECT 1 FROM information_schema.columns
+             WHERE table_name = 'all_sku' AND column_name = 'sfg_code'
+        )
+        """
+    ))
+
+
+async def ingest_sfg_master(conn, file_path: Path | None = None) -> dict:
+    """Load the canonical SFG items (SFG_Catalog_Plug.csv) into all_sku as
+    item_type='sfg'.
+
+    db/051_sfg_seed_catalog.sql prepares the schema (widens all_sku.sku_id to
+    BIGINT, adds sfg_code + its unique index); this loader does the DATA:
+      * re-types an existing bulk article matched by (normalised) name in place,
+        claiming its SFG#### and PRESERVING its sku_id / real item_group / uom / gst;
+      * inserts the derived net-new SFGs with an application-supplied 8-digit
+        BIGINT primary key via new_short_time_id() + insert_with_pk_retry()
+        (sale_group='wip', uom left NULL — the plug's 'kg' is conceptual and
+        all_sku.uom is NUMERIC).
+
+    MUST run inside an outer transaction (insert_with_pk_retry uses savepoints).
+    Idempotent (keyed on sfg_code). Safe in a half-migrated DB: skips with a
+    warning if the all_sku.sfg_code column (051) is absent.
+    """
+    path = Path(file_path) if file_path else SFG_CATALOG_PLUG
+    if not path.exists():
+        logger.warning("SFG catalogue ingest skipped — plug not found: %s", path)
+        return {"status": "file_not_found", "inserted": 0, "retyped": 0}
+
+    if not await _all_sku_has_sfg_code(conn):
+        logger.warning(
+            "SFG catalogue ingest skipped — all_sku.sfg_code missing; "
+            "run scripts/migrate.py (051_sfg_seed_catalog.sql) first"
+        )
+        return {"status": "schema_missing", "inserted": 0, "retyped": 0}
+
+    # Serialise concurrent loaders (cold-start storm of multiple workers, or a
+    # migrate path overlapping app startup) on the same advisory lock next_sfg_code
+    # uses. Transaction-scoped — auto-released at COMMIT/ROLLBACK. Combined with
+    # the per-row ON CONFLICT / NOT EXISTS guards this makes the whole load
+    # race-safe (no UniqueViolation can abort the shared master-ingest txn).
+    await conn.execute("SELECT pg_advisory_xact_lock($1)", SFG_CODE_LOCK)
+
+    # Read + normalise; dedupe defensively by code (last wins). Track how many
+    # rows the plug itself expects to be re-types (already_in_all_sku='Y') so we
+    # can warn on flag drift (e.g. SFG0334 is mis-flagged 'N' but pre-exists).
+    with path.open(encoding="utf-8-sig", newline="") as fh:
+        seed: dict[str, tuple[str, str | None]] = {}
+        retype_expected = 0
+        for r in csv.DictReader(fh):
+            code = normalise_key(r.get("sfg_code"))
+            name = normalise_key(r.get("particulars"))
+            if not code or not name:
+                continue
+            group = normalise_key(r.get("item_group")) or None
+            seed[code] = (name, group)
+            if normalise_key(r.get("already_in_all_sku")).upper() == "Y":
+                retype_expected += 1
+
+    # Idempotency guard keyed on the CANONICAL codes (not a raw item_type='sfg'
+    # count): a foreign/partial 'sfg' population must not mask a missing plug.
+    codes = list(seed.keys())
+    present = await conn.fetchval(
+        "SELECT count(*) FROM all_sku WHERE sfg_code = ANY($1::text[])", codes
+    )
+    if present and present >= len(codes):
+        logger.info(
+            "SFG catalogue already ingested (%d/%d canonical codes present) — skipping",
+            present, len(codes),
+        )
+        return {"status": "already_ingested", "inserted": 0, "retyped": 0,
+                "sfg_rows": present}
+
+    # Build a NORMALISED-name index of claimable rows (sfg_code IS NULL) so an
+    # NBSP/mojibake-bearing all_sku name still matches the clean plug name — the
+    # join is normalised on BOTH sides (normalise_key is Python-only, so the
+    # match is done here rather than in SQL). Lowest sku_id wins on a name clash.
+    claimable: dict[str, list[tuple]] = {}
+    for row in await conn.fetch(
+        "SELECT sku_id, particulars, item_type FROM all_sku WHERE sfg_code IS NULL"
+    ):
+        k = normalise_key(row["particulars"])
+        if k:
+            claimable.setdefault(k, []).append((row["sku_id"], row["item_type"]))
+    for k in claimable:
+        claimable[k].sort()  # ascending sku_id
+
+    retyped = 0
+    inserted = 0
+    retype_log: list[tuple[str, str, str | None]] = []
+    for code, (name, group) in seed.items():
+        # (a) Re-type an existing article matched by NORMALISED name, claiming
+        #     the code + tagging sale_group='wip' (consistent with net-new rows),
+        #     while PRESERVING sku_id / item_group / uom / gst. The NOT EXISTS +
+        #     row lock make it safe to run concurrently (the loser updates 0 rows
+        #     and falls through to the idempotent insert).
+        match = claimable.get(name)
+        if match:
+            sku_id, prev_type = match[0]
+            status = await conn.execute(
+                """
+                UPDATE all_sku
+                   SET item_type = 'sfg', sfg_code = $1, sale_group = 'wip'
+                 WHERE sku_id = $2 AND sfg_code IS NULL
+                   AND NOT EXISTS (SELECT 1 FROM all_sku WHERE sfg_code = $1)
+                """,
+                code, sku_id,
+            )
+            if status.rsplit(" ", 1)[-1] != "0":  # robust vs 'UPDATE N'
+                retyped += 1
+                retype_log.append((code, name, prev_type))
+                claimable[name].pop(0)             # don't let another code re-claim it
+                continue
+
+        # (b) Insert the derived net-new SFG with an app-supplied 8-digit BIGINT
+        #     PK. new_short_time_id() is re-evaluated on every retry so a same-ms
+        #     sku_id collision resolves with a fresh id; ON CONFLICT (sfg_code)
+        #     DO NOTHING makes the sfg_code key concurrency-safe (a racing worker
+        #     that already inserted this code -> 0 rows, no aborting violation).
+        async def _insert_sfg(_code=code, _name=name, _group=group):
+            return await conn.fetchval(
+                """
+                INSERT INTO all_sku (sku_id, sfg_code, particulars, item_type, item_group, sale_group)
+                VALUES ($1, $2, $3, 'sfg', $4, 'wip')
+                ON CONFLICT (sfg_code) WHERE sfg_code IS NOT NULL DO NOTHING
+                RETURNING sku_id
+                """,
+                new_short_time_id(), _code, _name, _group,
+            )
+
+        new_id = await insert_with_pk_retry(conn, _insert_sfg, max_retries=5)
+        if new_id is not None:
+            inserted += 1
+
+    # Audit + drift check: which existing rows were reclassified, and whether the
+    # re-typed count matches the plug's own already_in_all_sku='Y' expectation.
+    if retype_log:
+        logger.info(
+            "SFG re-typed %d existing rows in place (sku_id preserved): %s",
+            len(retype_log),
+            ", ".join(f"{c}<-[{p}]{n[:32]}" for c, n, p in retype_log[:60]),
+        )
+    if retyped != retype_expected:
+        logger.warning(
+            "SFG re-type count %d != plug already_in_all_sku='Y' count %d — plug "
+            "flag drift (e.g. SFG0334 pre-exists as a sellable FG but is flagged "
+            "'N'); the matching article was reclassified to 'sfg'. Verify the catalogue.",
+            retyped, retype_expected,
+        )
+    logger.info(
+        "SFG catalogue ingest: %d inserted, %d re-typed (target %d)",
+        inserted, retyped, len(seed),
+    )
+    return {"status": "ok", "inserted": inserted, "retyped": retyped,
+            "target": len(seed)}
+
+
+# ---------------------------------------------------------------------------
+# 1c. Process-category classification (Slice 2)
+# ---------------------------------------------------------------------------
+# Canonical per-token classification, derived from ProcessCategory_to_Operation.csv.
+# The Process Category column is split on '+' into individual tokens (so the CSV's
+# combined rows like "Blending + Bar Forming" are decomposed here per token), and
+# real data carries "X (Bulk Packaging" artifacts (unbalanced paren from the
+# split) — both handled by matching on the LEADING token (text before '(').
+#
+# G2 LOCKED: Sorting = inline (never a buffered SFG stage); Packaging family =
+# terminal (produces the FG).
+
+STAGE_CREATE_WIP = "Create WIP"
+STAGE_FINAL_FG = "Final FG"
+STAGE_INLINE = "inline"
+
+# transform token -> practical operation (each produces / feeds an SFG)
+_TRANSFORM_OPS = {
+    "de-seeding": "De-Seeding",
+    "deseeding": "De-Seeding",
+    "blanching": "Blanch & Slice",
+    "slicing/dicing/slivering": "Blanch & Slice",
+    "slicing": "Blanch & Slice",
+    "dicing": "Blanch & Slice",
+    "slivering": "Blanch & Slice",
+    "blending": "Blend & Form",
+    "bar forming": "Blend & Form",
+    "roasting": "Roasting",            # -> "Roast & Flavour/Salt" if seasoning co-present
+    "flavouring": "Roast & Flavour/Salt",
+    "salting": "Roast & Flavour/Salt",
+    "stuffing": "Stuffing",
+    "enrobing": "Enrobe / Choco-Coat",
+    "chocolate": "Enrobe / Choco-Coat",
+    # Bar-line token (G4): a bar-line "Mixing" step is a Create-WIP transform —
+    # same op family as Blending (it blends/forms the bar mass), so it produces
+    # an SFG, not packaging.
+    "mixing": "Blend & Form",
+}
+_SEASONING_TOKENS = {"flavouring", "salting"}
+# terminal tokens (produce the FG). "flow" is the bar-line G4 standalone token =
+# flow-wrap abbreviated (terminal / Final-FG), distinct from the full "flow wrap".
+_TERMINAL_TOKENS = {
+    "packaging", "packing", "bulk packaging", "master carton", "mono carton", "monocarton",
+    "flow wrap", "flow", "krugger", "x-ray", "xray", "weighing",
+}
+# inline tokens (no buffered stage) — G2: sorting is inline
+_INLINE_TOKENS = {"sorting", "receiving"}
+
+
+def _canon_process_token(name: str) -> str:
+    """Leading canonical token: lowercased, trimmed, dropping a trailing
+    '(...' artifact left by the '+' split (e.g. 'Roasting (Bulk Packaging')."""
+    t = (name or "").strip().lower()
+    return t.split("(")[0].strip()
+
+
+def classify_route_steps(step_names: list[str]) -> list[dict]:
+    """Classify an FG's ORDERED process-route tokens into per-step
+    (practical_operation, stage_bucket, produces_sfg).
+
+    Combine rule (ground reality): if the step set has Roasting AND a seasoning
+    token, the Roasting step is labelled the combined 'Roast & Flavour/Salt'.
+    Unknown tokens are left unclassified (NULL) rather than guessed.
+    """
+    canon = [_canon_process_token(s) for s in step_names]
+    has_season = any(t in _SEASONING_TOKENS for t in canon)
+    out: list[dict] = []
+    for name, t in zip(step_names, canon):
+        if t in _TRANSFORM_OPS:
+            op = _TRANSFORM_OPS[t]
+            if t == "roasting" and has_season:
+                op = "Roast & Flavour/Salt"
+            out.append({"process_name": name, "practical_operation": op,
+                        "stage_bucket": STAGE_CREATE_WIP, "produces_sfg": True})
+        elif t in _TERMINAL_TOKENS:
+            out.append({"process_name": name, "practical_operation": "Packaging",
+                        "stage_bucket": STAGE_FINAL_FG, "produces_sfg": False})
+        elif t in _INLINE_TOKENS:
+            out.append({"process_name": name, "practical_operation": None,
+                        "stage_bucket": STAGE_INLINE, "produces_sfg": False})
+        else:
+            out.append({"process_name": name, "practical_operation": None,
+                        "stage_bucket": None, "produces_sfg": False})
+    return out
+
+
+async def ingest_process_category_rules(conn, file_path: Path | None = None,
+                                        *, full: bool = False) -> dict:
+    """Backfill bom_process_route.practical_operation + stage_bucket (Slice 2).
+
+    Re-entrant + idempotent: by default only re-classifies routes that have at
+    least one UNCLASSIFIED step (stage_bucket IS NULL), re-running each such
+    route's FULL ordered step set so the combine rule is correct when a step is
+    appended later (e.g. by sync_fg_master). Pass ``full=True`` to re-label every
+    route (used by the cold ingest). A no-op when nothing needs classifying.
+
+    Concurrency-safe: takes a transaction-scoped advisory lock so two startups
+    can't run it at once. MUST run inside an outer transaction.
+    """
+    await conn.execute("SELECT pg_advisory_xact_lock($1)", PROCESS_CLASS_LOCK)
+
+    if full:
+        rows = await conn.fetch(
+            "SELECT bom_id, step_number, process_name FROM bom_process_route "
+            "ORDER BY bom_id, step_number"
+        )
+    else:
+        # Only routes with an unclassified step — but fetch ALL their steps so the
+        # combine rule sees the full ordered set.
+        rows = await conn.fetch(
+            """
+            SELECT bom_id, step_number, process_name
+              FROM bom_process_route
+             WHERE bom_id IN (
+                   SELECT DISTINCT bom_id FROM bom_process_route WHERE stage_bucket IS NULL)
+             ORDER BY bom_id, step_number
+            """
+        )
+
+    by_bom: dict[int, list] = {}
+    for r in rows:
+        by_bom.setdefault(r["bom_id"], []).append(r)
+
+    params: list[tuple] = []
+    create_wip = 0
+    for bom_id, steps in by_bom.items():
+        cls = classify_route_steps([s["process_name"] for s in steps])
+        for s, c in zip(steps, cls):
+            params.append((c["practical_operation"], c["stage_bucket"], bom_id, s["step_number"]))
+            if c["stage_bucket"] == STAGE_CREATE_WIP:
+                create_wip += 1
+
+    if params:
+        await conn.executemany(
+            """
+            UPDATE bom_process_route
+               SET practical_operation = $1, stage_bucket = $2
+             WHERE bom_id = $3 AND step_number = $4
+            """,
+            params,
+        )
+
+    logger.info(
+        "Process-category classification: %d steps labelled (%d Create-WIP, %d routes)",
+        len(params), create_wip, len(by_bom),
+    )
+    return {"status": "ok", "steps_classified": len(params),
+            "create_wip_steps": create_wip, "routes": len(by_bom)}
+
+
+# ---------------------------------------------------------------------------
+# 1d. JC Routing → bom_process_route (the 2-stage chain + SFG seam, Slice 3)
+# ---------------------------------------------------------------------------
+
+def _route_stage_slug(s: str | None) -> str:
+    """Slugify an operation/label into a clean lowercase ``stage`` token —
+    alphanumeric runs joined by '_' ('Blend & Form' -> 'blend_form',
+    'Roast & Flavour/Salt' -> 'roast_flavour_salt'). Empty -> '' so the caller
+    can supply a fallback. Never yields a 'pack'-bearing token for a WIP op, so
+    a Create-WIP step is never mis-sorted as packing by order_steps_packing_last."""
+    return re.sub(r"[^a-z0-9]+", "_", (s or "").strip().lower()).strip("_")
+
+
+async def ingest_jc_routing(conn, file_path: Path | None = None,
+                            *, full: bool = False) -> dict:
+    """Load the authoritative 2-stage routing chain (JC_Routing_Plug.csv) into
+    bom_process_route, REPLACING each covered article's route with its 1-or-2
+    step chain and stamping the SFG seam columns (Slice 3).
+
+    Per plug article (resolved to a bom_id via bom_header on the NORMALISED name
+    + entity; falls back to name alone when unambiguous):
+      * 2-stage: step 1 = Create WIP (output_kind=SFG, output_code=SFG####),
+        step 2 = Final FG (input_kind=SFG, input_code=SFG####, output_kind=FG);
+      * pack-only: a single Final FG step (input RM / output FG).
+    The route is REPLACED, not merged: each step is upserted by
+    (bom_id, step_number) and any surplus steps left by the earlier
+    Process-Category split (step_number > the plug's step count) are deleted.
+    process_name <- stage_label; stage <- 'packing' for the terminal Final FG
+    step (so order_steps_packing_last keeps it last + EGA detection works) and a
+    slug of the WIP operation for a Create-WIP step. input_code/output_code are
+    nulled for non-SFG kinds (the plug writes 'RM'/'FG' into the code columns).
+
+    This supersedes ingest_fg_master's naive per-FG derivation for the 1085
+    plug-covered articles; articles NOT in the plug keep that derivation (then
+    get classified by ingest_process_category_rules) — so the non-routed path is
+    untouched.
+
+    Re-entrant + idempotent. full=True (cold ingest) processes every plug
+    article; full=False (warm path) skips articles whose route is already
+    seam-stamped (any step carries output_kind), so warm re-runs are cheap.
+    Concurrency-safe via a transaction-scoped advisory lock. MUST run inside an
+    outer transaction. Skips with a warning if the plug is absent.
+    """
+    path = Path(file_path) if file_path else JC_ROUTING_PLUG
+    if not path.exists():
+        logger.warning("JC routing ingest skipped — plug not found: %s", path)
+        return {"status": "file_not_found", "articles": 0, "steps": 0}
+
+    # Serialise concurrent loaders (cold-start storm / migrate overlap) — the
+    # DELETE-then-upsert replacement is not safe to interleave across txns.
+    await conn.execute("SELECT pg_advisory_xact_lock($1)", ROUTING_LOCK)
+
+    # ---- read + group the plug by (normalised article, entity) ----
+    with path.open(newline="", encoding="utf-8-sig") as fh:
+        plug_rows = list(csv.DictReader(fh))
+
+    by_art: dict[tuple[str, str | None], list[dict]] = {}
+    for r in plug_rows:
+        art = normalise_key(r.get("article"))
+        if not art:
+            continue
+        entity = (_safe_str(r.get("entity")) or "").lower() or None
+        by_art.setdefault((art, entity), []).append(r)
+
+    # ---- resolve article -> bom_id via the generic (customer_name IS NULL)
+    #      bom_header rows (matching ingest_fg_master's keying) ----
+    headers = await conn.fetch(
+        "SELECT bom_id, fg_sku_name, entity FROM bom_header WHERE customer_name IS NULL"
+    )
+    by_name_entity: dict[tuple[str, str | None], int] = {}
+    by_name: dict[str, int] = {}
+    name_dupe: set[str] = set()
+    entity_dupe: set[tuple[str, str | None]] = set()
+    for h in headers:
+        nk = normalise_key(h["fg_sku_name"])
+        if not nk:
+            continue
+        ent = (_safe_str(h["entity"]) or "").lower() or None
+        key = (nk, ent)
+        # Detect a same-(name,entity) collision on the PRIMARY lookup too — not
+        # just the by_name fallback — so a duplicate generic bom_header never
+        # silently routes the plug to an arbitrary bom_id (there is no unique
+        # constraint on bom_header(fg_sku_name, entity)).
+        if key in by_name_entity and by_name_entity[key] != h["bom_id"]:
+            entity_dupe.add(key)
+        by_name_entity[key] = h["bom_id"]
+        if nk in by_name and by_name[nk] != h["bom_id"]:
+            name_dupe.add(nk)
+        by_name[nk] = h["bom_id"]
+
+    # ---- warm-path scope: bom_ids whose route is already seam-stamped ----
+    stamped: set[int] = set()
+    if not full:
+        rows = await conn.fetch(
+            "SELECT DISTINCT bom_id FROM bom_process_route WHERE output_kind IS NOT NULL"
+        )
+        stamped = {r["bom_id"] for r in rows}
+
+    articles = 0
+    steps_written = 0
+    two_stage = 0
+    unresolved = 0
+    ambiguous = 0
+    skipped_stamped = 0
+
+    for (art, entity), rows in by_art.items():
+        if (art, entity) in entity_dupe:
+            # Ambiguous: >1 generic bom_header with this exact (name, entity).
+            # Refuse to guess — skip + warn rather than route to an arbitrary one.
+            ambiguous += 1
+            logger.warning("JC routing: ambiguous (name=%r, entity=%r) -> multiple "
+                           "bom_header rows; route skipped", art, entity)
+            continue
+        bom_id = by_name_entity.get((art, entity))
+        if bom_id is None and art not in name_dupe:
+            # entity mismatch (e.g. bom_header.entity NULL) — resolve by name
+            # alone, but only when that name is unambiguous across entities.
+            bom_id = by_name.get(art)
+        if bom_id is None:
+            unresolved += 1
+            continue
+        if not full and bom_id in stamped:
+            skipped_stamped += 1
+            continue
+
+        steps = sorted(rows, key=lambda r: _safe_int(r.get("stage_seq")) or 0)
+        step_nums = [n for n in (_safe_int(r.get("stage_seq")) for r in steps) if n and n >= 1]
+        if not step_nums:
+            unresolved += 1
+            continue
+        max_step = max(step_nums)
+
+        # Replace: drop every route step NOT in the plug's authoritative step
+        # set (not just the tail). `> max_step` would orphan a stale middle step
+        # if the plug ever has a gap (e.g. [1,3]); matching the exact set is gap-
+        # safe. The plug is contiguous 1..N today, so this is defensive.
+        await conn.execute(
+            "DELETE FROM bom_process_route WHERE bom_id=$1 AND step_number <> ALL($2::int[])",
+            bom_id, step_nums,
+        )
+        for r in steps:
+            step_no = _safe_int(r.get("stage_seq")) or 0
+            if step_no < 1:
+                continue
+            # Canonicalise the bucket so an NBSP/case variant in the plug can't
+            # slip the terminal-step detection (mirrors the normalise_key care on
+            # the article-name join). 'final fg' -> 'Final FG', 'create wip' ->
+            # 'Create WIP'; anything else is stored as-cleaned.
+            bucket_raw = _safe_str(r.get("stage_bucket"))
+            bucket_norm = (normalise_key(bucket_raw) or "").casefold()
+            is_final = bucket_norm == "final fg"
+            stage_bucket = ("Final FG" if is_final
+                            else "Create WIP" if bucket_norm == "create wip"
+                            else bucket_raw)
+            label = _safe_str(r.get("stage_label")) or stage_bucket or f"Step {step_no}"
+            wip_op = _safe_str(r.get("create_wip_operation"))
+            input_kind = _safe_str(r.get("input_kind"))
+            output_kind = _safe_str(r.get("output_kind"))
+            input_code = _safe_str(r.get("input_code"))
+            output_code = _safe_str(r.get("output_code"))
+            # The code columns are only meaningful for SFG kinds; the plug writes
+            # the literal 'RM'/'FG' into them for non-SFG rows — null those out.
+            if (input_kind or "").upper() != "SFG":
+                input_code = None
+            if (output_kind or "").upper() != "SFG":
+                output_code = None
+            stage = ("packing" if is_final
+                     else (_route_stage_slug(wip_op) or "create_wip"))
+            await conn.execute(
+                """
+                INSERT INTO bom_process_route (
+                    bom_id, step_number, process_name, stage,
+                    practical_operation, stage_bucket,
+                    input_kind, output_kind, input_code, output_code
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                ON CONFLICT (bom_id, step_number) DO UPDATE SET
+                    process_name        = EXCLUDED.process_name,
+                    stage               = EXCLUDED.stage,
+                    practical_operation = EXCLUDED.practical_operation,
+                    stage_bucket        = EXCLUDED.stage_bucket,
+                    input_kind          = EXCLUDED.input_kind,
+                    output_kind         = EXCLUDED.output_kind,
+                    input_code          = EXCLUDED.input_code,
+                    output_code         = EXCLUDED.output_code
+                """,
+                bom_id, step_no, label, stage,
+                wip_op, stage_bucket,
+                input_kind, output_kind, input_code, output_code,
+            )
+            steps_written += 1
+        articles += 1
+        if max_step >= 2:
+            two_stage += 1
+
+    logger.info(
+        "JC routing: %d articles routed (%d two-stage), %d steps written "
+        "(%d unresolved, %d ambiguous, %d already-stamped)",
+        articles, two_stage, steps_written, unresolved, ambiguous, skipped_stamped,
+    )
+    return {"status": "ok", "articles": articles, "two_stage": two_stage,
+            "ambiguous": ambiguous,
+            "steps": steps_written, "unresolved": unresolved,
+            "skipped_stamped": skipped_stamped}
+
+
+# ---------------------------------------------------------------------------
+# 1e. JC BOM → bom_line SFG inputs (Slice 4, gate G1 = Option B)
+# ---------------------------------------------------------------------------
+
+async def ingest_jc_bom(conn, file_path: Path | None = None) -> dict:
+    """Load the SFG consumption lines (JC_BOM_Plug.csv, item_type='sfg') into
+    bom_line so a Stage-2 / pack-of-existing-SFG card consumes the SFG as a real
+    BOM input (Slice 4, gate G1 Option B).
+
+    The plug has 5017 lines (rm2784/pm1759/fg373/sfg101). The RM/PM/FG lines
+    already exist in bom_line via ingest_bom_lines (BOM_Enrichment.xlsx) — we do
+    NOT re-load them (that would duplicate). Only the **101 net-new sfg lines**
+    are inserted here, each:
+      * resolved to the parent FG's bom_id via bom_header on the NORMALISED
+        parent_article name (customer_name IS NULL; skipped when ambiguous),
+      * material_sku_name = the SFG#### code (so consumption / WIP inventory /
+        the chain seam all key on the same code),
+      * item_type='sfg', quantity_per_unit = bom_qty, consumed_at_stage from the
+        plug ('Final FG (opening RM)'), appended at MAX(line_number)+1.
+
+    Idempotent: skips any (bom_id, SFG####) sfg line already present (one upfront
+    query), so cold and warm re-runs converge. MUST run inside an outer
+    transaction. Skips with a warning if the plug is absent.  (dep: 050
+    consumed_at_stage column, Slice-1 catalogue, Slice-3 routing for bom_header)
+    """
+    path = Path(file_path) if file_path else JC_BOM_PLUG
+    if not path.exists():
+        logger.warning("JC BOM ingest skipped — plug not found: %s", path)
+        return {"status": "file_not_found", "sfg_lines": 0}
+
+    with path.open(newline="", encoding="utf-8-sig") as fh:
+        plug_rows = list(csv.DictReader(fh))
+
+    # Parsed-count audit (acceptance: rm2784/pm1759/fg373/sfg101).
+    counts: dict[str, int] = {}
+    sfg_rows: list[dict] = []
+    for r in plug_rows:
+        it = (_safe_str(r.get("item_type")) or "").lower()
+        counts[it] = counts.get(it, 0) + 1
+        if it == "sfg":
+            sfg_rows.append(r)
+
+    # Resolve parent_article -> bom_id via generic bom_header (name only — the
+    # plug carries no entity column). Ambiguous normalised names are skipped.
+    headers = await conn.fetch(
+        "SELECT bom_id, fg_sku_name FROM bom_header WHERE customer_name IS NULL"
+    )
+    by_name: dict[str, int] = {}
+    name_dupe: set[str] = set()
+    for h in headers:
+        nk = normalise_key(h["fg_sku_name"])
+        if not nk:
+            continue
+        if nk in by_name and by_name[nk] != h["bom_id"]:
+            name_dupe.add(nk)
+        by_name[nk] = h["bom_id"]
+
+    # Per-bom next line_number (append after the existing RM/PM lines), and the
+    # set of (bom_id, SFG####) sfg lines already loaded (idempotency).
+    existing = await conn.fetch(
+        "SELECT bom_id, line_number, item_type, material_sku_name FROM bom_line"
+    )
+    max_line: dict[int, int] = {}
+    have_sfg: set[tuple[int, str]] = set()
+    for e in existing:
+        max_line[e["bom_id"]] = max(max_line.get(e["bom_id"], 0), e["line_number"] or 0)
+        if (e["item_type"] or "").lower() == "sfg":
+            have_sfg.add((e["bom_id"], e["material_sku_name"]))
+
+    inserted = 0
+    unresolved = 0
+    ambiguous = 0
+    skipped_existing = 0
+    seen_in_run: set[tuple[int, str]] = set()
+
+    for r in sfg_rows:
+        art = normalise_key(r.get("parent_article"))
+        code = _safe_str(r.get("sfg_code"))
+        if not art or not code:
+            unresolved += 1
+            continue
+        if art in name_dupe:
+            ambiguous += 1
+            logger.warning("JC BOM: ambiguous parent_article %r -> multiple "
+                           "bom_header rows; sfg line skipped", art)
+            continue
+        bom_id = by_name.get(art)
+        if bom_id is None:
+            unresolved += 1
+            continue
+        key = (bom_id, code)
+        if key in have_sfg or key in seen_in_run:
+            skipped_existing += 1
+            continue
+        seen_in_run.add(key)
+        line_no = max_line.get(bom_id, 0) + 1
+        max_line[bom_id] = line_no
+        await conn.execute(
+            """
+            INSERT INTO bom_line (
+                bom_id, line_number, material_sku_name, item_type,
+                quantity_per_unit, uom, loss_pct, godown, consumed_at_stage
+            ) VALUES ($1, $2, $3, 'sfg', $4, $5, 0, $6, $7)
+            ON CONFLICT (bom_id, line_number) DO NOTHING
+            """,
+            bom_id, line_no, code,
+            _safe_float(r.get("bom_qty")) or 0,
+            "kg", _safe_str(r.get("godown")),
+            _safe_str(r.get("consumed_at_stage")) or "Final FG (opening RM)",
+        )
+        inserted += 1
+
+    logger.info(
+        "JC BOM: parsed %s; inserted %d sfg lines (%d unresolved, %d ambiguous, "
+        "%d already-present)",
+        counts, inserted, unresolved, ambiguous, skipped_existing,
+    )
+    return {"status": "ok", "parsed_counts": counts, "sfg_lines": inserted,
+            "unresolved": unresolved, "ambiguous": ambiguous,
+            "skipped_existing": skipped_existing}
 
 
 # ---------------------------------------------------------------------------
@@ -568,6 +1235,198 @@ async def ingest_stock(conn, data_dir: Path) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 056 enrichment / reconciliation loaders (the 4 companion plug files).
+# Each self-guards on a missing table (to_regclass) so a half-migrated DB skips
+# with a warning instead of erroring, mirroring ingest_sfg_master's column guard.
+# All are idempotent (ON CONFLICT DO UPDATE) and re-entrant.
+# ---------------------------------------------------------------------------
+
+async def _table_exists(conn, name: str) -> bool:
+    return await conn.fetchval("SELECT to_regclass($1)", name) is not None
+
+
+async def ingest_sfg_attributes(conn, file_path: Path | None = None) -> dict:
+    """Load the rich SFG attributes (JC_Stage1_Create_WIP_Master.csv) into
+    sfg_attributes. base_recipe / create_wip_operation / sfg_origin / item_group /
+    consumed_by_fgs_count only — suggested_shelf_life_days is intentionally NOT
+    ingested (WIP carries no shelf life). Keyed on sfg_code (1:1 with all_sku).
+    Idempotent; safe to re-run."""
+    path = Path(file_path) if file_path else JC_STAGE1_MASTER
+    if not path.exists():
+        logger.warning("SFG attributes ingest skipped — file not found: %s", path)
+        return {"status": "file_not_found", "rows": 0}
+    if not await _table_exists(conn, "sfg_attributes"):
+        logger.warning("SFG attributes ingest skipped — sfg_attributes table missing (run 056)")
+        return {"status": "schema_missing", "rows": 0}
+
+    rows = 0
+    with path.open(encoding="utf-8-sig", newline="") as fh:
+        for r in csv.DictReader(fh):
+            code = normalise_key(r.get("sfg_code"))
+            if not code:
+                continue
+            # va_article / primary_bu (GAP B): present only in the absent
+            # SFG_WIP_Item_List_FINAL source — .get() yields None for the current
+            # plug, so the columns stay NULL until that file is dropped in.
+            await conn.execute(
+                """
+                INSERT INTO sfg_attributes
+                    (sfg_code, base_recipe, create_wip_operation, sfg_origin,
+                     item_group, consumed_by_fgs_count, va_article, primary_bu)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                ON CONFLICT (sfg_code) DO UPDATE SET
+                    base_recipe           = EXCLUDED.base_recipe,
+                    create_wip_operation  = EXCLUDED.create_wip_operation,
+                    sfg_origin            = EXCLUDED.sfg_origin,
+                    item_group            = EXCLUDED.item_group,
+                    consumed_by_fgs_count = EXCLUDED.consumed_by_fgs_count,
+                    va_article            = COALESCE(EXCLUDED.va_article, sfg_attributes.va_article),
+                    primary_bu            = COALESCE(EXCLUDED.primary_bu, sfg_attributes.primary_bu)
+                """,
+                code,
+                _safe_str(r.get("base_recipe")),
+                _safe_str(r.get("create_wip_operation")),
+                _safe_str(r.get("sfg_origin")),
+                _safe_str(r.get("item_group")),
+                _safe_int(r.get("consumed_by_fgs_count")),
+                _safe_str(r.get("va_article")),
+                _safe_str(r.get("primary_bu")),
+            )
+            rows += 1
+    logger.info("SFG attributes ingest: %d rows upserted", rows)
+    return {"status": "ok", "rows": rows}
+
+
+async def ingest_stage_catalog(conn, file_path: Path | None = None) -> dict:
+    """Load the §6 token->operation map (ProcessCategory_to_Operation.csv) into
+    stage_catalog. The token string is the key. produces_sfg 'Y'->TRUE.
+    Reference config (the route classifier transcribes the same 9 rules)."""
+    path = Path(file_path) if file_path else PROCESS_CATEGORY_MAP
+    if not path.exists():
+        logger.warning("Stage catalog ingest skipped — file not found: %s", path)
+        return {"status": "file_not_found", "rows": 0}
+    if not await _table_exists(conn, "stage_catalog"):
+        logger.warning("Stage catalog ingest skipped — stage_catalog table missing (run 056)")
+        return {"status": "schema_missing", "rows": 0}
+
+    rows = 0
+    with path.open(encoding="utf-8-sig", newline="") as fh:
+        for r in csv.DictReader(fh):
+            token = _safe_str(r.get("process_category_token(s)"))
+            if not token:
+                continue
+            produces = (normalise_key(r.get("produces_sfg")).upper() == "Y")
+            await conn.execute(
+                """
+                INSERT INTO stage_catalog
+                    (process_category_tokens, practical_operation, stage_bucket,
+                     produces_sfg, note)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (process_category_tokens) DO UPDATE SET
+                    practical_operation = EXCLUDED.practical_operation,
+                    stage_bucket        = EXCLUDED.stage_bucket,
+                    produces_sfg        = EXCLUDED.produces_sfg,
+                    note                = EXCLUDED.note
+                """,
+                token,
+                _safe_str(r.get("practical_operation")),
+                _safe_str(r.get("stage_bucket")),
+                produces,
+                _safe_str(r.get("note")),
+            )
+            rows += 1
+    logger.info("Stage catalog ingest: %d rules upserted", rows)
+    return {"status": "ok", "rows": rows}
+
+
+async def ingest_fg_sfg_input_map(conn, file_path: Path | None = None) -> dict:
+    """Load the FG->stage-2-input map (JC_Stage2_Final_FG_Packing.csv) into
+    fg_sfg_input_map (all 1085 FGs, incl. pack-only input_code='RM'). Idempotent
+    on (fg_name, input_code)."""
+    path = Path(file_path) if file_path else JC_STAGE2_PACKING
+    if not path.exists():
+        logger.warning("FG->SFG input map ingest skipped — file not found: %s", path)
+        return {"status": "file_not_found", "rows": 0}
+    if not await _table_exists(conn, "fg_sfg_input_map"):
+        logger.warning("FG->SFG input map ingest skipped — fg_sfg_input_map table missing (run 056)")
+        return {"status": "schema_missing", "rows": 0}
+
+    rows = 0
+    with path.open(encoding="utf-8-sig", newline="") as fh:
+        for r in csv.DictReader(fh):
+            fg = _safe_str(r.get("fg_name"))
+            code = _safe_str(r.get("input_code"))
+            if not fg or not code:
+                continue
+            await conn.execute(
+                """
+                INSERT INTO fg_sfg_input_map
+                    (fg_name, cycle_archetype, final_stage_label, input_code,
+                     input_sfg_article, input_kind)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (fg_name, input_code) DO UPDATE SET
+                    cycle_archetype   = EXCLUDED.cycle_archetype,
+                    final_stage_label = EXCLUDED.final_stage_label,
+                    input_sfg_article = EXCLUDED.input_sfg_article,
+                    input_kind        = EXCLUDED.input_kind
+                """,
+                fg,
+                _safe_str(r.get("cycle_archetype")),
+                _safe_str(r.get("final_stage_label")),
+                code,
+                _safe_str(r.get("input_sfg_article")),
+                _safe_str(r.get("input_kind")),
+            )
+            rows += 1
+    logger.info("FG->SFG input map ingest: %d rows upserted", rows)
+    return {"status": "ok", "rows": rows}
+
+
+async def ingest_sfg_resolution_map(conn, file_path: Path | None = None) -> dict:
+    """Load the dedup provenance (SFG_Resolution_Map.csv) into sfg_resolution_map.
+    Idempotent on (sfg_code, fg_sample)."""
+    path = Path(file_path) if file_path else SFG_RESOLUTION_MAP
+    if not path.exists():
+        logger.warning("SFG resolution map ingest skipped — file not found: %s", path)
+        return {"status": "file_not_found", "rows": 0}
+    if not await _table_exists(conn, "sfg_resolution_map"):
+        logger.warning("SFG resolution map ingest skipped — sfg_resolution_map table missing (run 056)")
+        return {"status": "schema_missing", "rows": 0}
+
+    rows = 0
+    with path.open(encoding="utf-8-sig", newline="") as fh:
+        for r in csv.DictReader(fh):
+            code = normalise_key(r.get("sfg_code"))
+            fg = _safe_str(r.get("fg_sample"))
+            if not code or not fg:
+                continue
+            await conn.execute(
+                """
+                INSERT INTO sfg_resolution_map
+                    (sfg_code, fg_sample, base_recipe, create_wip_operation,
+                     sfg_origin, sfg_article, num_fgs)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                ON CONFLICT (sfg_code, fg_sample) DO UPDATE SET
+                    base_recipe          = EXCLUDED.base_recipe,
+                    create_wip_operation = EXCLUDED.create_wip_operation,
+                    sfg_origin           = EXCLUDED.sfg_origin,
+                    sfg_article          = EXCLUDED.sfg_article,
+                    num_fgs              = EXCLUDED.num_fgs
+                """,
+                code,
+                fg,
+                _safe_str(r.get("base_recipe")),
+                _safe_str(r.get("create_wip_operation")),
+                _safe_str(r.get("sfg_origin")),
+                _safe_str(r.get("sfg_article")),
+                _safe_int(r.get("num_fgs")),
+            )
+            rows += 1
+    logger.info("SFG resolution map ingest: %d rows upserted", rows)
+    return {"status": "ok", "rows": rows}
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 
@@ -596,6 +1455,59 @@ async def run_master_ingest(pool, data_dir: Path, master_items: list) -> dict | 
         else:
             logger.info("Master data already ingested (%d headers, %d capacity, %d stock), skipping",
                          count, cap_count, stock_count)
+
+        # Check if the SFG catalogue needs backfill (Slice 1). Self-guards on a
+        # missing sfg_code column and on an already-loaded catalogue.
+        sfg_count = await pool.fetchval(
+            "SELECT COUNT(*) FROM all_sku WHERE item_type = 'sfg'"
+        )
+        if not sfg_count:
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    sfg_result = await ingest_sfg_master(conn)
+                logger.info("Backfilled SFG catalogue: %s", sfg_result)
+
+        # Slice 3: load the 2-stage routing + SFG seam for any not-yet-stamped
+        # plug article (re-entrant — skips articles whose route already carries an
+        # output_kind). Runs BEFORE classification so the plug's authoritative
+        # stage_bucket isn't re-derived from the soon-to-be-replaced process_name.
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                routing_result = await ingest_jc_routing(conn)
+        if routing_result.get("steps"):
+            logger.info("Backfilled JC routing: %s", routing_result)
+
+        # Slice 4 (gate G1 = Option B): backfill the 101 sfg consumption bom_lines.
+        # Idempotent (skips (bom_id, SFG####) lines already present), so this is a
+        # cheap no-op once loaded. Needs bom_header (present on the warm path).
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                jc_bom_result = await ingest_jc_bom(conn)
+        if jc_bom_result.get("sfg_lines"):
+            logger.info("Backfilled JC BOM (sfg lines): %s", jc_bom_result)
+
+        # Classify any UNCLASSIFIED routes (Slice 2). Re-entrant + idempotent —
+        # cheap no-op when every route is already labelled, but catches routes
+        # added/changed by a later sync_fg_master run (the function scopes itself
+        # to routes with a NULL stage_bucket step). The plug routes above are now
+        # stamped, so this only touches non-routed articles.
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                cls_result = await ingest_process_category_rules(conn)
+        if cls_result["steps_classified"]:
+            logger.info("Backfilled process classification: %s", cls_result)
+
+        # 056: the 4 companion plug files (rich SFG attrs, §6 stage catalog,
+        # FG->input reconciliation, dedup provenance). Each self-guards on a
+        # missing table + is idempotent, so this is a cheap no-op once loaded.
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                attrs_result = await ingest_sfg_attributes(conn)
+                stage_cat_result = await ingest_stage_catalog(conn)
+                input_map_result = await ingest_fg_sfg_input_map(conn)
+                resolution_result = await ingest_sfg_resolution_map(conn)
+        logger.info("Backfilled SFG companion data: attrs=%s stage_catalog=%s input_map=%s resolution=%s",
+                    attrs_result, stage_cat_result, input_map_result, resolution_result)
         return None
 
     fg_file = data_dir / "FG_Master_Completion.xlsx"
@@ -609,17 +1521,36 @@ async def run_master_ingest(pool, data_dir: Path, master_items: list) -> dict | 
 
     async with pool.acquire() as conn:
         async with conn.transaction():
+            # SFG catalogue first so the codes exist before any later routing
+            # build references them (Slice 3+); independent of FG/BOM for Slice 1.
+            sfg_result = await ingest_sfg_master(conn)
             header_map = await ingest_fg_master(conn, fg_file, master_items)
             bom_result = await ingest_bom_lines(conn, bom_file, header_map, master_items)
             machine_result = await ingest_machines(conn, machine_file)
             capacity_result = await derive_machine_capacity(conn, fg_file)
             stock_result = await ingest_stock(conn, data_dir)
+            # Slice 2: classify the freshly-built routes (practical op + stage bucket).
+            await ingest_process_category_rules(conn, full=True)
+            # Slice 3: load the authoritative 2-stage routing + SFG seam, REPLACING
+            # the naive Process-Category routes for the plug-covered articles. Runs
+            # last so the plug has the final word over the classifier.
+            routing_result = await ingest_jc_routing(conn, full=True)
+            # Slice 4 (gate G1 = Option B): the 101 sfg consumption bom_lines so a
+            # Stage-2 / pack-of-existing-SFG card consumes the SFG as a BOM input.
+            jc_bom_result = await ingest_jc_bom(conn)
+            # 056: rich SFG attributes + §6 stage catalog + FG->input reconciliation
+            # + dedup provenance (the 4 companion plug files). Idempotent.
+            await ingest_sfg_attributes(conn)
+            await ingest_stage_catalog(conn)
+            await ingest_fg_sfg_input_map(conn)
+            await ingest_sfg_resolution_map(conn)
 
     logger.info(
-        "Master data ingest complete: %d headers, %d BOM lines, %d machines, %d capacity, %d stock entries",
+        "Master data ingest complete: %d headers, %d BOM lines, %d machines, "
+        "%d capacity, %d stock entries, SFG %s, routing %s, jc_bom %s",
         len(header_map), bom_result["lines_created"],
         machine_result["machines_created"], capacity_result["capacity_created"],
-        stock_result["inserted"],
+        stock_result["inserted"], sfg_result, routing_result, jc_bom_result,
     )
     return {
         "headers": len(header_map),
@@ -627,4 +1558,7 @@ async def run_master_ingest(pool, data_dir: Path, master_items: list) -> dict | 
         "machines": machine_result["machines_created"],
         "capacity_entries": capacity_result["capacity_created"],
         "stock_entries": stock_result["inserted"],
+        "sfg": sfg_result,
+        "routing": routing_result,
+        "jc_bom": jc_bom_result,
     }

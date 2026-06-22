@@ -83,17 +83,41 @@ async def run_mrp(conn, plan_id: int, entity: str) -> dict:
 
             final_need = gross_req - offgrade_use
 
-            # 3. On-hand stock (single ledger: inventory_batch)
-            on_hand = await conn.fetchval(
-                """
-                SELECT COALESCE(SUM(current_qty_kg), 0) FROM inventory_batch
-                WHERE sku_name ILIKE $1
-                  AND status = 'AVAILABLE'
-                  AND current_qty_kg > 0
-                  AND entity = $2
-                """,
-                f"%{material_sku}%", entity,
-            )
+            # 3. On-hand stock (single ledger: inventory_batch).
+            #    Slice 4 (gate G1 = Option B): an SFG bom_line's on-hand is the
+            #    materialised WIP stock — inventory_batch rows with item_type='wip'
+            #    keyed on the SFG#### code (Slice 5 close_batch writes these). The
+            #    extra item_type filter stops a like-named RM/FG batch from being
+            #    miscounted as SFG availability. RM/PM keep the unfiltered lookup
+            #    (their inventory carries assorted/NULL item_type values).
+            if (item_type or "").strip().lower() == "sfg":
+                # Key on the canonical inventory_batch.sfg_code (PT1/057) — exact
+                # SFG#### match, no substring over-match (SFG001 ⊂ SFG0012);
+                # expired WIP excluded (G3 strict). The bom_line's material_sku_name
+                # for an sfg line IS the SFG#### code (ingest_jc_bom).
+                on_hand = await conn.fetchval(
+                    """
+                    SELECT COALESCE(SUM(current_qty_kg), 0) FROM inventory_batch
+                    WHERE sfg_code = $1
+                      AND item_type = 'wip'
+                      AND status = 'AVAILABLE'
+                      AND current_qty_kg > 0
+                      AND (expiry_date IS NULL OR expiry_date >= CURRENT_DATE)
+                      AND entity = $2
+                    """,
+                    material_sku, entity,
+                )
+            else:
+                on_hand = await conn.fetchval(
+                    """
+                    SELECT COALESCE(SUM(current_qty_kg), 0) FROM inventory_batch
+                    WHERE sku_name ILIKE $1
+                      AND status = 'AVAILABLE'
+                      AND current_qty_kg > 0
+                      AND entity = $2
+                    """,
+                    f"%{material_sku}%", entity,
+                )
             on_hand = float(on_hand or 0)
 
             # 4. On-order (pending POs)

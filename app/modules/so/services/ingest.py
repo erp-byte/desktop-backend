@@ -270,7 +270,7 @@ async def ingest_sales_register(
                             so_number, so_date, customer_name, common_customer_name,
                             company, voucher_type, extraction_status
                         )
-                        VALUES ($1, $2, $3, $4, $5, $6, 'extracted'::e_extraction_status)
+                        VALUES ($1, $2, $3, $4, $5, $6, 'extracted')
                         RETURNING so_id
                         """,
                         so_number,
@@ -327,7 +327,7 @@ async def ingest_sales_register(
                                     $15, $16, $17, $18,
                                     $19, $20,
                                     $21, $22, $23,
-                                    $24, $25, 'pending'::e_so_line_status, $26
+                                    $24, $25, 'pending', $26
                                 )
                                 RETURNING so_line_id
                                 """,
@@ -561,7 +561,7 @@ async def ingest_manual_so(
                     so_number, so_date, customer_name, common_customer_name,
                     company, voucher_type, extraction_status
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, 'extracted'::e_extraction_status)
+                VALUES ($1, $2, $3, $4, $5, $6, 'extracted')
                 RETURNING so_id
                 """,
                 so_number,
@@ -609,7 +609,7 @@ async def ingest_manual_so(
                             $15, $16, $17, $18,
                             $19, $20,
                             $21, $22, $23,
-                            $24, $25, 'pending'::e_so_line_status, $26
+                            $24, $25, 'pending', $26
                         )
                         RETURNING so_line_id
                         """,
@@ -861,7 +861,7 @@ async def ingest_so_book(
                         so_number, so_date, customer_name, common_customer_name,
                         company, voucher_type, extraction_status
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6, 'extracted'::e_extraction_status)
+                    VALUES ($1, $2, $3, $4, $5, $6, 'extracted')
                     RETURNING so_id
                     """,
                     so["so_number"],
@@ -922,7 +922,7 @@ async def ingest_so_book(
                                 $15, $16, $17, $18,
                                 $19, $20,
                                 $21, $22, $23,
-                                $24, $25, 'pending'::e_so_line_status, $26
+                                $24, $25, 'pending', $26
                             )
                             RETURNING so_line_id
                             """,

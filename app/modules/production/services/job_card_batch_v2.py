@@ -267,7 +267,8 @@ async def close_batch(conn, *, batch_id: int,
     jc = await conn.fetchrow(
         """
         SELECT job_card_id, next_job_card_id, output_kind, uom,
-               dispatched_to_next_kg
+               dispatched_to_next_kg,
+               entity, output_code, fg_sku_name
         FROM   job_card_v2
         WHERE  job_card_id=$1 AND deleted_at IS NULL
         FOR    UPDATE
@@ -389,6 +390,7 @@ async def close_batch(conn, *, batch_id: int,
 
     dispatch_row = None
     downstream_unlocked = False
+    wip_batch_id = None  # Slice 5: set when the dispatch materialises WIP stock
     if jc["next_job_card_id"] is not None and effective_dispatch > 0:
         # Units mirror the qty ratio so downstream sees a coherent
         # pair (qty_kg, qty_units).  When the operator splits the
@@ -458,12 +460,29 @@ async def close_batch(conn, *, batch_id: int,
         # asyncpg returns 'UPDATE <count>' - we just need the boolean.
         downstream_unlocked = "UPDATE 0" not in (unlock_result or "")
 
+        # Slice 5: materialise the dispatched SFG once per dispatch — a WIP
+        # inventory_batch + a synthetic SFG consumption on the consumer +
+        # a floor_movement. Only for a Create-WIP producer (output_kind SFG/WIP);
+        # a terminal FG stage has next_job_card_id NULL so never reaches here.
+        if (resolved_output_kind or "").upper() in ('SFG', 'WIP'):
+            from app.modules.production.services.job_card_v2 import materialise_wip_dispatch
+            wip_batch_id = await materialise_wip_dispatch(
+                conn,
+                producer_job_card_id=resolved_jc_id,
+                consumer_job_card_id=jc["next_job_card_id"],
+                sfg_code=jc["output_code"], fg_sku_name=jc["fg_sku_name"],
+                qty_kg=effective_dispatch,
+                dispatch_id=dispatch_row["dispatch_id"] if dispatch_row else None,
+                entity=jc["entity"], recorded_by=closed_by,
+            )
+
     return {
         "closed":              True,
         "batch":               _serialize(updated_batch),
         "output":              _serialize(output_row),
         "dispatch":            _serialize(dispatch_row) if dispatch_row else None,
         "downstream_unlocked": downstream_unlocked,
+        "wip_batch_id":        wip_batch_id,
     }
 
 

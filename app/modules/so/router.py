@@ -1,5 +1,6 @@
 import logging
 import math
+import time
 from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, UploadFile, File
@@ -231,6 +232,7 @@ def _build_where_clause(
     search, status, company, voucher_type, customer_name, common_customer_name,
     date_from, date_to, item_category, sub_category, uom, grp_code,
     rate_type, item_type, sales_group, match_source, line_status,
+    article=None, so_number=None,
 ) -> tuple[str, list]:
     """Build a WHERE clause and params list from filter values."""
     conditions = []
@@ -250,6 +252,7 @@ def _build_where_clause(
 
     # Header-level filters: comma-separated → OR within field, AND across fields
     for col, val in [
+        ("h.so_number", so_number),
         ("h.company", company),
         ("h.voucher_type", voucher_type),
         ("h.customer_name", customer_name),
@@ -295,7 +298,10 @@ def _build_where_clause(
             conditions.append(f"h.so_date <= ${param_idx}")
             params.append(d2)
 
-    # Line-level filters: keep SOs that have at least one line matching
+    # Line-level filters: keep SOs that have at least one line matching.
+    # `sku_name` (the article) is an exact-value IN match — the multi-select
+    # on the listing toolbar feeds it from the distinct-sku_name option list,
+    # mirroring the planning page's "All Articles" filter.
     line_filters = {
         "item_category": item_category,
         "sub_category": sub_category,
@@ -306,6 +312,7 @@ def _build_where_clause(
         "sales_group": sales_group,
         "match_source": match_source,
         "status": line_status,
+        "sku_name": article,
     }
     for col, val in line_filters.items():
         if val:
@@ -338,6 +345,37 @@ def _build_where_clause(
 
     where_clause = (" AND ".join(conditions)) if conditions else "TRUE"
     return where_clause, params
+
+
+# Derived per-SO GST status priority for `sort_by=gst_status`. The status is
+# not a stored column — it's the worst recon outcome across the SO's lines —
+# so we rank mismatch < warning < ok (0/1/2). The frontend's Date-column sort
+# cycle requests this; with sort_order=asc the most actionable SOs (mismatch)
+# surface first. Static SQL (no user input), safe to interpolate.
+_GST_STATUS_ORDER = (
+    "(CASE"
+    " WHEN EXISTS (SELECT 1 FROM so_gst_reconciliation g WHERE g.so_id = h.so_id AND g.status = 'mismatch') THEN 0"
+    " WHEN EXISTS (SELECT 1 FROM so_gst_reconciliation g WHERE g.so_id = h.so_id AND g.status = 'warning') THEN 1"
+    " ELSE 2 END)"
+)
+
+
+def _sort_col(sort_by: str) -> str:
+    """Map an API ``sort_by`` value to its ORDER BY expression.
+
+    `gst_status` resolves to the derived-status CASE above; every other value
+    is a plain so_header column. Kept as one helper so /view and /export sort
+    identically. The Query() regex on each endpoint is the allow-list, so an
+    unknown key never reaches the dict lookup."""
+    if sort_by == "gst_status":
+        return _GST_STATUS_ORDER
+    return {
+        "so_id": "h.so_id",
+        "so_number": "h.so_number",
+        "so_date": "h.so_date",
+        "customer_name": "h.customer_name",
+        "company": "h.company",
+    }[sort_by]
 
 
 def _build_so_detail(h, so_lines, recon_by_line) -> dict:
@@ -463,6 +501,70 @@ async def _fetch_so_details(pool, so_ids, headers) -> list[dict]:
 # --- Endpoints ---
 
 
+# Filter-dropdown options are GLOBAL (computed across the whole DB, unfiltered)
+# and only change on upload/edit — yet /view recomputed two full-table DISTINCT
+# scans on EVERY call, including deep pagination where the lists are identical.
+# Cache the computed dict on app.state with a short TTL so paging through results
+# doesn't re-scan so_header + so_line each time. Concurrent cache misses may
+# recompute (harmless — they produce the same value), so no lock is needed.
+_FILTER_OPTIONS_TTL_SEC = 60.0
+
+
+async def _get_filter_options(request: Request) -> dict:
+    cache = getattr(request.app.state, "_so_filter_options_cache", None)
+    now = time.monotonic()
+    if cache is not None and (now - cache[0]) < _FILTER_OPTIONS_TTL_SEC:
+        return cache[1]
+
+    pool = request.app.state.db_pool
+    header_opts = await pool.fetchrow(
+        """
+        SELECT
+            COALESCE(array_agg(DISTINCT company) FILTER (WHERE company IS NOT NULL), '{}') AS companies,
+            COALESCE(array_agg(DISTINCT voucher_type) FILTER (WHERE voucher_type IS NOT NULL), '{}') AS voucher_types,
+            COALESCE(array_agg(DISTINCT customer_name) FILTER (WHERE customer_name IS NOT NULL), '{}') AS customer_names,
+            COALESCE(array_agg(DISTINCT common_customer_name) FILTER (WHERE common_customer_name IS NOT NULL), '{}') AS common_customer_names,
+            COALESCE(array_agg(DISTINCT so_number) FILTER (WHERE so_number IS NOT NULL), '{}') AS so_numbers
+        FROM so_header
+        """
+    )
+    line_opts = await pool.fetchrow(
+        """
+        SELECT
+            COALESCE(array_agg(DISTINCT item_category) FILTER (WHERE item_category IS NOT NULL), '{}') AS item_categories,
+            COALESCE(array_agg(DISTINCT sub_category) FILTER (WHERE sub_category IS NOT NULL), '{}') AS sub_categories,
+            COALESCE(array_agg(DISTINCT uom) FILTER (WHERE uom IS NOT NULL), '{}') AS uoms,
+            COALESCE(array_agg(DISTINCT grp_code) FILTER (WHERE grp_code IS NOT NULL), '{}') AS grp_codes,
+            COALESCE(array_agg(DISTINCT rate_type) FILTER (WHERE rate_type IS NOT NULL), '{}') AS rate_types,
+            COALESCE(array_agg(DISTINCT item_type) FILTER (WHERE item_type IS NOT NULL), '{}') AS item_types,
+            COALESCE(array_agg(DISTINCT sales_group) FILTER (WHERE sales_group IS NOT NULL), '{}') AS sales_groups,
+            COALESCE(array_agg(DISTINCT match_source) FILTER (WHERE match_source IS NOT NULL), '{}') AS match_sources,
+            COALESCE(array_agg(DISTINCT status) FILTER (WHERE status IS NOT NULL), '{}') AS statuses,
+            COALESCE(array_agg(DISTINCT sku_name) FILTER (WHERE sku_name IS NOT NULL), '{}') AS articles
+        FROM so_line
+        """
+    )
+    filter_options = {
+        "companies": sorted(header_opts["companies"]),
+        "voucher_types": sorted(header_opts["voucher_types"]),
+        "customer_names": sorted(header_opts["customer_names"]),
+        "common_customer_names": sorted(header_opts["common_customer_names"]),
+        "so_numbers": sorted(header_opts["so_numbers"]),
+        "item_categories": sorted(line_opts["item_categories"]),
+        "sub_categories": sorted(line_opts["sub_categories"]),
+        "uoms": sorted(line_opts["uoms"]),
+        "grp_codes": sorted(line_opts["grp_codes"]),
+        "rate_types": sorted(line_opts["rate_types"]),
+        "item_types": sorted(line_opts["item_types"]),
+        "sales_groups": sorted(line_opts["sales_groups"]),
+        "match_sources": sorted(line_opts["match_sources"]),
+        "statuses": sorted(line_opts["statuses"]),
+        "articles": sorted(line_opts["articles"]),
+    }
+    request.app.state._so_filter_options_cache = (now, filter_options)
+    return filter_options
+
+
 @router.get("/view", response_model=SOViewResponse)
 async def view_all_sos(
     request: Request,
@@ -470,7 +572,7 @@ async def view_all_sos(
     page_size: int = Query(50, ge=1, le=100),
     search: str = Query(None),
     status: str = Query(None, pattern="^(ok|mismatch|warning)$"),
-    sort_by: str = Query("so_date", pattern="^(so_id|so_number|so_date|customer_name|company)$"),
+    sort_by: str = Query("so_date", pattern="^(so_id|so_number|so_date|gst_status|customer_name|company)$"),
     sort_order: str = Query("asc", pattern="^(asc|desc)$"),
     company: str = Query(None),
     voucher_type: str = Query(None),
@@ -487,6 +589,8 @@ async def view_all_sos(
     sales_group: str = Query(None),
     match_source: str = Query(None),
     line_status: str = Query(None),
+    article: str = Query(None),
+    so_number: str = Query(None),
     user=Depends(get_current_user),
 ):
     """View Sales Orders with server-side pagination, filtering, sorting, and search.
@@ -499,46 +603,9 @@ async def view_all_sos(
     pool = request.app.state.db_pool
 
     # --- Filter options (from ALL data in DB, always unfiltered) ---
-    header_opts = await pool.fetchrow(
-        """
-        SELECT
-            COALESCE(array_agg(DISTINCT company) FILTER (WHERE company IS NOT NULL), '{}') AS companies,
-            COALESCE(array_agg(DISTINCT voucher_type) FILTER (WHERE voucher_type IS NOT NULL), '{}') AS voucher_types,
-            COALESCE(array_agg(DISTINCT customer_name) FILTER (WHERE customer_name IS NOT NULL), '{}') AS customer_names,
-            COALESCE(array_agg(DISTINCT common_customer_name) FILTER (WHERE common_customer_name IS NOT NULL), '{}') AS common_customer_names
-        FROM so_header
-        """
-    )
-    line_opts = await pool.fetchrow(
-        """
-        SELECT
-            COALESCE(array_agg(DISTINCT item_category) FILTER (WHERE item_category IS NOT NULL), '{}') AS item_categories,
-            COALESCE(array_agg(DISTINCT sub_category) FILTER (WHERE sub_category IS NOT NULL), '{}') AS sub_categories,
-            COALESCE(array_agg(DISTINCT uom) FILTER (WHERE uom IS NOT NULL), '{}') AS uoms,
-            COALESCE(array_agg(DISTINCT grp_code) FILTER (WHERE grp_code IS NOT NULL), '{}') AS grp_codes,
-            COALESCE(array_agg(DISTINCT rate_type) FILTER (WHERE rate_type IS NOT NULL), '{}') AS rate_types,
-            COALESCE(array_agg(DISTINCT item_type) FILTER (WHERE item_type IS NOT NULL), '{}') AS item_types,
-            COALESCE(array_agg(DISTINCT sales_group) FILTER (WHERE sales_group IS NOT NULL), '{}') AS sales_groups,
-            COALESCE(array_agg(DISTINCT match_source) FILTER (WHERE match_source IS NOT NULL), '{}') AS match_sources,
-            COALESCE(array_agg(DISTINCT status) FILTER (WHERE status IS NOT NULL), '{}') AS statuses
-        FROM so_line
-        """
-    )
-    filter_options = {
-        "companies": sorted(header_opts["companies"]),
-        "voucher_types": sorted(header_opts["voucher_types"]),
-        "customer_names": sorted(header_opts["customer_names"]),
-        "common_customer_names": sorted(header_opts["common_customer_names"]),
-        "item_categories": sorted(line_opts["item_categories"]),
-        "sub_categories": sorted(line_opts["sub_categories"]),
-        "uoms": sorted(line_opts["uoms"]),
-        "grp_codes": sorted(line_opts["grp_codes"]),
-        "rate_types": sorted(line_opts["rate_types"]),
-        "item_types": sorted(line_opts["item_types"]),
-        "sales_groups": sorted(line_opts["sales_groups"]),
-        "match_sources": sorted(line_opts["match_sources"]),
-        "statuses": sorted(line_opts["statuses"]),
-    }
+    # Cached on app.state with a short TTL — see _get_filter_options. Avoids two
+    # full-table DISTINCT scans on every page of a paginated browse.
+    filter_options = await _get_filter_options(request)
 
     # --- Build WHERE clause ---
     where_clause, params = _build_where_clause(
@@ -547,7 +614,8 @@ async def view_all_sos(
         date_from=date_from, date_to=date_to, item_category=item_category,
         sub_category=sub_category, uom=uom, grp_code=grp_code,
         rate_type=rate_type, item_type=item_type, sales_group=sales_group,
-        match_source=match_source, line_status=line_status,
+        match_source=match_source, line_status=line_status, article=article,
+        so_number=so_number,
     )
 
     # --- Global summary across ALL filtered SOs ---
@@ -599,13 +667,7 @@ async def view_all_sos(
     }
 
     # --- Paginated SO headers ---
-    sort_col = {
-        "so_id": "h.so_id",
-        "so_number": "h.so_number",
-        "so_date": "h.so_date",
-        "customer_name": "h.customer_name",
-        "company": "h.company",
-    }[sort_by]
+    sort_col = _sort_col(sort_by)
 
     offset = (page - 1) * page_size
     param_idx = len(params)
@@ -618,7 +680,7 @@ async def view_all_sos(
         f"""
         SELECT * FROM so_header h
         WHERE {where_clause}
-        ORDER BY {sort_col} {sort_order} NULLS LAST
+        ORDER BY {sort_col} {sort_order} NULLS LAST, h.so_id {sort_order}
         LIMIT ${limit_param} OFFSET ${offset_param}
         """,
         *params, page_size, offset,
@@ -648,7 +710,7 @@ async def export_sos(
     request: Request,
     search: str = Query(None),
     status: str = Query(None, pattern="^(ok|mismatch|warning)$"),
-    sort_by: str = Query("so_date", pattern="^(so_id|so_number|so_date|customer_name|company)$"),
+    sort_by: str = Query("so_date", pattern="^(so_id|so_number|so_date|gst_status|customer_name|company)$"),
     sort_order: str = Query("asc", pattern="^(asc|desc)$"),
     company: str = Query(None),
     voucher_type: str = Query(None),
@@ -665,9 +727,18 @@ async def export_sos(
     sales_group: str = Query(None),
     match_source: str = Query(None),
     line_status: str = Query(None),
+    article: str = Query(None),
+    so_number: str = Query(None),
+    limit: int = Query(10000, ge=1, le=50000),
     user=Depends(get_current_user),
 ):
-    """Export all filtered Sales Orders (no pagination) for download.
+    """Export filtered Sales Orders (no pagination) for download.
+
+    Capped at ``limit`` SOs (default 10000, hard max 50000): an authenticated
+    user with no filters would otherwise materialise the entire
+    so_header + so_line + so_gst_reconciliation tree through Pydantic in one
+    request. The cap bounds memory; a genuinely larger export should be paged
+    or filtered.
 
     B13 cost-metric gate: same surface as ``view_all_sos`` — strip ₹ columns
     for deny-listed roles. ``.model_dump()`` before strip because the helper
@@ -681,24 +752,22 @@ async def export_sos(
         date_from=date_from, date_to=date_to, item_category=item_category,
         sub_category=sub_category, uom=uom, grp_code=grp_code,
         rate_type=rate_type, item_type=item_type, sales_group=sales_group,
-        match_source=match_source, line_status=line_status,
+        match_source=match_source, line_status=line_status, article=article,
+        so_number=so_number,
     )
 
-    sort_col = {
-        "so_id": "h.so_id",
-        "so_number": "h.so_number",
-        "so_date": "h.so_date",
-        "customer_name": "h.customer_name",
-        "company": "h.company",
-    }[sort_by]
+    sort_col = _sort_col(sort_by)
 
+    # `limit` is bound positionally after the where-clause params (validated by
+    # Query ge/le), matching the existing parameterised-query convention.
     headers = await pool.fetch(
         f"""
         SELECT * FROM so_header h
         WHERE {where_clause}
-        ORDER BY {sort_col} {sort_order} NULLS LAST
+        ORDER BY {sort_col} {sort_order} NULLS LAST, h.so_id {sort_order}
+        LIMIT ${len(params) + 1}
         """,
-        *params,
+        *params, limit,
     )
 
     so_ids = [h["so_id"] for h in headers]
@@ -778,6 +847,13 @@ async def sku_lookup(
                 f" = LOWER(TRIM(REGEXP_REPLACE(${idx}, '\\s+', ' ', 'g')))"
             )
             params.append(val)
+
+    # SFG/WIP intermediates (item_type='sfg', Slice 1) are internal production
+    # articles, not sellable/purchasable line items — keep them OUT of the SO/PO/
+    # sample SKU picker (and the item_types dropdown) unless explicitly requested
+    # via item_type='sfg'. Mirrors the transfer dropdown's rm/pm/fg scope.
+    if not item_type:
+        conditions.append("item_type IS DISTINCT FROM 'sfg'")
 
     # Text search on particulars — case & space insensitive
     # "toor  dal" → "%toor%dal%" matches "Toor Dal 1kg", "TOOR DAL", etc.

@@ -24,6 +24,12 @@ _ALLOWED_TRANSITIONS = {
     ('production_floor', 'offgrade'),
     ('production_floor', 'rm_store'),
     ('offgrade', 'production_floor'),
+    # Slice 5: a Create-WIP stage emits semi-finished SFG to the WIP/SFG store;
+    # the downstream stage draws it back to the floor to pack/transform further.
+    ('production_floor', 'wip_store'),
+    ('production_floor', 'sfg_store'),
+    ('wip_store', 'production_floor'),
+    ('sfg_store', 'production_floor'),
 }
 
 
@@ -127,14 +133,36 @@ async def move_material(conn, sku_name: str, from_location: str, to_location: st
 
 
 async def get_floor_summary(conn, entity: str) -> list[dict]:
-    """Aggregated stock per floor location."""
+    """Aggregated stock per floor location.
+
+    Slice 5: materialised WIP/SFG lives in inventory_batch (item_type='wip'),
+    NOT floor_inventory, so it's UNION'd in here as its own bucket (by floor_id)
+    — otherwise the floor dashboard would show no WIP. The outer GROUP BY merges
+    any location that happens to appear in both ledgers (today they don't)."""
     rows = await conn.fetch(
         """
         SELECT floor_location,
-               COUNT(DISTINCT sku_name) AS item_count,
-               COALESCE(SUM(quantity_kg), 0) AS total_kg
-        FROM floor_inventory
-        WHERE entity = $1 AND quantity_kg > 0
+               SUM(item_count)::int AS item_count,
+               COALESCE(SUM(total_kg), 0) AS total_kg
+        FROM (
+            SELECT floor_location,
+                   COUNT(DISTINCT sku_name) AS item_count,
+                   COALESCE(SUM(quantity_kg), 0) AS total_kg
+            FROM floor_inventory
+            WHERE entity = $1 AND quantity_kg > 0
+              -- WIP is counted from inventory_batch below; exclude it here so a
+              -- sku present in BOTH ledgers on one floor isn't double-counted.
+              AND (item_type IS NULL OR item_type <> 'wip')
+            GROUP BY floor_location
+            UNION ALL
+            SELECT COALESCE(floor_id, 'wip_store') AS floor_location,
+                   COUNT(DISTINCT sku_name) AS item_count,
+                   COALESCE(SUM(current_qty_kg), 0) AS total_kg
+            FROM inventory_batch
+            WHERE entity = $1 AND item_type = 'wip'
+              AND status = 'AVAILABLE' AND current_qty_kg > 0
+            GROUP BY COALESCE(floor_id, 'wip_store')
+        ) t
         GROUP BY floor_location
         ORDER BY floor_location
         """,

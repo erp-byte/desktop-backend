@@ -382,7 +382,7 @@ async def confirm_sales_register_update(
                                 $15, $16, $17, $18,
                                 $19, $20,
                                 $21, $22, $23,
-                                $24, $25, 'pending'::e_so_line_status, $26
+                                $24, $25, 'pending', $26
                             )
                             RETURNING so_line_id
                             """,
@@ -705,7 +705,7 @@ async def manual_update_so(
                             $15, $16, $17, $18,
                             $19, $20,
                             $21, $22, $23,
-                            $24, $25, 'pending'::e_so_line_status, $26
+                            $24, $25, 'pending', $26
                         )
                         RETURNING so_line_id
                         """,

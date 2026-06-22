@@ -28,7 +28,10 @@ from asyncpg.exceptions import CheckViolationError
 
 from app.core.helpers import insert_with_pk_retry, new_short_time_id  # noqa: F401
 from app.core.warehouse_scope import WAREHOUSE_NORM_ANY_SQL, WAREHOUSE_NORM_SQL
-from app.modules.production.services.job_card_v2 import is_packing_stage
+from app.modules.production.services.job_card_v2 import (
+    _resolve_sfg_seam_code,
+    is_packing_stage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -445,11 +448,19 @@ async def list_plans(conn, *, entity=None, warehouse=None, plan_type=None,
                    jsonb_agg(
                        jsonb_build_object(
                            'plan_line_id',      plan_line_id,
+                           'bom_id',            bom_id,
                            'fg_sku_name',       fg_sku_name,
                            'customer_name',     customer_name,
                            'planned_qty_kg',    planned_qty_kg,
                            'planned_qty_units', planned_qty_units,
-                           'area',              area
+                           'area',              area,
+                           -- Drives the Create-vs-Edit Job Card button: >0 ⇒
+                           -- this article already has (non-deleted) job cards.
+                           'job_card_count',    (
+                               SELECT COUNT(*) FROM job_card_v2 j
+                               WHERE j.plan_line_id = production_plan_line_v2.plan_line_id
+                                 AND j.deleted_at IS NULL
+                           )
                        )
                        ORDER BY plan_line_id
                    ) AS lines_summary
@@ -572,11 +583,21 @@ async def approve_plan(conn, plan_id: int, approved_by: str) -> dict:
     from app.modules.production.services.job_card_v2 import create_job_cards_from_plan
     jc_result = await create_job_cards_from_plan(conn, plan_id)
 
-    return {
+    # The plan row IS approved (the UPDATE above succeeded), so `approved` stays
+    # true. But JC generation can soft-fail (most commonly job_cards_already_exist
+    # on an idempotent re-approve) and that used to be buried inside `job_cards`,
+    # making the envelope read like a clean success. Surface the outcome at the
+    # top level so callers can react without digging into the nested dict.
+    job_cards_created = "error" not in jc_result
+    envelope = {
         "approved": True,
+        "job_cards_created": job_cards_created,
         "plan": _serialize_row(result),
         "job_cards": jc_result,
     }
+    if not job_cards_created:
+        envelope["job_cards_error"] = jc_result["error"]
+    return envelope
 
 
 _SPLIT_MODES = ("per_line", "sku", "customer")
@@ -1010,13 +1031,45 @@ async def _resync_jcs_after_step_change(
     # avoid a transient collision if we ever rebuild it.  We don't
     # rebuild job_card_number — historical identifier — so a single
     # pass is enough.
+    # Slice 3: re-resolve the article's SFG#### so the reorder/add/delete keeps
+    # the seam codes consistent with the new ordering. Mirrors
+    # create_job_cards_from_plan's seam logic. A routed SFG article's route is
+    # exactly 2 steps, so the position-based seam is only trustworthy at n==2;
+    # if an add/delete diverged the chain, skip the seam (clear codes) + warn
+    # rather than stamp the wrong step. NOTE: this re-derives the seam from the
+    # CURRENT bom_process_route, so editing steps on an unstarted pre-Slice-3
+    # plan will (re)materialise the seam to current routing — intended, and
+    # gated to safe-state JCs by _line_jcs_safety above.
+    bom_id = await conn.fetchval(
+        "SELECT bom_id FROM production_plan_line_v2 WHERE plan_line_id = $1",
+        plan_line_id,
+    )
+    sfg_code = await _resolve_sfg_seam_code(conn, bom_id)
+
     n = len(ordered_jcs)
+    if sfg_code and n != 2:
+        logger.warning(
+            "plan_line %s: routed 2-stage article (SFG %s) but chain has %d JC(s) "
+            "after %s — SFG seam not materialised (expected 2)",
+            plan_line_id, sfg_code, n, reason,
+        )
     prev_jc_id: int | None = None
     for idx, item in enumerate(ordered_jcs):
         is_first = idx == 0
         is_last  = idx == n - 1
         input_kind  = "RM" if is_first else "SFG"
         output_kind = "FG" if is_last  else "WIP"
+        # SFG seam: producer (step 1 / Create WIP) emits SFG####; consumer
+        # (step 2 / Final FG) opens with it. Cleared on every other row so a step
+        # demoted out of the seam by a reorder doesn't keep a stale code.
+        input_code:  str | None = None
+        output_code: str | None = None
+        if sfg_code and n == 2:
+            if idx == 0:
+                output_kind = "SFG"
+                output_code = sfg_code
+            else:
+                input_code = sfg_code
         new_step_number = idx + 1
         await conn.execute(
             """
@@ -1027,7 +1080,9 @@ async def _resync_jcs_after_step_change(
                 output_kind      = $5,
                 process_name     = $6,
                 stage            = $7,
-                floor            = $8
+                floor            = $8,
+                input_code       = $9,
+                output_code      = $10
             WHERE job_card_id = $1
             """,
             item["job_card_id"],
@@ -1039,6 +1094,7 @@ async def _resync_jcs_after_step_change(
              or (item["plan_step"]["process_name"] or "").strip().lower().replace(" ", "_")
              or "unknown"),
             item["plan_step"]["floor"],
+            input_code, output_code,
         )
         prev_jc_id = item["job_card_id"]
 
@@ -1106,8 +1162,11 @@ async def _spawn_jc_for_new_step(
         return None
 
     # The new step has the largest step_order on the line, so it's the
-    # new tail.  Mark output_kind = 'FG'; the resync pass below flips
-    # the old tail from FG → WIP.
+    # new tail.  Mark output_kind = 'FG'; the resync pass that ALWAYS runs
+    # immediately after this spawn (add_step) flips the old tail from FG → WIP
+    # AND (Slice 3) rewrites the whole line's SFG seam codes — so we
+    # deliberately insert no input_code/output_code here rather than duplicate
+    # the seam resolution and risk it diverging from _resync_jcs_after_step_change.
     candidate_jc_number = (
         f"PLAN-{line['plan_id']}-L{line['plan_line_id']}-S{step['step_order']}"
     )
@@ -1282,6 +1341,15 @@ def derive_stage_from_process(process_name: str | None) -> str | None:
     "Slicing/Dicing/Slivering" stays as one token rather than fragmenting).
     Returns None when the input is empty/None — caller may want to bail
     on missing process_name separately rather than write an empty stage.
+
+    Caveat (audit DERIVE-STAGE-STRING): this is pure string-munging with NO
+    catalogue validation. The derived token later feeds job_card_v2.is_packing_stage,
+    which gates the EGA (extra-give-away) form — so a packing operation whose
+    name doesn't contain "packing"/"packaging" derives a stage that the gate
+    won't recognise. Don't treat the output as a validated stage; the canonical
+    classifier is processCatalog.classifySteps / master_ingest.classify_route_steps.
+    A future hardening (tracked with the Create-Job-Card backend) should validate
+    against the stage catalogue instead of trusting this derivation for the gate.
     """
     if not process_name:
         return None

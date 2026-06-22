@@ -104,7 +104,7 @@ async def reconcile_existing_so(
             common_customer_name = COALESCE($4, common_customer_name),
             company = COALESCE($5, company),
             voucher_type = COALESCE($6, voucher_type),
-            extraction_status = 'extracted'::e_extraction_status
+            extraction_status = 'extracted'
         WHERE so_id = $1
         """,
         so_id,
@@ -458,7 +458,7 @@ async def reconcile_existing_so(
                         $15, $16, $17, $18,
                         $19, $20,
                         $21, $22, $23,
-                        $24, $25, 'pending'::e_so_line_status, $26
+                        $24, $25, 'pending', $26
                     )
                     RETURNING so_line_id
                     """,

@@ -46,10 +46,12 @@ async def categorial_search(conn, search: Optional[str], limit: int, offset: int
     """Global search on all_sku.particulars — bypasses the hierarchy."""
     term = search.strip() if search else None
     args: list = []
-    where = "1=1"
+    # Exclude SFG/WIP intermediates (Slice 1) — transfers deal in rm/pm/fg, and
+    # the cascading dropdown already scopes to those; keep global search in sync.
+    where = "UPPER(item_type) IS DISTINCT FROM 'SFG'"
     if term:
         args.append(f"%{term.lower()}%")
-        where = "LOWER(particulars) LIKE $1"
+        where = "LOWER(particulars) LIKE $1 AND UPPER(item_type) IS DISTINCT FROM 'SFG'"
 
     total = await conn.fetchval(
         f"SELECT COUNT(*) FROM (SELECT DISTINCT UPPER(particulars), UPPER(item_type) FROM {_SKU} WHERE {where}) t",

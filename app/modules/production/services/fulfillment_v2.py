@@ -401,6 +401,75 @@ async def list_fulfillment(conn, *, entity=None, status=None, financial_year=Non
     }
 
 
+async def get_fulfillment_by_so_lines(conn, so_line_ids, *, entity=None,
+                                      financial_year=None) -> dict:
+    """Resolve a set of so_line_ids to their so_fulfillment_v2 rows (list shape).
+
+    Backs the SO-Creation "Selected for Plan" panel: the operator checks SO
+    article lines (so_line rows), and the panel needs the matching fulfillment
+    rows (fulfillment_id, pending qty, deadline, entity) to build a plan —
+    exactly the rows the planning page works with.
+
+    Returns the rows in the same shape as :func:`list_fulfillment` plus the
+    list of so_line_ids that have NO fulfillment row yet (not synced), so the
+    caller can prompt the operator to run Sync. Read-only — never creates rows.
+    """
+    ids = [int(i) for i in (so_line_ids or []) if i is not None]
+    if not ids:
+        return {"results": [], "missing_so_line_ids": []}
+
+    conditions = [f"v.so_line_id = ANY($1::bigint[])"]
+    params: list = [ids]
+    idx = 2
+    if entity:
+        conditions.append(f"v.entity = ${idx}")
+        params.append(entity); idx += 1
+    if financial_year:
+        conditions.append(f"v.financial_year = ${idx}")
+        params.append(financial_year); idx += 1
+    where = " AND ".join(conditions)
+
+    rows = await conn.fetch(
+        f"""
+        SELECT {_V2_LIST_SELECT}
+        {_V2_FROM_JOIN}
+        WHERE {where}
+        ORDER BY v.deadline_date ASC NULLS LAST, v.so_fulfillment_id ASC
+        """,
+        *params,
+    )
+    results = [_serialize_row(r) for r in rows]
+    found = {r["so_line_id"] for r in results}
+    not_in_scope = [i for i in ids if i not in found]
+
+    # When an entity/FY scope is applied, a so_line whose fulfillment row exists
+    # but in a DIFFERENT scope would otherwise be reported as "missing" — and the
+    # Sync the caller then runs can't fix it (sync upserts ON CONFLICT
+    # (so_line_id, financial_year) DO NOTHING, so the existing row is left
+    # untouched and no new in-scope row appears). Split the not-found ids into
+    # TRULY missing (no row in ANY scope → Sync helps) vs OUT OF SCOPE (a row
+    # exists, just not in this entity/FY → Sync won't help) so the caller can
+    # message accurately instead of prompting a futile Sync.
+    out_of_scope: list[int] = []
+    if not_in_scope and (entity or financial_year):
+        existing = await conn.fetch(
+            "SELECT DISTINCT so_line_id FROM so_fulfillment_v2 "
+            "WHERE so_line_id = ANY($1::bigint[])",
+            not_in_scope,
+        )
+        have_any = {r["so_line_id"] for r in existing}
+        out_of_scope = [i for i in not_in_scope if i in have_any]
+        missing = [i for i in not_in_scope if i not in have_any]
+    else:
+        missing = not_in_scope
+
+    return {
+        "results": results,
+        "missing_so_line_ids": missing,
+        "out_of_scope_so_line_ids": out_of_scope,
+    }
+
+
 async def get_filter_options(conn, *, entity=None, financial_year=None,
                               customer=None, so_number=None, article=None) -> dict:
     """Distinct dropdown values for customers / so_numbers / articles, narrowed

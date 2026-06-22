@@ -24,6 +24,7 @@ fpdf2==2.8.3                      # used by app/ runtime PDF endpoints
 reportlab==4.4.0                  # used by scripts/gen_auth_flow_pdf,
                                   # scripts/generate_jc_report_after
 Pillow==12.2.0                    # PIL — scripts/generate_db_diagrams_pdf
+qrcode[pil]==8.2                  # SFG WIP-box QR labels (Slice 6, label_service) — [pil] pulls Pillow
 
 # ── AI / agent integrations ──────────────────────────────────────────────
 anthropic==0.86.0

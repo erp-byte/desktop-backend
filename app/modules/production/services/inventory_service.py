@@ -6,10 +6,21 @@ reconciliation, and store-in-floor logic.
 """
 
 import logging
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
+from app.core.helpers import insert_with_pk_retry, new_short_time_id
+
 logger = logging.getLogger(__name__)
+
+# ── Gate G3 (Slice 5): WIP shelf life ──
+# Materialised WIP/SFG batches expire at manufacturing_date + WIP_SHELF_LIFE_DAYS.
+# Set to 0 per decision (2026-06-19): WIP carries NO shelf life for now — a 0
+# yields expiry_date = NULL (never expires), so the exclude_expired filters in
+# get_sfg_on_hand / get_available_batches / mrp treat all WIP as in-date. The
+# richer JC_Stage1 per-SFG suggested_shelf_life_days is intentionally NOT ingested
+# (see 056_sfg_master_enrichment.sql). Change here to re-introduce shelf life.
+WIP_SHELF_LIFE_DAYS = 0
 
 # ── Status state machine ──
 VALID_TRANSITIONS = {
@@ -73,6 +84,89 @@ async def create_batch(conn, *, batch_id, sku_name, item_type=None, transaction_
     return batch_id
 
 
+async def create_wip_batch(conn, *, sku_name, qty_kg, entity,
+                           job_card_id=None, floor_id='wip_store',
+                           manufacturing_date=None, performed_by=None,
+                           lot_number=None):
+    """Materialise a WIP/SFG inventory batch when a Create-WIP stage closes
+    (Slice 5). Thin wrapper over create_batch that fixes the WIP conventions:
+      * app-supplied 8-digit batch_id (str(new_short_time_id())) — batch_id is TEXT;
+      * item_type='wip', source='PRODUCTION', status AVAILABLE (create_batch default);
+      * expiry_date = manufacturing_date + WIP_SHELF_LIFE_DAYS, or NULL when the
+        constant is 0 (current setting: WIP carries no shelf life);
+      * sku_name should be the SFG#### code so the Stage-2 picker / get_sfg_on_hand
+        / the chain seam all key on the same identifier.
+    Returns the new batch_id. MUST run inside an outer transaction.
+
+    The id is minted INSIDE an insert_with_pk_retry closure (not create_batch's
+    ON CONFLICT DO NOTHING, which would silently DROP the WIP row on an 8-digit
+    time-id collision while the caller has already credited carried_qty_kg — lost
+    stock). A *_pkey collision re-mints a fresh id and retries; the CREATED event
+    is logged once, after the row is durably inserted.
+    """
+    mfg = manufacturing_date or date.today()
+    expiry = mfg + timedelta(days=WIP_SHELF_LIFE_DAYS) if WIP_SHELF_LIFE_DAYS else None
+
+    # PT1 (057): callers pass the SFG#### code as `sku_name`. Store the code in the
+    # canonical sfg_code column (what WIP reads key on) and put the article NAME in
+    # sku_name (uniform with rm/pm/fg) — no longer overloading sku_name with a code.
+    # Fall back to the code if the catalogue row isn't found (half-loaded DB).
+    sfg_code = sku_name
+    article_name = await conn.fetchval(
+        "SELECT particulars FROM all_sku WHERE sfg_code = $1 AND item_type = 'sfg'", sfg_code
+    ) or sfg_code
+
+    async def _insert():
+        bid = str(new_short_time_id())
+        # Phase 7 (LOT MINT): every WIP batch carries a lot so the box→box→lot
+        # genealogy has a leaf to anchor on. When the caller doesn't supply one,
+        # mint WLOT-<batch_id> from the just-minted 8-digit batch id (re-evaluated
+        # each insert_with_pk_retry attempt so a re-minted bid gets a matching lot).
+        lot = lot_number or f"WLOT-{bid}"
+        await conn.execute(
+            """
+            INSERT INTO inventory_batch
+                (batch_id, sku_name, sfg_code, item_type, source, lot_number,
+                 inward_date, manufacturing_date, expiry_date,
+                 original_qty_kg, current_qty_kg, floor_id, entity, status)
+            VALUES ($1, $2, $3, 'wip', 'PRODUCTION', $4, $5, $5, $6, $7, $7, $8, $9, 'AVAILABLE')
+            """,
+            bid, article_name, sfg_code, lot, mfg, expiry, qty_kg, floor_id, entity,
+        )
+        return bid
+
+    batch_id = await insert_with_pk_retry(conn, _insert)
+    await _log_event(conn, batch_id=batch_id, event_type='CREATED',
+                     to_status='AVAILABLE', to_location=f"None:{floor_id}",
+                     quantity_kg=qty_kg, reference_type='production',
+                     performed_by=performed_by)
+    return batch_id
+
+
+async def get_sfg_on_hand(conn, sku_name: str, entity: str, *, floor_id=None) -> float:
+    """Total non-expired AVAILABLE WIP/SFG on hand for an SFG#### code (Slice 5).
+    Sums inventory_batch.current_qty_kg over item_type='wip' AVAILABLE rows.
+
+    Keys on the canonical sfg_code column (PT1/057), not the overloaded sku_name —
+    exact equality on the SFG#### code (the seam joins JC1.output_code ==
+    JC2.input_code), so no substring over-match (SFG001 ⊂ SFG0012). The `sku_name`
+    arg name is kept for back-compat; callers pass the SFG#### code.
+    Expired batches are excluded (G3 strict)."""
+    conditions = ["sfg_code = $1", "item_type = 'wip'", "entity = $2",
+                  "status = 'AVAILABLE'", "current_qty_kg > 0",
+                  "(expiry_date IS NULL OR expiry_date >= CURRENT_DATE)"]
+    params = [sku_name, entity]
+    if floor_id:
+        conditions.append(f"floor_id = ${len(params) + 1}")
+        params.append(floor_id)
+    total = await conn.fetchval(
+        f"SELECT COALESCE(SUM(current_qty_kg), 0) FROM inventory_batch "
+        f"WHERE {' AND '.join(conditions)}",
+        *params,
+    )
+    return float(total or 0)
+
+
 async def get_batch(conn, batch_id: str):
     row = await conn.fetchrow("SELECT * FROM inventory_batch WHERE batch_id = $1", batch_id)
     return dict(row) if row else None
@@ -90,16 +184,43 @@ async def get_batch_history(conn, batch_id: str):
 
 async def get_available_batches(conn, sku_name: str, entity: str, *,
                                  exclude_blocked=True, floor_id=None,
-                                 exclude_so_id=None):
-    """Get available batches for a SKU in FIFO order (oldest inward_date first)."""
-    conditions = ["sku_name ILIKE $1", "entity = $2", "current_qty_kg > 0"]
-    params = [f"%{sku_name}%", entity]
+                                 exclude_so_id=None, item_type=None,
+                                 exact_match=False, exclude_expired=False,
+                                 by_sfg_code=False):
+    """Get available batches for a SKU in FIFO order (oldest inward_date first).
+
+    `item_type` (Slice 5): when given, restrict to that ledger type — e.g.
+    item_type='wip' for the Stage-2 SFG picker so a like-named RM/FG batch is
+    never offered as SFG stock.
+    `exact_match` (Slice 5): match sku_name exactly instead of substring ILIKE —
+    the SFG picker keys on the canonical SFG#### code, so a substring would
+    over-match longer codes (SFG001 ⊂ SFG0012). RM/PM keep fuzzy matching.
+    `by_sfg_code` (PT1/057): match the canonical inventory_batch.sfg_code column
+    (exact) instead of sku_name — used by the WIP/SFG picker now that sku_name
+    holds the article name, not the code. Implies an exact code match.
+    `exclude_expired` (Slice 5, G3 strict): drop batches past expiry_date so the
+    picker never offers expired WIP."""
+    if by_sfg_code:
+        conditions = ["sfg_code = $1", "entity = $2", "current_qty_kg > 0"]
+        params = [sku_name, entity]
+    else:
+        conditions = [("sku_name = $1" if exact_match else "sku_name ILIKE $1"),
+                      "entity = $2", "current_qty_kg > 0"]
+        params = [sku_name if exact_match else f"%{sku_name}%", entity]
     idx = 3
 
     if exclude_blocked:
         conditions.append("status IN ('AVAILABLE')")
     else:
         conditions.append("status IN ('AVAILABLE', 'BLOCKED')")
+
+    if exclude_expired:
+        conditions.append("(expiry_date IS NULL OR expiry_date >= CURRENT_DATE)")
+
+    if item_type:
+        conditions.append(f"item_type = ${idx}")
+        params.append(item_type)
+        idx += 1
 
     if floor_id:
         conditions.append(f"floor_id = ${idx}")
@@ -113,7 +234,7 @@ async def get_available_batches(conn, sku_name: str, entity: str, *,
 
     where = " AND ".join(conditions)
     rows = await conn.fetch(f"""
-        SELECT batch_id, sku_name, item_type, lot_number, source,
+        SELECT batch_id, sku_name, sfg_code, item_type, lot_number, source,
                inward_date, expiry_date, original_qty_kg, current_qty_kg,
                warehouse_id, floor_id, status, ownership,
                blocked_for_so_id, flag_reason, entity

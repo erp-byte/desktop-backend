@@ -109,6 +109,16 @@ async def assert_not_locked(conn, job_card_id: int) -> dict | None:
 # legacy values, normalise the stage and match any string containing
 # 'packaging' or 'packing'. This is resilient to data cleanups (e.g.
 # closing the paren on 'flavouring_(bulk_packaging)') and case drift.
+#
+# Caveat (audit DERIVE-STAGE-STRING): this substring test is deliberately
+# loose, so it can MIS-CLASSIFY edge names — a real packing operation whose
+# name lacks the token (e.g. "Pouch Filling" → "pouch_filling") reads as
+# non-packing and the EGA form is refused for it. The canonical classifier is
+# processCatalog.classifySteps (client) / master_ingest.classify_route_steps
+# (server). A future hardening should gate EGA on an explicit stage-catalogue
+# lookup rather than this string match — see the Create-Job-Card backend design.
+# Behaviour is intentionally LEFT AS-IS here to avoid shifting the EGA gate
+# across the (locked) SFG vertical without that catalogue in place.
 # ---------------------------------------------------------------------------
 _PACKING_STAGE_TOKENS = ("packaging", "packing")
 
@@ -442,9 +452,11 @@ async def upsert_consumption_lines(
 
     `entries` is the list of {bom_line_id, material_sku_name, consumed_qty,
     uom, remarks} dicts the UI sends in rm_consumed / pm_consumed.
-    `input_kind` is the consumption kind: 'RM' or 'PM' (RM/PM come from
-    the BOM catalog; SFG/WIP rows are written separately by the stage-
-    handoff code path, not this function).
+    `input_kind` is the consumption kind: 'RM' / 'PM' / 'SFG' / 'WIP'. RM/PM
+    come from the BOM catalog; SFG/WIP rows (Slice 4, gate G1 Option B) are an
+    opening input the FG stage consumes — they may carry a nullable bom_line_id
+    (the sfg bom_line) and a per-entry `source_dispatch_id` linking the
+    consumption back to the prev-stage dispatch that produced the SFG.
 
     Stage 2: rows are now tagged with batch_id.  The UNIQUE key on the
     table changed from (job_card_id, material_sku_name) to
@@ -463,7 +475,7 @@ async def upsert_consumption_lines(
 
     Returns the count of rows inserted/updated.
     """
-    if input_kind not in ('RM', 'PM'):
+    if input_kind not in ('RM', 'PM', 'SFG', 'WIP'):
         return 0
     written = 0
     for e in entries:
@@ -472,12 +484,20 @@ async def upsert_consumption_lines(
         if not sku or qty is None:
             continue   # skip malformed entries silently — backend validated
                        # bom_line_id at the router layer already
+        # Per-entry input_kind override (Slice 4): a mixed bucket (e.g. the
+        # /outputs rm_consumed list now carries SFG/WIP opening-input rows) tags
+        # each row with its own kind; fall back to the function-level default.
+        row_kind = (e.get("input_kind") or input_kind or "").upper()
+        if row_kind not in ('RM', 'PM', 'SFG', 'WIP'):
+            continue   # skip a row with an unknown kind rather than abort the txn
         bom_line_id = e.get("bom_line_id")
         uom         = e.get("uom") or "KGS"
         remarks     = e.get("remarks")
-        async def _upsert(_sku=sku, _kind=input_kind, _uom=uom,
+        src_dispatch = e.get("source_dispatch_id")
+        async def _upsert(_sku=sku, _kind=row_kind, _uom=uom,
                           _qty=qty, _bom_id=bom_line_id, _rem=remarks,
-                          _rec_by=recorded_by, _batch=batch_id):
+                          _rec_by=recorded_by, _batch=batch_id,
+                          _src_dispatch=src_dispatch):
             # ON CONFLICT references the expression UNIQUE INDEX
             # uq_jcmc_v2_jc_batch_material (migration 038) by its
             # column list — PG matches the index automatically when
@@ -488,9 +508,9 @@ async def upsert_consumption_lines(
                     consumption_id, job_card_id, bom_line_id, batch_id,
                     material_sku_name, input_kind, uom,
                     issued_qty, actual_consumed_qty, return_qty,
-                    remarks, recorded_by
+                    remarks, recorded_by, source_dispatch_id
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8, 0, $9, $10)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8, 0, $9, $10, $11)
                 ON CONFLICT (job_card_id, COALESCE(batch_id, 0),
                              material_sku_name)
                 DO UPDATE SET
@@ -509,11 +529,15 @@ async def upsert_consumption_lines(
                     uom                 = EXCLUDED.uom,
                     actual_consumed_qty = EXCLUDED.actual_consumed_qty,
                     remarks             = EXCLUDED.remarks,
-                    recorded_by         = EXCLUDED.recorded_by
+                    recorded_by         = EXCLUDED.recorded_by,
+                    -- Preserve a previously-set dispatch link when a routine
+                    -- re-save omits it (COALESCE keeps the existing value).
+                    source_dispatch_id  = COALESCE(EXCLUDED.source_dispatch_id,
+                                                   job_card_material_consumption_v2.source_dispatch_id)
                 RETURNING consumption_id
                 """,
                 new_short_time_id(), job_card_id, _bom_id, _batch,
-                _sku, _kind, _uom, float(_qty), _rem, _rec_by,
+                _sku, _kind, _uom, float(_qty), _rem, _rec_by, _src_dispatch,
             )
         await insert_with_pk_retry(conn, _upsert)
         written += 1
@@ -720,6 +744,32 @@ async def get_plan_job_card_groups(conn, plan_id: int) -> dict:
     }
 
 
+async def _resolve_sfg_seam_code(conn, bom_id: int | None) -> str | None:
+    """Return the SFG#### a 2-stage routed article produces — the Create-WIP
+    step's ``output_code`` in bom_process_route — or None for a single-stage /
+    unrouted article (Slice 3).
+
+    Used to stamp the chain seam at JC creation so that, for a 2-stage plan,
+    ``JC1.output_code == JC2.input_code == SFG####``. There is at most one
+    SFG-producing step per article (the routing plug is 1-or-2 steps), so the
+    ORDER BY step_number / LIMIT 1 is belt-and-braces.
+    """
+    if not bom_id:
+        return None
+    return await conn.fetchval(
+        """
+        SELECT output_code
+          FROM bom_process_route
+         WHERE bom_id = $1
+           AND output_kind = 'SFG'
+           AND output_code IS NOT NULL
+         ORDER BY step_number
+         LIMIT 1
+        """,
+        bom_id,
+    )
+
+
 async def create_job_cards_from_plan(conn, plan_id: int) -> dict:
     """Generate one job_card_v2 per (line × step) for the given plan.
 
@@ -782,6 +832,21 @@ async def create_job_cards_from_plan(conn, plan_id: int) -> dict:
         jc_ids: list[int] = []
         prev_jc_id: int | None = None
 
+        # Slice 3: the SFG#### this 2-stage article produces (Create-WIP step's
+        # output_code in bom_process_route), or None for single-stage / unrouted.
+        sfg_code = await _resolve_sfg_seam_code(conn, ln["bom_id"])
+        # A routed SFG article's route is exactly 2 steps (Create WIP -> Final FG),
+        # so the position-based seam below is only trustworthy when the plan kept
+        # that 2-step shape. If an admin added/removed steps the plan diverged —
+        # stamping by position would put the code on the wrong step, so skip the
+        # seam (codes left NULL) and warn rather than mis-wire it.
+        if sfg_code and step_count != 2:
+            logger.warning(
+                "plan %s line %s: routed 2-stage article (SFG %s) but plan has "
+                "%d step(s) — SFG seam not materialised (expected 2)",
+                plan_id, plan_line_id, sfg_code, step_count,
+            )
+
         for idx, step in enumerate(step_rows):
             is_first = idx == 0
             is_last  = idx == step_count - 1
@@ -789,6 +854,20 @@ async def create_job_cards_from_plan(conn, plan_id: int) -> dict:
             # Material-flow context per spec (see module docstring).
             input_kind  = 'RM'  if is_first else 'SFG'
             output_kind = 'FG'  if is_last  else 'WIP'
+
+            # Slice 3 — wire the SFG seam on the Create-WIP -> Final-FG handoff
+            # (the last seam of a >=2 step chain): the producer (second-to-last
+            # step) emits SFG####; the consumer (last step) opens with it. Only
+            # fires for a routed 2-stage article (sfg_code present); single-stage
+            # and unrouted chains keep the RM->WIP->FG defaults unchanged.
+            input_code:  str | None = None
+            output_code: str | None = None
+            if sfg_code and step_count == 2:
+                if idx == 0:                     # SFG producer (Create WIP)
+                    output_kind = 'SFG'
+                    output_code = sfg_code
+                else:                            # SFG consumer (Final FG; input_kind='SFG')
+                    input_code = sfg_code
 
             # Lock state: stage 1 opens immediately so floor can receive RM.
             # Downstream stages stay locked until prev-stage handoff fires.
@@ -805,6 +884,7 @@ async def create_job_cards_from_plan(conn, plan_id: int) -> dict:
                 _step=step, _jc_number=jc_number, _batch_no=batch_no,
                 _is_locked=is_locked, _status=status, _locked_reason=locked_reason,
                 _input_kind=input_kind, _output_kind=output_kind, _prev=prev_jc_id,
+                _input_code=input_code, _output_code=output_code,
             ):
                 candidate = new_short_time_id()
                 return await conn.fetchval(
@@ -818,7 +898,8 @@ async def create_job_cards_from_plan(conn, plan_id: int) -> dict:
                         input_kind, output_kind,
                         factory, floor, entity,
                         is_locked, locked_reason, status,
-                        prev_job_card_id
+                        prev_job_card_id,
+                        input_code, output_code
                     ) VALUES (
                         $1, $2,
                         $3, $4, $5, $6,
@@ -828,7 +909,8 @@ async def create_job_cards_from_plan(conn, plan_id: int) -> dict:
                         $16, $17,
                         $18, $19, $20,
                         $21, $22, $23,
-                        $24
+                        $24,
+                        $25, $26
                     )
                     RETURNING job_card_id
                     """,
@@ -851,6 +933,7 @@ async def create_job_cards_from_plan(conn, plan_id: int) -> dict:
                     factory, _step["floor"], entity,
                     _is_locked, _locked_reason, _status,
                     _prev,
+                    _input_code, _output_code,
                 )
             jc_id = await insert_with_pk_retry(conn, _insert)
             jc_ids.append(jc_id)
@@ -888,6 +971,361 @@ async def create_job_cards_from_plan(conn, plan_id: int) -> dict:
         sum(len(l["job_card_ids"]) for l in result_lines),
     )
     return {"plan_id": plan_id, "lines": result_lines}
+
+
+# ---------------------------------------------------------------------------
+# Per-article (wizard) job-card creation — the Plan-List "Create Job Card"
+# flow. Chained-per-process + mutable plan steps, per the signed-off design
+# in docs/SO_Planning_Convergence_Remediation.md §4.
+# ---------------------------------------------------------------------------
+
+async def create_job_cards_for_line(
+    conn,
+    plan_line_id: int,
+    *,
+    qty_kg,
+    qty_units=None,
+    wip_steps: list[dict],
+    pkg_floor: str,
+) -> dict:
+    """Create one chained job_card_v2 per WIP process → a terminating Packaging
+    JC for a SINGLE plan line, and dispatch each to its floor.
+
+    Driven by the wizard's per-article inputs (NOT the plan's snapshot steps):
+      * wip_steps: [{process, floor, sfg_output}] in operator order;
+      * pkg_floor: the packaging (Final FG) floor.
+
+    Behaviour mirrors create_job_cards_from_plan's chain machinery so the rest
+    of the system (lock/handoff/indents/PDF/annexure) keeps working:
+      * stage-1 `unlocked` (ready on its floor), the rest `locked` +
+        `awaiting_previous_stage`, released downstream by dispatch_to_next;
+      * RM + PM materialised on stage 1 ONLY, from the LINE's bom_id (the
+        wizard supplies no material data);
+      * input_kind first=RM / else SFG; output_kind last=FG / else WIP, with a
+        producer promoted to output_kind='SFG'+output_code when it declares an
+        sfg_output. The consumer opens with the previous producer's code
+        (input_code). A producer with no sfg_output stays plain WIP (NULL code)
+        — the legitimate multi-step WIP case the dispatch backstop allows.
+
+    Mutable steps: the line's production_plan_step_v2 rows are REPLACED with the
+    wizard's (satisfies job_card_v2.plan_step_id NOT NULL without double-creating
+    — safe because the per-line guard guarantees no JC references them yet).
+
+    Idempotent per LINE (not per plan): refuses if the line already has
+    non-deleted job cards, so a partial wizard-create + Approve can't double-
+    create (Approve's own plan-level guard blocks the other direction).
+
+    Returns {plan_id, plan_line_id, job_card_ids, count} or {error: ...}.
+    MUST run inside an outer transaction (the router wraps us).
+    """
+    # ---- validate inputs -------------------------------------------------
+    try:
+        qk = float(qty_kg)
+    except (TypeError, ValueError):
+        qk = 0.0
+    if qk <= 0:
+        return {"error": "invalid_qty", "message": "Quantity (kg) must be greater than 0"}
+    if not wip_steps:
+        return {"error": "no_wip_steps", "message": "At least one WIP process is required"}
+    if not pkg_floor or not str(pkg_floor).strip():
+        return {"error": "missing_pkg_floor", "message": "A packaging floor is required"}
+
+    qu = None
+    if qty_units not in (None, ""):
+        try:
+            _v = float(qty_units)
+            qu = _v if _v > 0 else None
+        except (TypeError, ValueError):
+            qu = None
+
+    # ---- load the line + its plan ---------------------------------------
+    line = await conn.fetchrow(
+        """
+        SELECT l.plan_line_id, l.plan_id, l.bom_id, l.fg_sku_name, l.customer_name,
+               p.entity, p.warehouse
+        FROM   production_plan_line_v2 l
+        JOIN   production_plan_v2 p ON p.plan_id = l.plan_id
+        WHERE  l.plan_line_id = $1
+        """,
+        plan_line_id,
+    )
+    if not line:
+        return {"error": "line_not_found"}
+
+    # ---- per-line idempotency guard -------------------------------------
+    existing = await conn.fetchval(
+        "SELECT COUNT(*) FROM job_card_v2 WHERE plan_line_id=$1 AND deleted_at IS NULL",
+        plan_line_id,
+    )
+    if existing and existing > 0:
+        return {"error": "job_cards_already_exist", "count": existing}
+
+    plan_id       = line["plan_id"]
+    bom_id        = line["bom_id"]
+    factory       = line["warehouse"]
+    entity        = line["entity"]
+    fg_sku_name   = line["fg_sku_name"]
+    customer_name = line["customer_name"]
+
+    # ---- build the ordered step spec: WIP steps (as given) + Packaging ---
+    def _stage_for(name: str) -> str:
+        # Same derive as create_job_cards_from_plan's NOT-NULL fallback.
+        return (name or "").strip().lower().replace(" ", "_") or "wip"
+
+    steps_spec: list[dict] = []
+    for s in wip_steps:
+        proc = (s.get("process") or "").strip()
+        steps_spec.append({
+            "process_name": proc or "WIP",
+            "stage":        _stage_for(proc),
+            "floor":        (s.get("floor") or "").strip() or None,
+            "sfg_output":   (s.get("sfg_output") or "").strip() or None,
+        })
+    # Packaging is the terminal Final-FG stage. Stamp an explicit 'packaging'
+    # stage so is_packing_stage() recognises it for EGA (never string-derive it).
+    steps_spec.append({
+        "process_name": "Packaging",
+        "stage":        "packaging",
+        "floor":        str(pkg_floor).strip(),
+        "sfg_output":   None,
+    })
+    n = len(steps_spec)
+
+    # ---- mutable-step reconciliation: REPLACE the line's snapshot steps --
+    # Safe: the per-line guard above guarantees no job_card_v2 references these
+    # (plan_step_id is ON DELETE RESTRICT), so the DELETE cannot orphan a JC.
+    await conn.execute(
+        "DELETE FROM production_plan_step_v2 WHERE plan_line_id=$1", plan_line_id,
+    )
+    step_ids: list[int] = []
+    for i, sp in enumerate(steps_spec):
+        async def _insert_step(_order=i + 1, _sp=sp):
+            return await conn.fetchval(
+                """
+                INSERT INTO production_plan_step_v2 (
+                    step_id, plan_line_id, step_order, process_name, stage, floor
+                ) VALUES ($1, $2, $3, $4, $5, $6)
+                RETURNING step_id
+                """,
+                new_short_time_id(), plan_line_id, _order,
+                _sp["process_name"], _sp["stage"], _sp["floor"],
+            )
+        step_ids.append(await insert_with_pk_retry(conn, _insert_step))
+
+    # ---- create one chained JC per step ---------------------------------
+    jc_ids: list[int] = []
+    prev_jc_id: int | None = None
+    prev_output_code: str | None = None
+
+    for idx, sp in enumerate(steps_spec):
+        is_first = idx == 0
+        is_last  = idx == n - 1
+
+        input_kind  = 'RM' if is_first else 'SFG'
+        output_kind = 'FG' if is_last  else 'WIP'
+        output_code: str | None = None
+        input_code:  str | None = prev_output_code   # opens with prev producer's code
+
+        # A non-last step that declares an SFG output is an SFG producer.
+        # (Blank → plain WIP / NULL code: the safe multi-step WIP case.)
+        if not is_last and sp["sfg_output"]:
+            output_kind = 'SFG'
+            output_code = sp["sfg_output"]
+
+        is_locked     = not is_first
+        status        = 'unlocked' if is_first else 'locked'
+        locked_reason = None if is_first else 'awaiting_previous_stage'
+
+        jc_number = f"PLAN-{plan_id}-L{plan_line_id}-S{idx + 1}"
+        batch_no  = _batch_number(plan_id, plan_line_id, idx + 1)
+        step_id   = step_ids[idx]
+
+        # NOTE: column/value order kept identical to
+        # create_job_cards_from_plan's INSERT — keep the two in sync.
+        async def _insert_jc(
+            _step_id=step_id, _jc_number=jc_number, _batch_no=batch_no,
+            _step_number=idx + 1, _process=sp["process_name"], _stage=sp["stage"],
+            _floor=sp["floor"], _input_kind=input_kind, _output_kind=output_kind,
+            _is_locked=is_locked, _status=status, _locked_reason=locked_reason,
+            _prev=prev_jc_id, _input_code=input_code, _output_code=output_code,
+        ):
+            candidate = new_short_time_id()
+            return await conn.fetchval(
+                """
+                INSERT INTO job_card_v2 (
+                    job_card_id, job_card_number,
+                    plan_id, plan_line_id, plan_step_id, bom_id,
+                    step_number, process_name, stage,
+                    fg_sku_name, customer_name, batch_number,
+                    planned_qty_kg, planned_qty_units, uom,
+                    input_kind, output_kind,
+                    factory, floor, entity,
+                    is_locked, locked_reason, status,
+                    prev_job_card_id,
+                    input_code, output_code
+                ) VALUES (
+                    $1, $2,
+                    $3, $4, $5, $6,
+                    $7, $8, $9,
+                    $10, $11, $12,
+                    $13, $14, $15,
+                    $16, $17,
+                    $18, $19, $20,
+                    $21, $22, $23,
+                    $24,
+                    $25, $26
+                )
+                RETURNING job_card_id
+                """,
+                candidate, _jc_number,
+                plan_id, plan_line_id, _step_id, bom_id,
+                _step_number, _process, _stage,
+                fg_sku_name, customer_name, _batch_no,
+                qk, qu, 'KGS',
+                _input_kind, _output_kind,
+                factory, _floor, entity,
+                _is_locked, _locked_reason, _status,
+                _prev,
+                _input_code, _output_code,
+            )
+        jc_id = await insert_with_pk_retry(conn, _insert_jc)
+        jc_ids.append(jc_id)
+
+        # RM + PM indents on stage 1 only, from the LINE's bom_id.
+        if is_first and bom_id:
+            await _materialise_indents(
+                conn,
+                job_card_id=jc_id,
+                bom_id=bom_id,
+                planned_qty_kg=qk,
+                is_first_stage=True,
+                fg_sku_name=fg_sku_name,
+                planned_qty_units=qu,
+            )
+
+        # Bi-directional chain — set the next pointer on the prev row.
+        if prev_jc_id is not None:
+            await conn.execute(
+                "UPDATE job_card_v2 SET next_job_card_id=$1 WHERE job_card_id=$2",
+                jc_id, prev_jc_id,
+            )
+
+        prev_jc_id = jc_id
+        prev_output_code = output_code
+
+    logger.info(
+        "Created %d job card(s) for plan_line_id=%d (plan_id=%d): dispatched to floors %s",
+        len(jc_ids), plan_line_id, plan_id,
+        [sp["floor"] for sp in steps_spec],
+    )
+    return {
+        "plan_id": plan_id,
+        "plan_line_id": plan_line_id,
+        "job_card_ids": jc_ids,
+        "count": len(jc_ids),
+    }
+
+
+# A job card is still EDITABLE only while it hasn't started moving — i.e. it is
+# in the initial locked/unlocked state with no material received / time logged.
+# Once the floor begins (material_received, in_progress, …) the chain carries
+# real work and must not be deleted/replaced.
+_JC_EDITABLE_STATUSES = ('locked', 'unlocked')
+
+
+async def get_line_job_card_config(conn, plan_line_id: int) -> dict:
+    """Reconstruct the Create-Job-Card wizard payload from a line's EXISTING
+    job cards, so the Edit flow can prefill the modal.
+
+    Returns {exists, editable, started, qty_kg, qty_units, wip_steps[], pkg_floor}.
+    `exists=False` when the line has no job cards (caller shows Create, not Edit).
+    `editable=False` when any card has progressed beyond locked/unlocked.
+    The last card in the chain is Packaging; the rest are the WIP processes.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT step_number, process_name, floor, output_code,
+               planned_qty_kg, planned_qty_units, status
+        FROM job_card_v2
+        WHERE plan_line_id = $1 AND deleted_at IS NULL
+        ORDER BY step_number
+        """,
+        plan_line_id,
+    )
+    if not rows:
+        return {"exists": False}
+
+    started = any(r["status"] not in _JC_EDITABLE_STATUSES for r in rows)
+    wip_rows = rows[:-1]          # every stage except the terminating Packaging
+    pkg_row  = rows[-1]
+    first    = rows[0]
+    return {
+        "exists": True,
+        "editable": not started,
+        "started": started,
+        "qty_kg": float(first["planned_qty_kg"]) if first["planned_qty_kg"] is not None else None,
+        "qty_units": float(first["planned_qty_units"]) if first["planned_qty_units"] is not None else None,
+        "wip_steps": [
+            {
+                "process": r["process_name"],
+                "floor": r["floor"],
+                "sfg_output": r["output_code"],
+            }
+            for r in wip_rows
+        ],
+        "pkg_floor": pkg_row["floor"],
+    }
+
+
+async def replace_job_cards_for_line(
+    conn,
+    plan_line_id: int,
+    *,
+    qty_kg,
+    qty_units=None,
+    wip_steps: list[dict],
+    pkg_floor: str,
+) -> dict:
+    """Edit a line's job cards by REPLACING them: delete the current chain and
+    recreate it from the wizard's inputs. Only valid while the chain is still
+    fresh (every card locked/unlocked); refuses once any stage has started so
+    in-progress work is never destroyed.
+
+    Deleting the cards cascades their RM/PM indents (FK ON DELETE CASCADE); the
+    plan_step rows are then rebuilt by create_job_cards_for_line. MUST run inside
+    an outer transaction.
+    """
+    existing = await conn.fetch(
+        "SELECT job_card_id, status FROM job_card_v2 "
+        "WHERE plan_line_id = $1 AND deleted_at IS NULL",
+        plan_line_id,
+    )
+    if not existing:
+        # Nothing to replace — fall through to a plain create.
+        return await create_job_cards_for_line(
+            conn, plan_line_id, qty_kg=qty_kg, qty_units=qty_units,
+            wip_steps=wip_steps, pkg_floor=pkg_floor,
+        )
+
+    if any(r["status"] not in _JC_EDITABLE_STATUSES for r in existing):
+        return {
+            "error": "not_editable",
+            "message": "These job cards have already started — they can't be edited.",
+        }
+
+    # Drop the whole chain in one statement (indents cascade; the bidirectional
+    # prev/next self-FK is satisfied because the entire referenced set goes too).
+    await conn.execute(
+        "DELETE FROM job_card_v2 WHERE plan_line_id = $1", plan_line_id,
+    )
+    # Recreate from the new inputs (its per-line guard now passes — no JC remains).
+    result = await create_job_cards_for_line(
+        conn, plan_line_id, qty_kg=qty_kg, qty_units=qty_units,
+        wip_steps=wip_steps, pkg_floor=pkg_floor,
+    )
+    if "error" not in result:
+        result["replaced"] = len(existing)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1314,6 +1752,12 @@ async def list_job_cards(
                jc.fg_sku_name, jc.customer_name, jc.batch_number,
                jc.planned_qty_kg, jc.planned_qty_units, jc.uom,
                jc.input_kind, jc.output_kind,
+               -- SFG seam codes (Slice 7): the SFG#### identifiers on the
+               -- chain edge. output_code is the SFG this JC produces (set on
+               -- Create-WIP / intermediate stages); input_code is the SFG this
+               -- JC consumes (set on downstream Final-FG stages). Additive
+               -- fields the list UI surfaces as `SFGxxxx` on Create-WIP rows.
+               jc.input_code, jc.output_code,
                jc.factory, jc.floor, jc.entity,
                jc.assigned_to_team_leader, jc.team_members,
                jc.is_locked, jc.locked_reason, jc.status,
@@ -1466,6 +1910,12 @@ async def search_job_cards(
                jc.fg_sku_name, jc.customer_name, jc.batch_number,
                jc.planned_qty_kg, jc.planned_qty_units, jc.uom,
                jc.input_kind, jc.output_kind,
+               -- SFG seam codes (Slice 7): the SFG#### identifiers on the
+               -- chain edge. output_code is the SFG this JC produces (set on
+               -- Create-WIP / intermediate stages); input_code is the SFG this
+               -- JC consumes (set on downstream Final-FG stages). Additive
+               -- fields the list UI surfaces as `SFGxxxx` on Create-WIP rows.
+               jc.input_code, jc.output_code,
                jc.factory, jc.floor, jc.entity,
                jc.assigned_to_team_leader, jc.team_members,
                jc.is_locked, jc.locked_reason, jc.status,
@@ -1576,6 +2026,92 @@ async def assign_team(conn, *, job_card_id: int,
 # Stage handoff: dispatch WIP/SFG to the next stage's JC
 # ---------------------------------------------------------------------------
 
+async def materialise_wip_dispatch(conn, *, producer_job_card_id: int,
+                                   consumer_job_card_id: int | None,
+                                   sfg_code: str | None, fg_sku_name: str | None,
+                                   qty_kg: float, dispatch_id: int | None,
+                                   entity: str | None,
+                                   recorded_by: str | None = None) -> str | None:
+    """Slice 5 — materialise a Create-WIP → Final-FG handoff EXACTLY ONCE per
+    dispatch event. Shared by close_batch (auto-dispatch on close) and
+    dispatch_to_next (manual) so both paths have identical side effects:
+
+      (1) a WIP `inventory_batch` (item_type='wip', sku = the SFG#### code so the
+          Stage-2 picker / get_sfg_on_hand / chain seam all agree, qty = dispatched,
+          expiry = mfg + WIP_SHELF_LIFE_DAYS) — the physical stock the next stage issues from;
+      (2) a synthetic SFG consumption row on the CONSUMER JC linked to the
+          dispatch (source_dispatch_id) — pre-records the opening SFG input + makes
+          the chain auditable. The mass-balance input for the consumer is its
+          carried_qty_kg (set by the caller), NOT this row, so there's no double count;
+      (3) a floor_movement audit (production_floor → wip_store).
+
+    Returns the new WIP batch_id, or None when there's nothing to materialise
+    (qty ≤ 0 or no resolvable sku). MUST run inside the caller's transaction.
+    Idempotency is per-dispatch: call once per dispatch event (each dispatch mints
+    its own batch); the synthetic-consumption upsert is keyed so a repeat is safe.
+    """
+    from app.modules.production.services.inventory_service import create_wip_batch
+    if not qty_kg or qty_kg <= 0:
+        return None
+    sku = sfg_code or fg_sku_name
+    if not sku:
+        return None
+
+    # Audit NULL-OUTPUT-CODE-CORRUPTION: minting under fg_sku_name (the fallback
+    # when sfg_code is NULL) is only correct for a genuine non-SFG WIP handoff.
+    # If this is actually a dropped SFG seam, the WIP lands under the FG name and
+    # the downstream picker can't find it. dispatch_to_next hard-fails the
+    # declared-SFG case before reaching here; this warning surfaces the remaining
+    # ambiguous case (WIP output with no code) so a mis-routed chain is visible
+    # rather than silent.
+    if not sfg_code:
+        logger.warning(
+            "materialise_wip_dispatch: producer JC %s has no SFG output_code — "
+            "minting WIP under FG sku '%s' (no distinct SFG identity). Verify this "
+            "is a non-SFG WIP chain, not a dropped seam.",
+            producer_job_card_id, fg_sku_name,
+        )
+
+    # (1) WIP stock
+    wip_batch_id = await create_wip_batch(
+        conn, sku_name=sku, qty_kg=qty_kg, entity=entity,
+        job_card_id=producer_job_card_id, floor_id='wip_store',
+        performed_by=recorded_by,
+    )
+
+    # (2) synthetic downstream consumption — AUDIT ONLY. actual_consumed_qty=0
+    # so it never inflates any mass-balance input sum: the consumer's chain input
+    # is its carried_qty_kg (set by the caller), and double-counting carried_in +
+    # this row was the Slice-5-review conservation bug (roll-up multi-count /
+    # close-modal). The row's value is the source_dispatch_id breadcrumb linking
+    # the consumer back to the dispatch that fed it (+ the SFG#### identity).
+    if consumer_job_card_id is not None:
+        await upsert_consumption_lines(
+            conn, job_card_id=consumer_job_card_id,
+            entries=[{
+                "material_sku_name": sku, "consumed_qty": 0, "uom": "KGS",
+                "input_kind": "SFG", "source_dispatch_id": dispatch_id,
+                "bom_line_id": None,
+            }],
+            input_kind="SFG", recorded_by=recorded_by,
+        )
+
+    # (3) floor_movement audit. job_card_id is left NULL: floor_movement.job_card_id
+    # FKs the legacy v1 job_card table, so a v2 id would violate it. The producing
+    # v2 JC is recorded in the reason text for traceability. A direct INSERT (not
+    # move_material) because the WIP is newly produced — there's no pre-existing
+    # production_floor stock for move_material to debit.
+    await conn.execute(
+        """
+        INSERT INTO floor_movement
+            (sku_name, from_location, to_location, quantity_kg, reason, entity, moved_by)
+        VALUES ($1, 'production_floor', 'wip_store', $2, $3, $4, $5)
+        """,
+        sku, qty_kg, f"wip_production jc={producer_job_card_id}", entity, recorded_by,
+    )
+    return wip_batch_id
+
+
 async def dispatch_to_next(conn, *, job_card_id: int, qty_kg: float,
                            qty_units: float | None = None,
                            dispatched_by: str | None = None,
@@ -1596,9 +2132,11 @@ async def dispatch_to_next(conn, *, job_card_id: int, qty_kg: float,
     src = await conn.fetchrow(
         """
         SELECT job_card_id, next_job_card_id, planned_qty_kg,
-               dispatched_to_next_kg, output_kind
+               dispatched_to_next_kg, output_kind, status,
+               entity, output_code, fg_sku_name
         FROM   job_card_v2
         WHERE  job_card_id=$1 AND deleted_at IS NULL
+        FOR    UPDATE
         """,
         job_card_id,
     )
@@ -1610,6 +2148,24 @@ async def dispatch_to_next(conn, *, job_card_id: int, qty_kg: float,
     if src["next_job_card_id"] is None:
         return {"error": "chain_broken",
                 "message": "next_job_card_id is NULL; cannot dispatch"}
+    # Slice-5 review #1: cap cumulative dispatch at produced output so a manual
+    # dispatch on top of close_batch's auto-dispatch can't mint phantom WIP
+    # (total dispatched > produced). Mirrors the legacy v1 engine's invariant
+    # (dispatched_to_next_kg + qty <= produced). FOR UPDATE above serialises
+    # concurrent dispatches so the check can't race.
+    if (src["status"] or "") in ('closed', 'cancelled'):
+        return {"error": "jc_terminal",
+                "message": f"Cannot dispatch from a {src['status']} job card"}
+    produced = float(await conn.fetchval(
+        "SELECT COALESCE(SUM(output_qty_kg), 0) FROM job_card_output_v2 WHERE job_card_id=$1",
+        job_card_id,
+    ) or 0)
+    already = float(src["dispatched_to_next_kg"] or 0)
+    if produced > 0 and already + qty_kg > produced + 1e-6:
+        return {"error": "over_dispatch",
+                "message": (f"Dispatching {qty_kg} would exceed produced output: "
+                            f"{already} already dispatched of {produced} produced."),
+                "produced_kg": produced, "already_dispatched_kg": already}
 
     async def _insert_dispatch():
         return await conn.fetchrow(
@@ -1644,7 +2200,36 @@ async def dispatch_to_next(conn, *, job_card_id: int, qty_kg: float,
         """,
         qty_kg, src["next_job_card_id"],
     )
-    return {"dispatched": True, "dispatch": _serialize(audit)}
+
+    # Slice 5: materialise the dispatched SFG (WIP batch + synthetic consumption +
+    # floor_movement). output_kind here is always SFG/WIP (FG returned early above).
+    wip_batch_id = None
+    if (src["output_kind"] or "").upper() in ('SFG', 'WIP'):
+        # Defensive (audit NULL-OUTPUT-CODE-CORRUPTION): a step explicitly
+        # declared as an SFG producer MUST carry its SFG#### output_code. A NULL
+        # here means the seam was never stamped — e.g. a routed 2-stage article
+        # whose plan diverged from the expected 2-step shape, which
+        # create_job_cards_from_plan deliberately skips (codes left NULL). Without
+        # this guard materialise_wip_dispatch falls back to `sfg_code or
+        # fg_sku_name` and mints WIP stock under the FINISHED-GOODS sku name —
+        # stock the Stage-2 picker / get_sfg_on_hand can never find. Fail loudly
+        # rather than silently corrupt inventory.
+        if (src["output_kind"] or "").upper() == 'SFG' and not src["output_code"]:
+            raise ValueError(
+                f"dispatch_to_next: JC {job_card_id} is an SFG producer "
+                f"(output_kind=SFG) with a NULL output_code — refusing to "
+                f"dispatch. The SFG seam was not stamped at JC creation."
+            )
+        wip_batch_id = await materialise_wip_dispatch(
+            conn,
+            producer_job_card_id=job_card_id,
+            consumer_job_card_id=src["next_job_card_id"],
+            sfg_code=src["output_code"], fg_sku_name=src["fg_sku_name"],
+            qty_kg=qty_kg, dispatch_id=audit["dispatch_id"],
+            entity=src["entity"], recorded_by=dispatched_by,
+        )
+    return {"dispatched": True, "dispatch": _serialize(audit),
+            "wip_batch_id": wip_batch_id}
 
 
 # ---------------------------------------------------------------------------
@@ -2073,14 +2658,17 @@ async def _derive_accounting_payload(conn, job_card_id: int) -> dict:
     ) or 0)
     canonical_input = rm_issued + carried_in
     if canonical_input <= 0:
-        # RM-only consumption sum. input_kind='RM' filter excludes the
-        # PM rows the operator typed alongside in the same grid.
+        # Input-side consumption sum: RM + SFG/WIP opening inputs (only PM is
+        # excluded — packaging doesn't convert into FG mass). This matches the FE
+        # SummaryCard rule (item_type !== 'PM'); an earlier RM-only filter dropped
+        # the whole SFG input to 0 on a pack-of-existing-SFG (archetype C) card
+        # whose only input is the SFG (Slice-5 review #5).
         rm_consumption = float(await conn.fetchval(
             """
             SELECT COALESCE(SUM(actual_consumed_qty), 0)
             FROM   job_card_material_consumption_v2
             WHERE  job_card_id = $1
-              AND  COALESCE(input_kind, 'RM') = 'RM'
+              AND  COALESCE(input_kind, 'RM') <> 'PM'
             """,
             job_card_id,
         ) or 0)
@@ -2839,6 +3427,10 @@ async def get_job_card(conn, job_card_id: int) -> dict | None:
     bom_item_group: str | None = None
     bom_pack_size:  float | None = None
     bom_version:    int | None = None
+    # G4 bar-line override (migration 061): surfaced so the FE can BADGE a
+    # bar-line FG and show whether its route was re-derived from bar_line_process.
+    bom_bar_line_process: str | None = None
+    bom_bar_line_routed:  bool | None = None
     sales_order_ref: str | None = None
 
     if h.get("plan_line_id"):
@@ -2871,18 +3463,38 @@ async def get_job_card(conn, job_card_id: int) -> dict | None:
     # BOM enrichment: item_group + pack_size_kg + version (catalog metadata
     # the overview shows under "Business Unit" / "Pack Size").
     if h.get("bom_id"):
-        bom_row = await conn.fetchrow(
-            """
-            SELECT item_group, pack_size_kg, version
-            FROM   bom_header
-            WHERE  bom_id = $1
-            """,
-            h["bom_id"],
-        )
+        # G4: bar_line_process / bar_line_routed (migration 061) are additive —
+        # on a server running 061-aware code BEFORE the migration lands, asyncpg
+        # raises UndefinedColumnError; fall back to the pre-061 projection with
+        # those two surfaced as NULL so JC detail stays loadable (mirrors the
+        # batch_id fallback pattern above).
+        try:
+            bom_row = await conn.fetchrow(
+                """
+                SELECT item_group, pack_size_kg, version,
+                       bar_line_process, bar_line_routed
+                FROM   bom_header
+                WHERE  bom_id = $1
+                """,
+                h["bom_id"],
+            )
+        except UndefinedColumnError:
+            bom_row = await conn.fetchrow(
+                """
+                SELECT item_group, pack_size_kg, version,
+                       NULL::TEXT AS bar_line_process,
+                       NULL::BOOLEAN AS bar_line_routed
+                FROM   bom_header
+                WHERE  bom_id = $1
+                """,
+                h["bom_id"],
+            )
         if bom_row:
             bom_item_group = bom_row["item_group"]
             bom_pack_size  = float(bom_row["pack_size_kg"]) if bom_row["pack_size_kg"] is not None else None
             bom_version    = bom_row["version"]
+            bom_bar_line_process = bom_row["bar_line_process"]
+            bom_bar_line_routed  = bom_row["bar_line_routed"]
 
     # BOM catalogue — the full list of articles (RM + PM) attached to
     # this JC's product, regardless of which stage they're issued on.
@@ -3206,6 +3818,10 @@ async def get_job_card(conn, job_card_id: int) -> dict | None:
         "item_group":      bom_item_group,
         "pack_size_kg":    bom_pack_size,
         "bom_version":     bom_version,
+        # G4 bar-line override badge (migration 061): the richer routing string
+        # and whether this FG's route was re-derived from it. NULL pre-061.
+        "bar_line_process": bom_bar_line_process,
+        "bar_line_routed":  bom_bar_line_routed,
         # Stage + lineage context handy for the overview header
         "step_number":     h.get("step_number"),
         "process_name":    h.get("process_name"),

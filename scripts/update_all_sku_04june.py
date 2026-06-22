@@ -21,9 +21,9 @@ import openpyxl
 from dotenv import load_dotenv
 
 load_dotenv()
-DB_URL = os.environ["DATABASE_URL"]
+DB_URL = os.environ["DATABASE_URL"].strip()  # .strip() guards against CRLF in .env
 ROOT = Path(__file__).resolve().parent.parent
-SRC = Path(r"C:\Users\Lenovo\Downloads\All_SKU Updated List\All_Sku Update CFPL & CDPL 04th June (1).xlsx")
+SRC = ROOT / "data" / "All_Sku Update CFPL & CDPL 04th June.xlsx"
 FIELDS = ["item_type", "item_group", "sub_group", "uom", "sale_group", "gst"]
 
 
