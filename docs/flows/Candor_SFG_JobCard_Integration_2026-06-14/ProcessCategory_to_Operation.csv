@@ -1,0 +1,10 @@
+﻿process_category_token(s),practical_operation,stage_bucket,produces_sfg,note
+De-Seeding,De-Seeding,Create WIP,Y,dates de-seeded
+Blanching + Slicing/Dicing/Slivering,Blanch & Slice,Create WIP,Y,almond line (combined)
+Blending + Bar Forming,Blend & Form,Create WIP,Y,bar/ball line (combined)
+Roasting (no seasoning),Roasting,Create WIP,Y,plain roasted seeds/nuts
+Flavouring / Salting (Roasting combined),Roast & Flavour/Salt,Create WIP,Y,seasoned nuts/seeds - ONE op
+Stuffing,Stuffing,Create WIP,Y,stuffed dates
+Enrobing / Chocolate,Enrobe / Choco-Coat,Create WIP,Y,choco bites
+Sorting,(inline),RM intake / Final FG,N,done at intake or with packing - NOT an SFG
+Packaging / Bulk Packaging / Master Carton / Mono Carton / Flow Wrap / Krugger / X-Ray / Weighing,Packaging,Final FG,N,terminal -> FG

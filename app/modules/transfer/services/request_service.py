@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from app.core.helpers import insert_with_pk_retry, new_short_time_id
 from app.modules.transfer import schemas
 from app.modules.transfer.services.query_service import (
     _convert_date,
@@ -57,25 +58,28 @@ async def create_request(conn, data: schemas.RequestCreate, created_by: str) -> 
     )
 
     async with conn.transaction():
-        header = await conn.fetchrow(
-            """
-            INSERT INTO interunit_transfer_requests
-                (request_no, request_date, from_site, to_site,
-                 reason_code, remarks, status, created_by, created_ts)
-            VALUES ($1, $2, $3, $4, $5, $6, 'Pending', $7, $8)
-            RETURNING id, request_no, request_date, from_site, to_site,
-                      reason_code, remarks, status, reject_reason,
-                      created_by, created_ts, rejected_ts, updated_at
-            """,
-            request_no,
-            request_date,
-            data.form_data.from_warehouse,
-            data.form_data.to_warehouse,
-            data.form_data.reason_description or "General Transfer",
-            data.form_data.reason_description or "No remarks",
-            created_by,
-            datetime.now(),
-        )
+        async def _ins_request():
+            return await conn.fetchrow(
+                """
+                INSERT INTO interunit_transfer_requests
+                    (request_no, request_date, from_site, to_site,
+                     reason_code, remarks, status, created_by, created_ts, id)
+                VALUES ($1, $2, $3, $4, $5, $6, 'Pending', $7, $8, $9)
+                RETURNING id, request_no, request_date, from_site, to_site,
+                          reason_code, remarks, status, reject_reason,
+                          created_by, created_ts, rejected_ts, updated_at
+                """,
+                request_no,
+                request_date,
+                data.form_data.from_warehouse,
+                data.form_data.to_warehouse,
+                data.form_data.reason_description or "General Transfer",
+                data.form_data.reason_description or "No remarks",
+                created_by,
+                datetime.now(),
+                new_short_time_id(),
+            )
+        header = await insert_with_pk_retry(conn, _ins_request)
         request_id = header["id"]
 
         lines = []
@@ -95,31 +99,36 @@ async def create_request(conn, data: schemas.RequestCreate, created_by: str) -> 
             fe_total = _f(line.total_weight)
             total_weight = round(fe_total, 3) if fe_total > 0 else net_weight
 
-            row = await conn.fetchrow(
-                """
-                INSERT INTO interunit_transfer_request_lines
-                    (request_id, rm_pm_fg_type, item_category, sub_category,
-                     item_desc_raw, pack_size, qty, uom,
-                     unit_pack_size, net_weight, total_weight, lot_number)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-                RETURNING id, request_id, rm_pm_fg_type, item_category, sub_category,
-                          item_desc_raw, pack_size, qty, uom,
-                          unit_pack_size, net_weight, total_weight, lot_number,
-                          created_at, updated_at
-                """,
-                request_id,
-                line.material_type,
-                line.item_category,
-                line.sub_category,
-                line.item_description,
-                pack_size_f,
-                qty_i,
-                _uom(line.uom),
-                unit_pack,
-                net_weight,
-                total_weight,
-                line.lot_number,
-            )
+            async def _ins_request_line(line=line, pack_size_f=pack_size_f, qty_i=qty_i,
+                                        unit_pack=unit_pack, net_weight=net_weight,
+                                        total_weight=total_weight):
+                return await conn.fetchrow(
+                    """
+                    INSERT INTO interunit_transfer_request_lines
+                        (request_id, rm_pm_fg_type, item_category, sub_category,
+                         item_desc_raw, pack_size, qty, uom,
+                         unit_pack_size, net_weight, total_weight, lot_number, id)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                    RETURNING id, request_id, rm_pm_fg_type, item_category, sub_category,
+                              item_desc_raw, pack_size, qty, uom,
+                              unit_pack_size, net_weight, total_weight, lot_number,
+                              created_at, updated_at
+                    """,
+                    request_id,
+                    line.material_type,
+                    line.item_category,
+                    line.sub_category,
+                    line.item_description,
+                    pack_size_f,
+                    qty_i,
+                    _uom(line.uom),
+                    unit_pack,
+                    net_weight,
+                    total_weight,
+                    line.lot_number,
+                    new_short_time_id(),
+                )
+            row = await insert_with_pk_retry(conn, _ins_request_line)
             lines.append(_map_request_line(dict(row)))
 
     result = _map_request_header(dict(header))

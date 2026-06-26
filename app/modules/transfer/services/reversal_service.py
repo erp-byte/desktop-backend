@@ -10,12 +10,25 @@ transaction. asyncpg type-strictness handled via stock_service._dec / _date / _j
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime
 
+from app.core.helpers import insert_with_pk_retry, new_short_time_id
 from app.modules.transfer.services.stock_service import _date, _dec, _json, _table_exists
 
+logger = logging.getLogger(__name__)
+
+# Include the BARE sub-cold names (not just the "… cold" variants): the transfer forms
+# offer "Rishi" / "Savla D-39" / "Savla D-514" / "Supreme" as cold destinations, so
+# _is_cold_site must classify those as cold — otherwise a dispatch TO them routes to a
+# warehouse table and the cold goods are dropped on receive (pick_from_pending only lands
+# *_cold_stocks destinations). Mirrors the reference pending_stock_tools site set.
 COLD_STORAGE_SITE_NAMES = {
-    "cold storage", "rishi cold", "savla d-39 cold", "savla d-514 cold",
+    "cold storage",
+    "rishi", "rishi cold",
+    "savla d-39", "savla d-39 cold",
+    "savla d-514", "savla d-514 cold",
+    "supreme", "supreme cold",
 }
 _COLD_TABLES = ("cfpl_cold_stocks", "cdpl_cold_stocks")
 _WH_TABLES = ("cfpl_boxes_v2", "cdpl_boxes_v2", "cfpl_bulk_entry_boxes", "cdpl_bulk_entry_boxes")
@@ -156,9 +169,21 @@ async def restore_to_source(conn, transfer_out_id: int) -> int:
                         await conn.execute("DELETE FROM pending_transfer_stock WHERE id = $1", p["id"])
                         restored += 1
                         continue
-            key = (p.get("transaction_no") or "", p.get("article") or p.get("item_description") or "")
-            box_num_counters[key] = box_num_counters.get(key, 0) + 1
-            await conn.execute(
+            # Derive box_number from the box_id suffix (e.g. '34732254-5' -> 5) so the
+            # restored row keeps its ORIGINAL number. A fresh counter starting at 1 would
+            # collide with a surviving box #1 on the (transaction_no, article, box_number)
+            # unique key; ON CONFLICT DO NOTHING would then SILENTLY drop the restore and
+            # the box would be lost. Fall back to a per-(txn,article) counter only when the
+            # box_id carries no numeric suffix.
+            bid = str(p.get("box_id") or "")
+            suffix = bid.rsplit("-", 1)[-1] if "-" in bid else ""
+            if suffix.isdigit():
+                box_num = int(suffix)
+            else:
+                key = (p.get("transaction_no") or "", p.get("article") or p.get("item_description") or "")
+                box_num_counters[key] = box_num_counters.get(key, 0) + 1
+                box_num = box_num_counters[key]
+            res = await conn.execute(
                 f"""INSERT INTO {target}
                     (box_id, transaction_no, article_description, lot_number,
                      net_weight, gross_weight, box_number, count)
@@ -166,8 +191,14 @@ async def restore_to_source(conn, transfer_out_id: int) -> int:
                 p.get("box_id"), p.get("transaction_no"),
                 p.get("article") or p.get("item_description"), p.get("lot_no"),
                 _dec(p.get("net_weight") if p.get("net_weight") is not None else p.get("weight_kg")),
-                _dec(p.get("gross_weight")), box_num_counters[key], _dec(p.get("no_of_cartons") or 1),
+                _dec(p.get("gross_weight")), box_num, int(p.get("no_of_cartons") or 1),
             )
+            # Surface a dropped restore (ON CONFLICT no-op) loudly instead of losing it silently.
+            if res and res.split()[-1] == "0":
+                logger.warning(
+                    "RESTORE_TO_SOURCE: box_id=%s tno=%s NOT restored to %s (ON CONFLICT — "
+                    "row already present?); transfer_out_id=%s",
+                    p.get("box_id"), p.get("transaction_no"), target, transfer_out_id)
 
         await _revert_disposition(conn, box_id=p.get("box_id"), transaction_no=p.get("transaction_no"),
                                   disposition_type="transfer_out_pending",
@@ -189,9 +220,9 @@ _PENDING_INSERT = (
     "(transfer_type, transfer_out_id, transfer_out_challan_no, box_id, transaction_no, "
     "from_company, to_company, from_site, to_site, from_storage_type, to_storage_type, "
     "source_table, source_row_id, destination_table, item_description, lot_no, weight_kg, "
-    "no_of_cartons, cold_storage_data, gross_weight, net_weight, article, status, dispatched_at, dispatched_by) "
+    "no_of_cartons, cold_storage_data, gross_weight, net_weight, article, status, dispatched_at, dispatched_by, id) "
     "VALUES ('INTERUNIT',$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,CAST($18 AS JSONB),"
-    "$19,$20,$21,'In Transit',$22,$23) ON CONFLICT (box_id, transaction_no) DO NOTHING"
+    "$19,$20,$21,'In Transit',$22,$23,$24) ON CONFLICT (box_id, transaction_no) DO NOTHING"
 )
 
 
@@ -258,18 +289,173 @@ async def unpick_to_pending(conn, transfer_in_id: int, transfer_out_id: int) -> 
             else "cfpl_bulk_entry_boxes" if to_company == "cfpl" else "cdpl_bulk_entry_boxes")
         dest_keep = dest_table or _destination_table(to_st, to_company)
 
-        await conn.execute(
-            _PENDING_INSERT,
-            transfer_out_id, tout["challan_no"], b["box_id"], b["transaction_no"],
-            from_company, to_company, from_site, to_site, from_st, to_st,
-            source_guess, None, dest_keep, item_description, lot_no, _dec(weight_kg),
-            no_of_cartons, json.dumps(cold_data) if cold_data else None,
-            _dec(b.get("gross_weight")), _dec(b.get("net_weight")), b.get("article"),
-            now, tout["created_by"] or "system",
-        )
+        async def _ins_pending(b=b, cold_data=cold_data, dest_keep=dest_keep,
+                               item_description=item_description, lot_no=lot_no,
+                               weight_kg=weight_kg, no_of_cartons=no_of_cartons,
+                               source_guess=source_guess, to_company=to_company):
+            return await conn.execute(
+                _PENDING_INSERT,
+                transfer_out_id, tout["challan_no"], b["box_id"], b["transaction_no"],
+                from_company, to_company, from_site, to_site, from_st, to_st,
+                source_guess, None, dest_keep, item_description, lot_no, _dec(weight_kg),
+                no_of_cartons, json.dumps(cold_data) if cold_data else None,
+                _dec(b.get("gross_weight")), _dec(b.get("net_weight")), b.get("article"),
+                now, tout["created_by"] or "system", new_short_time_id(),
+            )
+        await insert_with_pk_retry(conn, _ins_pending)
         restored += 1
 
     return restored
+
+
+async def park_boxes(conn, *, transfer_out_id: int, challan_no: str, from_site, to_site,
+                     boxes: list, dispatched_at, dispatched_by: str) -> dict:
+    """Park each dispatched box into pending_transfer_stock (status 'In Transit')
+    and deduct it from its source table (cold_stocks or bulk_entry_boxes).
+
+    `boxes` are dicts carrying box_id / transaction_no / article / lot_number /
+    batch_number / net_weight / gross_weight (the shape of both interunit_transfer_boxes
+    rows and the BoxCreate payload). transaction_no == 'DIRECT' or a missing
+    box_id/transaction_no are quantity-only entries — skipped here (use park_lines
+    to give them a tracking row). Returns per-source counters.
+
+    This is the single-transfer park used by BOTH create_transfer (real-time
+    dispatch) and backfill (one-off ledger reconstruction), so the verified
+    cold/warehouse deduction lives in exactly one place.
+    """
+    from_st = "cold" if _is_cold_site(from_site) else "warehouse"
+    to_st = "cold" if _is_cold_site(to_site) else "warehouse"
+    s = {"parked_from_cold": 0, "parked_from_warehouse": 0, "parked_without_source": 0,
+         "skipped_already_parked": 0, "missing_id": 0}
+
+    for brow in boxes:
+        b = dict(brow)
+        box_id = (b.get("box_id") or "").strip()
+        tno = (b.get("transaction_no") or "").strip()
+        if not box_id or not tno or tno == "DIRECT":
+            s["missing_id"] += 1
+            continue
+        if await conn.fetchval(
+                "SELECT 1 FROM pending_transfer_stock WHERE box_id = $1 AND transaction_no = $2 LIMIT 1", box_id, tno):
+            s["skipped_already_parked"] += 1
+            continue
+
+        source_table = source_row = cold_data = None
+        warehouse_data: dict = {}
+        if from_st == "cold":
+            source_table, source_row = await _find_in_cold_stocks(conn, box_id, tno)
+            if source_row is not None:
+                cold_data = _cold_row_to_json(source_row)
+        if source_row is None:
+            wh_table, wh_row = await _find_in_bulk_entry(conn, box_id, tno)
+            if wh_row is not None:
+                source_table, source_row = wh_table, wh_row
+                warehouse_data = {
+                    "gross_weight": float(wh_row.get("gross_weight") or 0),
+                    "net_weight": float(wh_row.get("net_weight") or b.get("net_weight") or 0),
+                    "article": wh_row.get("article_description"),
+                }
+
+        if cold_data is not None and source_row is not None:
+            item_description = source_row.get("item_description") or b.get("article") or ""
+            lot_no = source_row.get("lot_no") or b.get("lot_number")
+            weight_kg = float(source_row.get("weight_kg") or b.get("net_weight") or 0)
+            no_of_cartons = int(source_row.get("no_of_cartons") or 1)
+        elif warehouse_data:
+            item_description = warehouse_data.get("article") or b.get("article") or ""
+            lot_no = b.get("lot_number")
+            weight_kg = float(warehouse_data.get("net_weight") or b.get("net_weight") or 0)
+            no_of_cartons = 1
+        else:
+            item_description = b.get("article") or ""
+            lot_no = b.get("lot_number")
+            weight_kg = float(b.get("net_weight") or 0)
+            no_of_cartons = 1
+            site_lower = (from_site or "").strip().lower()
+            gc = "cdpl" if ("rishi" in site_lower or "cdpl" in site_lower) else "cfpl"
+            source_table = f"{gc}_cold_stocks" if from_st == "cold" else f"{gc}_bulk_entry_boxes"
+
+        from_company = "cfpl" if (source_table or "").startswith("cfpl") else "cdpl"
+        to_company = from_company
+        destination_table = _destination_table(to_st, to_company)
+
+        async def _ins_pending(b=b, source_row=source_row, source_table=source_table,
+                               destination_table=destination_table, cold_data=cold_data,
+                               item_description=item_description, lot_no=lot_no,
+                               weight_kg=weight_kg, no_of_cartons=no_of_cartons,
+                               warehouse_data=warehouse_data, from_company=from_company,
+                               to_company=to_company):
+            return await conn.execute(
+                _PENDING_INSERT,
+                transfer_out_id, challan_no, box_id, tno, from_company, to_company,
+                from_site, to_site, from_st, to_st, source_table,
+                source_row.get("id") if source_row is not None else None, destination_table,
+                item_description, lot_no, _dec(weight_kg), no_of_cartons,
+                json.dumps(cold_data) if cold_data else None,
+                _dec(warehouse_data.get("gross_weight") if warehouse_data else b.get("gross_weight")),
+                _dec(warehouse_data.get("net_weight") if warehouse_data else b.get("net_weight")),
+                warehouse_data.get("article") or b.get("article"),
+                dispatched_at, dispatched_by, new_short_time_id(),
+            )
+        await insert_with_pk_retry(conn, _ins_pending)
+        if source_row is not None and source_row.get("id") is not None and source_table:
+            await conn.execute(f"DELETE FROM {source_table} WHERE id = $1", source_row["id"])
+
+        if cold_data is not None:
+            s["parked_from_cold"] += 1
+        elif warehouse_data:
+            s["parked_from_warehouse"] += 1
+        else:
+            s["parked_without_source"] += 1
+
+    return s
+
+
+async def park_lines(conn, *, transfer_out_id: int, challan_no: str, from_site, to_site,
+                     lines: list, dispatched_at, dispatched_by: str) -> int:
+    """Insert one tracking-only 'In Transit' pending row PER UNIT for box-less lines
+    (manual/article-only entries with no scanned box). These move no inventory:
+    source_table/destination_table are empty sentinels so restore_to_source no-ops
+    them and pick_from_pending just deletes them — they only keep the in-transit
+    ledger complete. box_id is the synthetic "LINE-<line_id>-<n>" so the
+    (box_id, transaction_no) uniqueness constraint is satisfied.
+
+    `lines` are dicts: id, item_desc_raw, qty, net_weight, total_weight, lot_number,
+    batch_number. Mirrors the reference park_lines_in_pending but writes only the
+    columns list_pending_transfers reads (item/lot/weights) — not the extra
+    classification columns — to stay within the proven _PENDING_INSERT shape.
+    """
+    parked = 0
+    for lrow in lines:
+        l = dict(lrow)
+        article = (l.get("item_desc_raw") or "").strip()
+        qty = int(l.get("qty") or 0)
+        if not article or qty <= 0:
+            continue
+        line_id = l.get("id")
+        total_net = float(l.get("net_weight") or 0)
+        total_gross = float(l.get("total_weight") or 0) or total_net
+        per_unit_net = round(total_net / qty, 3) if qty else total_net
+        per_unit_gross = round(total_gross / qty, 3) if qty else total_gross
+        lot_no = (l.get("lot_number") or "") or None
+        for n in range(1, qty + 1):
+            async def _ins_pending(n=n, line_id=line_id, article=article, lot_no=lot_no,
+                                   per_unit_net=per_unit_net, per_unit_gross=per_unit_gross):
+                return await conn.execute(
+                    _PENDING_INSERT,
+                    transfer_out_id, challan_no, f"LINE-{line_id}-{n}", challan_no, "", "",
+                    from_site, to_site,
+                    "cold" if _is_cold_site(from_site) else "warehouse",
+                    "cold" if _is_cold_site(to_site) else "warehouse",
+                    "", None, "",
+                    article, lot_no, _dec(per_unit_net), 1,
+                    None,
+                    _dec(per_unit_gross), _dec(per_unit_net), article,
+                    dispatched_at, dispatched_by, new_short_time_id(),
+                )
+            await insert_with_pk_retry(conn, _ins_pending)
+            parked += 1
+    return parked
 
 
 async def backfill_pending_from_existing_transfers(conn) -> dict:
@@ -298,84 +484,19 @@ async def backfill_pending_from_existing_transfers(conn) -> dict:
                 s["transfers_with_existing_pending"] += 1
                 continue
             boxes = await conn.fetch(
-                """SELECT box_id, transaction_no, article, lot_number, batch_number, net_weight, gross_weight, box_number
+                """SELECT box_id, transaction_no, article, lot_number, batch_number, net_weight, gross_weight
                    FROM interunit_transfer_boxes WHERE header_id = $1""", t["id"])
-            from_st = "cold" if _is_cold_site(t["from_site"]) else "warehouse"
-            to_st = "cold" if _is_cold_site(t["to_site"]) else "warehouse"
-            dispatched_at = t["created_ts"] or datetime.now()
-            dispatched_by = t["created_by"] or "backfill"
-
-            for brow in boxes:
-                b = dict(brow)
-                box_id = (b.get("box_id") or "").strip()
-                tno = (b.get("transaction_no") or "").strip()
-                if not box_id or not tno or tno == "DIRECT":
-                    s["boxes_with_missing_id"] += 1
-                    continue
-                if await conn.fetchval(
-                        "SELECT 1 FROM pending_transfer_stock WHERE box_id = $1 AND transaction_no = $2 LIMIT 1", box_id, tno):
-                    s["boxes_skipped_already_parked"] += 1
-                    continue
-
-                source_table = source_row = cold_data = None
-                warehouse_data: dict = {}
-                if from_st == "cold":
-                    source_table, source_row = await _find_in_cold_stocks(conn, box_id, tno)
-                    if source_row is not None:
-                        cold_data = _cold_row_to_json(source_row)
-                if source_row is None:
-                    wh_table, wh_row = await _find_in_bulk_entry(conn, box_id, tno)
-                    if wh_row is not None:
-                        source_table, source_row = wh_table, wh_row
-                        warehouse_data = {
-                            "gross_weight": float(wh_row.get("gross_weight") or 0),
-                            "net_weight": float(wh_row.get("net_weight") or b.get("net_weight") or 0),
-                            "article": wh_row.get("article_description"),
-                        }
-
-                if cold_data is not None and source_row is not None:
-                    item_description = source_row.get("item_description") or b.get("article") or ""
-                    lot_no = source_row.get("lot_no") or b.get("lot_number")
-                    weight_kg = float(source_row.get("weight_kg") or b.get("net_weight") or 0)
-                    no_of_cartons = int(source_row.get("no_of_cartons") or 1)
-                elif warehouse_data:
-                    item_description = warehouse_data.get("article") or b.get("article") or ""
-                    lot_no = b.get("lot_number")
-                    weight_kg = float(warehouse_data.get("net_weight") or b.get("net_weight") or 0)
-                    no_of_cartons = 1
-                else:
-                    item_description = b.get("article") or ""
-                    lot_no = b.get("lot_number")
-                    weight_kg = float(b.get("net_weight") or 0)
-                    no_of_cartons = 1
-                    site_lower = (t.get("from_site") or "").strip().lower()
-                    gc = "cdpl" if ("rishi" in site_lower or "cdpl" in site_lower) else "cfpl"
-                    source_table = f"{gc}_cold_stocks" if from_st == "cold" else f"{gc}_bulk_entry_boxes"
-
-                from_company = "cfpl" if (source_table or "").startswith("cfpl") else "cdpl"
-                to_company = from_company
-                destination_table = _destination_table(to_st, to_company)
-
-                await conn.execute(
-                    _PENDING_INSERT,
-                    t["id"], t["challan_no"], box_id, tno, from_company, to_company,
-                    t["from_site"], t["to_site"], from_st, to_st, source_table,
-                    source_row.get("id") if source_row is not None else None, destination_table,
-                    item_description, lot_no, _dec(weight_kg), no_of_cartons,
-                    json.dumps(cold_data) if cold_data else None,
-                    _dec(warehouse_data.get("gross_weight") if warehouse_data else b.get("gross_weight")),
-                    _dec(warehouse_data.get("net_weight") if warehouse_data else b.get("net_weight")),
-                    warehouse_data.get("article") or b.get("article"),
-                    dispatched_at, dispatched_by,
-                )
-                if source_row is not None and source_row.get("id") is not None and source_table:
-                    await conn.execute(f"DELETE FROM {source_table} WHERE id = $1", source_row["id"])
-
-                if cold_data is not None:
-                    s["boxes_parked_from_cold"] += 1
-                elif warehouse_data:
-                    s["boxes_parked_from_warehouse"] += 1
-                else:
-                    s["boxes_parked_without_source"] += 1
+            stats = await park_boxes(
+                conn, transfer_out_id=t["id"], challan_no=t["challan_no"],
+                from_site=t["from_site"], to_site=t["to_site"],
+                boxes=[dict(b) for b in boxes],
+                dispatched_at=t["created_ts"] or datetime.now(),
+                dispatched_by=t["created_by"] or "backfill",
+            )
+            s["boxes_parked_from_cold"] += stats["parked_from_cold"]
+            s["boxes_parked_from_warehouse"] += stats["parked_from_warehouse"]
+            s["boxes_parked_without_source"] += stats["parked_without_source"]
+            s["boxes_skipped_already_parked"] += stats["skipped_already_parked"]
+            s["boxes_with_missing_id"] += stats["missing_id"]
 
     return s

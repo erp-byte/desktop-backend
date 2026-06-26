@@ -10,6 +10,7 @@ JWT (`AuthUser`) rather than a client-supplied query param, and let `is_admin`
 from __future__ import annotations
 
 from app.core.middleware.request_context import AuthError
+from app.core.warehouse_scope import user_has_warehouse
 from app.modules.auth.middleware import AuthUser
 
 # Mirrors interunit_server.AUTHORIZED_DELETE_EMAILS / ADMIN_ROLES.
@@ -22,6 +23,9 @@ INNER_COLD_DELETE_EMAILS = {"hrithik@candorfoods.in", "yash@candorfoods.in"}
 ACKNOWLEDGE_EMAILS = {
     "yash@candorfoods.in", "b.hrithik@candorfoods.in", "sunil.jasoria@candorfoods.in",
 }
+# Re-open / edit a Received transfer-in (reverses posted stock back to in-transit) —
+# stricter than acknowledge; mirrors the reference's canReopenReceived gate.
+REOPEN_EMAILS = {"b.hrithik@candorfoods.in"}
 # The Transfer Summary analytics dashboard is admin-only in the replica
 # (see assert_can_view_dashboard) — no email allowlist.
 
@@ -80,6 +84,13 @@ def assert_can_acknowledge(u: AuthUser) -> AuthUser:
     return u
 
 
+def assert_can_reopen(u: AuthUser) -> AuthUser:
+    """Gate for re-opening / editing a Received transfer-in (reverses posted stock)."""
+    if not (u.is_admin or _email(u) in REOPEN_EMAILS):
+        _forbid("You are not authorized to re-open or edit a received transfer-in")
+    return u
+
+
 def assert_can_view_dashboard(u: AuthUser) -> AuthUser:
     """Gate for the Transfer Summary analytics dashboard. Admin-only — the
     superuser flag or an admin/developer role. (The reference used a 2-email
@@ -97,3 +108,30 @@ def scope_warehouses(u: AuthUser) -> list[str]:
     if u.is_admin:
         return []
     return list(u.allowed_warehouses or [])
+
+
+# ── Profile warehouse lock (mutations) ───────────────────────────────────────
+# A warehouse-locked operator may only DISPATCH FROM and RECEIVE INTO a warehouse
+# in their profile scope (`allowed_warehouses`). Admins and users with no lock
+# (empty scope) are unrestricted — consistent with `scope_warehouses` read scoping.
+# Comparison is normalized (A185 == A-185 == "a 185") via `user_has_warehouse`.
+def assert_can_dispatch_from(u: AuthUser, from_warehouse: str | None) -> None:
+    """Transfer-OUT lock: from_warehouse must be the operator's profile warehouse."""
+    if u.is_admin or not u.allowed_warehouses:
+        return
+    if not user_has_warehouse(u.allowed_warehouses, from_warehouse):
+        _forbid(
+            "Transfer OUT must originate from your assigned warehouse "
+            f"({', '.join(u.allowed_warehouses)}); got '{from_warehouse or '—'}'."
+        )
+
+
+def assert_can_receive_into(u: AuthUser, to_warehouse: str | None) -> None:
+    """Transfer-IN lock: receiving (to) warehouse must be the operator's profile warehouse."""
+    if u.is_admin or not u.allowed_warehouses:
+        return
+    if not user_has_warehouse(u.allowed_warehouses, to_warehouse):
+        _forbid(
+            "Transfer IN must be received into your assigned warehouse "
+            f"({', '.join(u.allowed_warehouses)}); got '{to_warehouse or '—'}'."
+        )

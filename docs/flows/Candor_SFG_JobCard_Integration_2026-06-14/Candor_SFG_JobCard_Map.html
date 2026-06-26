@@ -1,0 +1,721 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Candor Foods · SFG ↔ Job-Card Interactive Wiring</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,700;12..96,800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0a0e16;--panel:#111a2b;--panel2:#0e1626;--line:rgba(120,160,210,.11);--ink:#e8eef7;--mut:#8593ab;
+--cyan:#34e0d0;--amber:#f6a833;--green:#5ed98a;--coral:#ff7b86;--slate:#6f93c4;--violet:#a98bff;
+--plug:#5ed98a;--backend:#34e0d0;--frontend:#f6a833;}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--ink);font-family:"Bricolage Grotesque",system-ui,sans-serif;-webkit-font-smoothing:antialiased;line-height:1.5}
+body::before{content:"";position:fixed;inset:0;z-index:-2;background:
+ radial-gradient(900px 520px at 10% -8%,rgba(52,224,208,.10),transparent 60%),
+ radial-gradient(900px 600px at 108% 6%,rgba(246,168,51,.07),transparent 55%),linear-gradient(180deg,#0a0e16,#070a11)}
+body::after{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;opacity:.5;
+ background-image:linear-gradient(var(--line) 1px,transparent 1px),linear-gradient(90deg,var(--line) 1px,transparent 1px);
+ background-size:34px 34px;mask-image:radial-gradient(circle at 50% 25%,#000,transparent 95%)}
+.wrap{max-width:1640px;margin:0 auto;padding:26px 22px 60px}
+header{display:flex;flex-wrap:wrap;align-items:flex-end;gap:14px 28px;border-bottom:1px solid var(--line);padding-bottom:18px}
+.kick{font-family:"JetBrains Mono",monospace;font-size:10.5px;letter-spacing:.34em;color:var(--cyan);text-transform:uppercase}
+h1{font-size:clamp(24px,3.4vw,40px);font-weight:800;letter-spacing:-.02em;line-height:1.04}
+h1 .am{color:var(--amber)}h1 .cy{color:var(--cyan)}
+.meta{font-family:"JetBrains Mono",monospace;font-size:10.5px;color:var(--mut);letter-spacing:.04em;margin-left:auto;text-align:right}
+.bar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:18px 0 10px}
+.views{display:flex;gap:6px}
+.vbtn{font-family:"JetBrains Mono",monospace;font-size:12px;letter-spacing:.1em;text-transform:uppercase;color:var(--mut);
+ background:transparent;border:1px solid var(--line);border-radius:9px;padding:10px 15px;cursor:pointer;transition:.2s}
+.vbtn:hover{color:var(--ink);border-color:rgba(52,224,208,.5)}
+.vbtn.active{color:#06121a;background:linear-gradient(120deg,var(--cyan),#7af0e4);border-color:transparent;font-weight:700}
+.spacer{flex:1}
+.chips{display:flex;gap:6px;flex-wrap:wrap}
+.chip{font-family:"JetBrains Mono",monospace;font-size:11px;letter-spacing:.06em;color:var(--mut);background:rgba(255,255,255,.02);
+ border:1px solid var(--line);border-radius:20px;padding:7px 13px;cursor:pointer;transition:.2s;user-select:none}
+.chip:hover{color:var(--ink);border-color:rgba(52,224,208,.4)}
+.chip.on{color:#06121a;font-weight:700}
+.chip.on.l-all{background:#cbd5e3}.chip.on.l-plug{background:var(--plug)}.chip.on.l-backend{background:var(--backend)}.chip.on.l-frontend{background:var(--frontend)}
+#clearSel{border-color:rgba(255,123,134,.5);color:var(--coral)}
+#clearSel:hover{background:rgba(255,123,134,.12)}
+#search{font-family:"JetBrains Mono",monospace;font-size:12px;background:var(--panel2);border:1px solid var(--line);
+ color:var(--ink);border-radius:9px;padding:9px 12px;width:200px;outline:none}
+#search:focus{border-color:rgba(52,224,208,.5)}
+.ctlhide{display:none!important}
+.legend{display:flex;gap:16px;flex-wrap:wrap;font-family:"JetBrains Mono",monospace;font-size:10.5px;color:var(--mut);margin:4px 2px 12px}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.swatch{width:22px;height:0;border-top:2.4px solid}
+.k-loads{border-color:var(--cyan)}.k-fk{border-color:var(--slate)}.k-reads{border-color:var(--amber)}.k-writes{border-color:var(--green)}
+.view{display:none;animation:fade .45s ease both}.view.show{display:block}
+@keyframes fade{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+.gwrap{display:grid;grid-template-columns:1fr 312px;gap:14px;align-items:start}
+@media(max-width:1100px){.gwrap{grid-template-columns:1fr}}
+.stagebox{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:16px;
+ padding:14px;overflow:auto;max-height:78vh;position:relative}
+.stage{position:relative}
+.wires{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:1;overflow:visible}
+.cols{position:relative;z-index:2;display:flex;gap:104px;align-items:flex-start;min-width:1080px}
+.col{display:flex;flex-direction:column;gap:24px;flex:1;min-width:236px}
+.colh{font-family:"JetBrains Mono",monospace;font-size:11px;letter-spacing:.22em;text-transform:uppercase;font-weight:700;padding:2px 2px 0}
+.colh.plug{color:var(--plug)}.colh.backend{color:var(--backend)}.colh.frontend{color:var(--frontend)}
+.tnode{background:rgba(13,20,34,.94);border:1px solid var(--line);border-radius:11px;overflow:hidden;transition:.25s;opacity:0;
+ animation:nodein .5s ease forwards;animation-delay:var(--d,0s)}
+@keyframes nodein{to{opacity:1}}
+.tnode .th{display:flex;align-items:center;gap:8px;padding:9px 11px;cursor:pointer;border-bottom:1px solid var(--line);font-weight:700;font-size:13.5px;user-select:none}
+.tnode .th .lz{width:8px;height:8px;border-radius:2px;flex:none}
+.tnode.l-plug .lz{background:var(--plug)}.tnode.l-backend .lz{background:var(--backend)}.tnode.l-frontend .lz{background:var(--frontend)}
+.tnode .th small{margin-left:auto;font-family:"JetBrains Mono",monospace;font-size:9px;color:var(--mut);letter-spacing:.08em;font-weight:400}
+.tnode.l-plug{border-color:rgba(94,217,138,.4)}.tnode.l-backend{border-color:rgba(52,224,208,.36)}.tnode.l-frontend{border-color:rgba(246,168,51,.4)}
+.rows{display:flex;flex-direction:column}
+.row{display:flex;align-items:center;gap:7px;padding:5px 11px;font-family:"JetBrains Mono",monospace;font-size:11px;color:#c2cee0;
+ border-top:1px solid rgba(120,160,210,.05);position:relative;transition:.15s}
+.row:hover{background:rgba(52,224,208,.07)}
+.row .fn{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.badge{font-size:8.5px;font-weight:700;letter-spacing:.05em;padding:1.5px 5px;border-radius:4px;flex:none}
+.b-pk{background:rgba(246,168,51,.18);color:var(--amber)}
+.b-fk{background:rgba(111,147,196,.2);color:#9fc0ee}
+.b-new{background:rgba(94,217,138,.18);color:var(--green)}
+.tnode.dimmed{opacity:.3!important;filter:saturate(.4) brightness(.86)!important}
+.tnode.searchdim{opacity:.2!important}
+.tnode.sel{box-shadow:0 0 0 1.6px var(--cyan),0 14px 40px -18px rgba(52,224,208,.6)}
+.tnode.sel .th{background:rgba(52,224,208,.08)}
+.tnode.neigh{box-shadow:0 0 0 1px rgba(246,168,51,.6)}
+.hide{display:none!important}
+path.wire{fill:none;stroke-width:.9;opacity:.13;stroke-linecap:round;transition:opacity .25s,stroke-width .25s}
+path.wire.k-loads{stroke:var(--cyan)}path.wire.k-fk{stroke:var(--slate)}path.wire.k-reads{stroke:var(--amber)}path.wire.k-writes{stroke:var(--green)}
+.stage.focus path.wire{opacity:.04}
+.stage.focus path.wire.on,path.wire.on{opacity:.92;stroke-width:1.5;stroke-dasharray:4 6;animation:dash 1.2s linear infinite}
+@keyframes dash{to{stroke-dashoffset:-20}}
+circle.blip{pointer-events:none}
+.ah-c{fill:var(--cyan)}.ah-s{fill:var(--slate)}.ah-a{fill:var(--amber)}.ah-g{fill:var(--green)}
+.detail{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:16px;padding:18px;position:sticky;top:14px;max-height:78vh;overflow:auto}
+.detail h3{font-size:16px;font-weight:800;letter-spacing:-.01em;display:flex;align-items:center;gap:8px}
+.detail .selcount{font-family:"JetBrains Mono",monospace;font-size:10px;color:var(--cyan);margin-top:4px}
+.detail .dl{font-family:"JetBrains Mono",monospace;font-size:10px;color:var(--mut);text-transform:uppercase;letter-spacing:.16em;margin:16px 0 7px}
+.detail .empty{color:var(--mut);font-family:"JetBrains Mono",monospace;font-size:12px;line-height:1.8}
+.rel{font-family:"JetBrains Mono",monospace;font-size:11px;padding:7px 9px;border:1px solid var(--line);border-radius:8px;margin-bottom:6px;cursor:pointer;transition:.15s;line-height:1.45}
+.rel:hover{border-color:rgba(52,224,208,.5);background:rgba(52,224,208,.05)}
+.rel .ar{color:var(--cyan)}.rel .tgt{color:var(--amber)}.rel .kd{color:var(--mut)}
+.fl{font-family:"JetBrains Mono",monospace;font-size:11px;color:#c2cee0;padding:3px 0;display:flex;gap:6px;align-items:center}
+.endp{font-family:"JetBrains Mono",monospace;font-size:11px;color:var(--cyan);padding:6px 0 0;border-top:1px dashed var(--line);margin-top:8px;word-break:break-word}
+.pcard{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:16px;padding:20px;margin-top:14px}
+.proot{text-align:center;font-weight:700;font-size:14px;background:rgba(52,224,208,.08);border:1px solid rgba(52,224,208,.35);border-radius:11px;padding:13px;max-width:560px;margin:0 auto}
+.pdec{text-align:center;font-family:"JetBrains Mono",monospace;font-size:12px;color:var(--amber);margin:16px auto;max-width:660px;padding:11px 14px;border:1px dashed rgba(246,168,51,.45);border-radius:11px}
+.branches{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-top:8px}
+@media(max-width:1000px){.branches{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:560px){.branches{grid-template-columns:1fr}}
+.branch{border:1px solid var(--line);border-radius:13px;overflow:hidden;background:rgba(13,20,34,.6)}
+.branch .bh{padding:12px;font-weight:700;font-size:13.5px;border-bottom:1px solid var(--line)}
+.branch.a .bh{background:rgba(246,168,51,.12);color:var(--amber)}
+.branch.b .bh{background:rgba(52,224,208,.1);color:var(--cyan)}
+.branch.c .bh{background:rgba(94,217,138,.12);color:var(--green)}
+.branch.d .bh{background:rgba(120,160,210,.1);color:var(--slate)}
+.branch .cond{font-family:"JetBrains Mono",monospace;font-size:10.5px;color:var(--mut);padding:9px 12px;border-bottom:1px solid var(--line);line-height:1.6}
+.branch .flowline{font-family:"JetBrains Mono",monospace;font-size:10.5px;color:#cdd7e6;padding:10px 12px;line-height:1.7}
+.branch .flowline b{color:var(--amber)}
+.eff{padding:10px 12px;border-top:1px solid var(--line)}
+.eff .et{font-family:"JetBrains Mono",monospace;font-size:9px;letter-spacing:.14em;text-transform:uppercase;margin-bottom:5px}
+.eff.be .et{color:var(--cyan)}.eff.fe .et{color:var(--amber)}
+.eff ul{margin:0;padding:0}
+.eff li{list-style:none;font-family:"JetBrains Mono",monospace;font-size:10px;color:var(--mut);padding:2px 0 2px 12px;position:relative;line-height:1.5}
+.eff li::before{content:"›";position:absolute;left:0;color:var(--cyan)}
+.eff.fe li::before{color:var(--amber)}
+.branch{display:flex;flex-direction:column}
+.lyrs{padding:6px 10px 2px}
+.lyr{border:1px solid var(--line);border-radius:9px;margin:7px 0;overflow:hidden;transition:.2s;background:rgba(255,255,255,.012)}
+.lyr:hover{border-color:rgba(52,224,208,.45);transform:translateX(2px)}
+.lyr .lh{display:flex;align-items:center;gap:8px;padding:9px 10px;cursor:pointer;font-family:"JetBrains Mono",monospace;font-size:11px;font-weight:700;color:#dbe3ee;user-select:none}
+.lyr .lh .ln{width:17px;height:17px;border-radius:5px;background:rgba(52,224,208,.16);color:var(--cyan);display:grid;place-items:center;font-size:9px;flex:none}
+.lyr .chev{margin-left:auto;color:var(--mut);transition:transform .2s}
+.lyr.open .chev{transform:rotate(90deg);color:var(--cyan)}
+.lyr .lb{max-height:0;opacity:0;overflow:hidden;transition:max-height .32s ease,opacity .25s;padding:0 10px}
+.lyr.open .lb{max-height:600px;opacity:1;padding:2px 10px 11px}
+.lbd{font-family:"JetBrains Mono",monospace;font-size:10px;color:var(--mut);line-height:1.6;margin-bottom:8px}
+.tchips{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:8px}
+.tchip{font-family:"JetBrains Mono",monospace;font-size:9.5px;color:#bcd;background:rgba(52,224,208,.08);border:1px solid rgba(52,224,208,.22);border-radius:6px;padding:3px 7px;cursor:pointer;transition:.15s;white-space:nowrap}
+.tchip:hover{background:rgba(52,224,208,.22);color:#eaffff;font-weight:700;transform:translateY(-1px)}
+.lep{font-family:"JetBrains Mono",monospace;font-size:9.5px;color:var(--cyan);margin-bottom:8px;word-break:break-word;opacity:.9}
+.lyrbtns{margin-top:2px}
+.lbtn{font-family:"JetBrains Mono",monospace;font-size:9.5px;color:var(--mut);background:transparent;border:1px solid var(--line);border-radius:6px;padding:5px 9px;cursor:pointer;transition:.15s}
+.lbtn:hover{color:var(--cyan);border-color:rgba(52,224,208,.5)}
+.cfoot{display:flex;gap:6px;flex-wrap:wrap;padding:10px;border-top:1px solid var(--line);margin-top:auto}
+.cbtn{flex:1;min-width:84px;font-family:"JetBrains Mono",monospace;font-size:10px;letter-spacing:.03em;color:#dbe3ee;background:rgba(255,255,255,.02);border:1px solid var(--line);border-radius:8px;padding:8px 6px;cursor:pointer;transition:.18s}
+.cbtn:hover{color:#06121a;background:linear-gradient(120deg,var(--cyan),#7af0e4);border-color:transparent;font-weight:700;transform:translateY(-1px)}
+.fbanner{display:none;align-items:center;gap:10px;background:rgba(52,224,208,.08);border:1px solid rgba(52,224,208,.3);border-radius:10px;padding:9px 13px;margin-bottom:10px;font-family:"JetBrains Mono",monospace;font-size:11px;color:var(--cyan)}
+.fbanner.show{display:flex}
+.fbanner button{margin-left:auto;font-family:"JetBrains Mono",monospace;font-size:10px;color:var(--coral);background:transparent;border:1px solid rgba(255,123,134,.4);border-radius:6px;padding:5px 10px;cursor:pointer}
+.fbanner button:hover{background:rgba(255,123,134,.12)}
+.dpanelnav{display:flex;gap:6px;margin-top:13px}
+.dpanelnav button{flex:1;font-family:"JetBrains Mono",monospace;font-size:10px;color:#dbe3ee;background:rgba(255,255,255,.02);border:1px solid var(--line);border-radius:7px;padding:8px;cursor:pointer;transition:.15s}
+.dpanelnav button:hover{color:var(--cyan);border-color:rgba(52,224,208,.5)}
+table.rels{width:100%;border-collapse:collapse;font-size:12.5px;margin-top:6px}
+table.rels th{font-family:"JetBrains Mono",monospace;font-size:10px;letter-spacing:.12em;text-transform:uppercase;text-align:left;color:var(--mut);padding:10px;border-bottom:1px solid rgba(120,160,210,.25);position:sticky;top:0;background:var(--panel2)}
+table.rels td{padding:9px 10px;border-bottom:1px solid var(--line);font-family:"JetBrains Mono",monospace;font-size:11.5px;vertical-align:top}
+#relsBody tr{cursor:pointer}#relsBody tr:hover td{background:rgba(52,224,208,.06)}
+#apiBody tr{cursor:pointer}#apiBody tr:hover td{background:rgba(52,224,208,.06)}
+.apibtn{font-family:"JetBrains Mono",monospace;font-size:9.5px;color:#cdd;background:rgba(255,255,255,.03);border:1px solid var(--line);border-radius:6px;padding:4px 8px;margin-right:5px;cursor:pointer;transition:.15s}
+.apibtn:hover{color:#06121a;background:var(--cyan);border-color:transparent;font-weight:700}
+td.trace{white-space:nowrap}
+.src-c{color:#c2cee0}.tgt-c{color:var(--amber)}.fld{color:var(--cyan)}
+.pill{font-size:9px;font-weight:700;padding:2px 7px;border-radius:5px}
+.p-loads{background:rgba(52,224,208,.16);color:var(--cyan)}.p-fk{background:rgba(111,147,196,.18);color:#9fc0ee}
+.p-reads{background:rgba(246,168,51,.16);color:var(--amber)}.p-writes{background:rgba(94,217,138,.16);color:var(--green)}
+footer{margin-top:26px;padding-top:16px;border-top:1px solid var(--line);font-family:"JetBrains Mono",monospace;font-size:10.5px;color:var(--mut)}
+.hint{font-family:"JetBrains Mono",monospace;font-size:10.5px;color:var(--mut);margin:0 2px 10px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+ <div>
+  <div class="kick">Candor Foods · Production Integration</div>
+  <h1>SFG <span class="cy">↔</span> Job-Card <span class="am">Interactive Wiring</span></h1>
+ </div>
+ <div class="meta">reference only · no DB / app code touched<br>snapshot 2026-06-14 · endpoints audited vs router.py</div>
+</header>
+
+<div class="bar">
+ <div class="views">
+  <button class="vbtn active" data-v="graph">◇ Wiring Graph</button>
+  <button class="vbtn" data-v="flow">⌥ Process Flow</button>
+  <button class="vbtn" data-v="rels">▤ Relationships</button>
+  <button class="vbtn" data-v="api">⇄ API Endpoints</button>
+ </div>
+ <div class="spacer"></div>
+ <div class="chips" id="layerChips">
+  <span class="chip on l-all" data-l="all">ALL</span>
+  <span class="chip l-plug" data-l="plug">PLUG</span>
+  <span class="chip l-backend" data-l="backend">BACKEND</span>
+  <span class="chip l-frontend" data-l="frontend">FRONTEND</span>
+  <span class="chip" id="clearSel" style="display:none">✕ clear</span>
+ </div>
+ <input id="search" placeholder="search…" autocomplete="off">
+</div>
+
+<section class="view show" id="view-graph">
+ <div class="legend">
+  <span><i class="swatch k-loads"></i>plug → backend (loads/feeds)</span>
+  <span><i class="swatch k-fk"></i>foreign key (backend)</span>
+  <span><i class="swatch k-reads"></i>backend → frontend (reads)</span>
+  <span><i class="swatch k-writes"></i>writes</span>
+  <span style="color:var(--cyan)">click tables to multi-select · blips show flow direction</span>
+ </div>
+ <div class="gwrap">
+  <div class="stagebox"><div class="stage" id="stage">
+    <svg class="wires" id="wires"><defs>
+      <marker id="ac" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="4.5" markerHeight="4.5" orient="auto"><path d="M0 0 L10 5 L0 10z" class="ah-c"/></marker>
+      <marker id="as" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="4.5" markerHeight="4.5" orient="auto"><path d="M0 0 L10 5 L0 10z" class="ah-s"/></marker>
+      <marker id="aa" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="4.5" markerHeight="4.5" orient="auto"><path d="M0 0 L10 5 L0 10z" class="ah-a"/></marker>
+      <marker id="ag" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="4.5" markerHeight="4.5" orient="auto"><path d="M0 0 L10 5 L0 10z" class="ah-g"/></marker>
+    </defs></svg>
+    <div class="cols" id="cols"></div>
+  </div></div>
+  <aside class="detail" id="detail"></aside>
+ </div>
+</section>
+
+<section class="view" id="view-flow">
+ <div class="hint">Functional decision tree — what the SFG model does to each FG, with the resulting backend writes and frontend behaviour at each leaf.</div>
+ <div class="pcard">
+  <div class="proot">FG from <b>FG Master</b> · read <b>Process Category</b> → canonicalise to practical operations<br><span style="font-family:'JetBrains Mono';font-size:10.5px;color:var(--mut)">roasting+flavouring/salting = ONE op · sorting = inline</span></div>
+  <div class="pdec">◇ DECISION 1 — does the FG have a transform operation? (de-seed / blanch+slice / roast&amp;flavour / blend&amp;form / stuff / coat) — sorting &amp; packaging excluded</div>
+  <div class="branches" id="branches"></div>
+ </div>
+</section>
+
+<section class="view" id="view-rels">
+ <div class="hint">Every field-level link. Click a row to open it in the Wiring Graph. Layer chips &amp; search filter this table.</div>
+ <div class="fbanner" id="relsBanner"></div>
+ <div class="pcard" style="padding:8px 14px;max-height:74vh;overflow:auto">
+  <table class="rels"><thead><tr><th>From table</th><th>Field</th><th>Refers / flows to</th><th>Target field</th><th>Kind</th><th>What it does</th></tr></thead>
+  <tbody id="relsBody"></tbody></table>
+ </div>
+</section>
+
+<section class="view" id="view-api">
+ <div class="hint">Live job-card endpoints (audited against <b style="color:var(--ink)">backend/app/modules/production/router.py</b>, line refs shown). Search filters this table. Frontend calls under <b style="color:var(--ink)">/api/v1/production/…</b>. <b style="color:var(--cyan)">Click a row (or ◇) to open its tables in the Graph; ▤ for its links.</b></div>
+ <div class="fbanner" id="apiBanner"></div>
+ <div class="pcard" style="padding:8px 14px;max-height:74vh;overflow:auto">
+  <table class="rels"><thead><tr><th>Method</th><th>Endpoint / trigger</th><th>Service</th><th>Writes / reads</th><th>SFG role</th><th>Trace</th></tr></thead>
+  <tbody id="apiBody"></tbody></table>
+ </div>
+</section>
+
+<footer>CANDOR FOODS · SFG / Job-Card integration · interactive wiring blueprint · 2026-06-14 · endpoints verified against router.py · open the .md / .xlsx for source detail.</footer>
+</div>
+
+<script>
+const SVGNS='http://www.w3.org/2000/svg';
+const L={plug:0,backend:1,frontend:2};
+const KCOL={loads:'#34e0d0',fk:'#6f93c4',reads:'#f6a833',writes:'#5ed98a'};
+const NODES=[
+ {id:'procop',name:'ProcessCategory_to_Operation',layer:'plug',sub:'config lookup',fields:[
+   {n:'token',k:'PK'},{n:'practical_operation'},{n:'stage_bucket'},{n:'produces_sfg'}]},
+ {id:'sfgcat',name:'SFG_Catalog_Plug',layer:'plug',sub:'all_sku delta',fields:[
+   {n:'sfg_code',k:'PK'},{n:'particulars'},{n:'item_type'},{n:'create_wip_operation'},{n:'sfg_origin'}]},
+ {id:'routing',name:'JC_Routing_Plug',layer:'plug',sub:'article → stages',fields:[
+   {n:'article'},{n:'stage_seq'},{n:'stage_bucket'},{n:'input_kind'},{n:'output_code'},{n:'output_kind'},{n:'create_wip_operation'}]},
+ {id:'bomplug',name:'JC_BOM_Plug',layer:'plug',sub:'components rm/pm/sfg',fields:[
+   {n:'parent_article'},{n:'component'},{n:'item_type'},{n:'sfg_code',k:'FK'},{n:'consumed_at_stage'}]},
+ {id:'all_sku',name:'all_sku',layer:'backend',sub:'item catalogue',ep:'svc · master_ingest.py',fields:[
+   {n:'sku_id',k:'PK'},{n:'particulars'},{n:'item_type',k:'NEW'},{n:'item_group'},{n:'uom'},{n:'sale_group'}]},
+ {id:'bom_header',name:'bom_header',layer:'backend',sub:'FG master',ep:'svc · master_ingest.py',fields:[
+   {n:'bom_id',k:'PK'},{n:'fg_sku_name'},{n:'entity'}]},
+ {id:'bom_line',name:'bom_line',layer:'backend',sub:'recipe components',ep:'svc · master_ingest.py',fields:[
+   {n:'bom_line_id',k:'PK'},{n:'bom_id',k:'FK'},{n:'material_sku_name'},{n:'item_type',k:'NEW'},{n:'quantity_per_unit'},{n:'godown'}]},
+ {id:'bom_route',name:'bom_process_route',layer:'backend',sub:'stage sequence',ep:'svc · master_ingest.py',fields:[
+   {n:'route_id',k:'PK'},{n:'bom_id',k:'FK'},{n:'step_number'},{n:'process_name'},{n:'stage'}]},
+ {id:'plan_step',name:'production_plan_step_v2',layer:'backend',sub:'plan steps',ep:'POST /plans-v2',fields:[
+   {n:'step_id',k:'PK'},{n:'plan_line_id',k:'FK'},{n:'step_order'},{n:'stage'}]},
+ {id:'jc_v2',name:'job_card_v2',layer:'backend',sub:'the stage chain',ep:'POST /plans-v2/{id}/approve → create_job_cards_from_plan',fields:[
+   {n:'job_card_id',k:'PK'},{n:'plan_step_id',k:'FK'},{n:'step_number'},{n:'stage'},{n:'input_kind'},{n:'output_kind'},
+   {n:'prev_job_card_id',k:'FK'},{n:'next_job_card_id',k:'FK'},{n:'carried_qty_kg'},{n:'dispatched_to_next_kg'},{n:'status'},{n:'machine_id',k:'FK'}]},
+ {id:'jc_output',name:'job_card_output_v2',layer:'backend',sub:'yield / SFG out',ep:'POST /{id}/outputs',fields:[
+   {n:'output_id',k:'PK'},{n:'job_card_id',k:'FK'},{n:'output_kind'},{n:'output_qty_kg'},{n:'process_loss_kg'}]},
+ {id:'jc_dispatch',name:'job_card_partial_dispatch_v2',layer:'backend',sub:'stage handoff',ep:'POST /{id}/dispatch-to-next',fields:[
+   {n:'dispatch_id',k:'PK'},{n:'from_job_card_id',k:'FK'},{n:'to_job_card_id',k:'FK'},{n:'qty_kg'}]},
+ {id:'jc_consume',name:'job_card_material_consumption_v2',layer:'backend',sub:'SFG/RM consumed',ep:'POST /{id}/outputs',fields:[
+   {n:'consumption_id',k:'PK'},{n:'job_card_id',k:'FK'},{n:'material_sku_name'},{n:'input_kind'},{n:'source_dispatch_id',k:'FK'},{n:'bom_line_id',k:'FK'}]},
+ {id:'inv_batch',name:'inventory_batch',layer:'backend',sub:'WIP stock (FIFO)',ep:'(on batch close)',fields:[
+   {n:'batch_id',k:'PK'},{n:'sku_name'},{n:'item_type'},{n:'current_qty_kg'},{n:'status'},{n:'job_card_id',k:'FK'}]},
+ {id:'jc_acct',name:'job_card_accounting_v2',layer:'backend',sub:'balance gate',ep:'GET /{id}/accounting',fields:[
+   {n:'accounting_id',k:'PK'},{n:'job_card_id',k:'FK'},{n:'output_kind'},{n:'total_input_qty'},{n:'total_accounted_qty'},{n:'is_balanced'}]},
+ {id:'fe_list',name:'JC List · page.tsx',layer:'frontend',sub:'list + status',ep:'GET /job-cards-v2',fields:[
+   {n:'status'},{n:'stage'},{n:'step_number'},{n:'is_locked'}]},
+ {id:'fe_chain',name:'StageChainTab',layer:'frontend',sub:'detail · chain',ep:'GET /job-cards-v2/{id}/chain',fields:[
+   {n:'input_kind'},{n:'output_kind'},{n:'carried_qty_kg'},{n:'dispatched_to_next_kg'}]},
+ {id:'fe_picker',name:'Item Picker',layer:'frontend',sub:'material select',ep:'GET /job-cards-v2/{id}',fields:[
+   {n:'item_type'}]},
+ {id:'fe_output',name:'Output & Accounting tab',layer:'frontend',sub:'yield / balance',ep:'POST /{id}/outputs',fields:[
+   {n:'output_kind'},{n:'process_loss'},{n:'is_balanced'}]},
+ {id:'fe_wip',name:'Create-WIP checklist (NEW)',layer:'frontend',sub:'op selection',ep:'POST /{id}/batches/open',fields:[
+   {n:'practical_operation'},{n:'combine_intermingled'}]},
+ // ── related tables added (full job-card-v2 ecosystem) ──
+ {id:'so_ful',name:'so_fulfillment_v2',layer:'backend',sub:'demand ledger',ep:'POST /fulfillment-v2/sync',fields:[
+   {n:'so_fulfillment_id',k:'PK'},{n:'fg_sku_name'},{n:'planned_qty_kg'},{n:'pending_qty_kg'},{n:'order_status'}]},
+ {id:'plan_v2',name:'production_plan_v2',layer:'backend',sub:'plan header',ep:'POST /plans-v2',fields:[
+   {n:'plan_id',k:'PK'},{n:'entity'},{n:'status'},{n:'plan_date'}]},
+ {id:'plan_line',name:'production_plan_line_v2',layer:'backend',sub:'plan line (FG)',ep:'POST /plans-v2',fields:[
+   {n:'plan_line_id',k:'PK'},{n:'plan_id',k:'FK'},{n:'fg_sku_name'},{n:'bom_id',k:'FK'},{n:'so_fulfillment_id',k:'FK'}]},
+ {id:'jc_batch',name:'job_card_batch_v2',layer:'backend',sub:'per-batch close',ep:'POST /{id}/batches/open',fields:[
+   {n:'batch_id',k:'PK'},{n:'job_card_id',k:'FK'},{n:'batch_number'},{n:'produced_qty_kg'},{n:'status'}]},
+ {id:'jc_rm',name:'job_card_rm_indent_v2',layer:'backend',sub:'RM issued (S1)',ep:'GET /{id}',fields:[
+   {n:'rm_indent_id',k:'PK'},{n:'job_card_id',k:'FK'},{n:'material_sku_name'},{n:'bom_line_id',k:'FK'},{n:'issued_qty'},{n:'consumed_qty'}]},
+ {id:'jc_pm',name:'job_card_pm_indent_v2',layer:'backend',sub:'PM issued (Final FG)',ep:'GET /{id}',fields:[
+   {n:'pm_indent_id',k:'PK'},{n:'job_card_id',k:'FK'},{n:'material_sku_name'},{n:'bom_line_id',k:'FK'},{n:'issued_qty'}]},
+ {id:'jc_byp',name:'job_card_byproducts_v2',layer:'backend',sub:'off-grade / loss',ep:'POST /{id}/outputs',fields:[
+   {n:'byproduct_id',k:'PK'},{n:'job_card_id',k:'FK'},{n:'category'},{n:'quantity'},{n:'bom_line_id',k:'FK'}]},
+ {id:'jc_bal',name:'job_card_balance_material_v2',layer:'backend',sub:'returns / wastage',ep:'POST /{id}/outputs',fields:[
+   {n:'balance_id',k:'PK'},{n:'job_card_id',k:'FK'},{n:'bom_line_id',k:'FK'},{n:'balance_type'},{n:'qty_kg'}]},
+ {id:'jc_add',name:'job_card_additive_consumption_v2',layer:'backend',sub:'seasoning (data)',ep:'POST /{id}/outputs',fields:[
+   {n:'additive_id',k:'PK'},{n:'job_card_id',k:'FK'},{n:'sku_name'},{n:'qty_kg'}]},
+ {id:'jc_sign',name:'job_card_sign_off_v2',layer:'backend',sub:'close gate',ep:'POST /{id}/sign-off',fields:[
+   {n:'sign_off_id',k:'PK'},{n:'job_card_id',k:'FK'},{n:'role'},{n:'signed_by'}]},
+ {id:'jc_qc',name:'job_card_qc_v2 + annexures',layer:'backend',sub:'QC · metal/weight/env/remarks',ep:'POST /{id}/metal-detection …',fields:[
+   {n:'qc_id',k:'PK'},{n:'job_card_id',k:'FK'},{n:'result'},{n:'(annexure rows)'}]},
+ {id:'floor_mv',name:'floor_movement',layer:'backend',sub:'SFG physical move',ep:'(on dispatch)',fields:[
+   {n:'movement_id',k:'PK'},{n:'sku_name'},{n:'from_location'},{n:'to_location'},{n:'job_card_id',k:'FK'}]},
+ {id:'machine',name:'machine',layer:'backend',sub:'equipment',ep:'svc · master_ingest.py',fields:[
+   {n:'machine_id',k:'PK'},{n:'machine_name'},{n:'area'}]},
+];
+const EDGES=[
+ {f:['sfgcat','sfg_code'],t:['all_sku','particulars'],k:'loads',d:'load SFG into catalogue'},
+ {f:['sfgcat','item_type'],t:['all_sku','item_type'],k:'loads',d:'set item_type = sfg'},
+ {f:['bomplug','component'],t:['bom_line','material_sku_name'],k:'loads',d:'BOM component line'},
+ {f:['bomplug','item_type'],t:['bom_line','item_type'],k:'loads',d:'extend item_type to sfg'},
+ {f:['bomplug','sfg_code'],t:['all_sku','particulars'],k:'fk',d:'SFG input references catalogue'},
+ {f:['routing','create_wip_operation'],t:['bom_route','process_name'],k:'loads',d:'stage = practical op'},
+ {f:['routing','output_kind'],t:['jc_v2','output_kind'],k:'loads',d:'stage output kind (SFG/FG)'},
+ {f:['routing','input_kind'],t:['jc_v2','input_kind'],k:'loads',d:'stage input kind (RM/SFG)'},
+ {f:['routing','stage_seq'],t:['jc_v2','step_number'],k:'loads',d:'stage order'},
+ {f:['procop','practical_operation'],t:['bom_route','process_name'],k:'loads',d:'token → operation'},
+ {f:['procop','stage_bucket'],t:['jc_v2','stage'],k:'loads',d:'Create WIP / Final FG'},
+ {f:['bom_line','bom_id'],t:['bom_header','bom_id'],k:'fk',d:'line belongs to BOM'},
+ {f:['bom_route','bom_id'],t:['bom_header','bom_id'],k:'fk',d:'route belongs to BOM'},
+ {f:['jc_v2','plan_step_id'],t:['plan_step','step_id'],k:'fk',d:'JC derives from plan step'},
+ {f:['jc_v2','prev_job_card_id'],t:['jc_v2','job_card_id'],k:'fk',d:'chain ← previous stage'},
+ {f:['jc_v2','next_job_card_id'],t:['jc_v2','job_card_id'],k:'fk',d:'chain → next stage'},
+ {f:['jc_output','job_card_id'],t:['jc_v2','job_card_id'],k:'fk',d:'output of a JC'},
+ {f:['jc_dispatch','from_job_card_id'],t:['jc_v2','job_card_id'],k:'fk',d:'dispatched from stage'},
+ {f:['jc_dispatch','to_job_card_id'],t:['jc_v2','job_card_id'],k:'fk',d:'dispatched to stage'},
+ {f:['jc_consume','job_card_id'],t:['jc_v2','job_card_id'],k:'fk',d:'consumption of a JC'},
+ {f:['jc_consume','source_dispatch_id'],t:['jc_dispatch','dispatch_id'],k:'fk',d:'SFG row ← dispatch'},
+ {f:['jc_consume','bom_line_id'],t:['bom_line','bom_line_id'],k:'fk',d:'RM/PM row ← BOM line'},
+ {f:['inv_batch','job_card_id'],t:['jc_v2','job_card_id'],k:'fk',d:'WIP batch ← producing JC'},
+ {f:['inv_batch','sku_name'],t:['all_sku','particulars'],k:'fk',d:'batch is a catalogue item'},
+ {f:['jc_acct','job_card_id'],t:['jc_v2','job_card_id'],k:'fk',d:'accounting of a JC'},
+ {f:['jc_output','output_qty_kg'],t:['jc_dispatch','qty_kg'],k:'writes',d:'net SFG dispatched fwd'},
+ {f:['jc_v2','dispatched_to_next_kg'],t:['jc_v2','carried_qty_kg'],k:'writes',d:'SFG seam: out → in'},
+ {f:['jc_output','output_qty_kg'],t:['inv_batch','current_qty_kg'],k:'writes',d:'materialise WIP stock'},
+ {f:['jc_v2','status'],t:['fe_list','status'],k:'reads',d:'status badge'},
+ {f:['jc_v2','stage'],t:['fe_list','stage'],k:'reads',d:'stage column'},
+ {f:['jc_v2','step_number'],t:['fe_list','step_number'],k:'reads',d:'chain order'},
+ {f:['jc_v2','input_kind'],t:['fe_chain','input_kind'],k:'reads',d:'RM/SFG in chain tab'},
+ {f:['jc_v2','output_kind'],t:['fe_chain','output_kind'],k:'reads',d:'SFG/FG in chain tab'},
+ {f:['jc_v2','carried_qty_kg'],t:['fe_chain','carried_qty_kg'],k:'reads',d:'carried-in qty'},
+ {f:['jc_v2','dispatched_to_next_kg'],t:['fe_chain','dispatched_to_next_kg'],k:'reads',d:'dispatched qty'},
+ {f:['all_sku','item_type'],t:['fe_picker','item_type'],k:'reads',d:'rm/pm/SFG picker'},
+ {f:['jc_output','output_kind'],t:['fe_output','output_kind'],k:'reads',d:'yield entry'},
+ {f:['jc_acct','is_balanced'],t:['fe_output','is_balanced'],k:'reads',d:'balance gate UI'},
+ {f:['procop','practical_operation'],t:['fe_wip','practical_operation'],k:'reads',d:'op checklist'},
+ // ── edges for the added related tables ──
+ {f:['plan_line','plan_id'],t:['plan_v2','plan_id'],k:'fk',d:'line belongs to plan'},
+ {f:['plan_line','bom_id'],t:['bom_header','bom_id'],k:'fk',d:'line uses a BOM'},
+ {f:['plan_line','so_fulfillment_id'],t:['so_ful','so_fulfillment_id'],k:'fk',d:'plan fulfils demand'},
+ {f:['plan_step','plan_line_id'],t:['plan_line','plan_line_id'],k:'fk',d:'step of a plan line'},
+ {f:['so_ful','planned_qty_kg'],t:['plan_v2','plan_id'],k:'writes',d:'plan commits demand'},
+ {f:['jc_batch','job_card_id'],t:['jc_v2','job_card_id'],k:'fk',d:'batch of a JC'},
+ {f:['jc_batch','produced_qty_kg'],t:['jc_dispatch','qty_kg'],k:'writes',d:'batch close → dispatch SFG'},
+ {f:['jc_rm','job_card_id'],t:['jc_v2','job_card_id'],k:'fk',d:'RM indent of a JC'},
+ {f:['jc_rm','bom_line_id'],t:['bom_line','bom_line_id'],k:'fk',d:'indent ← BOM line'},
+ {f:['jc_pm','job_card_id'],t:['jc_v2','job_card_id'],k:'fk',d:'PM indent of a JC'},
+ {f:['jc_pm','bom_line_id'],t:['bom_line','bom_line_id'],k:'fk',d:'indent ← BOM line'},
+ {f:['jc_byp','job_card_id'],t:['jc_v2','job_card_id'],k:'fk',d:'byproduct of a JC'},
+ {f:['jc_byp','bom_line_id'],t:['bom_line','bom_line_id'],k:'fk',d:'byproduct ← article'},
+ {f:['jc_byp','quantity'],t:['jc_acct','total_accounted_qty'],k:'writes',d:'loss feeds balance'},
+ {f:['jc_bal','job_card_id'],t:['jc_v2','job_card_id'],k:'fk',d:'balance of a JC'},
+ {f:['jc_bal','bom_line_id'],t:['bom_line','bom_line_id'],k:'fk',d:'balance ← article'},
+ {f:['jc_add','job_card_id'],t:['jc_v2','job_card_id'],k:'fk',d:'additive of a JC'},
+ {f:['jc_add','sku_name'],t:['all_sku','particulars'],k:'fk',d:'additive ← catalogue'},
+ {f:['jc_sign','job_card_id'],t:['jc_v2','job_card_id'],k:'fk',d:'sign-off of a JC'},
+ {f:['jc_sign','sign_off_id'],t:['jc_v2','status'],k:'writes',d:'all roles → status=closed'},
+ {f:['jc_qc','job_card_id'],t:['jc_v2','job_card_id'],k:'fk',d:'QC of a JC'},
+ {f:['floor_mv','job_card_id'],t:['jc_v2','job_card_id'],k:'fk',d:'move triggered by JC'},
+ {f:['floor_mv','sku_name'],t:['all_sku','particulars'],k:'fk',d:'moves a catalogue item'},
+ {f:['jc_dispatch','qty_kg'],t:['floor_mv','movement_id'],k:'writes',d:'dispatch logs a move'},
+ {f:['jc_v2','machine_id'],t:['machine','machine_id'],k:'fk',d:'JC runs on a machine'},
+];
+const NMAP={};NODES.forEach(n=>NMAP[n.id]=n);
+const MARK={loads:'ac',fk:'as',reads:'aa',writes:'ag'};
+const elMap={};
+let curLayer='all', curView='graph', hoverId=null, relsFocus=null, apiFocus=null;
+const selSet=new Set();
+// build cards
+const cols={plug:[],backend:[],frontend:[]};
+NODES.forEach(n=>cols[n.layer].push(n));
+const colsEl=document.getElementById('cols');
+[['plug','PLUG · input config'],['backend','BACKEND · postgres'],['frontend','FRONTEND · job-card module']].forEach(([lk,lbl],ci)=>{
+ const c=document.createElement('div');c.className='col';c.dataset.layer=lk;
+ c.innerHTML=`<div class="colh ${lk}">${lbl}</div>`;
+ cols[lk].forEach((n,i)=>{
+   const card=document.createElement('div');card.className='tnode l-'+n.layer;card.dataset.id=n.id;card.style.setProperty('--d',(ci*0.15+i*0.05)+'s');
+   let rows=n.fields.map(f=>`<div class="row" data-n="${n.id}" data-f="${f.n}"><span class="fn">${f.n}</span>${f.k?`<span class="badge b-${f.k.toLowerCase()}">${f.k}</span>`:''}</div>`).join('');
+   card.innerHTML=`<div class="th"><i class="lz"></i>${n.name}<small>${n.sub}</small></div><div class="rows">${rows}</div>`;
+   c.appendChild(card);
+ });
+ colsEl.appendChild(c);
+});
+document.querySelectorAll('.row').forEach(r=>elMap[r.dataset.n+'||'+r.dataset.f]=r);
+const stage=document.getElementById('stage'), svg=document.getElementById('wires');
+function anchor(id,field,side){
+ const el=elMap[id+'||'+field]; if(!el) return null;
+ const r=el.getBoundingClientRect(), s=stage.getBoundingClientRect();
+ return {x:(side==='r'?r.right:r.left)-s.left, y:r.top-s.top+r.height/2};
+}
+let pathEls=[];
+function removeBlips(){[...svg.querySelectorAll('circle.blip')].forEach(b=>b.remove());}
+function draw(){
+ [...svg.querySelectorAll('path.wire')].forEach(p=>p.remove()); removeBlips(); pathEls=[];
+ svg.setAttribute('width',stage.scrollWidth); svg.setAttribute('height',stage.scrollHeight);
+ svg.setAttribute('viewBox',`0 0 ${stage.scrollWidth} ${stage.scrollHeight}`);
+ const loopCount={};
+ EDGES.forEach((e,idx)=>{
+   const fn=NMAP[e.f[0]], tn=NMAP[e.t[0]];
+   if(curLayer!=='all' && fn.layer!==curLayer && tn.layer!==curLayer) return;
+   const fc=document.querySelector(`.tnode[data-id="${e.f[0]}"]`), tc=document.querySelector(`.tnode[data-id="${e.t[0]}"]`);
+   if(!fc||!tc||fc.classList.contains('hide')||tc.classList.contains('hide')) return;
+   const fwd=L[tn.layer]>L[fn.layer];
+   const p1=anchor(e.f[0],e.f[1],'r');
+   const p2=anchor(e.t[0],e.t[1],fwd?'l':'r');
+   if(!p1||!p2) return;
+   let d;
+   if(fwd){const dx=Math.max(46,Math.abs(p2.x-p1.x)*0.4);d=`M${p1.x} ${p1.y} C ${p1.x+dx} ${p1.y}, ${p2.x-dx} ${p2.y}, ${p2.x} ${p2.y}`;}
+   else{const key=e.f[0];loopCount[key]=(loopCount[key]||0)+1;const off=66+loopCount[key]*20;d=`M${p1.x} ${p1.y} C ${p1.x+off} ${p1.y}, ${p2.x+off} ${p2.y}, ${p2.x} ${p2.y}`;}
+   const path=document.createElementNS(SVGNS,'path');
+   path.setAttribute('d',d);path.setAttribute('class','wire k-'+e.k);
+   path.id='wp'+idx; path._e=e; svg.appendChild(path); pathEls.push(path);
+ });
+ applyHi();
+}
+function activeIds(){ if(selSet.size) return selSet; if(hoverId) return new Set([hoverId]); return null; }
+function makeBlips(){
+ removeBlips();
+ pathEls.forEach(p=>{
+   if(!p.classList.contains('on')) return;
+   const len=p.getTotalLength?p.getTotalLength():200;
+   const blip=document.createElementNS(SVGNS,'circle');
+   blip.setAttribute('r','2');blip.setAttribute('class','blip');blip.setAttribute('fill',KCOL[p._e.k]);
+   blip.setAttribute('filter','drop-shadow(0 0 2px '+KCOL[p._e.k]+')');
+   const am=document.createElementNS(SVGNS,'animateMotion');
+   am.setAttribute('dur',(Math.max(0.9,len/170)).toFixed(2)+'s');
+   am.setAttribute('repeatCount','indefinite');am.setAttribute('rotate','auto');
+   const mp=document.createElementNS(SVGNS,'mpath');
+   mp.setAttributeNS('http://www.w3.org/1999/xlink','href','#'+p.id);mp.setAttribute('href','#'+p.id);
+   am.appendChild(mp);blip.appendChild(am);svg.appendChild(blip);
+ });
+}
+function applyHi(){
+ const act=activeIds();
+ if(!act){clearHi();return;}
+ stage.classList.add('focus');
+ const neigh=new Set(act);
+ pathEls.forEach(p=>{const e=p._e;const on=act.has(e.f[0])||act.has(e.t[0]);p.classList.toggle('on',on);if(on){p.setAttribute('marker-end','url(#'+MARK[e.k]+')');neigh.add(e.f[0]);neigh.add(e.t[0]);}else p.removeAttribute('marker-end');});
+ document.querySelectorAll('.tnode').forEach(c=>{const id=c.dataset.id;
+   c.classList.toggle('sel',selSet.has(id));
+   c.classList.toggle('neigh',neigh.has(id)&&!selSet.has(id));
+   c.classList.toggle('dimmed',!neigh.has(id));
+ });
+ makeBlips();updateClear();
+}
+function clearHi(){stage.classList.remove('focus');pathEls.forEach(p=>{p.classList.remove('on');p.removeAttribute('marker-end');});removeBlips();
+ document.querySelectorAll('.tnode').forEach(c=>c.classList.remove('sel','neigh','dimmed'));updateClear();}
+function updateClear(){const cs=document.getElementById('clearSel');cs.style.display=selSet.size?'':'none';cs.textContent=`✕ clear (${selSet.size})`;}
+const EMPTY='<div class="empty">Click tables to <b style="color:var(--ink)">multi-select</b> (they stay selected; others grey out). Hover to preview. Each table shows its <b style="color:var(--cyan)">fields</b>, what it <b style="color:var(--cyan)">refers to</b> and what <b style="color:var(--amber)">refers to it</b>, plus its <b style="color:var(--cyan)">endpoint</b>.</div>';
+function clearDetail(){document.getElementById('detail').innerHTML=EMPTY;}
+function detail(id){
+ const n=NMAP[id];const out=EDGES.filter(e=>e.f[0]===id),inc=EDGES.filter(e=>e.t[0]===id);
+ const refRow=(e,dir)=>{const o=dir==='out'?e.t:e.f;const fld=dir==='out'?e.f[1]:e.t[1];const on=NMAP[o[0]];
+   return `<div class="rel" data-go="${o[0]}"><span class="fld">${fld}</span> <span class="ar">${dir==='out'?'→':'←'}</span> <span class="tgt">${on.name}</span>.<span class="fld">${o[1]}</span><br><span class="kd">${e.k.toUpperCase()} · ${e.d}</span></div>`;};
+ document.getElementById('detail').innerHTML=
+  `<h3><i class="lz" style="width:10px;height:10px;border-radius:2px;background:var(--${n.layer})"></i>${n.name}</h3>
+   <div style="font-family:'JetBrains Mono';font-size:10.5px;color:var(--mut);margin-top:3px">${n.layer.toUpperCase()} · ${n.sub}</div>
+   ${selSet.size>1?`<div class="selcount">${selSet.size} tables selected — showing ${n.name}</div>`:''}
+   ${n.ep?`<div class="endp">⇄ ${n.ep}</div>`:''}
+   <div class="dl">Fields (${n.fields.length})</div>${n.fields.map(f=>`<div class="fl">${f.n}${f.k?` <span class="badge b-${f.k.toLowerCase()}">${f.k}</span>`:''}</div>`).join('')}
+   <div class="dl">Refers to → (${out.length})</div>${out.length?out.map(e=>refRow(e,'out')).join(''):'<div class="empty">—</div>'}
+   <div class="dl">← Referred by (${inc.length})</div>${inc.length?inc.map(e=>refRow(e,'in')).join(''):'<div class="empty">—</div>'}
+   <div class="dpanelnav"><button data-dn="rels">▤ open links in Relationships</button></div>`;
+ document.querySelectorAll('#detail .rel').forEach(r=>r.onclick=()=>toggleSelect(r.dataset.go,true));
+ const nb=document.querySelector('#detail .dpanelnav button[data-dn="rels"]');if(nb)nb.onclick=()=>focusRels([id]);
+}
+function toggleSelect(id,additive){
+ if(!additive){selSet.clear();selSet.add(id);}
+ else{ if(selSet.has(id))selSet.delete(id); else selSet.add(id); }
+ applyHi();
+ const showId = selSet.has(id)?id:[...selSet].pop();
+ if(showId) detail(showId); else clearDetail();
+}
+document.querySelectorAll('.tnode .th').forEach(th=>{
+ const card=th.closest('.tnode');
+ th.onclick=()=>toggleSelect(card.dataset.id,true);
+ card.onmouseenter=()=>{if(!selSet.size){hoverId=card.dataset.id;applyHi();detail(card.dataset.id);}};
+ card.onmouseleave=()=>{if(!selSet.size){hoverId=null;applyHi();clearDetail();}};
+});
+clearDetail();
+// ---- controls ----
+function applyGraphFilters(){
+ const q=document.getElementById('search').value.toLowerCase().trim();
+ document.querySelectorAll('.tnode').forEach(c=>{
+   const n=NMAP[c.dataset.id];
+   const layerHide=curLayer!=='all'&&n.layer!==curLayer;
+   const searchHide=q&&!(n.name.toLowerCase().includes(q)||n.fields.some(f=>f.n.toLowerCase().includes(q)));
+   c.classList.toggle('hide',layerHide||searchHide);
+ });
+ document.querySelectorAll('#cols .col').forEach(c=>{const any=[...c.querySelectorAll('.tnode')].some(t=>!t.classList.contains('hide'));c.style.display=any?'':'none';});
+ requestAnimationFrame(draw);
+}
+function filterRels(){
+ const q=document.getElementById('search').value.toLowerCase().trim();
+ document.querySelectorAll('#relsBody tr').forEach(r=>{
+   const lo=curLayer==='all'||r.dataset.fl===curLayer||r.dataset.tl===curLayer;
+   const to=!q||r.textContent.toLowerCase().includes(q);
+   const fo=!relsFocus||relsFocus.has(r.dataset.go)||relsFocus.has(r.dataset.to);
+   r.style.display=(lo&&to&&fo)?'':'none';
+ });
+}
+function filterApi(){
+ const q=document.getElementById('search').value.toLowerCase().trim();
+ document.querySelectorAll('#apiBody tr').forEach(r=>{
+   const t=r.textContent.toLowerCase();
+   r.style.display=((!q||t.includes(q))&&(!apiFocus||apiFocus.some(k=>t.includes(k))))?'':'none';
+ });
+}
+function fBanner(id,txt,onClear){const el=document.getElementById(id);el.innerHTML='◆ '+txt+' <button>✕ show all</button>';el.classList.add('show');el.querySelector('button').onclick=onClear;}
+function fHide(id){const el=document.getElementById(id);if(el)el.classList.remove('show');}
+function resetLayerChips(){curLayer='all';document.querySelectorAll('#layerChips .chip[data-l]').forEach(x=>x.classList.toggle('on',x.dataset.l==='all'));}
+function gotoView(v){const b=document.querySelector('.vbtn[data-v="'+v+'"]');if(b)b.click();}
+function focusGraph(ids){
+ ids=ids.filter(i=>NMAP[i]); if(!ids.length)return;
+ selSet.clear(); ids.forEach(i=>selSet.add(i)); resetLayerChips();
+ gotoView('graph');
+ setTimeout(()=>{applyHi();detail(ids[0]);const f=document.querySelector('.tnode[data-id="'+ids[0]+'"]');if(f)f.scrollIntoView({block:'center',behavior:'smooth'});},150);
+}
+function focusRels(ids){
+ ids=ids.filter(i=>NMAP[i]);
+ gotoView('rels'); relsFocus=new Set(ids); resetLayerChips(); filterRels();
+ fBanner('relsBanner','showing links for this flow ('+ids.length+' tables)',()=>{relsFocus=null;fHide('relsBanner');filterRels();});
+}
+function focusApi(keys){
+ gotoView('api'); apiFocus=keys.map(k=>String(k).toLowerCase()); filterApi();
+ fBanner('apiBanner','showing endpoints for this flow',()=>{apiFocus=null;fHide('apiBanner');filterApi();});
+}
+function applyControls(){
+ if(curView==='graph') applyGraphFilters();
+ else if(curView==='rels') filterRels();
+ else if(curView==='api') filterApi();
+}
+document.querySelectorAll('#layerChips .chip[data-l]').forEach(ch=>ch.onclick=()=>{
+ document.querySelectorAll('#layerChips .chip[data-l]').forEach(x=>x.classList.remove('on'));ch.classList.add('on');
+ curLayer=ch.dataset.l; applyControls();
+});
+document.getElementById('clearSel').onclick=()=>{selSet.clear();hoverId=null;applyHi();clearDetail();};
+document.getElementById('search').oninput=applyControls;
+// view switch + control visibility
+function setControlVis(){
+ const chips=document.getElementById('layerChips'), search=document.getElementById('search');
+ const chipsOn=(curView==='graph'||curView==='rels'); const searchOn=(curView!=='flow');
+ chips.classList.toggle('ctlhide',!chipsOn);
+ search.classList.toggle('ctlhide',!searchOn);
+ search.placeholder=curView==='api'?'search endpoints…':(curView==='rels'?'search links…':'search table / field…');
+}
+document.querySelectorAll('.vbtn').forEach(b=>b.onclick=()=>{
+ document.querySelectorAll('.vbtn').forEach(x=>x.classList.remove('active'));b.classList.add('active');
+ document.querySelectorAll('.view').forEach(v=>v.classList.remove('show'));
+ relsFocus=null;apiFocus=null;fHide('relsBanner');fHide('apiBanner');
+ document.getElementById('search').value='';
+ curView=b.dataset.v; document.getElementById('view-'+curView).classList.add('show');
+ setControlVis(); applyControls();
+ if(curView==='graph')requestAnimationFrame(draw);
+});
+// relationships table
+document.getElementById('relsBody').innerHTML=EDGES.map(e=>{
+ const fn=NMAP[e.f[0]],tn=NMAP[e.t[0]];
+ return `<tr data-go="${e.f[0]}" data-to="${e.t[0]}" data-fl="${fn.layer}" data-tl="${tn.layer}"><td class="src-c">${fn.name}</td><td class="fld">${e.f[1]}</td><td class="tgt-c">${tn.name}</td><td class="fld">${e.t[1]}</td><td><span class="pill p-${e.k}">${e.k}</span></td><td style="color:var(--mut)">${e.d}</td></tr>`;
+}).join('');
+document.querySelectorAll('#relsBody tr').forEach(tr=>tr.onclick=()=>{
+ document.querySelector('.vbtn[data-v="graph"]').click();
+ toggleSelect(tr.dataset.go,false);
+ const el=document.querySelector('.tnode[data-id="'+tr.dataset.go+'"]');if(el)el.scrollIntoView({block:'center',behavior:'smooth'});
+});
+// api table (audited vs router.py)
+const API=[
+ ['SVC','master_ingest.py · service (not an HTTP route)','ingest_fg_master / ingest_bom_lines','all_sku · bom_header · bom_line · bom_process_route','loads SFG catalogue + sfg bom lines','all_sku,bom_header,bom_line,bom_route,sfgcat,bomplug,machine'],
+ ['POST','/plans-v2/{id}/approve  → create_job_cards_from_plan','plan_v2.py:572','builds the 2-stage chain · prev/next','sets output_kind=SFG (S1), input_kind=SFG (S2)','plan_v2,plan_line,plan_step,jc_v2,routing,procop'],
+ ['GET','/job-cards-v2  (router.py:4886)','list_job_cards_v2','status, stage, step_number','lists SFG-bearing stages','jc_v2,fe_list'],
+ ['GET','/job-cards-v2/{id}  (5032)','get_job_card_v2','header + bom + indents + consumption','SFG item in BOM / consumption','jc_v2,jc_rm,jc_pm,jc_consume,bom_line,fe_picker'],
+ ['GET','/job-cards-v2/{id}/chain  (5062)','chain','prev/next, carried, dispatched','renders the SFG seam','jc_v2,fe_chain'],
+ ['PUT','/job-cards-v2/{id}/start  (6469)','start','status → in_progress','begins Create WIP','jc_v2,jc_batch'],
+ ['POST','/job-cards-v2/{id}/batches/open  (6046)','open_batch','batch row','floor-mgr op selection','jc_batch,jc_v2,fe_wip'],
+ ['POST','/job-cards-v2/{id}/batches/{bid}/close  (6076)','close_batch','auto-dispatch + synth consumption','closes SFG, dispatches net','jc_batch,jc_dispatch,jc_consume,jc_output,inv_batch'],
+ ['POST','/job-cards-v2/{id}/dispatch-to-next  (5451)','dispatch_to_next','partial_dispatch + carried_qty','moves SFG to next stage','jc_dispatch,jc_v2,jc_consume,floor_mv'],
+ ['POST','/job-cards-v2/{id}/outputs  (5590)','record_output','output_v2 + consumption + byproducts','SFG / FG yield + losses','jc_output,jc_consume,jc_byp,jc_bal,jc_add,inv_batch,fe_output'],
+ ['GET','/job-cards-v2/{id}/accounting  (5328)','get_accounting','conservation identity','gross − losses = net SFG','jc_acct,fe_output'],
+ ['PUT','/job-cards-v2/{id}/accounting/summary  (5410)','save_summary','accounting_v2 summary','computes balance','jc_acct'],
+ ['POST','/job-cards-v2/{id}/sign-off  (6311)','sign_off','sign_off_v2','gates close','jc_sign,jc_v2'],
+ ['PUT','/job-cards-v2/{id}/complete  (6508)','complete','status → completed','all batches closed','jc_v2,jc_batch'],
+ ['PUT','/job-cards-v2/{id}/close  (6687)','close','status → closed','terminal','jc_v2,jc_sign'],
+ ['POST','/job-cards-v2/{id}/metal-detection · /weight-checks · /environment · /loss-reconciliation · /remarks  (6825-7143)','annexures','QC annexure rows','per-stage QC evidence','jc_qc'],
+];
+document.getElementById('apiBody').innerHTML=API.map(a=>`<tr data-tables="${a[5]}"><td><span class="pill p-${a[0]==='GET'?'reads':(a[0]==='POST'||a[0]==='PUT'?'writes':'fk')}">${a[0]}</span></td><td class="fld">${a[1]}</td><td class="src-c">${a[2]}</td><td style="color:#cdd7e6">${a[3]}</td><td class="tgt-c">${a[4]}</td><td class="trace"><button class="apibtn" data-act="graph">◇ graph</button><button class="apibtn" data-act="rels">▤ links</button></td></tr>`).join('');
+document.querySelectorAll('#apiBody tr').forEach(tr=>{
+ const ids=()=>(tr.dataset.tables||'').split(',').filter(Boolean);
+ tr.querySelectorAll('.apibtn').forEach(b=>b.onclick=(e)=>{e.stopPropagation(); if(b.dataset.act==='graph')focusGraph(ids()); else focusRels(ids());});
+ tr.onclick=()=>focusGraph(ids());
+});
+// process branches — layered, expandable, cross-linked
+const ARCH=[
+ {c:'a',t:'A · WIP producer (bulk)',cond:'YES transform · the FG itself IS a bulk article (e.g. "Roasted & Salted Cashew Bulk")',
+  flow:'RM → <b>Create WIP</b> (Roast&amp;Flavour/Salt) → <b>SFG</b> (the bulk)',
+  tables:['plan_v2','plan_line','plan_step','jc_v2','jc_rm','jc_batch','machine','jc_output','jc_byp','jc_acct','inv_batch','sfgcat','all_sku','jc_sign'],
+  endpoints:['plans-v2','/start','batches','outputs','accounting','sign-off','complete','close','master_ingest'],
+  layers:[
+   {n:'Plan → generate the JC',d:'An approved plan-v2 line/step spawns ONE job_card_v2 (single Create-WIP stage). The bulk recipe is the plan line.',
+    tables:['plan_v2','plan_line','plan_step','jc_v2'],ep:'POST /plans-v2/{id}/approve → create_job_cards_from_plan',
+    be:['job_card_v2: 1 stage, output_kind=SFG','step from production_plan_step_v2'],fe:['JC appears in list with stage = the operation']},
+   {n:'Issue RM & run',d:'RM indented from stores; floor manager opens a batch and runs the combined Roast & Flavour/Salt operation on a machine.',
+    tables:['jc_rm','jc_batch','jc_v2','machine'],ep:'PUT /{id}/start · POST /{id}/batches/open',
+    be:['job_card_rm_indent_v2 (issued/consumed)','job_card_batch_v2 open · machine_id'],fe:['Create-WIP checklist enables/combines ops','status → in_progress']},
+   {n:'Close & yield the SFG',d:'Batch close records output (output_kind=SFG), byproducts/losses and the balance; net SFG is materialised as WIP stock.',
+    tables:['jc_output','jc_byp','jc_acct','inv_batch'],ep:'POST /{id}/outputs · GET /{id}/accounting · POST /{id}/batches/{bid}/close',
+    be:['job_card_output_v2.output_kind=SFG','byproducts + accounting balance','inventory_batch.item_type=wip (gross−losses)'],fe:['Output & Accounting tab: SFG yield + is_balanced']},
+   {n:'Catalogue the SFG',d:'The bulk article is registered as a first-class SFG so downstream packs can consume it.',
+    tables:['sfgcat','all_sku'],ep:'svc · master_ingest.py',
+    be:['all_sku: bulk re-typed item_type=sfg','SFG_Catalog_Plug row'],fe:['SFG appears in the Item Picker']},
+   {n:'Sign-off & close',d:'Required role sign-offs gate completion; the JC closes.',
+    tables:['jc_sign','jc_v2'],ep:'POST /{id}/sign-off · PUT /{id}/complete · PUT /{id}/close',
+    be:['job_card_sign_off_v2 rows','status → completed → closed'],fe:['status badge → closed']}]},
+ {c:'b',t:'B · Transform → Pack (in-line)',cond:'YES transform · NO existing bulk (BOM makes from raw)',
+  flow:'RM → <b>Create WIP</b> → SFG → <b>Final FG</b> → FG',
+  tables:['plan_v2','plan_line','plan_step','jc_v2','jc_rm','jc_batch','jc_output','jc_byp','inv_batch','jc_dispatch','floor_mv','jc_consume','jc_pm','jc_acct','sfgcat','all_sku','jc_sign'],
+  endpoints:['plans-v2','/start','batches','dispatch-to-next','outputs','accounting','sign-off','complete','close'],
+  layers:[
+   {n:'Plan → 2-stage chain',d:'Plan approval spawns TWO chained job_card_v2 (Create WIP → Final FG) linked by prev/next.',
+    tables:['plan_v2','plan_line','plan_step','jc_v2'],ep:'POST /plans-v2/{id}/approve',
+    be:['job_card_v2 ×2 · prev_job_card_id / next_job_card_id','step_number 1,2'],fe:['StageChainTab shows 2 rows']},
+   {n:'Create WIP (Stage 1)',d:'RM issued; batch run of the practical operation; SFG output + losses; WIP stock materialised.',
+    tables:['jc_rm','jc_batch','jc_output','jc_byp','inv_batch'],ep:'PUT /{id}/start · POST /{id}/batches/open · /outputs',
+    be:['output_kind=SFG · process_loss_kg','inventory_batch wip'],fe:['Create-WIP checklist · status per stage']},
+   {n:'The SFG seam (handoff)',d:'Net SFG (gross−losses) dispatched to Stage 2; carried_qty mirrors it; a synthetic SFG consumption row + floor movement are written.',
+    tables:['jc_dispatch','jc_v2','floor_mv','jc_consume'],ep:'POST /{id}/dispatch-to-next · POST /{id}/batches/{bid}/close',
+    be:['dispatched_to_next_kg → carried_qty_kg','partial_dispatch_v2 · consumption input_kind=SFG (source_dispatch_id)','floor_movement logged'],fe:['StageChainTab carried/dispatched qty']},
+   {n:'Final FG · pack (Stage 2)',d:'PM issued; the SFG is packed into the FG; yield + balance recorded.',
+    tables:['jc_pm','jc_output','jc_acct'],ep:'POST /{id}/outputs · GET /{id}/accounting',
+    be:['pm_indent_v2 · output_kind=FG','accounting balances both stages'],fe:['Output tab shows SFG then FG yield']},
+   {n:'Catalogue + close',d:'SFG catalogued; sign-offs close each stage.',
+    tables:['sfgcat','all_sku','jc_sign'],ep:'POST /{id}/sign-off · PUT /{id}/close',
+    be:['all_sku item_type=sfg','status → closed'],fe:['SFG in Item Picker · closed badge']}]},
+ {c:'c',t:'C · Pack of existing SFG',cond:'NO own transform · BOM consumes exactly ONE bulk SFG',
+  flow:'existing bulk SFG → <b>Final FG</b> (Packing) → FG',
+  tables:['plan_v2','plan_line','plan_step','jc_v2','bomplug','bom_line','all_sku','jc_consume','jc_pm','jc_output','jc_acct','jc_sign'],
+  endpoints:['plans-v2','outputs','accounting','sign-off','close','master_ingest','/job-cards-v2/{id}'],
+  layers:[
+   {n:'Plan → single Final-FG stage',d:'Plan approval spawns ONE Final-FG job card (no Create WIP).',
+    tables:['plan_v2','plan_line','plan_step','jc_v2'],ep:'POST /plans-v2/{id}/approve',
+    be:['job_card_v2: single stage'],fe:['no Create-WIP step shown']},
+   {n:'Consume the existing SFG',d:'The BOM carries the bulk SFG as a component (item_type=sfg); it is the opening RM of packing.',
+    tables:['bomplug','bom_line','all_sku','jc_consume'],ep:'svc · master_ingest.py · GET /{id}',
+    be:['bom_line sfg-typed line','consumption_v2 input_kind=SFG · no new article'],fe:['Item Picker shows the SFG input']},
+   {n:'Pack & balance',d:'PM issued; FG produced; balance recorded.',
+    tables:['jc_pm','jc_output','jc_acct'],ep:'POST /{id}/outputs · GET /{id}/accounting',
+    be:['output_kind=FG'],fe:['single status flow']},
+   {n:'Close',d:'Sign-offs close the JC.',
+    tables:['jc_sign','jc_v2'],ep:'POST /{id}/sign-off · PUT /{id}/close',
+    be:['status → closed'],fe:['closed badge']}]},
+ {c:'d',t:'D · Pack-only (no SFG)',cond:'NO transform (sorting + packing only)',
+  flow:'RM → <b>Final FG</b> (Sorting + Packing) → FG',
+  tables:['plan_v2','plan_line','plan_step','jc_v2','bom_line','jc_rm','jc_pm','jc_output','jc_acct','jc_sign'],
+  endpoints:['plans-v2','outputs','accounting','sign-off','close','/job-cards-v2/{id}'],
+  layers:[
+   {n:'Plan → single stage',d:'One Final-FG job card; sorting is inline at intake.',
+    tables:['plan_v2','plan_line','plan_step','jc_v2'],ep:'POST /plans-v2/{id}/approve',
+    be:['job_card_v2: 1 stage, output_kind=FG'],fe:['status flow as today']},
+   {n:'Issue RM/PM & pack',d:'RM + PM issued; FG produced. No SFG, no dispatch.',
+    tables:['jc_rm','jc_pm','bom_line','jc_output'],ep:'GET /{id} · POST /{id}/outputs',
+    be:['bom_line rm/pm only · output_kind=FG · no dispatch'],fe:['Item Picker rm/pm only · no SFG']},
+   {n:'Balance & close',d:'Balance recorded; sign-offs close.',
+    tables:['jc_acct','jc_sign'],ep:'GET /{id}/accounting · PUT /{id}/close',
+    be:['accounting · status → closed'],fe:['closed badge']}]},
+];
+document.getElementById('branches').innerHTML=ARCH.map((a,ai)=>`<div class="branch ${a.c}">
+ <div class="bh">${a.t}</div><div class="cond">${a.cond}</div><div class="flowline">${a.flow}</div>
+ <div class="lyrs">${a.layers.map((ly,li)=>`<div class="lyr" data-arch="${ai}" data-ly="${li}">
+   <div class="lh"><span class="ln">${li+1}</span>${ly.n}<span class="chev">›</span></div>
+   <div class="lb">
+     <div class="lbd">${ly.d}</div>
+     <div class="tchips">${ly.tables.map(t=>`<span class="tchip" data-go="${t}">${NMAP[t]?NMAP[t].name:t}</span>`).join('')}</div>
+     ${ly.ep?`<div class="lep">⇄ ${ly.ep}</div>`:''}
+     ${ly.be?`<div class="eff be"><div class="et">Backend</div><ul>${ly.be.map(x=>`<li>${x}</li>`).join('')}</ul></div>`:''}
+     ${ly.fe?`<div class="eff fe"><div class="et">Frontend</div><ul>${ly.fe.map(x=>`<li>${x}</li>`).join('')}</ul></div>`:''}
+     <div class="lyrbtns"><button class="lbtn" data-act="graph" data-set="${ly.tables.join(',')}">◇ this step in the graph</button></div>
+   </div></div>`).join('')}</div>
+ <div class="cfoot">
+   <button class="cbtn" data-act="graph" data-set="${a.tables.join(',')}">◇ flow in Graph</button>
+   <button class="cbtn" data-act="rels" data-set="${a.tables.join(',')}">▤ Relationships</button>
+   <button class="cbtn" data-act="api" data-set="${a.endpoints.join('|')}">⇄ Endpoints</button>
+ </div></div>`).join('');
+document.querySelectorAll('#branches .lh').forEach(h=>h.onclick=()=>h.closest('.lyr').classList.toggle('open'));
+document.querySelectorAll('#branches .tchip').forEach(c=>c.onclick=()=>focusGraph([c.dataset.go]));
+document.querySelectorAll('#branches .lbtn,#branches .cbtn').forEach(b=>b.onclick=()=>{
+ const act=b.dataset.act, set=b.dataset.set;
+ if(act==='graph')focusGraph(set.split(','));
+ else if(act==='rels')focusRels(set.split(','));
+ else if(act==='api')focusApi(set.split('|'));
+});
+window.addEventListener('resize',()=>{clearTimeout(window._rt);window._rt=setTimeout(()=>{if(curView==='graph')draw();},150);});
+window.addEventListener('load',()=>setTimeout(draw,260));
+setControlVis();
+setTimeout(draw,120);
+</script>
+</body>
+</html>

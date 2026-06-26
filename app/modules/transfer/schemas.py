@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, List, Optional
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 # ── Common ──────────────────────────────────────────────────────────────────
@@ -52,6 +52,30 @@ class FinalizeTransferIn(BaseModel):
     box_condition: Optional[str] = "Good"
     condition_remarks: Optional[str] = None
     cold_storage_items: Optional[List[dict]] = None
+
+
+class ReopenTransferIn(BaseModel):
+    reason: Optional[str] = None
+
+
+class CloseWithShortage(BaseModel):
+    shortage_reason: Optional[str] = None
+
+
+class EditTransferInBox(BaseModel):
+    box_id: str
+    lot_number: Optional[str] = None
+    article: Optional[str] = None
+    net_weight: Optional[float] = None
+    gross_weight: Optional[float] = None
+
+
+class EditTransferIn(BaseModel):
+    grn_number: Optional[str] = None
+    receiving_warehouse: Optional[str] = None
+    box_condition: Optional[str] = None
+    condition_remarks: Optional[str] = None
+    boxes: Optional[List[EditTransferInBox]] = None
 
 
 # ── Request create input (doc 05) ─────────────────────────────────────────────
@@ -185,6 +209,89 @@ class RequestListResponse(BaseModel):
     page: int = 1
     per_page: int = 10
     total_pages: int = 0
+
+
+# ── Transfer (OUT) create input (doc 07) ─────────────────────────────────────
+# Ported from interunit_models.py (TransferHeaderCreate / TransferLineCreate /
+# BoxCreate / TransferCreate). The transferform / directtransferform pages POST
+# this shape to create a dispatch. Lines accept both the canonical field names
+# and the internal aliases (rm_pm_fg_type / item_desc_raw / qty); numeric values
+# arrive as numbers or strings and are coerced to str so the endpoint never 422s.
+class TransferHeaderCreate(BaseModel):
+    challan_no: Optional[str] = None
+    stock_trf_date: str = Field(..., description="DD-MM-YYYY")
+    from_warehouse: str
+    to_warehouse: str
+    vehicle_no: str
+    driver_name: Optional[str] = None
+    approved_by: Optional[str] = None
+    remark: Optional[str] = None
+    reason_code: Optional[str] = None
+
+    @model_validator(mode="after")
+    def warehouses_must_differ(self):
+        if self.from_warehouse and self.to_warehouse and self.from_warehouse == self.to_warehouse:
+            raise ValueError("From warehouse and to warehouse must be different")
+        return self
+
+
+class TransferLineCreate(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    material_type: str = Field(validation_alias=AliasChoices("material_type", "rm_pm_fg_type"))
+    item_category: str
+    sub_category: str
+    item_description: str = Field(validation_alias=AliasChoices("item_description", "item_desc_raw"))
+    quantity: Optional[str] = Field(default="0", validation_alias=AliasChoices("quantity", "qty"))
+    uom: Optional[str] = ""
+    pack_size: Optional[str] = "0.00"
+    unit_pack_size: Optional[str] = None
+    net_weight: Optional[str] = None
+    total_weight: Optional[str] = None
+    batch_number: Optional[str] = None
+    lot_number: Optional[str] = None
+    vakkal: Optional[str] = None
+
+    @field_validator(
+        "quantity", "pack_size", "unit_pack_size", "net_weight", "total_weight",
+        mode="before",
+    )
+    @classmethod
+    def _coerce_number_to_str(cls, v):
+        return str(v) if isinstance(v, (int, float)) else v
+
+    @field_validator("material_type")
+    @classmethod
+    def uppercase_material(cls, v: str) -> str:
+        return v.upper() if v else v
+
+    @field_validator("uom")
+    @classmethod
+    def uppercase_uom(cls, v: Optional[str]) -> str:
+        return v.upper() if v else (v or "")
+
+    @field_validator("item_category", "sub_category", "item_description")
+    @classmethod
+    def uppercase_text(cls, v: str) -> str:
+        return v.upper() if v else v
+
+
+class BoxCreate(BaseModel):
+    box_number: int
+    box_id: Optional[str] = None
+    article: str
+    lot_number: Optional[str] = None
+    batch_number: Optional[str] = None
+    transaction_no: Optional[str] = None
+    net_weight: str = "0.00"
+    gross_weight: str = "0.00"
+
+
+class TransferCreate(BaseModel):
+    header: TransferHeaderCreate
+    lines: List[TransferLineCreate] = Field(..., min_length=1)
+    boxes: Optional[List[BoxCreate]] = None
+    request_id: Optional[int] = None
 
 
 # ── Transfers (OUT) ──────────────────────────────────────────────────────────
@@ -361,6 +468,34 @@ class PendingTransferRecord(BaseModel):
     header_status: Optional[str] = None
     unallocated_boxes: Optional[int] = None
     updated_ts: Optional[datetime] = None
+
+
+# ── Inner cold transfer create (doc 11) ───────────────────────────────────────
+# Relabel a lot (old_lot → new_lot) and/or relocate boxes within cold storage.
+class InnerTransferLine(BaseModel):
+    stock_record_id: Optional[int] = None
+    item_category: Optional[str] = None
+    item_description: Optional[str] = None
+    net_weight: Optional[float] = None
+    quantity: int
+    old_lot_number: str
+    new_lot_number: str
+    new_storage_location: Optional[str] = None
+
+
+class InnerTransferHeader(BaseModel):
+    challan_no: str
+    transfer_name: Optional[str] = None   # transfer date (DD-MM-YYYY), free text
+    from_warehouse: str
+    remark: Optional[str] = None
+    reason_code: Optional[str] = None
+    transfer_type: Optional[str] = "INNER_COLD"
+
+
+class InnerTransferPayload(BaseModel):
+    company: Optional[str] = None
+    header: InnerTransferHeader
+    lines: List[InnerTransferLine] = Field(..., min_length=1)
 
 
 # ── Inner cold (dashboard tab) ────────────────────────────────────────────────

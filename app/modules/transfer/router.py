@@ -16,10 +16,12 @@ from fastapi import APIRouter, Depends, Query, Request
 from app.modules.auth.middleware import AuthUser, get_current_user
 from app.modules.transfer import permissions, schemas
 from app.modules.transfer.services import (
+    create_service,
     dashboard_service,
     delete_service,
     dropdown_service,
     inner_cold_service,
+    lookup_service,
     pending_service,
     query_service,
     receive_service,
@@ -181,6 +183,77 @@ async def list_transfers(
         )
 
 
+@router.post("/transfers", response_model=schemas.TransferWithLines, status_code=201)
+async def create_transfer(
+    request: Request,
+    body: schemas.TransferCreate,
+    user: AuthUser = Depends(get_current_user),
+):
+    # Authenticated operators create dispatches (parity with create_request — no
+    # extra gate; the page itself has no role gate). Deduction is atomic in the service.
+    # Profile lock: a warehouse-bound operator may only dispatch FROM their warehouse.
+    permissions.assert_can_dispatch_from(user, body.header.from_warehouse)
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await create_service.create_transfer(conn, body, user.email or "unknown")
+
+
+# ── Box lookups (transfer-OUT form: manual entry + TR-/BE- QR) ───────────────
+@router.get("/box-lookup/{company}")
+async def box_lookup(
+    request: Request,
+    company: str,
+    box_number: int = Query(..., description="Box number"),
+    transaction_no: str = Query(..., description="Transaction number"),
+    user: AuthUser = Depends(get_current_user),
+):
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await lookup_service.get_box_by_number(conn, company, box_number, transaction_no)
+
+
+@router.get("/box-lookup-by-id/{company}")
+async def box_lookup_by_id(
+    request: Request,
+    company: str,
+    box_id: str = Query(..., description="Box ID from a TR- QR"),
+    transaction_no: str = Query(..., description="Transaction number"),
+    user: AuthUser = Depends(get_current_user),
+):
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await lookup_service.get_box_by_box_id(conn, company, box_id, transaction_no)
+
+
+@router.get("/bulk-entry-box-lookup/{company}")
+async def bulk_entry_box_lookup(
+    request: Request,
+    company: str,
+    box_id: str = Query(..., description="Box ID from a BE- QR"),
+    transaction_no: str = Query(..., description="Transaction number starting with BE-"),
+    user: AuthUser = Depends(get_current_user),
+):
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await lookup_service.get_bulk_entry_box(conn, company, box_id, transaction_no)
+
+
+@router.put("/transfers/{transfer_id}", response_model=schemas.TransferWithLines)
+async def update_transfer(
+    request: Request,
+    transfer_id: int,
+    body: schemas.TransferCreate,
+    user: AuthUser = Depends(get_current_user),
+):
+    # Edit (doc 08, ?editId). Authenticated operators edit dispatches (parity with create);
+    # the dashboard gates editing of Received/Completed transfers.
+    # Profile lock: the edited from_warehouse must stay within the operator's scope.
+    permissions.assert_can_dispatch_from(user, body.header.from_warehouse)
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await create_service.update_transfer(conn, transfer_id, body)
+
+
 @router.get("/transfers/{transfer_id}", response_model=schemas.TransferWithLines)
 async def get_transfer(
     request: Request,
@@ -238,6 +311,8 @@ async def create_transfer_in(
     user: AuthUser = Depends(get_current_user),
 ):
     permissions.assert_can_acknowledge(user)
+    # Profile lock (bulk receipt): receiving warehouse must be in the operator's scope.
+    permissions.assert_can_receive_into(user, (body or {}).get("receiving_warehouse"))
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
         return await receive_service.create_transfer_in(conn, body)
@@ -250,6 +325,8 @@ async def create_pending_transfer_in(
     user: AuthUser = Depends(get_current_user),
 ):
     permissions.assert_can_acknowledge(user)
+    # Profile lock: a warehouse-bound operator may only receive INTO their warehouse.
+    permissions.assert_can_receive_into(user, body.receiving_warehouse)
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
         return await receive_service.create_pending_transfer_in(conn, body)
@@ -318,6 +395,49 @@ async def finalize_transfer_in(
         return await receive_service.finalize_transfer_in(conn, header_id, body)
 
 
+@router.post("/transfer-in/{header_id}/reopen")
+async def reopen_transfer_in(
+    request: Request,
+    header_id: int,
+    body: schemas.ReopenTransferIn | None = None,
+    user: AuthUser = Depends(get_current_user),
+):
+    # Reverses a Received GRN back to Pending (un-posts stock) for corrections.
+    permissions.assert_can_reopen(user)
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await receive_service.reopen_transfer_in(conn, header_id, user.email or "system")
+
+
+@router.post("/transfer-in/{header_id}/close-with-shortage")
+async def close_transfer_in_with_shortage(
+    request: Request,
+    header_id: int,
+    body: schemas.CloseWithShortage,
+    user: AuthUser = Depends(get_current_user),
+):
+    # Finalize the acknowledged boxes and write off the un-received shortfall.
+    permissions.assert_can_acknowledge(user)
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await receive_service.close_with_shortage(conn, header_id, body.shortage_reason, user.email or "system")
+
+
+@router.put("/transfer-in/{transfer_in_id}")
+async def edit_transfer_in(
+    request: Request,
+    transfer_in_id: int,
+    body: schemas.EditTransferIn,
+    user: AuthUser = Depends(get_current_user),
+):
+    # Edit a Received GRN: header-only edits update in place; per-box edits reverse,
+    # correct, and re-post the destination stock.
+    permissions.assert_can_reopen(user)
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await receive_service.edit_transfer_in(conn, transfer_in_id, body, user.email or "system")
+
+
 @router.get("/transfer-in/{transfer_in_id}", response_model=schemas.TransferInDetail)
 async def get_transfer_in(
     request: Request,
@@ -362,6 +482,22 @@ async def list_pending_stock(
         )
 
 
+@router.get("/pending-stock/by-lot")
+async def pending_stock_by_lot(
+    request: Request,
+    lot_no: Optional[str] = Query(None),
+    item_description: Optional[str] = Query(None),
+    from_site: Optional[str] = Query(None),
+    from_company: Optional[str] = Query(None, description="cfpl or cdpl"),
+    user: AuthUser = Depends(get_current_user),
+):
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await pending_service.pending_by_lot(
+            conn, lot_no=lot_no, item_description=item_description,
+            from_site=from_site, from_company=from_company)
+
+
 @router.post("/pending-stock/backfill")
 async def backfill_pending_stock(
     request: Request,
@@ -373,7 +509,7 @@ async def backfill_pending_stock(
         return await pending_service.backfill_pending_from_existing_transfers(conn)
 
 
-# ── Inner cold (dashboard tab) ────────────────────────────────────────────────
+# ── Inner cold transfer (doc 11 form + dashboard tab) ─────────────────────────
 @router.get("/inner-transfer/list", response_model=schemas.InnerColdListResponse)
 async def list_inner_cold(
     request: Request,
@@ -385,6 +521,31 @@ async def list_inner_cold(
     async with pool.acquire() as conn:
         return await inner_cold_service.list_inner_cold(
             conn, page=page, per_page=per_page, scope=permissions.scope_warehouses(user))
+
+
+@router.post("/inner-transfer", status_code=201)
+async def create_inner_transfer(
+    request: Request,
+    body: schemas.InnerTransferPayload,
+    user: AuthUser = Depends(get_current_user),
+):
+    # Relabel/relocate within cold storage (doc 11). Authenticated operators (parity with
+    # the other transfer mutations); mutates cfpl/cdpl_cold_stocks + writes the audit rows.
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await inner_cold_service.create_inner_transfer(conn, body)
+
+
+# Declared AFTER /inner-transfer/list so the literal `list` is never captured as a challan.
+@router.get("/inner-transfer/{challan_no}")
+async def get_inner_transfer(
+    request: Request,
+    challan_no: str,
+    user: AuthUser = Depends(get_current_user),
+):
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await inner_cold_service.get_inner_transfer(conn, challan_no)
 
 
 @router.delete("/inner-transfer/{challan_no}", response_model=schemas.DeleteResponse)

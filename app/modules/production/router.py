@@ -4417,10 +4417,15 @@ async def create_plan_v2(
 
     from app.modules.production.services.plan_v2 import create_plan
     pool = request.app.state.db_pool
+    # Stamp the creating user on the header (same identity convention as the
+    # other audit fields, e.g. record_output's recorded_by). Surfaces in the
+    # Plan List "Created by" column via list_plans' SELECT p.*.
+    payload = body.model_dump()
+    payload["created_by"] = user.full_name or user.phone
     try:
         async with pool.acquire() as conn:
             async with conn.transaction():
-                result = await create_plan(conn, body.model_dump())
+                result = await create_plan(conn, payload)
     except ValueError as exc:
         # Over-allocation against so_fulfillment_v2 pending_qty bounds.
         # Surface as a structured envelope so the frontend's friendlyApiError
@@ -4873,6 +4878,143 @@ async def replace_line_job_cards_v2(
     if err == "not_editable":
         raise HTTPException(status_code=409, detail=result.get("message"))
     if err in ("invalid_qty", "no_wip_steps", "missing_pkg_floor"):
+        raise HTTPException(status_code=400, detail=result.get("message"))
+    return result
+
+
+class JobCardLineEditStep(BaseModel):
+    """One WIP process in the LIVE Edit-Job-Card payload. Existing steps carry
+    their job_card_id; newly added steps omit it (None)."""
+    job_card_id: int | None = None
+    process: str
+    floor: str
+    sfg_output: str | None = None
+
+
+class JobCardLineApplyEdits(BaseModel):
+    """POST /plans-v2/lines/{plan_line_id}/job-cards/apply-edits — constrained
+    live edit of a STARTED chain (floor/qty change, add in the un-started tail,
+    remove with forced JC-data snapshot). Any existing WIP job_card_id absent
+    from `steps` is treated as a removal."""
+    qty_kg: float
+    qty_units: float | None = None
+    steps: list[JobCardLineEditStep]
+    pkg_floor: str
+    pkg_job_card_id: int | None = None
+    remove_reasons: dict[str, str] | None = None
+
+
+@router.post("/plans-v2/lines/{plan_line_id}/job-cards/apply-edits")
+async def apply_line_job_card_edits_v2(
+    request: Request,
+    plan_line_id: int,
+    body: JobCardLineApplyEdits,
+    user=Depends(get_current_user),
+):
+    """Apply constrained LIVE edits to a plan line's job cards even after stages
+    have started: real-time floor change, add a process (un-started tail), qty
+    change (synced to the linked SO — ledger + so_line), and remove a process
+    (force-records the JC's data then cancels it). Same floor-lock + single
+    transaction as create/replace."""
+    floors = [s.floor for s in body.steps] + [body.pkg_floor]
+    if not user.is_admin and user.allowed_floors:
+        bad = sorted({f for f in floors if f and f not in user.allowed_floors})
+        if bad:
+            raise HTTPException(
+                status_code=403,
+                detail=f"User is not assigned to floor(s): {', '.join(bad)}",
+            )
+
+    from app.modules.production.services.job_card_v2 import apply_live_job_card_edits
+    pool = request.app.state.db_pool
+    actor = user.full_name or user.phone
+    try:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                result = await apply_live_job_card_edits(
+                    conn,
+                    plan_line_id,
+                    qty_kg=body.qty_kg,
+                    qty_units=body.qty_units,
+                    steps=[s.model_dump() for s in body.steps],
+                    pkg_floor=body.pkg_floor,
+                    pkg_job_card_id=body.pkg_job_card_id,
+                    user=actor,
+                    remove_reasons=body.remove_reasons or {},
+                )
+    except ValueError as exc:
+        # Over-allocation against so_fulfillment_v2 pending bounds (qty sync).
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "over_allocation", "message": str(exc)},
+        )
+    err = result.get("error")
+    if err in ("no_job_cards", "job_card_not_found"):
+        raise HTTPException(status_code=404, detail=result.get("message") or "Not found")
+    if err in ("cannot_remove_terminal", "cannot_remove_started_midchain",
+               "cannot_reorder_started_region"):
+        raise HTTPException(status_code=409, detail=result.get("message"))
+    if err in ("invalid_qty", "no_wip_steps"):
+        raise HTTPException(status_code=400, detail=result.get("message"))
+    return result
+
+
+@router.get("/plans-v2/lines/{plan_line_id}/dispatch-info")
+async def get_line_dispatch_info_v2(
+    request: Request,
+    plan_line_id: int,
+    user=Depends(get_current_user),
+):
+    """Prefill payload for the FG-dispatch modal: the packaging (FG) job card +
+    its batches (the batch selector source, defaulting to the packaging stage)
+    + recipient role labels."""
+    from app.modules.production.services.fg_dispatch_service import get_line_dispatch_info
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await get_line_dispatch_info(conn, plan_line_id)
+
+
+class FgDispatchBody(BaseModel):
+    """POST /plans-v2/lines/{plan_line_id}/dispatch — one packaging batch.
+    num_boxes / customer_location / transport fields are operator-entered (no
+    stored source)."""
+    batch_id: int
+    num_boxes: int | None = None
+    customer_location: str | None = None
+    vehicle_number: str | None = None
+    transporter: str | None = None
+    transport_location: str | None = None
+
+
+@router.post("/plans-v2/lines/{plan_line_id}/dispatch")
+async def dispatch_line_fg_v2(
+    request: Request,
+    plan_line_id: int,
+    body: FgDispatchBody,
+    user=Depends(get_current_user),
+):
+    """Raise an FG dispatch for one article + packaging batch: emails To
+    (billing, candor_operations, store_head) + CC (business_head,
+    operations_head, inventory_manager, production_manager) with the job-card
+    body, and records it in fg_dispatch_log_v2."""
+    from app.modules.production.services.fg_dispatch_service import dispatch_fg
+    pool = request.app.state.db_pool
+    actor = user.full_name or user.phone
+    async with pool.acquire() as conn:
+        result = await dispatch_fg(
+            conn, plan_line_id,
+            batch_id=body.batch_id,
+            num_boxes=body.num_boxes,
+            customer_location=body.customer_location,
+            vehicle_number=body.vehicle_number,
+            transporter=body.transporter,
+            transport_location=body.transport_location,
+            dispatched_by=actor,
+        )
+    err = result.get("error")
+    if err == "no_packaging_jc":
+        raise HTTPException(status_code=404, detail=result.get("message"))
+    if err == "batch_not_found":
         raise HTTPException(status_code=400, detail=result.get("message"))
     return result
 
@@ -7634,6 +7776,19 @@ class ScanSfgBoxesRequest(BaseModel):
     box_ids: list[int]
 
 
+class FgCartonItem(BaseModel):
+    net_weight: float
+    units: int | None = None
+    gross_weight: float | None = None
+
+
+class CreateFgCartonsRequest(BaseModel):
+    cartons: list[FgCartonItem]
+    batch_id: int | None = None
+    batch_code: str | None = None
+    expected_net_kg: float | None = None
+
+
 @router.post("/job-cards-v2/{job_card_id}/wip-boxes")
 async def create_wip_boxes_endpoint(
     request: Request, job_card_id: int, body: CreateWipBoxesRequest,
@@ -7792,7 +7947,7 @@ async def sfg_box_genealogy_endpoint(
     async with pool.acquire() as conn:
         if not is_admin:
             box_ent = await conn.fetchval(
-                "SELECT entity FROM sfg_box WHERE box_id = $1", box_id
+                "SELECT entity FROM sfg_box WHERE carton_id = $1", box_id
             )
             if box_ent and allowed_ent and box_ent not in allowed_ent:
                 raise HTTPException(status_code=403, detail="Entity outside your scope")
@@ -7802,6 +7957,139 @@ async def sfg_box_genealogy_endpoint(
                                          allowed_entities=allowed_ent or None)
     if result is None:
         raise HTTPException(status_code=404, detail="Box not found")
+    return strip_cost_fields(
+        result, getattr(user, "role_name", None),
+        is_admin=getattr(user, "is_admin", False),
+    )
+
+
+# ── Canonical SFG catalogue search (typeahead for the Job-Card SFG field) ───
+
+@router.get("/sfg-canonical/search")
+async def sfg_canonical_search_endpoint(
+    request: Request, q: str = "", entity: str | None = None, limit: int = 20,
+    user=Depends(get_current_user),
+):
+    """Typeahead over the canonical SFG catalogue (``sfg_canonical_map``) for the
+    Create/Edit Job-Card SFG-output autocomplete (SFG canonicalization design
+    §5.4). Matches ``q`` against the canonical SFG name or the FG (article) name;
+    returns distinct canonical SFG suggestions, entity-preferred."""
+    from app.modules.production.services.sfg_canonical import search_canonical_sfg
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        results = await search_canonical_sfg(conn, q, entity, limit)
+    return {"q": q, "results": results}
+
+
+# ── FG cartons (packing stage) — sibling of the wip-boxes routes ────────────
+
+@router.post("/job-cards-v2/{job_card_id}/fg-cartons")
+async def create_fg_cartons_endpoint(
+    request: Request, job_card_id: int, body: CreateFgCartonsRequest,
+    user=Depends(get_current_user),
+):
+    """Pack a terminal FG/packing JC's output into cartons; mint an 8-digit
+    carton_id (the QR payload) per carton. Print stickers via
+    …/fg-cartons/labels.pdf."""
+    from app.modules.production.services.sfg_box_service import create_fg_cartons
+    pool = request.app.state.db_pool
+    created_by = getattr(user, "full_name", None) or getattr(user, "phone", None)
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await create_fg_cartons(
+                conn, job_card_id, [c.model_dump() for c in body.cartons],
+                batch_id=body.batch_id, batch_code=body.batch_code,
+                expected_net_kg=body.expected_net_kg, created_by=created_by,
+            )
+    if "error" in result:
+        code = 404 if result["error"] == "not_found" else 400
+        raise HTTPException(status_code=code, detail=result.get("message", result["error"]))
+    return strip_cost_fields(
+        result, getattr(user, "role_name", None),
+        is_admin=getattr(user, "is_admin", False),
+    )
+
+
+@router.get("/job-cards-v2/{job_card_id}/fg-cartons")
+async def list_fg_cartons_endpoint(
+    request: Request, job_card_id: int, user=Depends(get_current_user),
+):
+    """List the cartons packed by a terminal FG/packing JC (+ Σ net weight)."""
+    from app.modules.production.services.sfg_box_service import get_cartons_for_jc
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        result = await get_cartons_for_jc(conn, job_card_id)
+    return strip_cost_fields(
+        result, getattr(user, "role_name", None),
+        is_admin=getattr(user, "is_admin", False),
+    )
+
+
+@router.get("/job-cards-v2/{job_card_id}/fg-cartons/labels.pdf")
+async def fg_carton_labels_endpoint(
+    request: Request, job_card_id: int, user=Depends(get_current_user),
+):
+    """One QR sticker per carton for a packing JC (stickers carry no cost figures)."""
+    from app.modules.production.services.sfg_box_service import get_cartons_for_jc
+    from app.modules.production.services.label_service import fg_carton_labels_pdf
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        result = await get_cartons_for_jc(conn, job_card_id)
+    if not result.get("cartons"):
+        raise HTTPException(status_code=404, detail="No cartons to label for this job card")
+    pdf_bytes = fg_carton_labels_pdf(result.get("cartons", []))
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="FG-cartons-{job_card_id}.pdf"'},
+    )
+
+
+@router.get("/fg-cartons/{carton_id}/label.pdf")
+async def fg_carton_single_label_endpoint(
+    request: Request, carton_id: int, user=Depends(get_current_user),
+):
+    """Single carton sticker. Entity-scoped for non-admins (mirror of the box reads)."""
+    from app.modules.production.services.sfg_box_service import get_box
+    from app.modules.production.services.label_service import fg_carton_label_pdf
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        carton = await get_box(conn, carton_id)
+    if not carton or carton.get("item_type") != "fg":
+        raise HTTPException(status_code=404, detail="Carton not found")
+    if not getattr(user, "is_admin", False):
+        allowed_ent = getattr(user, "allowed_entities", []) or []
+        if carton.get("entity") and allowed_ent and carton["entity"] not in allowed_ent:
+            raise HTTPException(status_code=403, detail="Entity outside your scope")
+    pdf_bytes = fg_carton_label_pdf(carton)
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="FG-carton-{carton_id}.pdf"'},
+    )
+
+
+@router.get("/fg-cartons/{carton_id}/genealogy")
+async def fg_carton_genealogy_endpoint(
+    request: Request, carton_id: int, user=Depends(get_current_user),
+):
+    """Carton upstream trace: carton → SFG boxes consumed into the packing JC →
+    each box's box→lot lineage. ``level`` 0 = the carton; increases upstream."""
+    from app.modules.production.services.sfg_box_service import get_carton_genealogy
+    pool = request.app.state.db_pool
+    is_admin = getattr(user, "is_admin", False)
+    allowed_ent = [] if is_admin else (getattr(user, "allowed_entities", []) or [])
+    async with pool.acquire() as conn:
+        if not is_admin:
+            ent = await conn.fetchval(
+                "SELECT entity FROM sfg_box WHERE carton_id = $1 AND item_type = 'fg'",
+                carton_id,
+            )
+            if ent and allowed_ent and ent not in allowed_ent:
+                raise HTTPException(status_code=403, detail="Entity outside your scope")
+        result = await get_carton_genealogy(conn, carton_id, allowed_entities=allowed_ent or None)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Carton not found")
     return strip_cost_fields(
         result, getattr(user, "role_name", None),
         is_admin=getattr(user, "is_admin", False),

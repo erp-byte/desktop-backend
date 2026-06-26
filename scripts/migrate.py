@@ -305,6 +305,20 @@ SQL_FILES = [
     # new columns; view + index only. Additive + idempotent. Reversible via
     # app/db/rollback/sfg_integration_down.sql.
     DB_DIR / "062_sfg_seam_pending.sql",
+    # 063 Plan List: production_plan_v2.created_by — persist the creating user so
+    # the Plan List + detail preview can show "Created by". Volume/units stay
+    # derived. to_regclass-guarded (v2 header is applied out-of-band). Idempotent.
+    DB_DIR / "063_plan_created_by.sql",
+    # 064 job_card_edit_log_v2 — audit trail for live (started-chain) Edit-Job-Card
+    # actions (floor change / add / qty change / remove-with-forced-snapshot) and
+    # the resulting SO sync delta (ledger + so_line). Additive + idempotent.
+    DB_DIR / "064_jc_edit_audit.sql",
+    # 065 seed FG-dispatch recipient roles (billing, candor_operations,
+    # operations_head) so the "Dispatch to" To/CC can resolve to users. Idempotent.
+    DB_DIR / "065_dispatch_roles.sql",
+    # 066 fg_dispatch_log_v2 — audit log for FG dispatch notifications from a
+    # completed packaging stage (body fields + transport + recipients). Additive.
+    DB_DIR / "066_fg_dispatch_log.sql",
 ]
 
 # ── Optional: drop the v1 legacy job-card stack (TEST / Supabase DB ONLY) ──────

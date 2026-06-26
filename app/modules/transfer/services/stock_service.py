@@ -71,13 +71,24 @@ _COLD_INSERT_COLS = (
 _COLD_INSERT_PH = ", ".join(f"${i}" for i in range(1, 20))
 
 
-async def pick_from_pending(conn, transfer_out_id: int, challan_no_for_inward: str | None = None) -> int:
-    """Move every 'In Transit' pending row for this transfer-out into its
-    destination cold_stocks table, then delete the pending row. Returns count."""
-    pending = await conn.fetch(
-        "SELECT * FROM pending_transfer_stock WHERE transfer_out_id = $1 AND status = 'In Transit'",
-        transfer_out_id,
-    )
+async def pick_from_pending(conn, transfer_out_id: int, challan_no_for_inward: str | None = None,
+                            box_ids: set | None = None) -> int:
+    """Move 'In Transit' pending rows for this transfer-out into their destination
+    cold_stocks table, then delete the pending row. Returns count. When `box_ids`
+    is given, only those boxes are posted (the rest stay In Transit — used by
+    close-with-shortage to post the received subset and leave the shortfall to be
+    written off); otherwise every In-Transit row is posted (the full-finalize path)."""
+    if box_ids is not None:
+        pending = await conn.fetch(
+            "SELECT * FROM pending_transfer_stock WHERE transfer_out_id = $1 "
+            "AND status = 'In Transit' AND box_id = ANY($2::text[])",
+            transfer_out_id, list(box_ids),
+        )
+    else:
+        pending = await conn.fetch(
+            "SELECT * FROM pending_transfer_stock WHERE transfer_out_id = $1 AND status = 'In Transit'",
+            transfer_out_id,
+        )
     picked = 0
     for prow in pending:
         p = dict(prow)

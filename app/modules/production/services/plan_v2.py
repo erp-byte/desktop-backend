@@ -139,6 +139,7 @@ async def create_plan(conn, payload: dict) -> dict:
     plan_date     = _parse_date(payload['plan_date'])
     date_from     = _parse_date(payload.get('date_from')) or plan_date
     date_to       = _parse_date(payload.get('date_to'))   or plan_date
+    created_by    = payload.get('created_by')
     lines         = payload.get('lines', [])
 
     if not lines:
@@ -153,11 +154,12 @@ async def create_plan(conn, payload: dict) -> dict:
             """
             INSERT INTO production_plan_v2 (
                 plan_id, entity, warehouse, plan_type, plan_date, date_from, date_to,
-                status, revision_number
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'draft', 0)
+                status, revision_number, created_by
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'draft', 0, $8)
             RETURNING plan_id
             """,
             candidate, entity, warehouse, plan_type, plan_date, date_from, date_to,
+            created_by,
         )
     plan_id = await insert_with_pk_retry(conn, _insert_plan_header)
 

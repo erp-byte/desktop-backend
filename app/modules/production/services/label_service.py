@@ -76,7 +76,6 @@ def wip_box_labels_pdf(boxes: list[dict]) -> bytes:
         pdf.set_font("Helvetica", "", 9)
         lines = [
             f"JC  {_safe(b.get('job_card_number'))}",
-            f"Box {_safe(b.get('box_number'))} / {_safe(b.get('total_boxes'))}",
             f"Net {_safe(b.get('net_weight'))} kg",
             f"{_safe(b.get('entity'))}  ·  {_safe(b.get('floor'))}",
             f"{_safe(b.get('stage_bucket'))}",
@@ -87,3 +86,76 @@ def wip_box_labels_pdf(boxes: list[dict]) -> bytes:
 
     raw = pdf.output(dest="S")
     return raw.encode("latin-1") if isinstance(raw, str) else bytes(raw)
+
+
+# ── FG carton stickers (item_type='fg') ────────────────────────────────────
+
+def _carton_id_of(c: dict) -> str:
+    cid = c.get("carton_id")
+    return _safe(cid if cid is not None else c.get("box_id"))
+
+
+def _fg_carton_page(pdf: FPDF, c: dict) -> None:
+    """Render one FG carton sticker page: QR(carton_id) + FG name + JC + batch +
+    net kg + units + entity/floor."""
+    pdf.add_page()
+    cid = _carton_id_of(c)
+    try:
+        png = _qr_png(cid)
+        pdf.image(png, x=4, y=4, w=46, h=46)
+    except Exception:  # never let a QR-render hiccup 500 the print job
+        logger.exception("QR render failed for carton %s", cid)
+        pdf.set_xy(4, 4)
+        pdf.set_font("Helvetica", "", 8)
+        pdf.cell(46, 46, "QR ERR", border=1, align="C")
+
+    x = 54
+    pdf.set_xy(x, 5)
+    pdf.set_font("Helvetica", "B", 15)
+    pdf.cell(0, 8, cid, ln=1)
+
+    pdf.set_xy(x, 15)
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 6, _safe(c.get("fg_sku_name") or c.get("sfg_code")), ln=1)
+
+    net = c.get("net_weight_kg")
+    if net is None:
+        net = c.get("net_weight")
+    pdf.set_x(x)
+    pdf.set_font("Helvetica", "", 9)
+    lines = [
+        f"JC  {_safe(c.get('job_card_number'))}",
+        f"Batch {_safe(c.get('batch_code'))}",
+        f"Net {_safe(net)} kg",
+        f"Units {_safe(c.get('units'))}",
+        f"{_safe(c.get('entity'))}  ·  {_safe(c.get('floor'))}",
+    ]
+    for ln in lines:
+        pdf.set_x(x)
+        pdf.cell(0, 5.5, ln, ln=1)
+
+
+def fg_carton_labels_pdf(cartons: list[dict]) -> bytes:
+    """Render one QR sticker per FG carton (``cartons`` are sfg_box item_type='fg'
+    rows). Always returns valid PDF bytes — an empty list yields a 'no cartons'
+    sheet so the endpoint contract stays simple."""
+    pdf = FPDF(orientation="L", unit="mm", format=(_LABEL_H, _LABEL_W))
+    pdf.set_auto_page_break(auto=False)
+
+    if not cartons:
+        pdf.add_page()
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.cell(0, 10, "No FG cartons", border=0)
+        raw = pdf.output(dest="S")
+        return raw.encode("latin-1") if isinstance(raw, str) else bytes(raw)
+
+    for c in cartons:
+        _fg_carton_page(pdf, c)
+
+    raw = pdf.output(dest="S")
+    return raw.encode("latin-1") if isinstance(raw, str) else bytes(raw)
+
+
+def fg_carton_label_pdf(carton: dict) -> bytes:
+    """Single FG carton sticker (one page)."""
+    return fg_carton_labels_pdf([carton])

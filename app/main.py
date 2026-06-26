@@ -29,6 +29,7 @@ from app.modules.amendment_router import router as amendment_router
 from app.modules.vendor.router import router as vendor_router
 from app.modules.sample.router import router as sample_router
 from app.modules.transfer.router import router as transfer_router
+from app.modules.cold_storage.router import router as cold_storage_router
 from app.modules.lookups_router import router as lookups_router
 from app.modules.qc.router import router as qc_router
 from app.modules.so.services.item_matcher import load_master_items
@@ -136,6 +137,7 @@ app.include_router(amendment_router)
 app.include_router(vendor_router)
 app.include_router(sample_router)
 app.include_router(transfer_router)
+app.include_router(cold_storage_router)
 app.include_router(lookups_router)
 app.include_router(qc_router)
 app.include_router(webhook_router)

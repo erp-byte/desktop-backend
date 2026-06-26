@@ -403,7 +403,7 @@ async def list_transfers(conn, *, page, per_page, status=None, from_site=None,
         LEFT JOIN (
             SELECT header_id,
                    COUNT(DISTINCT item_desc_raw) AS items_count,
-                   COUNT(*) AS total_qty
+                   COALESCE(SUM(qty), 0) AS total_qty
             FROM interunit_transfers_lines
             GROUP BY header_id
         ) lc ON h.id = lc.header_id

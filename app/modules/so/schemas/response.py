@@ -28,6 +28,13 @@ class UploadSummary(BaseModel):
     so_ok: int = 0
     so_mismatch: int = 0
     so_warning: int = 0
+    # Fulfillment-availability counters — back the "Pending SO" / "Fulfilled SO"
+    # listing chips. so_pending = SOs with at least one so_fulfillment_v2 line
+    # whose pending_qty_kg > 0; so_fulfilled = SOs that have fulfillment rows
+    # but none still pending. Un-synced SOs (no fulfillment rows) count toward
+    # neither. Defaulted so the upload endpoint (same model) stays valid.
+    so_pending: int = 0
+    so_fulfilled: int = 0
 
 
 class SOUploadResponse(BaseModel):

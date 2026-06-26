@@ -1,0 +1,1391 @@
+entity,fg,fg_salegroup,case,sfg
+cfpl,3 Jar Jute Bag Gift Hamper,VA,NO_SFG_hamper,
+cfpl,3pcs date balls with blister,VA,SFG_blend,date balls with blister Bulk
+cfpl,4 PET WOODEN BOX WITH LID HAMPER,VA,NO_SFG_hamper,
+cfpl,5 Grain Cereal 35gm,VA,SFG_blend,5 Grain Cereal Bulk
+cfpl,5 Grain Cereal 50 GM,VA,SFG_blend,5 Grain Cereal Bulk
+cfpl,AL BARAKAH DATES SYRUP (400G Packing),DATES ING,SFG_reuse_intermediate,DATES SYRUP ( Packing)
+cdpl,AL BARAKAH DATES SYRUP 400G,DATES ING,SFG_reuse_intermediate,Date Syrup
+cfpl,AL BARAKAH FARD DATES PREMIUM - 500g,DATES RPC,NO_SFG_plain_repack,
+cfpl,AL BARAKAH KHALAS DATES 1KG,DATES RPC,NO_SFG_plain_repack,
+cfpl,AL BARAKAH KHALAS DATES 500 Gm,DATES RPC,SFG_blend,KHALAS DATES Bulk
+cfpl,AL BARAKAH KHALAS DATES SEEDLESS 350GM,DATES RPC,NO_SFG_plain_repack,
+cdpl,AL BARAKAH KHALAS SEEDLESS DATES 500 Gm,DATES RPC,NO_SFG_plain_repack,
+cdpl,AL BARAKAH MEDJOUL DATES 500gm,DATES RPC,SFG_reuse_intermediate,WET DATES MEDJOUL BULK MEDIUM(5)
+cdpl,AL BARAKAH PREMIUM ARABIAN DATES 500G,DATES RPC,NO_SFG_plain_repack,
+cfpl,AL BARAKAH PREMIUM SEEDLESS DATES 500G,DATES RPC,NO_SFG_plain_repack,
+cfpl,AL BARAKAH SAFAVI DATES 500gm,DATES RPC,NO_SFG_plain_repack,
+cdpl,AL Barakah Dates Paste 500gm,DATES ING,SFG_reuse_intermediate,Date Paste
+cdpl,AL Barakah Premium Emirates Dates 500g,DATES RPC,NO_SFG_plain_repack,
+cfpl,AUSTRALIA MACADAMIA HONEY ROAST 100G PCH,VA,SFG_reuse_intermediate,Honey Roasted Macadamia Nut
+cfpl,AUSTRALIA MACADAMIA SWEETCHILLI 100G PCH,VA,SFG_reuse_intermediate,Sweet Chilli Macadamia Nut
+cfpl,AUSTRALIA MCADAMIA DARKCHOCOLTE 100G PCH,VA,SFG_reuse_intermediate,Macadamia Dark Chocolate Clusters
+cfpl,AUSTRALIA MCDAMIA MILKCHOCOLATE 100G PCH,VA,SFG_reuse_intermediate,Macadamia Milk Chocolate Clusters
+cfpl,Abjosh (Munakka) 100gm,RPC,NO_SFG_plain_repack,
+cfpl,Afghan Black Raisins Seedless 1*1,Bulk,NO_SFG_rm_stockitem,
+cfpl,Afghan Raisins 1*1 Green round,Bulk,NO_SFG_rm_stockitem,
+cdpl,Ajfan Kimia Dates 500 Gm,DATES RPC,NO_SFG_plain_repack,
+cfpl,Al Barakah Ajwa Dates 400gm,DATES RPC,NO_SFG_plain_repack,
+cfpl,Al Barakah Arabian Dates 600g,DATES RPC,NO_SFG_plain_repack,
+cdpl,Al Barakah Date Powder 250gm,DATES ING,SFG_reuse_intermediate,Date Powder 5%
+cdpl,Al Barakah Date Syrup 400gm,DATES ING,SFG_reuse_intermediate,Date Syrup
+cdpl,Al Barakah Date Syrup 450gm,DATES ING,SFG_reuse_intermediate,Date Syrup
+cfpl,Al Barakah Dates Ajwa 35gm,DATES RPC,NO_SFG_plain_repack,
+cfpl,Al Barakah Dates Arabian 400g,DATES RPC,NO_SFG_plain_repack,
+cfpl,Al Barakah Dates Arabian 500g,DATES RPC,NO_SFG_plain_repack,
+cdpl,Al Barakah Dates Fard 400 Gm,DATES RPC,NO_SFG_plain_repack,
+cfpl,Al Barakah Dates Golden 300g,DATES RPC,NO_SFG_plain_repack,
+cfpl,Al Barakah Dates Golden 500g,DATES RPC,NO_SFG_plain_repack,
+cfpl,Al Barakah Dates Gulf 300g,DATES RPC,NO_SFG_plain_repack,
+cfpl,Al Barakah Dates Khalas 35gm,DATES RPC,NO_SFG_plain_repack,
+cfpl,Al Barakah Dates Khaneizi 35gm,DATES RPC,NO_SFG_plain_repack,
+cdpl,Al Barakah Dates Khanezi 400 gm,DATES RPC,NO_SFG_plain_repack,
+cfpl,Al Barakah Dates Oman Seedless 1kg,DATES RPC,NO_SFG_plain_repack,
+cfpl,Al Barakah Dates Safavi 35gm,DATES RPC,NO_SFG_plain_repack,
+cfpl,Al Barakah Dates Safavi 400g,DATES RPC,NO_SFG_plain_repack,
+cfpl,Al Barakah Dates Safavi Seedless 400g,DATES RPC,NO_SFG_plain_repack,
+cfpl,Al Barakah Dehydrated Date Powder 250g,DATES ING,SFG_reuse_intermediate,DEHYDRATED DATE POWDER - BULK PACK
+cfpl,Al Barakah Emirate Dates 500gm,DATES RPC,NO_SFG_plain_repack,
+cdpl,Al Barakah Emirates Dates 500 Gm,DATES RPC,NO_SFG_plain_repack,
+cdpl,Al Barakah Fard 500g,DATES RPC,NO_SFG_plain_repack,
+cfpl,Al Barakah Fard Dates 400g,DATES RPC,NO_SFG_plain_repack,
+cfpl,Al Barakah Gulf Dates 250gm,DATES RPC,NO_SFG_plain_repack,
+cfpl,Al Barakah Khalas Dates 400g,DATES RPC,NO_SFG_plain_repack,
+cfpl,Al Barakah Khanezi Dates 500 GM,DATES RPC,NO_SFG_plain_repack,
+cdpl,Al Barakah Khanezi Dates 500gm,DATES RPC,NO_SFG_plain_repack,
+cfpl,Al Barakah Khenaizi Dates 400g,DATES RPC,NO_SFG_plain_repack,
+cfpl,Al Barakah Kimia Dates 500 Gm,DATES RPC,SFG_blend,Kimia Dates Bulk
+cfpl,Al Barakah Medjoul Dates 500Gm,DATES RPC,NO_SFG_plain_repack,
+cfpl,Al Barakah Oman 600g,DATES RPC,NO_SFG_plain_repack,
+cfpl,Al Barakah Oman Dates 400g,DATES RPC,NO_SFG_plain_repack,
+cfpl,Al Barakah Oman Dates 500gm Tub,DATES RPC,NO_SFG_plain_repack,
+cdpl,Al Barakah Organic Date Syrup 470gm,DATES ING,SFG_reuse_intermediate,Date Syrup
+cfpl,Al Barakah Premium Emirate Date Seedless (500gmx16),DATES RPC,NO_SFG_plain_repack,
+cfpl,Al Barakah Premium Emirates Dates (500gm x 16 Nos),DATES RPC,NO_SFG_plain_repack,
+cfpl,Al Barakah Premium Medjool 800gm,DATES RPC,NO_SFG_plain_repack,
+cdpl,Al Barakah Premium Seedless Dates 500gm,DATES RPC,NO_SFG_plain_repack,
+cdpl,Al Barakaha Safavi Dates 500g,DATES RPC,NO_SFG_plain_repack,
+cfpl,Almond Apricot and Seeds Date Balls 48 gms,VA,SFG_blend,Almond Apricot and Seeds Date Balls Bulk
+cfpl,Almond Blanched Sliced,Bulk,NO_SFG_rm_stockitem,
+cfpl,"Almond Blanched, whole",Bulk,NO_SFG_rm_stockitem,
+cfpl,Almond Cranberry Black currant and seeds Date Balls 48 gms,VA,SFG_blend,Almond Cranberry Black currant and seeds Date Balls Bulk
+cfpl,Almond Flavoured Cajun Loose,VA,SFG_mint_va,American Almonds Running 25-27 count Bulk (Cajun)
+cfpl,Almond Flavoured Smoked Paprika Loose,VA,SFG_blend,Almond Flavoured Smoked Paprika Loose Bulk
+cdpl,Almond Inshell,NA,NO_SFG_plain_repack,
+cfpl,Almond Kernal 150gm,RPC,NO_SFG_plain_repack,
+cfpl,Almond Kernal 450gm,RPC,NO_SFG_plain_repack,
+cdpl,Almond Kernel,Bulk,NO_SFG_rm_stockitem,
+cfpl,Almond Masala,VA,SFG_blend,Almond Masala Bulk
+cfpl,Almond Peri Peri,VA,SFG_blend,Almond Peri Peri Bulk
+cfpl,Almond Plain 75gm,RPC,NO_SFG_plain_repack,
+cfpl,Almond Roasted,Bulk,SFG_mint_va,Roasted American Almonds Running 25-27 count Bulk
+cfpl,Almond Selected 230g,RPC,NO_SFG_plain_repack,
+cfpl,Almond Sliced,VA,NO_SFG_rm_stockitem,
+cfpl,Almonds Halves Loose,Bulk,NO_SFG_plain_repack,
+cfpl,Almonds Kernel Cube Cut,Bulk,NO_SFG_rm_stockitem,
+cfpl,Alpino Peanut Crackers Chipotle Honey 60g,VA,SFG_reuse_intermediate,Peanut Crackers Chipotle Honey Bulk
+cfpl,Alpino Peanut Crackers Smokey BBQ 60g,VA,SFG_reuse_intermediate,Peanut Crackers Smokey BBQ Bulk
+cfpl,Amary Dates 250g (1356293),DATES RPC,NO_SFG_plain_repack,
+cfpl,Amazon Brand - Vedaka Premium Dry Fruits Combo 400 gm Gift Box ( B0BBDJMLYR ),VA,SFG_blend,Vedaka Premium Dry Fruits Combo Gift Box Bulk
+cfpl,Amazon Brand - Vedaka Raw Sunflower Seeds 1 Kg B0D9P1N25J,RPC,NO_SFG_plain_repack,
+cfpl,Amazon Brand Nuts Berries and Seed Mix 200g (B0B69J57QV),VA,SFG_blend,Nuts Berries and Seed Mix Bulk
+cfpl,Amazon Brand Vedaka Dryfruits and Berries Mix 200g (B0B69KXW9J),VA,SFG_blend,Vedaka Dryfruits and Berries Mix Bulk
+cfpl,Amazon Brand Vedaka Dryfruits and Nut Mix 200g (B0B69KB4GB),VA,SFG_blend,Vedaka Dryfruits and Nut Mix Bulk
+cfpl,Amazon Brand- Vedaka Dry Dates powder 200g,DATES ING,SFG_reuse_intermediate,DEHYDRATED DATE POWDER - BULK PACK
+cfpl,American Almonds (23-25 Count),Bulk,NO_SFG_rm_stockitem,
+cfpl,American Almonds (24-25 Count),Bulk,NO_SFG_rm_stockitem,
+cfpl,American Almonds Running 25-27 count,Bulk,NO_SFG_rm_stockitem,
+cfpl,American Almonds Tukda,Bulk,NO_SFG_rm_stockitem,
+cfpl,American Pecan 50gm,RPC,NO_SFG_plain_repack,
+cfpl,Anjeer (Figs),Bulk,NO_SFG_rm_stockitem,
+cfpl,Anjeer 1*2 75gm,RPC,NO_SFG_plain_repack,
+cfpl,Antioxidant Mix 33gm,VA,SFG_blend,Antioxidant Mix Bulk
+cfpl,Antioxidant Mix 35gm,VA,SFG_blend,Antioxidant Mix Bulk
+cfpl,Apollo Life Arabian Dates 500g,DATES RPC,NO_SFG_plain_repack,
+cfpl,Apricot Kernel,Bulk,NO_SFG_rm_stockitem,
+cfpl,Ar Barakah Fard Dates 1kg,DATES RPC,NO_SFG_plain_repack,
+cfpl,Azmah Dates 500 Gms (110002703),DATES RPC,SFG_blend,Azmah Dates Bulk
+cfpl,BB Royal Ajwa Dates 500g,DATES RPC,NO_SFG_plain_repack,
+cfpl,BB Royal Black Current 250g,RPC,NO_SFG_plain_repack,
+cfpl,BB Royal Dates - Ajwa 250g,DATES RPC,NO_SFG_plain_repack,
+cfpl,BB Royal Dates - Deri 500 g,DATES RPC,NO_SFG_plain_repack,
+cfpl,BB Royal Dates - Golden 500 g,DATES RPC,NO_SFG_plain_repack,
+cfpl,BB Royal Dates - Mazafati 250g,DATES RPC,NO_SFG_plain_repack,
+cfpl,BB Royal Dates - Medjool 250g,DATES RPC,NO_SFG_plain_repack,
+cfpl,BB Royal Dates - Omani 250g,DATES RPC,NO_SFG_plain_repack,
+cfpl,"BB Royal Dates - Red, Seedless 250 g",DATES RPC,NO_SFG_plain_repack,
+cfpl,BB Royal Dates - Safawi 250g,DATES RPC,NO_SFG_plain_repack,
+cfpl,BB Royal Dates - Zahidi 500 g,DATES RPC,NO_SFG_plain_repack,
+cfpl,BB Royal Dried Blue Berries 100g,RPC,NO_SFG_plain_repack,
+cfpl,BB Royal Dried Blue Berries 250g,RPC,NO_SFG_plain_repack,
+cfpl,BB Royal Dried Cran Berries 100g,RPC,NO_SFG_plain_repack,
+cfpl,BB Royal Dried Cran Berry 250g,RPC,NO_SFG_plain_repack,
+cfpl,BB Royal Mazafati Dates 500g,DATES RPC,NO_SFG_plain_repack,
+cfpl,BB Royal Medjool Dates 500g,DATES RPC,NO_SFG_plain_repack,
+cfpl,BB Royal Red Dates - With Seeds 500gm,DATES RPC,NO_SFG_plain_repack,
+cfpl,BB Royal Safavi Dates 500g,DATES RPC,NO_SFG_plain_repack,
+cfpl,BBroyal Black Current 100g,RPC,NO_SFG_plain_repack,
+cfpl,BLACK PEPPER CASHEW,VA,SFG_blend,BLACK PEPPER CASHEW Bulk
+cfpl,BLISSFUL CELEBRATION 360gm,VA,NO_SFG_assembly,
+cfpl,Banarasi Box Hamper 03,VA,NO_SFG_hamper,
+cfpl,Barbeque Almonds,VA,SFG_mint_va,American Almonds Running 25-27 count Bulk (Barbeque)
+cfpl,Barbeque Cashew,VA,SFG_blend,Barbeque Cashew Bulk
+cfpl,Barbeque Cashew Bulk,VA,SFG_already_bulk,Barbeque Cashew Bulk
+cfpl,Barbeque Coated Peanuts 60gm,VA,SFG_blend,Barbeque Coated Peanuts Bulk
+cfpl,Barbeque Macadamia,VA,SFG_blend,Barbeque Macadamia Bulk
+cfpl,Barbeque Makhana,VA,SFG_mint_va,Makhana Bulk (Barbeque)
+cfpl,Bb Royal Omani Dates 500gm,DATES RPC,NO_SFG_plain_repack,
+cfpl,Berry Mix,VA,SFG_blend,Berry Mix Bulk
+cfpl,Black Pepper Almonds,VA,SFG_blend,Black Pepper Almonds Bulk
+cfpl,Black Pepper Cashew Bulk,VA,SFG_already_bulk,Black Pepper Cashew Bulk
+cfpl,Black Pepper Macadamia Trail Mix,VA,SFG_blend,Black Pepper Macadamia Trail Mix Bulk
+cfpl,Black Pepper Nutty Seed Mix 250gm,VA,SFG_blend,Black Pepper Nutty Seed Mix Bulk
+cfpl,Black Pepper Pecannut,VA,SFG_blend,Black Pepper Pecannut Bulk
+cfpl,Blackcurrant Date Balls 48 gms,VA,SFG_blend,Blackcurrant Date Balls Bulk
+cfpl,Blueberries 230g,RPC,NO_SFG_plain_repack,
+cfpl,Blueberries 75gm,RPC,NO_SFG_plain_repack,
+cfpl,Booster Berries 33gm,VA,SFG_blend,Booster Berries Bulk
+cfpl,Booster Berries 35gm,VA,SFG_blend,Booster Berries Bulk
+cfpl,Brazil Nuts,Bulk,NO_SFG_rm_stockitem,
+cfpl,Breakfast Mix Bulk,VA,SFG_already_bulk,Breakfast Mix Bulk
+cfpl,CA GOA PRE CASHEW 230GM/P,RPC,NO_SFG_plain_repack,
+cfpl,CA INDIAN PREMIUM QUALITY RAISINS 150/P,RPC,NO_SFG_plain_repack,
+cfpl,CA PREMIUM ALMOND CALIFORNIA 218GM/P,RPC,NO_SFG_plain_repack,
+cfpl,CA PREMIUM DRY CANBERRY 230GM/P,RPC,NO_SFG_plain_repack,
+cfpl,CA PREMIUM PINSHROSTSALTIRANIPISTA15 /P,VA,SFG_mint_va,Pista Irani 101 Inshell Bulk
+cfpl,CA WALNUT CHILE (VACUUM PACKING)250GM /P,RPC,NO_SFG_plain_repack,
+cfpl,CARNIVAL Mayur Ratna Big 520g,VA,NO_SFG_assembly,
+cfpl,CARNIVAL Mayur Ratna Big 520gm,VA,NO_SFG_assembly,
+cfpl,CARNIVAL Mayur Ratna Small 360g,VA,NO_SFG_assembly,
+cfpl,CARNIVAL Mayur Ratna Small 360gm,VA,NO_SFG_assembly,
+cfpl,CARNIVAL RAISIN IDNIAN GREEN/GOLDEN ROUND 1KG,RPC,NO_SFG_plain_repack,
+cfpl,CARNIVAL Royal divine 550g,VA,NO_SFG_assembly,
+cfpl,CARNIVAL Utsav 700g,VA,NO_SFG_assembly,
+cfpl,CCD Energy Bar with Jaggery,VA,SFG_blend,CCD Energy Bar with Jaggery Bulk
+cfpl,CCD Energy Bar with Jaggery Semi Finished,VA,SFG_already_bulk,CCD Energy Bar with Jaggery Semi Finished
+cfpl,CELEBRATING MOMENTS 300gm,VA,NO_SFG_assembly,
+cfpl,CELEBRATION SLEEK BOX 300gm,VA,NO_SFG_assembly,
+cfpl,CELEBRATIONS 550gm,VA,NO_SFG_assembly,
+cfpl,CHATPATA SNACK MIX,VA,SFG_blend,CHATPATA SNACK MIX Bulk
+cfpl,CLASSIC WOODEN BOX 480gm,VA,NO_SFG_assembly,
+cfpl,CURATE BLUEBERRIES 200G,RPC,NO_SFG_plain_repack,
+cfpl,CURATE DATE BITES ASRTD RO/CA IND 420G,VA,NO_SFG_assembly,
+cfpl,CURATE DATE BITES COFFEE IND 210G,VA,SFG_blend,DATE BITES COFFEE IND Bulk
+cfpl,CURATE DATE BITES IND 210G,VA,SFG_reuse_intermediate,Date Bites Semi Finished
+cfpl,CURATE DATE BITES ROSE IND 210G,VA,SFG_reuse_intermediate,Date Bites Rose (Semi Finished)
+cfpl,CURATE DATE BITES ROSE IND 360G,VA,SFG_reuse_intermediate,Date Bites Rose (Semi Finished)
+cdpl,CURATE DATES AJWA IMP SAUDI 500G,DATES RPC,NO_SFG_plain_repack,
+cdpl,CURATE DATES ASSORTED IMP 500G,DATES RPC,SFG_blend,DATES ASSORTED IMP Bulk
+cdpl,CURATE DATES FARD IMP OMAN 500G,DATES RPC,NO_SFG_plain_repack,
+cdpl,CURATE DATES KIMIA IMP IRAN 500G,DATES RPC,NO_SFG_plain_repack,
+cdpl,CURATE DATES MEDJOUL IMP ISREL 500G,DATES RPC,SFG_reuse_intermediate,WET DATES MEDJOUL BULK LARGE (5)
+cdpl,CURATE DATES ORIENTAL IMP ISREL 500G,DATES RPC,NO_SFG_plain_repack,
+cdpl,CURATE DATES SAFAVI IMP SAUDI 500G,DATES RPC,NO_SFG_plain_repack,
+cfpl,CURATE MACADEMIA NUTS 200G,RPC,NO_SFG_plain_repack,
+cfpl,CURATE MAMRA ALMOND 500G,RPC,NO_SFG_plain_repack,
+cfpl,CURATE WHOLE CRANBERRIES 200G,RPC,NO_SFG_plain_repack,
+cfpl,Cafe Galleria Walnut Kernel 250g,RPC,NO_SFG_plain_repack,
+cfpl,Cafe Galleries  Pepper Pista Inshell 250gm,VA,SFG_reuse_intermediate,Pepper Pista Inshell
+cfpl,Cafe Galleries American Almond 25-27count - 250gm,RPC,NO_SFG_plain_repack,
+cfpl,Cafe Galleries American Pista Inshell Regular 250gm,RPC,NO_SFG_plain_repack,
+cfpl,Cafe Galleries American Pista Inshell Selected 250g,RPC,NO_SFG_plain_repack,
+cfpl,Cafe Galleries Blueberry 250g,RPC,NO_SFG_plain_repack,
+cfpl,Cafe Galleries Brazil Nuts 250g,RPC,NO_SFG_plain_repack,
+cfpl,Cafe Galleries Cashew 180 - 250gm,RPC,NO_SFG_plain_repack,
+cfpl,Cafe Galleries Cashew 180 - 500gm,RPC,NO_SFG_plain_repack,
+cfpl,Cafe Galleries Cashew 210 - 250gm,RPC,NO_SFG_plain_repack,
+cfpl,Cafe Galleries Cashew 210 - 500g,RPC,NO_SFG_plain_repack,
+cfpl,Cafe Galleries Cashew 240 - 250g,RPC,NO_SFG_plain_repack,
+cfpl,Cafe Galleries Cashew 240 - 500gm,RPC,NO_SFG_plain_repack,
+cfpl,Cafe Galleries Cashew 320 - 250gm,RPC,NO_SFG_plain_repack,
+cfpl,Cafe Galleries Cashew Black Pepper 250 Gm,VA,SFG_reuse_intermediate,Black Pepper Cashew Bulk
+cfpl,Cafe Galleries Cashew Salted 180 250g,VA,SFG_blend,Cashew Salted 180 Bulk
+cfpl,Cafe Galleries Chia seeds 250g,RPC,NO_SFG_plain_repack,
+cfpl,"Cafe Galleries Cocktail Mix 250g(Almond,Cashew,Pista,Black Raisins)",VA,SFG_blend,"Cocktail Mix (Almond,Cashew,Pista,Black Raisins) Bulk"
+cfpl,Cafe Galleries Cranberry Whole 250g,RPC,NO_SFG_plain_repack,
+cfpl,Cafe Galleries Flax seeds 250g,RPC,NO_SFG_plain_repack,
+cfpl,Cafe Galleries Hazelnuts 250g,RPC,NO_SFG_plain_repack,
+cfpl,Cafe Galleries Healthy Mewa Mix 250g,VA,SFG_blend,Healthy Mewa Mix Bulk
+cfpl,Cafe Galleries Macadamia Nut Salted 250g,VA,SFG_mint_va,Salted Macadamia Roasted - Size 0 Bulk
+cfpl,Cafe Galleries Premium Cocktail Mix 250g,VA,SFG_blend,Premium Cocktail Mix Bulk
+cfpl,Cafe Galleries Pumpkin Seeds 250g,RPC,NO_SFG_plain_repack,
+cfpl,Cafe Galleries Salted Cashew 210- 250gm,VA,SFG_reuse_intermediate,Roasted & Salted Cashew Bulk
+cfpl,Cafe Galleries Salted Pumpkin Seeds 250g,VA,SFG_mint_va,Salted Pumpkin Seed 12% Bulk
+cfpl,"Cafe Galleries Seeds Mix, 250g",VA,SFG_blend,Seeds Mix Bulk
+cfpl,Cafe Galleries Selected American Almond 18 count - 250gm,RPC,NO_SFG_plain_repack,
+cfpl,Cafe Galleries Selected American Almond 20-22 count - 250gm,RPC,NO_SFG_plain_repack,
+cfpl,Cafe Galleries Slice Cranberry 250g,RPC,NO_SFG_plain_repack,
+cfpl,Cafe Galleries Sunflower Seeds - 250gm,RPC,NO_SFG_plain_repack,
+cfpl,Cajun Spice Pecan Nuts Loose,VA,SFG_mint_va,Pecan Nuts Bulk (Cajun)
+cfpl,California Pista Inshell Black Pepper,VA,SFG_blend,California Pista Inshell Black Pepper Bulk
+cfpl,California Pista Inshell Pink Salted,VA,SFG_blend,California Pista Inshell Pink Salted Bulk
+cfpl,California Pista Inshell Roasted and Salted,Bulk,SFG_mint_va,Roasted & Salted California Pista Inshell Bulk
+cfpl,California Pista Inshell Roasted and Salted 75gm,VA,SFG_mint_va,Roasted & Salted California Pista Inshell Roasted and Salted Bulk
+cfpl,Caramel Pecannut,VA,SFG_blend,Caramel Pecannut Bulk
+cfpl,Carnial Almond Dragees 100gm,VA,SFG_blend,Almond Dragees Bulk
+cfpl,Carnival Afghan Apricot 250gm,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Almond Choco Bite (Dark Chocolate) 100g,VA,SFG_blend,Almond Choco Bite (Dark Chocolate) Bulk
+cfpl,Carnival Almond Choco Bite (Milk Chocolate) 100g,VA,SFG_blend,Almond Choco Bite (Milk Chocolate) Bulk
+cfpl,Carnival Almond Choco Bite (White Chocolate) 100g,VA,SFG_blend,Almond Choco Bite (White Chocolate) Bulk
+cfpl,Carnival Almond Smoked Paprika 100g,VA,SFG_mint_va,American Almonds (23-25 Count) Bulk (Smoked Paprika & Smoked & Paprika)
+cfpl,Carnival Almond Smoked Paprika 200g,VA,SFG_blend,Almond Smoked Paprika Bulk
+cfpl,Carnival Almonds - Indepance 200g Mono Carton,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Almonds - Independence 200g,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Almonds 250 Gm,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Almonds Independence 1Kg,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Apricot Turkey 1x2 300gm,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Arabian 350gm,DATES RPC,NO_SFG_plain_repack,
+cdpl,Carnival Arabian Dates 350gm,DATES RPC,NO_SFG_plain_repack,
+cfpl,Carnival Barbeque Cashew 100gm,VA,SFG_reuse_intermediate,Barbeque Cashew Bulk
+cfpl,Carnival Barbeque Cashew 200gm,VA,SFG_reuse_intermediate,Barbeque Cashew Bulk
+cfpl,Carnival Barbeque Makhana 125 Gm,VA,SFG_blend,Barbeque Makhana Bulk
+cfpl,Carnival Barbeque Makhana 55g,VA,SFG_mint_va,Makhana Bulk (Barbeque)
+cfpl,Carnival Berry Barbeque Trail Mix 200g,VA,SFG_blend,Berry Barbeque Trail Mix Bulk
+cfpl,Carnival Black Currant 250 Gm,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Black Pepper Makhana 125 Gm,VA,SFG_blend,Black Pepper Makhana Bulk
+cfpl,Carnival Black Pepper Makhana 55g,VA,SFG_mint_va,Makhana Bulk (Black Pepper & Pepper)
+cfpl,Carnival Black Pepper Pistachio 80g,VA,SFG_reuse_intermediate,California Pista Inshell Black Pepper
+cfpl,Carnival Blueberries Dried - 250G,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Blueberry 100g,RPC,NO_SFG_plain_repack,
+cfpl,Carnival California Almonds Independence 1kg,RPC,NO_SFG_plain_repack,
+cfpl,Carnival California Pista Roasted and Salted 800g,VA,SFG_blend,California Pista Roasted and Salted Bulk
+cfpl,Carnival California Pistachio 200g,RPC,NO_SFG_plain_repack,
+cfpl,Carnival California Pitted Prunes 300 Gms,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Caramel Sesame Walnut 150g,VA,SFG_blend,Caramel Sesame Walnut Bulk
+cfpl,Carnival Caramel Sesame Walnut 70g,RPC,SFG_blend,Caramel Sesame Walnut Bulk
+cfpl,Carnival Cashew (400 - 450) 200g Mono Carton,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Cashew Roasted And Salted 250g,VA,SFG_reuse_intermediate,Roasted & Salted Cashew Bulk
+cfpl,Carnival Chatpata Black Raisins 100g,VA,SFG_mint_va,Indian Black Raisins Bulk (Chatpata)
+cfpl,Carnival Chatpata Cranberry 100G,VA,SFG_mint_va,Dried Cranberry Sliced Bulk (Chatpata)
+cfpl,Carnival Chatpata Cranberry 250gm,VA,SFG_blend,Chatpata Cranberry Bulk
+cfpl,Carnival Chatpata Prunes 100gm,VA,SFG_blend,Chatpata Prunes Bulk
+cfpl,Carnival Cheese Cashew 100g,VA,SFG_blend,Cheese Cashew Bulk
+cfpl,Carnival Cheese Cashew 230g,VA,SFG_blend,Cheese Cashew Bulk
+cfpl,Carnival Cheese Makhana 125g,VA,SFG_blend,Cheese Makhana Bulk
+cfpl,Carnival Cheese Makhana 55g,VA,SFG_blend,Cheese Makhana Bulk
+cfpl,Carnival Choco Orange Walnut 150gm,VA,SFG_blend,Choco Orange Walnut Bulk
+cfpl,Carnival Classic Almonds 100g,RPC,SFG_blend,Classic Almonds Bulk
+cfpl,Carnival Classic Almonds 250g,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Classic Anjeer 250g,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Classic Cashew 250 Gms,RPC,SFG_blend,Classic Cashew Bulk
+cfpl,Carnival Classic Chia Seeds 1 Kg,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Classic Chia Seeds 100gm,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Classic Date Bites 357gm,VA,SFG_blend,Classic Date Bites Bulk
+cfpl,Carnival Classic Hazelnut 250 GMS,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Classic Indian Kishmish 500 Gms,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Classic Indian Raisins 250g,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Classic Irani Pistachio Salted 80g,VA,SFG_reuse_intermediate,Pista Irani Inshell Roasted and Salted
+cfpl,Carnival Classic Pumpkin Seeds 100g,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Classic Sunflower Seeds 100G,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Cocktail Mix 100g,VA,SFG_blend,Cocktail Mix Bulk
+cfpl,Carnival Cocktail Mix 200g,VA,SFG_blend,Cocktail Mix Bulk
+cfpl,Carnival Cocktail Mix 250g,VA,SFG_blend,Cocktail Mix Bulk
+cfpl,Carnival Cocktail Mix Plain Pouch 100g,VA,SFG_blend,Cocktail Mix Plain Pouch Bulk
+cfpl,Carnival Cranberry Flavoured Chatpata 200g,VA,SFG_blend,Cranberry Flavoured Chatpata Bulk
+cfpl,Carnival Cranberry Sliced 250 Gms,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Cranberry Whole - 100gm,RPC,SFG_blend,Cranberry Whole Bulk
+cfpl,Carnival Cranberry Whole 250G,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Crunchy Caramel Trail Mix 100g,VA,SFG_blend,Crunchy Caramel Trail Mix Bulk
+cfpl,Carnival Crunchy Caramel Trail Mix 200g,VA,SFG_blend,Crunchy Caramel Trail Mix Bulk
+cfpl,Carnival Crunchy Caramel Trail Mix 250g,VA,SFG_blend,Crunchy Caramel Trail Mix Bulk
+cdpl,Carnival Dates Premium Black Loose,DATES RPC,NO_SFG_plain_repack,
+cfpl,Carnival Deluxe Seeded Black Raisin 250gm,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Dried Blueberry 250g,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Dried Blueberry 250g - Tub,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Dried Cranberry Whole 100g (PP),RPC,NO_SFG_plain_repack,
+cfpl,Carnival Dried Cranberry Whole 250g - Tub,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Festive Almonds (27-28 count) 100gm,RPC,SFG_blend,Festive Almonds (27-28 count) Bulk
+cfpl,Carnival Festive Almonds (27-28 count) 125gm,RPC,SFG_blend,Festive Almonds (27-28 count) Bulk
+cfpl,Carnival Festive Almonds (27-28 count) 150gm,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Festive Almonds (27-28 count) 200gm,RPC,SFG_blend,Festive Almonds (27-28 count) Bulk
+cfpl,Carnival Festive Black Raisin Seedless 150gm,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Festive California Pista (21-26) 100gm,VA,SFG_blend,Festive California Pista (21-26) Bulk
+cfpl,Carnival Festive California Pista (21-26) 125gm,VA,NO_SFG_assembly,
+cfpl,Carnival Festive California Pista (21-26) 150gm,VA,NO_SFG_assembly,
+cfpl,Carnival Festive California Pista (21-26) 200gm,VA,NO_SFG_assembly,
+cfpl,Carnival Festive California Pista (21-26) 80gm,VA,SFG_blend,Festive California Pista (21-26) Bulk
+cfpl,Carnival Festive Cashew (320) 100gm,RPC,SFG_blend,Festive Cashew (320) Bulk
+cfpl,Carnival Festive Cashew (320) 125gm,RPC,SFG_blend,Festive Cashew (320) Bulk
+cfpl,Carnival Festive Cashew (320) 150gm,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Festive Cashew (320) 200gm,RPC,SFG_blend,Festive Cashew (320) Bulk
+cfpl,Carnival Festive Cashew (320) 80gm,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Festive Chatpata Cranberry 100gm,VA,SFG_blend,Festive Chatpata Cranberry Bulk
+cfpl,Carnival Festive Chatpata Cranberry 120g,VA,SFG_blend,Festive Chatpata Cranberry Bulk
+cfpl,Carnival Festive Chatpata Cranberry 250gm,VA,SFG_blend,Festive Chatpata Cranberry Bulk
+cfpl,Carnival Festive Chatpata Cranberry 80gm,VA,SFG_mint_va,Cranberry Slice Bulk (Chatpata)
+cfpl,Carnival Festive Crunchy Caramel Trail Mix 250g,VA,SFG_blend,Festive Crunchy Caramel Trail Mix Bulk
+cfpl,Carnival Festive Flavoured Cashew (320) 100gm,VA,SFG_mint_va,Cashew 320 Bulk
+cfpl,Carnival Festive Flavoured Cashew (320) 80gm,VA,SFG_mint_va,Cashew 320 Bulk
+cfpl,Carnival Festive Indian Raisin 100gm,RPC,SFG_blend,Festive Indian Raisin Bulk
+cfpl,Carnival Festive Indian Raisin 150gm,RPC,SFG_blend,Festive Indian Raisin Bulk
+cfpl,Carnival Festive Indian Raisin 175gm,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Festive Indian Raisin 200gm,RPC,SFG_blend,Festive Indian Raisin Bulk
+cfpl,Carnival Festive Indian Raisin 250gm,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Festive Nuts & Seeds Mix 120g,VA,SFG_blend,Festive Nuts & Seeds Mix Bulk
+cfpl,Carnival Festive Paan Cranberry 125gm,VA,SFG_blend,Festive Paan Cranberry Bulk
+cfpl,Carnival Festive Paan Raisin 125gm,VA,SFG_blend,Festive Paan Raisin Bulk
+cfpl,Carnival Festive Salted Almonds (27-28 Count) 230gm,VA,SFG_blend,Festive Salted Almonds (27-28 Count) Bulk
+cfpl,Carnival Festive Salted Almonds (27-28 count) 100gm,VA,SFG_blend,Festive Salted Almonds (27-28 count) Bulk
+cfpl,Carnival Festive Salted Almonds (27-28 count) 150gm,VA,SFG_blend,Festive Salted Almonds (27-28 count) Bulk
+cfpl,Carnival Festive Salted Almonds (27-28 count) 80gm,VA,SFG_mint_va,Salted American Almonds Running 25-27 count Bulk
+cfpl,Carnival Festive Salted Cashew (320) 150gm,VA,SFG_blend,Festive Salted Cashew (320) Bulk
+cfpl,Carnival Festive Salted Cashew (320) 230gm,VA,SFG_blend,Festive Salted Cashew (320) Bulk
+cfpl,Carnival Festive Seedless Black Raisin 200gm,VA,SFG_mint_va,Afghan Black Raisins Seeded Bulk
+cfpl,Carnival FestiveSalted Cashew (320) 100gm,VA,SFG_blend,FestiveSalted Cashew (320) Bulk
+cfpl,Carnival Flax Seeds 100G,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Ganpati Date Mewa Box 242g,VA,SFG_reuse_intermediate,Date Bites Semi Finished
+cfpl,Carnival Green Chilli Cashew 100g,VA,SFG_mint_va,Cashew 320 Bulk (Green Chilli & Chilli)
+cfpl,Carnival Green Chilli Cashew 230g,VA,SFG_reuse_intermediate,Green Chilli Cashew Bulk
+cfpl,Carnival Himalayan Salt & Pepper Pistachios 200gm,VA,SFG_blend,Himalayan Salt & Pepper Pistachios Bulk
+cfpl,Carnival Himalayan Salt & Pepper Pistachios 25g,VA,SFG_blend,Himalayan Salt & Pepper Pistachios Bulk
+cfpl,Carnival Honey Roasted Almonds 100G,VA,SFG_mint_va,Honey Roasted Honey Roast Almonds Bulk (Honey)
+cfpl,Carnival Indian Green Raisins 200g,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Indian Kishmish 100g,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Iranian Pistachio 250 Gm,RPC,SFG_blend,Iranian Pistachio Bulk
+cfpl,Carnival Jumbo Salted Cashew with Skin 200g,VA,SFG_reuse_intermediate,Cashew Jumbo with Skin Roasted and Salted
+cfpl,Carnival Macadamia 200gm,RPC,SFG_blend,Macadamia Bulk
+cfpl,Carnival Madhur Mahotsav DF Box 4P 400g,VA,NO_SFG_assembly,
+cfpl,Carnival Magic Moments 4P 600gm,VA,SFG_blend,Magic Moments 4P Bulk
+cfpl,Carnival Mangalmay Utsav DF Box 6P 600g,VA,NO_SFG_assembly,
+cfpl,Carnival Mocha Mojo Trail Mix 100g,VA,SFG_blend,Mocha Mojo Trail Mix Bulk
+cfpl,Carnival Mocha Mojo Trail Mix 200g,VA,SFG_blend,Mocha Mojo Trail Mix Bulk
+cfpl,Carnival Mocha Mojo Trail Mix 250g,VA,SFG_blend,Mocha Mojo Trail Mix Bulk
+cfpl,Carnival Nuts & Seed Mix 100gm,VA,SFG_blend,Nuts & Seed Mix Bulk
+cfpl,Carnival Oman Dates 250g,DATES RPC,NO_SFG_plain_repack,
+cfpl,Carnival Pan Raisin 125g,VA,SFG_blend,Pan Raisin Bulk
+cfpl,Carnival Pepper Cashew 100G,VA,SFG_blend,Pepper Cashew Bulk
+cfpl,Carnival Pepper Cashew 125gm,VA,SFG_blend,Pepper Cashew Bulk
+cfpl,Carnival Pepper Cashew 200G,VA,SFG_blend,Pepper Cashew Bulk
+cfpl,Carnival Pepper Pistachios 200G,VA,SFG_blend,Pepper Pistachios Bulk
+cfpl,Carnival Peri Peri Cashew 100 Gms,VA,SFG_mint_va,Cashew 320 Bulk (Peri Peri)
+cfpl,Carnival Peri Peri Cashew 150gm,VA,SFG_reuse_intermediate,Peri Peri Cashew Bulk
+cfpl,Carnival Peri Peri Cashew 200gm,VA,SFG_reuse_intermediate,Peri Peri Cashew Bulk
+cfpl,Carnival Peri Peri Makhana 125g,VA,SFG_blend,Peri Peri Makhana Bulk
+cfpl,Carnival Peri Peri Makhana 55g,VA,SFG_mint_va,Makhana Bulk (Peri Peri)
+cfpl,Carnival Peri Peri Walnut 150g,VA,SFG_blend,Peri Peri Walnut Bulk
+cfpl,Carnival Pine Nut 100 Gms,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Pitted Prunes 250g,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Popcorn Makhana 125g,VA,SFG_mint_va,Makhana Bulk
+cfpl,Carnival Popcorn Makhana 55gm,VA,SFG_mint_va,Makhana Bulk
+cfpl,"Carnival Premium Brazil Nuts, 250 Gms",RPC,NO_SFG_plain_repack,
+cfpl,Carnival Premium Cocktail Mix 100g,VA,SFG_blend,Premium Cocktail Mix Bulk
+cfpl,Carnival Premium Cocktail Mix 250 Gms,VA,SFG_blend,Premium Cocktail Mix Bulk
+cfpl,Carnival Premium Kesar 0.5 Gms,RPC,SFG_mint_va,Saffron (Kesar) - Irani Bulk (Kesar)
+cfpl,Carnival Premium Macadamia Nut 250 Gms,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Premium Pecan Nuts 200g Mono Carton,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Premium Pecan Nuts 250 Gms,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Premium Walnut Kernels 250 Gms,RPC,SFG_blend,Premium Walnut Kernels Bulk
+cfpl,Carnival Pudina Almonds 125g,VA,SFG_blend,Pudina Almonds Bulk
+cfpl,Carnival Pudina Makhana 125 Gm,VA,SFG_blend,Pudina Makhana Bulk
+cfpl,Carnival Raisin Black Seeded 250gm,RPC,NO_SFG_plain_repack,
+cfpl,Carnival Raisins Black Chatpata 200g,VA,SFG_blend,Raisins Black Chatpata Bulk
+cfpl,Carnival Roasted & Salted Almonds 100g,VA,SFG_blend,Roasted & Salted Almonds Bulk
+cfpl,Carnival Roasted & Salted Almonds 230g,VA,SFG_blend,Roasted & Salted Almonds Bulk
+cfpl,Carnival Roasted & Salted Almonds 250g,VA,SFG_blend,Roasted & Salted Almonds Bulk
+cfpl,Carnival Roasted & Salted Cashew 100g,VA,SFG_blend,Roasted & Salted Cashew Bulk
+cfpl,Carnival Roasted & Salted Cashew 230g,VA,SFG_blend,Roasted & Salted Cashew Bulk
+cfpl,Carnival Roasted & Salted Pistachio 100g,VA,NO_SFG_assembly,
+cfpl,Carnival Roasted & Salted Pistachio 200g,VA,SFG_blend,Roasted & Salted Pistachio Bulk
+cfpl,Carnival Roasted & Salted Pistachio 250g,VA,SFG_mint_va,Roasted & Salted California Pista Inshell Roasted and Salted Bulk
+cfpl,Carnival Roasted Macadamia Nuts 250g,RPC,SFG_mint_va,Roasted Macadamia Roasted - Size 1 Bulk
+cfpl,Carnival Salt & Pepper Walnut 150g,VA,SFG_blend,Salt & Pepper Walnut Bulk
+cfpl,Carnival Salted Caramel Pecannuts 80g,VA,SFG_blend,Salted Caramel Pecannuts Bulk
+cdpl,Carnival Sayer Dates 300g,DATES RPC,NO_SFG_plain_repack,
+cfpl,Carnival Shubhakamnayein 3P 300g,VA,NO_SFG_assembly,
+cfpl,Carnival Simply Thandai 100g,VA,SFG_blend,Simply Thandai Bulk
+cfpl,Carnival Simply Thandai Mix 200gm,VA,SFG_blend,Simply Thandai Mix Bulk
+cfpl,Carnival Smoked Almonds 100gm,VA,SFG_blend,Smoked Almonds Bulk
+cfpl,Carnival Smoked Almonds 200g,VA,SFG_mint_va,American Almonds Running 25-27 count Bulk (Smoked)
+cfpl,Carnival Spanish Tomato Cashew 100G,VA,SFG_mint_va,Cashew 320 Bulk
+cfpl,Carnival Walnut Kernal 2pc 200gm,RPC,NO_SFG_plain_repack,
+cdpl,Carnival Zahidi 500g,DATES RPC,NO_SFG_plain_repack,
+cdpl,Carnival khalas dates 350g,DATES RPC,NO_SFG_plain_repack,
+cfpl,Cashew 100g (B07GQZSS49) FBA,RPC,NO_SFG_plain_repack,
+cfpl,Cashew 180,Bulk,NO_SFG_rm_stockitem,
+cfpl,Cashew 230gm,RPC,NO_SFG_plain_repack,
+cfpl,Cashew 240,Bulk,NO_SFG_rm_stockitem,
+cfpl,Cashew 240 230g,RPC,NO_SFG_plain_repack,
+cfpl,Cashew 320,Bulk,NO_SFG_rm_stockitem,
+cfpl,Cashew 500g (B07GQW1HHN),RPC,NO_SFG_plain_repack,
+cfpl,Cashew Flavoured Rosemary Loose,VA,SFG_mint_va,Cashew 320 Bulk (Rosemary)
+cfpl,Cashew Jumbo with Skin Roasted and Salted,VA,SFG_blend,Cashew Jumbo with Skin Roasted and Salted Bulk
+cfpl,Cashew Masala,VA,SFG_blend,Cashew Masala Bulk
+cfpl,Cashew Pink salt,VA,SFG_blend,Cashew Pink salt Bulk
+cfpl,Cashew Roasted,Bulk,SFG_mint_va,Roasted Cashew 320 Bulk
+cfpl,Cashew Wasabi,VA,SFG_blend,Cashew Wasabi Bulk
+cfpl,Celebration Sleek Box 200g,VA,NO_SFG_assembly,
+cfpl,Celebration Sleek Box Hamper 01,VA,NO_SFG_hamper,
+cfpl,Celebration Sleek Box Hamper 02,VA,NO_SFG_hamper,
+cfpl,Chatpata Black Raisin,VA,SFG_mint_va,Afghan Black Raisins Seedless Bulk (Chatpata)
+cfpl,Chatpata Cranberry,VA,SFG_blend,Chatpata Cranberry Bulk
+cfpl,Chatpata Cranberry 75gm,VA,SFG_blend,Chatpata Cranberry Bulk
+cfpl,Chatpata Prunes,VA,SFG_blend,Chatpata Prunes Bulk
+cfpl,Chatpata Seasoning,Bulk,NO_SFG_rm_stockitem,
+cfpl,Cheese Cashew,VA,SFG_blend,Cheese Cashew Bulk
+cfpl,Cheese Makhana,VA,SFG_blend,Cheese Makhana Bulk
+cfpl,Cheese Tomato Flavoured Coated Peanuts,NA,SFG_blend,Cheese Tomato Flavoured Coated Peanuts Bulk
+cfpl,Cheese Tomato Flavoured Coated Peanuts 35gm,VA,SFG_blend,Cheese Tomato Flavoured Coated Peanuts Bulk
+cfpl,Chia Seeds 100G (B07GQZCP91),RPC,NO_SFG_plain_repack,
+cfpl,Chia Seeds 200G (B07GQQLZPD),RPC,NO_SFG_plain_repack,
+cfpl,Chia Seeds 500G (B07GQZSJFH),RPC,NO_SFG_plain_repack,
+cfpl,Chilean  Walnut Kernel 2pc 230g,RPC,NO_SFG_plain_repack,
+cfpl,Chilean Walnut Kernel 2 pcs,Bulk,NO_SFG_rm_stockitem,
+cfpl,Chilean Walnut Kernel Quarter,Bulk,NO_SFG_rm_stockitem,
+cfpl,Chilean Walnut Kernel Quarter BBQ,VA,SFG_blend,Chilean Walnut Kernel Quarter BBQ Bulk
+cfpl,Chilean Walnut Kernel Quarter caramel,VA,SFG_blend,Chilean Walnut Kernel Quarter caramel Bulk
+cfpl,Chilean Walnut Kernel Quarter lemon pepper,VA,SFG_blend,Chilean Walnut Kernel Quarter lemon pepper Bulk
+cfpl,Chilean Walnut Kernel Quarter pepper,VA,SFG_blend,Chilean Walnut Kernel Quarter pepper Bulk
+cfpl,Chilean Walnut Kernel Quarter peri peri,VA,SFG_blend,Chilean Walnut Kernel Quarter peri peri Bulk
+cfpl,Chilli Almonds Bulk,VA,SFG_already_bulk,Chilli Almonds Bulk
+cfpl,Chilli Garlic Cashew Bulk,VA,SFG_already_bulk,Chilli Garlic Cashew Bulk
+cfpl,Chilli Garlic Masala Seasoning,Bulk,NO_SFG_rm_stockitem,
+cfpl,Chilly Garlic Coated Peanuts 60gm,VA,SFG_blend,Chilly Garlic Coated Peanuts Bulk
+cfpl,Chipotle Honey Coated Peanuts 200g,VA,SFG_blend,Chipotle Honey Coated Peanuts Bulk
+cfpl,Chipotle Honey Coated Peanuts 70gm,VA,SFG_blend,Chipotle Honey Coated Peanuts Bulk
+cfpl,Choco Crunch Energy Bar 38gm,VA,SFG_blend,Choco Crunch Energy Bar Bulk
+cfpl,Chocolate Coated Almond Dragees 50gm,VA,SFG_blend,Chocolate Coated Almond Dragees Bulk
+cfpl,Chocolate Coated Blueberries Dragees 50gm,VA,SFG_blend,Chocolate Coated Blueberries Dragees Bulk
+cfpl,Chocolate Dipped Pecan Nut Loose,VA,SFG_blend,Chocolate Dipped Pecan Nut Loose Bulk
+cfpl,Cinnamon Glazed Almond,VA,SFG_blend,Cinnamon Glazed Almond Bulk
+cfpl,Cinnamon Glazed Pecan,VA,SFG_blend,Cinnamon Glazed Pecan Bulk
+cfpl,Classic Flavour Date Mewa 18gm,VA,SFG_reuse_intermediate,Noice Classic Flavour Date Mewa (Semi Finished)
+cfpl,Coated Peanut Base,VA,SFG_blend,Coated Peanut Base Bulk
+cfpl,Coated Peanuts,VA,SFG_blend,Coated Peanuts Bulk
+cfpl,Coated Peanuts - Magic Masala 1Kg,VA,SFG_blend,Coated Peanuts - Magic Masala Bulk
+cfpl,Coated Peanuts Pudina Patakha Bulk,VA,SFG_already_bulk,Coated Peanuts Pudina Patakha Bulk
+cfpl,Coated Peanuts Tandoori Toofan Bulk,VA,SFG_already_bulk,Coated Peanuts Tandoori Toofan Bulk
+cfpl,Coated Peanuts Thai Flavour Bulk,VA,SFG_already_bulk,Coated Peanuts Thai Flavour Bulk
+cfpl,Cocktail Mix,VA,SFG_blend,Cocktail Mix Bulk
+cfpl,Cocktail Mix 230g,VA,SFG_blend,Cocktail Mix Bulk
+cfpl,Cocoa Glazed Almonds,VA,SFG_blend,Cocoa Glazed Almonds Bulk
+cfpl,Cocoa Glazed Hazelnuts,VA,SFG_blend,Cocoa Glazed Hazelnuts Bulk
+cfpl,Cocoa Peanut Date Balls 48 gms,VA,SFG_blend,Cocoa Peanut Date Balls Bulk
+cfpl,Cococart Almond & Cranberry Date Bar 35gm,VA,SFG_blend,Cococart Almond & Cranberry Date Bar Bulk
+cfpl,Cococart Almond & Orange Dark Choco Date Bar 35gm,VA,SFG_blend,Cococart Almond & Orange Dark Choco Date Bar Bulk
+cfpl,Cococart Barbeque Trail Mix 60gm,VA,SFG_blend,Cococart Barbeque Trail Mix Bulk
+cfpl,Cococart Black Pepper Trail Mix 60gm,VA,SFG_blend,Cococart Black Pepper Trail Mix Bulk
+cfpl,Cococart Cheese Makhana 100gm,VA,SFG_blend,Cococart Cheese Makhana Bulk
+cfpl,Cococart Fruit & Nut Date Bar 35gm,VA,SFG_blend,Cococart Fruit & Nut Date Bar Bulk
+cfpl,Cococart Himalayan Pink Salt Makhana 100gm,VA,SFG_blend,Cococart Himalayan Pink Salt Makhana Bulk
+cfpl,Cococart Himalayan Salt Trail Mix 60gm,VA,SFG_blend,Cococart Himalayan Salt Trail Mix Bulk
+cfpl,Cococart Lime Chilli Makhana 100gm,VA,SFG_blend,Cococart Lime Chilli Makhana Bulk
+cfpl,Cococart Peri Peri Trail Mix 60gm,VA,SFG_blend,Cococart Peri Peri Trail Mix Bulk
+cfpl,Cococart Pudina Salt Makhana 100gm,VA,SFG_blend,Cococart Pudina Salt Makhana Bulk
+cfpl,Cococart Raspberry Almond Dark Choco Date Bar 35gm,VA,SFG_blend,Cococart Raspberry Almond Dark Choco Date Bar Bulk
+cfpl,Coconut Laddubar (Semi Finished),VA,SFG_already_bulk,Coconut Laddubar (Semi Finished)
+cfpl,Coconut Laddubar Mini 9g,VA,SFG_reuse_intermediate,Coconut Laddubar (Semi Finished)
+cfpl,Coffee Laddoo 18gm,VA,SFG_blend,Coffee Laddoo Bulk
+cfpl,Coffee Laddoo Semi Finished,VA,SFG_already_bulk,Coffee Laddoo Semi Finished
+cfpl,Cranberry Date Balls 48 gms,VA,SFG_blend,Cranberry Date Balls Bulk
+cfpl,Cranberry Whole 230g,RPC,NO_SFG_plain_repack,
+cfpl,Crunchy Caramel Trail Mix,VA,SFG_blend,Crunchy Caramel Trail Mix Bulk
+cfpl,Crunchy Caramel Trail Mix 230g,VA,SFG_blend,Crunchy Caramel Trail Mix Bulk
+cfpl,Curate Anjeer 200g,RPC,NO_SFG_plain_repack,
+cfpl,Curate Cashews 200g,RPC,NO_SFG_plain_repack,
+cfpl,Curate Cashews 500g,RPC,NO_SFG_plain_repack,
+cfpl,Curate Mamra Almonds 200g,RPC,NO_SFG_plain_repack,
+cfpl,Curate Oriental Dates 500gm,DATES RPC,NO_SFG_plain_repack,
+cfpl,Curate Pista Pishori 200g,RPC,NO_SFG_plain_repack,
+cfpl,Curate Prunes 200g,RPC,NO_SFG_plain_repack,
+cfpl,Curate Roasted Hazelnuts 200g,RPC,SFG_mint_va,Roasted Hazelnut Kernal Bulk
+cfpl,Curate Roasted Hazelnuts 550g Jr,RPC,SFG_mint_va,Roasted Hazelnut Kernal Bulk
+cfpl,DCC Almonds,Bulk,NO_SFG_plain_repack,
+cfpl,DEGLET.908 GM,DATES BULK,SFG_blend,DEGLET. Bulk
+cfpl,Daily Mewa Healthy Mix,VA,SFG_blend,Daily Mewa Healthy Mix Bulk
+cfpl,Dark Almond Draggies,VA,SFG_blend,Dark Almond Draggies Bulk
+cfpl,Dark Chocolate Coated Almond Stuffed Khalas Single,VA,SFG_blend,Dark Chocolate Coated Almond Stuffed Khalas Single Bulk
+cfpl,Dark Chocolate Coated Almond Stuffed Khalas(No Use),VA,SFG_blend,Dark Chocolate Coated Almond Stuffed Khalas(No Use) Bulk
+cfpl,Dark Chocolate Coated Cashew Stuffed Khalas Single,VA,SFG_blend,Dark Chocolate Coated Cashew Stuffed Khalas Single Bulk
+cfpl,Dark Chocolate Coated Cashew Stuffed Khalas(No Use),VA,SFG_blend,Dark Chocolate Coated Cashew Stuffed Khalas(No Use) Bulk
+cfpl,Dark Chocolate Coated Deri Date with Almond Single,VA,SFG_blend,Dark Chocolate Coated Deri Date with Almond Single Bulk
+cfpl,Dark Chocolate Coated Fard Date with Almond Single,VA,SFG_blend,Dark Chocolate Coated Fard Date with Almond Single Bulk
+cfpl,Dark Chocolate Coated Macadamia 110g,VA,SFG_blend,Dark Chocolate Coated Macadamia Bulk
+cfpl,Dark Chocolate Coated Safavi Stuffed Dates Pc,VA,SFG_blend,Dark Chocolate Coated Safavi Stuffed Dates Pc Bulk
+cfpl,Dark Chocolate Macadamia Clusters 100gm,VA,SFG_reuse_intermediate,Macadamia Dark Chocolate Clusters
+cfpl,Date Balls Coated Coconut (22G X 3),VA,SFG_blend,Date Balls Coated Coconut ( X 3) Bulk
+cfpl,Date Balls Coated Dark (22g x 3),VA,SFG_blend,Date Balls Coated Dark ( x 3) Bulk
+cfpl,Date Balls Coated Milk (22g x 3),VA,SFG_blend,Date Balls Coated Milk ( x 3) Bulk
+cfpl,Date Balls Coated White (22g x 3),VA,SFG_blend,Date Balls Coated White ( x 3) Bulk
+cfpl,Date Bites 9gm,VA,SFG_reuse_intermediate,Date Bites Semi Finished
+cfpl,Date Bites Rose (Semi Finished),VA,SFG_already_bulk,Date Bites Rose (Semi Finished)
+cfpl,Date Bites Semi Finished,VA,SFG_already_bulk,Date Bites Semi Finished
+cfpl,Date Mewa Bon Bon Laddu (18g x 3),VA,SFG_reuse_intermediate,Date Mewa Ladu
+cfpl,Date Mewa Festive Gifting & Feast Parcel 500gm,VA,SFG_blend,Date Mewa Festive Gifting & Feast Parcel Bulk
+cfpl,Date Mewa Ladu 18gm,VA,SFG_blend,Date Mewa Ladu Bulk
+cfpl,Dates Ajwa Loose,DATES BULK,NO_SFG_rm_stockitem,
+cfpl,Dates Ameri Loose,DATES BULK,NO_SFG_rm_stockitem,
+cfpl,Dates Delight Khajur Pak 375gm,VA,SFG_blend,Dates Delight Khajur Pak Bulk
+cfpl,Dates Fard Loose,DATES BULK,NO_SFG_plain_repack,
+cfpl,Dates Mazafati Loose,DATES BULK,NO_SFG_rm_stockitem,
+cfpl,Dates Medjool Jumbo Loose,DATES BULK,NO_SFG_rm_stockitem,
+cfpl,Dates Medjool Large Loose,DATES BULK,NO_SFG_rm_stockitem,
+cfpl,Dates Medjool Super Jumbo Loose,DATES BULK,NO_SFG_rm_stockitem,
+cfpl,Dates Medjoul Junior Loose,DATES BULK,NO_SFG_plain_repack,
+cfpl,Dates Mewa Assorted 210gm,VA,SFG_blend,Dates Mewa Assorted Bulk
+cfpl,Dates Mewa Classic 210gm,VA,SFG_reuse_intermediate,Date Bites Semi Finished
+cfpl,Dates Oriental Loose,DATES BULK,NO_SFG_rm_stockitem,
+cfpl,Dates Safavi Loose,DATES BULK,NO_SFG_rm_stockitem,
+cfpl,Dates Sayer Loose,DATES BULK,NO_SFG_plain_repack,
+cfpl,Dates Zahidi Loose,DATES BULK,NO_SFG_rm_stockitem,
+cdpl,Deglet,DATES BULK,NO_SFG_rm_stockitem,
+cfpl,Dehydrated Ginger,Bulk,NO_SFG_rm_stockitem,
+cfpl,Delkash Dates 500 Gms (110002704),DATES RPC,SFG_blend,Delkash Dates Bulk
+cfpl,Delmonte Cranberries 130gm,RPC,NO_SFG_plain_repack,
+cfpl,Delmonte Prunes 130g,RPC,NO_SFG_plain_repack,
+cfpl,Delmonte Prunes 130g [1 Case x 40 unit],RPC,NO_SFG_plain_repack,
+cfpl,Delmonte Prunes 340g,RPC,NO_SFG_plain_repack,
+cfpl,Delmonte Prunes 340g [1 Case x 20 unit],RPC,NO_SFG_plain_repack,
+cfpl,Delmonte Royal Arabian dates 200g,DATES RPC,NO_SFG_plain_repack,
+cfpl,Delmonte Royal Arabian dates 200g [1 Case x 36 unit] Promo,DATES RPC,NO_SFG_plain_repack,
+cfpl,Delmonte Royal Arabian dates 500g,DATES RPC,NO_SFG_plain_repack,
+cfpl,Delmonte Royal Arabian dates 500g [1 Case x 24 unit] Non-Promo,DATES RPC,NO_SFG_plain_repack,
+cfpl,Delmonte Royal Arabian dates 500g [1 Case x 24 unit] Promo,DATES RPC,NO_SFG_plain_repack,
+cfpl,Delmonte Royal Fard Dates 200gm,DATES RPC,NO_SFG_plain_repack,
+cfpl,Delmonte Royal Fard Dates 200gm [1 Case x 36 unit] Non-Promo,DATES RPC,NO_SFG_plain_repack,
+cfpl,Delmonte Royal Fard Dates 200gm [1 Case x 36 unit] Promo,DATES RPC,NO_SFG_plain_repack,
+cfpl,Delmonte Royal Fard Dates 450gm [1Case x 24Pack] PR,DATES RPC,NO_SFG_plain_repack,
+cfpl,Delmonte Royal Fard Dates 450gm [1Case x 24Pack]NPR,DATES RPC,NO_SFG_plain_repack,
+cfpl,Delmonte Royal Fard Dates 500gm,DATES RPC,NO_SFG_plain_repack,
+cfpl,Delmonte Royal Fard Dates 500gm [1 Case x 24 unit] Non-Promo,DATES RPC,NO_SFG_plain_repack,
+cfpl,Delmonte Royal Fard Dates 500gm [1 Case x 24 unit] Promo,DATES RPC,NO_SFG_plain_repack,
+cfpl,Deri Dates 250g (1359841),DATES RPC,SFG_blend,Deri Dates Bulk
+cfpl,Diced Almond,Bulk,NO_SFG_rm_stockitem,
+cfpl,Dr Batra Hair Health Protein Bar (Semi Finished),VA,SFG_already_bulk,Hair Health Protein Bar (Semi Finished)
+cfpl,Dr Batra#s Hair Health Protein Bar 35gm,VA,SFG_reuse_intermediate,Hair Health Protein Bar (Semi Finished)
+cfpl,Dragees Dark Cranberry,VA,SFG_blend,Dragees Dark Cranberry Bulk
+cfpl,Dragees Milk Cranberry,VA,SFG_blend,Dragees Milk Cranberry Bulk
+cfpl,Dragees White Cranberry,VA,SFG_blend,Dragees White Cranberry Bulk
+cfpl,Drangees Dark Almond,VA,SFG_blend,Drangees Dark Almond Bulk
+cfpl,Dried Blueberry 100gm,RPC,NO_SFG_plain_repack,
+cfpl,Dried Cranberry 100gm,RPC,NO_SFG_plain_repack,
+cfpl,Dried Cranberry Sliced,Bulk,NO_SFG_rm_stockitem,
+cfpl,Dried Cranberry Whole,Bulk,NO_SFG_rm_stockitem,
+cfpl,Dried Kiwi,Bulk,NO_SFG_rm_stockitem,
+cfpl,Dried Mango Loose,Bulk,NO_SFG_rm_stockitem,
+cfpl,Dried Masala Kiwi,VA,SFG_blend,Dried Masala Kiwi Bulk
+cfpl,Dried Masala Mango,VA,SFG_blend,Dried Masala Mango Bulk
+cfpl,Dried Masala Pineapple,VA,SFG_blend,Dried Masala Pineapple Bulk
+cfpl,Dried Prunes (Pitted),Bulk,NO_SFG_rm_stockitem,
+cfpl,Dried Raspberry,RPC,NO_SFG_rm_stockitem,
+cfpl,Dry Fruit Hamper,VA,SFG_blend,Dry Fruit Hamper Bulk
+cfpl,Dryfruit Instant Energy LadduBar Pack of 5,VA,SFG_reuse_intermediate,Dryfruit Instant Energy Laddubar (Semi Finished)
+cfpl,Dryfruit Instant Energy Laddubar (Semi Finished),VA,SFG_already_bulk,Dryfruit Instant Energy Laddubar (Semi Finished)
+cfpl,Dryfruit Instant Energy Laddubar Bites 9gm,VA,SFG_reuse_intermediate,Dryfruit Instant Energy Laddubar (Semi Finished)
+cfpl,Dryfruit instant Energy laddu Bar 35gm,VA,SFG_reuse_intermediate,Dryfruit Instant Energy Laddubar (Semi Finished)
+cfpl,Energy Bar - Choco Crunch (Semi Finished),VA,SFG_already_bulk,Energy Bar - Choco Crunch (Semi Finished)
+cfpl,Energy Bar - Choco Crunch 30gm,VA,SFG_reuse_intermediate,Energy Bar - Choco Crunch (Semi Finished)
+cfpl,Energy Bar - Fig & Dates 30gm,VA,SFG_reuse_intermediate,Energy Bar- Fig & Dates (Semi Finished)
+cfpl,Energy Bar - Hazelnut Magic 30gm,VA,SFG_reuse_intermediate,Energy Bar- Hazelnut Magic (Semi Finished)
+cfpl,Energy Bar - Oats & Apricot 30gm,VA,SFG_reuse_intermediate,Energy Bar- Oats & Apricot (Semi Finished)
+cfpl,Energy Bar with Jaggery 30gm,VA,SFG_blend,Energy Bar with Jaggery Bulk
+cfpl,Energy Bar- Fig & Dates (Semi Finished),VA,SFG_already_bulk,Energy Bar- Fig & Dates (Semi Finished)
+cfpl,Energy Bar- Hazelnut Magic (Semi Finished),VA,SFG_already_bulk,Energy Bar- Hazelnut Magic (Semi Finished)
+cfpl,Energy Bar- Oats & Apricot (Semi Finished),VA,SFG_already_bulk,Energy Bar- Oats & Apricot (Semi Finished)
+cfpl,Energy Bars Oats and Dates (Pack of 6) 210gm,VA,SFG_reuse_intermediate,Energy Bar- Oats & Apricot (Semi Finished)
+cfpl,Energy Bars Oats and Dates (Semi Finished),VA,SFG_already_bulk,Energy Bars Oats and Dates (Semi Finished)
+cfpl,Extra Cheese Seasoning (UNC) 1Kg,RPC,SFG_blend,Extra Cheese Seasoning (UNC) Bulk
+cfpl,Extra Cheese Seasoning Extreme,RPC,SFG_blend,Extra Cheese Seasoning Extreme Bulk
+cfpl,Extra Cheese Seasoning-UNC( Malaysian) 15kg,RPC,SFG_blend,Extra Cheese Seasoning-UNC( Malaysian) Bulk
+cfpl,Extra Cheese Seasoning-UNC( Malaysian) 1kg,RPC,SFG_blend,Extra Cheese Seasoning-UNC( Malaysian) Bulk
+cfpl,Extreme Cheese Seasoning( Malaysian) 1kg,RPC,SFG_blend,Extreme Cheese Seasoning( Malaysian) Bulk
+cfpl,Ez Almond California Bold Loose,Bulk,NO_SFG_plain_repack,
+cfpl,Ez Almond California Regular Loose,Bulk,NO_SFG_plain_repack,
+cfpl,Ez Almond Mammra Regular Loose,Bulk,NO_SFG_plain_repack,
+cfpl,Ez Almond Mamra Regular Loose (1459019),Bulk,NO_SFG_plain_repack,
+cfpl,Ez Almond Rstd Salted Loose,Bulk,SFG_reuse_intermediate,Roasted & Salted Almonds Bulk
+cfpl,Ez Anjeer Small Loose,Bulk,NO_SFG_plain_repack,
+cfpl,Ez Black Raisin Loose (1459026),Bulk,NO_SFG_plain_repack,
+cfpl,Ez Black Raisin Seedless Loose,Bulk,NO_SFG_plain_repack,
+cfpl,Ez Blue Berry Loose,Bulk,NO_SFG_plain_repack,
+cfpl,Ez Cashew 210 Loose,Bulk,NO_SFG_plain_repack,
+cfpl,Ez Cashew 240 Loose,Bulk,NO_SFG_plain_repack,
+cfpl,Ez Cashew 320 Loose,Bulk,NO_SFG_plain_repack,
+cfpl,Ez Cashew 4pc Loose,Bulk,NO_SFG_plain_repack,
+cfpl,Ez Cashew Roasted Salted Loose,Bulk,SFG_mint_va,Roasted Cashew 320 Bulk
+cfpl,Ez Chilean Walnut Giri Regular Loose,Bulk,NO_SFG_plain_repack,
+cfpl,Ez Chilean Walnut Giri Small Loose (1459038),Bulk,NO_SFG_plain_repack,
+cfpl,Ez Cranberry Loose,Bulk,NO_SFG_plain_repack,
+cfpl,Ez Dried Apricot Loose,Bulk,NO_SFG_plain_repack,
+cfpl,Ez Green Pista Loose (1459047),Bulk,NO_SFG_plain_repack,
+cfpl,Ez Honey Amla Loose (1459048),Bulk,SFG_mint_va,Sweet Amala Candy 5% Bulk (Honey)
+cfpl,Ez Khurmani Wet Apricot Loose (1459052),Bulk,NO_SFG_plain_repack,
+cfpl,Ez Kishmish Afghani Loose,Bulk,NO_SFG_plain_repack,
+cfpl,Ez Mix Dry Fruit Regular Loose (1459062),VA,SFG_mint_va,Mamra Almonds 2A Bulk
+cfpl,Ez Munakka Loose,Bulk,NO_SFG_plain_repack,
+cfpl,Ez Pista Roasted Salted Akbari Loose,Bulk,SFG_mint_va,Roasted Pista Akbari Roasted and Salted Bulk
+cfpl,Ez Pista Roasted Salted Irani Loose,Bulk,SFG_mint_va,Roasted Pista Irani 101 Inshell Bulk
+cfpl,Ez Walnut Broken Loose,Bulk,NO_SFG_plain_repack,
+cfpl,Ez Walnut Whole Loose,Bulk,NO_SFG_plain_repack,
+cfpl,FABSTA ALMOND 100G,RPC,NO_SFG_plain_repack,
+cfpl,FABSTA ALMOND 200G,RPC,NO_SFG_plain_repack,
+cfpl,FABSTA ALMOND 500G,RPC,NO_SFG_plain_repack,
+cfpl,FABSTA ALMOND REGULAR 100G,RPC,NO_SFG_plain_repack,
+cfpl,FABSTA ALMOND REGULAR 200G,RPC,NO_SFG_plain_repack,
+cfpl,FABSTA ALMOND REGULAR 500G,RPC,NO_SFG_plain_repack,
+cfpl,FABSTA Apricots Dry 100gm,RPC,NO_SFG_plain_repack,
+cfpl,FABSTA BLACK RAISINS 100G (1455547),RPC,NO_SFG_plain_repack,
+cfpl,FABSTA BLACK RAISINS 200G,RPC,NO_SFG_plain_repack,
+cfpl,FABSTA BLACK RAISINS 500G,RPC,NO_SFG_plain_repack,
+cfpl,FABSTA CASHEW RS W320 100G,RPC,SFG_reuse_intermediate,Roasted & Salted Cashew Bulk
+cfpl,FABSTA CASHEW RS W320 200G,RPC,SFG_reuse_intermediate,Roasted & Salted Cashew Bulk
+cfpl,FABSTA CASHEWNUT 240 COUNT 200g,RPC,NO_SFG_plain_repack,
+cfpl,FABSTA CASHEWNUT BROKEN 200G,RPC,NO_SFG_plain_repack,
+cfpl,FABSTA INDIAN RAISINS 200G,RPC,NO_SFG_plain_repack,
+cfpl,FABSTA INDIAN RAISINS 500G,RPC,NO_SFG_plain_repack,
+cfpl,FABSTA PISTA CALIFORNIA 200G,RPC,NO_SFG_plain_repack,
+cfpl,FABSTA Raisins Indian 100 Gm,RPC,NO_SFG_plain_repack,
+cfpl,FABSTA WALNUT SPLIT 250G,RPC,NO_SFG_plain_repack,
+cfpl,FABSTA Walnut Split 100gm,RPC,NO_SFG_plain_repack,
+cfpl,FESTIVE GREETING 560gm,VA,NO_SFG_assembly,
+cfpl,FIESTA DryFruit Box 800gm,VA,NO_SFG_assembly,
+cfpl,FNP Almonds 26-29 - Salted & Roasted 50 gm,VA,SFG_blend,FNP Almonds 26-29 - Salted & Roasted Bulk
+cfpl,FNP Choco Almonds 50gm,VA,SFG_blend,FNP Choco Almonds Bulk
+cfpl,FNP Choco Berry Bites 50gm,VA,SFG_blend,FNP Choco Berry Bites Bulk
+cfpl,FNP Fiery Almonds Sizzlin Peri Peri 50gm,VA,SFG_mint_va,American Almonds Running 25-27 count Bulk (Peri Peri)
+cfpl,FNP Indian Raisins 70 gm,RPC,NO_SFG_plain_repack,
+cfpl,FNP Pistachios Salted & Roasted 50 gm,VA,SFG_blend,FNP Pistachios Salted & Roasted Bulk
+cfpl,FNP Salt & Pepper Cashew 50gm,VA,SFG_reuse_intermediate,Salt and Pepper Cashew Bulk
+cfpl,FNP Smokin Sweet N Smoky BBQ Almond 50gm,VA,SFG_mint_va,American Almonds Running 25-27 count Bulk (Bbq)
+cfpl,FNP Smokin Sweet N Smoky BBQ Cashew 50g,VA,SFG_reuse_intermediate,Smokey BBQ Cashew Bulk
+cfpl,Fabsta Almond Roasted 200g (1468499),RPC,SFG_reuse_intermediate,Roasted & Salted Almonds Bulk
+cfpl,Fabsta Anjeer 200gm,RPC,NO_SFG_plain_repack,
+cfpl,Fabsta Cashew W320 Roasted 200g (1468502),RPC,SFG_reuse_intermediate,Roasted & Salted Cashew Bulk
+cfpl,Fabsta Figs Regular 500gm,RPC,NO_SFG_plain_repack,
+cfpl,Fabsta Rstd Flax Seeds 100g,RPC,NO_SFG_plain_repack,
+cfpl,Fabsta Rstd Melon Seeds 100g,RPC,NO_SFG_plain_repack,
+cfpl,Fabsta Rstd Pumpkin Seeds 100g,RPC,NO_SFG_plain_repack,
+cfpl,Fabsta Rstd Sunflower Seeds 100g,RPC,NO_SFG_plain_repack,
+cfpl,Fabsta Walnut Split 500g,RPC,NO_SFG_plain_repack,
+cfpl,Fan Bag 300g,VA,NO_SFG_assembly,
+cfpl,Fardh Dates,DATES BULK,NO_SFG_rm_stockitem,
+cfpl,Festive Box - Magic Moments 600g,VA,NO_SFG_assembly,
+cfpl,Festive Box - Supreme 1000g,VA,NO_SFG_assembly,
+cfpl,Festive Hamper 01,VA,NO_SFG_hamper,
+cfpl,Festive Hamper 02,VA,NO_SFG_hamper,
+cfpl,Festive Hamper 03,VA,NO_SFG_hamper,
+cfpl,Flaxseeds 200G (B07GR346G4),RPC,NO_SFG_plain_repack,
+cfpl,Flaxseeds 500G (B07GQZ7ZVT),RPC,NO_SFG_plain_repack,
+cfpl,Floppy Bag Gift Hamper,VA,NO_SFG_hamper,
+cfpl,Foodsquare Truffle Laquered Nuts (Bulk),VA,SFG_already_bulk,Truffle Laquered Nuts (Bulk)
+cfpl,Foodsquare Truffle Laquered Nuts 200gm,VA,SFG_blend,Truffle Laquered Nuts Bulk
+cfpl,Forsi Coctail Mix,VA,SFG_blend,Forsi Coctail Mix Bulk
+cfpl,Forsi Panchmewa,VA,SFG_blend,Forsi Panchmewa Bulk
+cdpl,Fresho Kimia Dates 500 Gm,DATES RPC,NO_SFG_plain_repack,
+cfpl,Fresho Kimia Dates 500gm,DATES RPC,NO_SFG_plain_repack,
+cfpl,GI- Eatrite Arabian Dates 500gm,DATES RPC,NO_SFG_plain_repack,
+cfpl,GI- Eatrite Fard Dates 500gm,DATES RPC,NO_SFG_plain_repack,
+cfpl,GL CALIFORNIA PISTA RSTED & SLTD 500g PP,VA,SFG_mint_va,California Pista Inshell Bulk
+cfpl,GL ROSTED&SLTD CALIFORNIA PISTA 200g PCH,VA,SFG_mint_va,California Pista Inshell Bulk
+cfpl,GOOD LIFE ALMOND 100 g PP,RPC,NO_SFG_plain_repack,
+cfpl,GOOD LIFE ALMOND 200 g PP,RPC,NO_SFG_plain_repack,
+cfpl,GOOD LIFE ALMOND 500 g PP,RPC,NO_SFG_plain_repack,
+cfpl,GOOD LIFE ARABIAN DATES 500 g,DATES RPC,NO_SFG_plain_repack,
+cfpl,GOOD LIFE CHIA SEED 100G,RPC,NO_SFG_plain_repack,
+cfpl,GOOD LIFE FARD DATES 500 g,DATES RPC,NO_SFG_plain_repack,
+cfpl,GOOD LIFE FLAX SEED 100G,RPC,NO_SFG_plain_repack,
+cfpl,GOOD LIFE PUMPKIN SEED 100G,RPC,NO_SFG_plain_repack,
+cfpl,GOOD LIFE SUNFLOWER SEED 100G,RPC,NO_SFG_plain_repack,
+cfpl,Gondh Dryfruit Laddu Bar 35gm,VA,SFG_reuse_intermediate,Gondh Dryfruit Laddubar Semi Finished
+cfpl,Gondh Dryfruit LadduBar Pack of 6,VA,SFG_reuse_intermediate,Gondh Dryfruit Laddubar Semi Finished
+cfpl,Gondh Dryfruit Laddubar Semi Finished,VA,SFG_already_bulk,Gondh Dryfruit Laddubar Semi Finished
+cfpl,Good Health Dry Fruit Box 750 g,VA,SFG_blend,Good Health Dry Fruit Box Bulk
+cfpl,Green Chilli Cashew Bulk,VA,SFG_already_bulk,Green Chilli Cashew Bulk
+cfpl,Green Chilly Cashew,VA,SFG_blend,Green Chilly Cashew Bulk
+cfpl,Green Leafy Trunk Gift Hamper,VA,NO_SFG_hamper,
+cfpl,Greendot Coated Peanuts,VA,SFG_blend,Greendot Coated Peanuts Bulk
+cfpl,Grey Carry All Basket Hamper,VA,NO_SFG_hamper,
+cfpl,H Finest Turkey Appricot 300g(1340538),RPC,NO_SFG_plain_repack,
+cfpl,HA AJWA DATES 300GM (1357012),DATES RPC,NO_SFG_plain_repack,
+cfpl,HA ALMOND MAMRA 100g (1340535),RPC,NO_SFG_plain_repack,
+cfpl,HA APRICOT - JARDALOO 200g (1340540),RPC,NO_SFG_plain_repack,
+cfpl,HA BLACK CURRENT 250g (1340541),RPC,NO_SFG_plain_repack,
+cfpl,HA MABOROOM DATES 300GM (1357011),DATES RPC,NO_SFG_plain_repack,
+cfpl,HA SEGAI DATES 300GM (1357010),DATES RPC,NO_SFG_plain_repack,
+cfpl,HA SINDUKANI RAISIN 250GM,RPC,NO_SFG_plain_repack,
+cfpl,HA SUKHRY DATES 300GM (1357013),DATES RPC,NO_SFG_plain_repack,
+cdpl,HABIT DATES 800g Old,DATES RPC,NO_SFG_plain_repack,
+cfpl,HARDIK SHUBHKAMANYEN 280gm,VA,NO_SFG_assembly,
+cfpl,HOH Raksha Bandhan Box 190 Gm,VA,SFG_blend,HOH Raksha Bandhan Box Bulk
+cfpl,HOH Raksha Bandhan Box 268g,VA,SFG_blend,HOH Raksha Bandhan Box Bulk
+cfpl,HOH ZORRO PECAN MAPLE GLAZED 100G BOX,VA,SFG_blend,HOH ZORRO PECAN MAPLE GLAZED BOX Bulk
+cfpl,HOH ZORRO PECAN ROASTED SALTED100G BOX,VA,SFG_blend,HOH ZORRO PECAN ROASTED SALTED100G BOX Bulk
+cfpl,HOH ZORRO PECAN SIMPLY PECAN 100G BOX,RPC,NO_SFG_plain_repack,
+cfpl,HOH ZORRO PECAN SWEET & SPICY 100G BOX,VA,SFG_blend,HOH ZORRO PECAN SWEET & SPICY BOX Bulk
+cfpl,HOH ZORRO PECANS FREE GRANOLA 100G BOX,VA,SFG_blend,HOH ZORRO PECANS FREE GRANOLA BOX Bulk
+cfpl,Ha Akbari Pista 200g (1357005),RPC,NO_SFG_plain_repack,
+cfpl,Ha Almond Mamro 250g (1340532),RPC,NO_SFG_plain_repack,
+cfpl,Ha Almond Mamro 500g (1350928),RPC,NO_SFG_plain_repack,
+cfpl,Ha Brazil Nut 200g (1340533),RPC,NO_SFG_plain_repack,
+cfpl,Ha Hazulnut 250g (1340531),RPC,NO_SFG_plain_repack,
+cfpl,Ha Maryam Dates 300g(1340537),DATES RPC,NO_SFG_plain_repack,
+cfpl,Ha Pinenut 100g (1340543),RPC,NO_SFG_plain_repack,
+cfpl,Ha Premium Dates Medjool 300g(1340530),DATES RPC,NO_SFG_plain_repack,
+cfpl,Ha Premium Pecans 150g (1340534),RPC,NO_SFG_plain_repack,
+cfpl,Ha Premium Saudi Dates 300g(1340536),DATES RPC,NO_SFG_plain_repack,
+cfpl,Ha Premium Saudi Dates 500g(1356005),DATES RPC,NO_SFG_plain_repack,
+cfpl,Ha Prunes 275g(1340539),RPC,NO_SFG_plain_repack,
+cfpl,Ha Walnut Kernal 250g(1340542),RPC,NO_SFG_plain_repack,
+cfpl,Ha Walnut Kernal 500g(1350930),RPC,NO_SFG_plain_repack,
+cfpl,Ha Walnut Whole 500g(1350935),RPC,NO_SFG_plain_repack,
+cdpl,Habit Arabian dates 900 gm,DATES RPC,NO_SFG_plain_repack,
+cfpl,Habit Coconut Cream Powder 1 Kg (Instant),RPC,SFG_blend,Coconut Cream Powder (Instant) Bulk
+cfpl,Habit Extra Cheese Seasoning (15kg),RPC,SFG_blend,Extra Cheese Seasoning Bulk
+cfpl,Healthy & Tasty BBQ Makhana 25gm,VA,SFG_blend,Healthy & Tasty BBQ Makhana Bulk
+cfpl,Healthy & Tasty Ghee and Himalayan Pink Salt Makhana 25gm,VA,SFG_blend,Healthy & Tasty Ghee and Himalayan Pink Salt Makhana Bulk
+cfpl,Healthy & Tasty Peri Peri Makhana 25gm,VA,SFG_blend,Healthy & Tasty Peri Peri Makhana Bulk
+cfpl,Healthy & Tasty Pudina Makhana 25gm,VA,SFG_blend,Healthy & Tasty Pudina Makhana Bulk
+cfpl,Healthy Choice 5 in 1 Seeds Mix 200gm,VA,SFG_reuse_intermediate,Healthy Choice 5 in 1 Seeds Mix Bulk
+cfpl,Healthy Choice 5 in 1 Seeds Mix Bulk,VA,SFG_already_bulk,Healthy Choice 5 in 1 Seeds Mix Bulk
+cfpl,Healthy Choice Chia Seeds 100 g,RPC,NO_SFG_plain_repack,
+cfpl,Healthy Choice Chia Seeds 200 g,RPC,NO_SFG_plain_repack,
+cfpl,Healthy Choice Roasted Pumpkin Seeds 100 g,RPC,SFG_mint_va,Roasted Pumpkin Seeds Roasted Bulk
+cfpl,Healthy Choice Roasted Pumpkin Seeds 200 g,RPC,SFG_mint_va,Roasted Pumpkin Seeds Roasted Bulk
+cfpl,Healthy Choice Roasted Sunflower Seeds 100 g,RPC,SFG_mint_va,Roasted Sunflower Seeds Roasted Bulk
+cfpl,Healthy Choice Roasted Sunflower Seeds 200 g,RPC,SFG_mint_va,Roasted Sunflower Seeds Roasted Bulk
+cfpl,Healthy Choice Roasted Watermelon Seeds 100 g,RPC,SFG_mint_va,Roasted Watermelon Seeds Roasted Bulk
+cfpl,Healthy Choice Roasted Watermelon Seeds 200 g,RPC,SFG_mint_va,Roasted Watermelon Seeds Roasted Bulk
+cfpl,Honey Roasted Macadamias 100gm,VA,SFG_reuse_intermediate,Honey Roasted Macadamia Nut
+cfpl,Independence Almonds,Bulk,NO_SFG_rm_stockitem,
+cfpl,Indian Green Raisins,Bulk,NO_SFG_rm_stockitem,
+cfpl,Indian Green Raisins 230g,RPC,NO_SFG_plain_repack,
+cfpl,Indian Green Raisins 90gm,RPC,NO_SFG_plain_repack,
+cfpl,Indian Long Green Raisins,Bulk,NO_SFG_rm_stockitem,
+cfpl,Jute Drawstring  300g,VA,NO_SFG_assembly,
+cfpl,Jute Floppy Bag Hamper,VA,NO_SFG_hamper,
+cdpl,KINGDOM OF DATES AMARY DATES,DATES BULK,NO_SFG_rm_stockitem,
+cdpl,KINGDOM OF DATES DATE POWDER 250G,DATES ING,SFG_reuse_intermediate,Date Powder 5%
+cdpl,KINGDOM OF DATES DATE SYRUP 450G,DATES ING,SFG_reuse_intermediate,Date Syrup
+cdpl,KINGDOM OF DATES DEGLET DATES,DATES BULK,NO_SFG_rm_stockitem,
+cdpl,KINGDOM OF DATES KALMI REGULARE,DATES BULK,NO_SFG_rm_stockitem,
+cdpl,KINGDOM OF DATES KHALAS DATES,DATES BULK,NO_SFG_rm_stockitem,
+cdpl,KINGDOM OF DATES KHANEIZI DATES,DATES BULK,NO_SFG_rm_stockitem,
+cdpl,KINGDOM OF DATES MARYAM DATES,DATES BULK,NO_SFG_rm_stockitem,
+cdpl,KINGDOM OF DATES MAZAFATI DATES,DATES BULK,NO_SFG_rm_stockitem,
+cdpl,KINGDOM OF DATES MEDJOUL BON DATES,DATES BULK,NO_SFG_rm_stockitem,
+cdpl,KINGDOM OF DATES MEDJOUL BON DATES 750gm,DATES RPC,NO_SFG_plain_repack,
+cdpl,KINGDOM OF DATES MEDJOUL SP JUM DATES,DATES BULK,NO_SFG_rm_stockitem,
+cdpl,KINGDOM OF DATES MEDJOUL-JUMBO DATES,DATES BULK,NO_SFG_rm_stockitem,
+cdpl,KINGDOM OF DATES MEDJOUL-LARGE DATES,DATES BULK,NO_SFG_rm_stockitem,
+cdpl,KINGDOM OF DATES MEDJOUL-MEDIUM DATES,DATES BULK,NO_SFG_rm_stockitem,
+cdpl,KINGDOM OF DATES ORIENTAL DATES,DATES BULK,NO_SFG_rm_stockitem,
+cdpl,KINGDOM OF DATES SAYER DATES,DATES RPC,NO_SFG_plain_repack,
+cdpl,KINGDOM OF DATES SEGAI DATES,DATES BULK,NO_SFG_rm_stockitem,
+cdpl,KINGDOM OF DATES SUKKARY DATES,DATES BULK,NO_SFG_rm_stockitem,
+cdpl,KINGDOM OF DATES ZAHIDI DATES,DATES BULK,NO_SFG_rm_stockitem,
+cfpl,King Solomon 3 Dates 2 Go,DATES RPC,NO_SFG_plain_repack,
+cfpl,King Solomon Dates Medjool Medium 200g,DATES RPC,NO_SFG_plain_repack,
+cdpl,King Solomon Dates Medjool Mini 500g,DATES RPC,SFG_reuse_intermediate,WET DATES MEDJOUL BULK MINI (5)
+cdpl,King Solomon Dates Medjoul 200g,DATES RPC,SFG_reuse_intermediate,WET DATES MEDJOUL BULK MEDIUM(5)
+cfpl,King Solomon Dates Medjoul Medium [Y1562] 200gm,DATES RPC,NO_SFG_plain_repack,
+cfpl,King Solomon Medjoul Dates 250 Gms,DATES RPC,SFG_blend,Medjoul Dates Bulk
+cfpl,King Solomon Medjoul Dates 3 Dates 2 Go,DATES RPC,NO_SFG_plain_repack,
+cfpl,King Solomon Medjoul Dates 500 Gms,DATES RPC,SFG_blend,Medjoul Dates Bulk
+cfpl,King Solomon Medjoul Dates Jumbo 1kg,DATES RPC,SFG_blend,Medjoul Dates Jumbo Bulk
+cfpl,King Solomon Medjoul Dates Junior 1kg,DATES RPC,SFG_blend,Medjoul Dates Junior Bulk
+cfpl,King Solomon Medjoul Dates Large 1kg,DATES RPC,SFG_blend,Medjoul Dates Large Bulk
+cdpl,King Solomon Medjoul Dates Large 5 Kg,DATES BULK,NO_SFG_rm_stockitem,
+cfpl,King Solomon Medjoul Dates Medium 1kg,DATES RPC,SFG_blend,Medjoul Dates Medium Bulk
+cfpl,King Solomon Medjoul Dates Medium 500 Gm,DATES RPC,SFG_blend,Medjoul Dates Medium Bulk
+cfpl,King Solomon Medjoul Dates Mini 500 Gm,DATES RPC,NO_SFG_plain_repack,
+cfpl,King Solomon Medjoul Jumbo Dates 500gm,DATES RPC,SFG_blend,Medjoul Jumbo Dates Bulk
+cfpl,King Solomon Medjoul Junior 500g,DATES RPC,NO_SFG_plain_repack,
+cdpl,King Solomon Medjoul Super Jumbo 1 Kg,DATES RPC,SFG_reuse_intermediate,Wet Dates Medjoul Bulk Super Jumbo
+cfpl,King Solomon Medjoul Super Jumbo 1kg,DATES RPC,NO_SFG_plain_repack,
+cdpl,King Solomon Medjoul Super Jumbo 500 Gm,DATES RPC,SFG_reuse_intermediate,Wet Dates Medjoul Bulk Super Jumbo
+cfpl,King Solomon Medjoul Super Jumbo 500gm,DATES RPC,NO_SFG_plain_repack,
+cdpl,King Solomon Oriental Dates 250 Gms,DATES RPC,SFG_reuse_intermediate,WET DATES DERI BULK (5)
+cfpl,King Solomon Oriental Dates 250g,DATES RPC,SFG_blend,Oriental Dates Bulk
+cdpl,King Solomon Oriental Dates 400g,DATES RPC,NO_SFG_plain_repack,
+cfpl,King Solomon Oriental Dates 500gm,DATES RPC,SFG_blend,Oriental Dates Bulk
+cdpl,King Solomon Oriental Jumbo 5 Kg,DATES RPC,NO_SFG_plain_repack,
+cdpl,King Solomon medjoul junior 500 gm,DATES RPC,NO_SFG_plain_repack,
+cfpl,Korean Coated Peanuts 60gm,VA,SFG_blend,Korean Coated Peanuts Bulk
+cfpl,Krack Nut Coated Peanuts Magic Masala 110g,VA,SFG_blend,Krack Nut Coated Peanuts Magic Masala Bulk
+cfpl,Krack Nut Coated Peanuts Pudina Patakha 100g,VA,SFG_reuse_intermediate,Coated Peanuts Pudina Patakha Bulk
+cfpl,Krack Nut Coated Peanuts Pudina Patakha 25g Not Use,VA,SFG_blend,Krack Nut Coated Peanuts Pudina Patakha Not Use Bulk
+cfpl,Krack Nut Coated Peanuts Pudina Patakha 25gm,VA,SFG_reuse_intermediate,Coated Peanuts Pudina Patakha Bulk
+cfpl,Krack Nut Coated Peanuts Tandoori Toofan 1 Kg,VA,SFG_reuse_intermediate,Coated Peanuts Tandoori Toofan Bulk
+cfpl,Krack Nut Coated Peanuts Thai Firangi 1 Kg,VA,SFG_reuse_intermediate,Coated Peanuts Thai Flavour Bulk
+cfpl,Krack Nut Coated Peanuts Thai Firangi 100g,VA,SFG_reuse_intermediate,Coated Peanuts Thai Flavour Bulk
+cfpl,Kracknut Coated Peanuts - Tandoori Toofan 110g,VA,SFG_reuse_intermediate,Coated Peanuts Tandoori Toofan Bulk
+cfpl,Kracknut Coated Peanuts - Tandoori Toofan 160gm,VA,SFG_reuse_intermediate,Coated Peanuts Tandoori Toofan Bulk
+cfpl,Kracknut Coated Peanuts - Tandoori Toofan 25g,VA,SFG_reuse_intermediate,Coated Peanuts Tandoori Toofan Bulk
+cfpl,Kracknut Coated Peanuts - Thai Firangi 25g,VA,SFG_reuse_intermediate,Coated Peanuts Thai Flavour Bulk
+cfpl,Kracknut Coated Peanuts-Pudhina Patakha 110g,VA,SFG_reuse_intermediate,Coated Peanuts Pudina Patakha Bulk
+cfpl,Kracknut Coated Peanuts-Pudhina Patakha 1kg,VA,SFG_reuse_intermediate,Coated Peanuts Pudina Patakha Bulk
+cfpl,Kracknut Coated Peanuts-Thai Firangi 110g,VA,SFG_reuse_intermediate,Coated Peanuts Thai Flavour Bulk
+cfpl,Kracknut Coated Peanuts-Thai Firangi 160gm,VA,SFG_reuse_intermediate,Coated Peanuts Thai Flavour Bulk
+cfpl,Lemon Pepper Cashew Bulk,VA,SFG_already_bulk,Lemon Pepper Cashew Bulk
+cfpl,Lime Chilly Coated Peanuts 60gm,VA,SFG_blend,Lime Chilly Coated Peanuts Bulk
+cdpl,Lulu Dates Sagai ( 66189 ),DATES BULK,NO_SFG_rm_stockitem,
+cfpl,MACSNACK DRYRST MCADAMIAMUNCHIE 100G PCH,RPC,SFG_reuse_intermediate,Macadamia Roasted & Salted style 4
+cfpl,MACSNACK DRYRST MCADAMIAMUNCHIE 200G PCH,RPC,NO_SFG_plain_repack,
+cfpl,MACSNACK R&S MACADAMIA MUNCHIES 100G PCH,VA,SFG_mint_va,Macadamia Roasted Salted - Size 4 Bulk
+cfpl,MACSNACK R&S MACADAMIA MUNCHIES 200G PCH,VA,SFG_mint_va,Macadamia Roasted Salted - Size 4 Bulk
+cfpl,MDF Premium Medjoul Dates Box 18 Pcs,VA,NO_SFG_assembly,
+cfpl,Mac Snack Macadamia Stlye 0 Premium-200gm,VA,SFG_mint_va,Macadamia Roasted - Size 0 Bulk
+cfpl,Mac Snack Macadamia Style 1 Roasted & Salted Premium 200g,VA,SFG_mint_va,Roasted & Salted Macadamia Roasted Salted - Size 1 Bulk
+cfpl,Macadamia Inshell 150g,RPC,NO_SFG_plain_repack,
+cfpl,Macadamia Kernal 150gm,RPC,NO_SFG_plain_repack,
+cfpl,Macadamia Roasted & Salted style 4,VA,SFG_blend,Macadamia Roasted & Salted style 4 Bulk
+cfpl,Macadamia Roasted - Size 1,Bulk,NO_SFG_rm_stockitem,
+cfpl,Macadamia Roasted - Size 2,Bulk,NO_SFG_rm_stockitem,
+cfpl,Macadamia Roasted - Size 4,Bulk,NO_SFG_rm_stockitem,
+cfpl,Macadamia Roasted NIS Sawn,Bulk,NO_SFG_rm_stockitem,
+cfpl,Macadamia Roasted Salted - Size 0,Bulk,SFG_mint_va,Roasted Macadamia Roasted - Size 0 Bulk
+cfpl,Macadamia Roasted Salted - Size 1,Bulk,NO_SFG_rm_stockitem,
+cfpl,Makhana Black Pepper,VA,SFG_blend,Makhana Black Pepper Bulk
+cfpl,Makhana Black Salt 75gm,VA,SFG_blend,Makhana Black Salt Bulk
+cfpl,Makhana Chilli Lime 75gm,VA,SFG_blend,Makhana Chilli Lime Bulk
+cfpl,Makhana Himalayan Pink Salt,VA,SFG_blend,Makhana Himalayan Pink Salt Bulk
+cfpl,Makhana Himalayan Pink Salt 75gm,VA,SFG_reuse_intermediate,Makhana Himalayan Pink Salt
+cfpl,Makhana Masala,VA,SFG_blend,Makhana Masala Bulk
+cfpl,Makhana Peri Peri,VA,SFG_blend,Makhana Peri Peri Bulk
+cfpl,Makhana Salted 50gm,VA,SFG_mint_va,Salted Makhana Bulk
+cfpl,Makhana Tangy Tomato 75gm,VA,SFG_blend,Makhana Tangy Tomato Bulk
+cfpl,Masala Cashew,VA,SFG_blend,Masala Cashew Bulk
+cfpl,Masala Raisin,VA,SFG_mint_va,Indian Green Raisins Bulk (Masala)
+cfpl,Methi Dryfruit Laddu bar 35gm,VA,SFG_blend,Methi Dryfruit Laddu bar Bulk
+cfpl,Mexican Coated Peanuts 60gm,VA,SFG_blend,Mexican Coated Peanuts Bulk
+cfpl,Mexican Flavoured Coated Peanuts,NA,SFG_blend,Mexican Flavoured Coated Peanuts Bulk
+cfpl,Mexican Flavoured Coated Peanuts 35gm,VA,SFG_blend,Mexican Flavoured Coated Peanuts Bulk
+cfpl,Mild Chilly Glazed Almonds,VA,SFG_blend,Mild Chilly Glazed Almonds Bulk
+cfpl,Mild Chilly Glazed Cashew,VA,SFG_blend,Mild Chilly Glazed Cashew Bulk
+cfpl,Milk Almond Draggies,VA,SFG_blend,Milk Almond Draggies Bulk
+cfpl,Milk Chocolate Coated Almond Stuffed Khalas Single,VA,SFG_blend,Milk Chocolate Coated Almond Stuffed Khalas Single Bulk
+cfpl,Milk Chocolate Coated Date Bites,VA,SFG_blend,Milk Chocolate Coated Date Bites Bulk
+cfpl,Milk Chocolate Macadamia Clusters 100gm,VA,SFG_reuse_intermediate,Macadamia Milk Chocolate Clusters
+cfpl,Millennium Nut Mix,VA,SFG_reuse_intermediate,Millennium Nut Mix
+cfpl,Mocha Mojo Trail Mix,VA,SFG_blend,Mocha Mojo Trail Mix Bulk
+cfpl,Moon Freeze Banana Date Fruit Bar - 10 GM,VA,SFG_blend,Moon Freeze Banana Date Fruit Bar Bulk
+cfpl,Moon Freeze Banana Date Fruit Bar - 45 Gm,VA,SFG_blend,Moon Freeze Banana Date Fruit Bar Bulk
+cfpl,Moon Freeze Mango Date Fruit Bar - 10 GM,VA,SFG_blend,Moon Freeze Mango Date Fruit Bar Bulk
+cfpl,Moon Freeze Mango Date Fruit Bar - 45 Gm,VA,SFG_blend,Moon Freeze Mango Date Fruit Bar Bulk
+cfpl,Moon Freeze Pineapple Date Fruit Bar - 45 Gm,VA,SFG_blend,Moon Freeze Pineapple Date Fruit Bar Bulk
+cfpl,Moon Freeze Pineapple Date Fruit Bar -10 GM,VA,SFG_blend,Moon Freeze Pineapple Date Fruit Bar Bulk
+cfpl,Moon Freeze Strawberry Date Fruit Bar - 45 Gm,VA,SFG_blend,Moon Freeze Strawberry Date Fruit Bar Bulk
+cfpl,Moon Freeze Strawberry Date Fruit Bar -10 GM,VA,SFG_blend,Moon Freeze Strawberry Date Fruit Bar Bulk
+cfpl,NATAPURE Almond 200g,RPC,NO_SFG_plain_repack,
+cfpl,NATAPURE Roasted Almonds 175gms,RPC,SFG_mint_va,Roasted Almond Roasted Bulk
+cfpl,NATURES FIGS 250GM (1357008),RPC,NO_SFG_plain_repack,
+cfpl,NATURES FIGS 500G (1357009),RPC,NO_SFG_plain_repack,
+cfpl,NATURES MACADAMIA ROASTED&SALTED 100g (1443558),RPC,SFG_blend,NATURES MACADAMIA ROASTED&SALTED Bulk
+cfpl,NB AMERICAN ALMOND LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB AMERICAN ALMOND SELECTED LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB ANJEER LARGE (SLW) LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB ANJEER SELECT (WHITE) LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB ANJEER SMALL (1X1W) LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB APRICOT SEEDLESS (TURKEY) DRIED LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB APRICOT WHOLE DRIED LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB BARBEQUE ALMOND LOOSE,RPC,SFG_blend,NB BARBEQUE ALMOND LOOSE Bulk
+cfpl,NB BARBEQUE CASHEW LOOSE,RPC,SFG_blend,NB BARBEQUE CASHEW LOOSE Bulk
+cfpl,NB BLACK PEPPER CASHEW LOOSE,RPC,SFG_blend,NB BLACK PEPPER CASHEW LOOSE Bulk
+cfpl,NB BLACK RAISIN SEEDLESS LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB BLACKBERRY DRIED LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB BLACKCURRANT DRIED LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB BLUEBERRY DRIED LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB BRAZIL NUT LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB CASHEW W150 LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB CASHEW W180 LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB CASHEW W240 LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB CHARCOAL CASHEW LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB CHEESE CASHEW LOOSE,RPC,SFG_blend,NB CHEESE CASHEW LOOSE Bulk
+cfpl,NB CHIA SEED LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB CRANBERRY DRIED LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB DEHYDRATED BABY ORANGE LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB DEHYDRATED CHERRY LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB DEHYDRATED GINGER LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB DEHYDRATED GUAVA LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB DEHYDRATED KIWI LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB DEHYDRATED MANGO SLICED LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB DEHYDRATED PEACH GREEN LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB DEHYDRATED PEACH RED LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB DEHYDRATED PEACH YELLOW LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB DEHYDRATED PINEAPPLE COIN LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB DEHYDRATED PINEAPPLE RING LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB DEHYDRATED STRAWBERRY LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB FLAX SEED LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB GOJI BERRY DRIED LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB GREEN CHILLY CASHEW LOOSE,RPC,SFG_blend,NB GREEN CHILLY CASHEW LOOSE Bulk
+cfpl,NB HAZELNUT LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB HONEY ROAST ALMOND LOOSE,VA,SFG_mint_va,Honey Roasted Honey Roast Almonds Bulk (Honey)
+cfpl,NB MACADAMIA INSHELL VANILLA LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB MACADAMIA LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB MAMRA ALMOND CLASSIC LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB MAMRA ALMOND ROYAL LOOSE (Not in Use),Bulk,NO_SFG_plain_repack,
+cfpl,"NB MAMRA ALMOND ROYAL LOOSE_x000D_
+",RPC,NO_SFG_plain_repack,
+cfpl,NB MASALA CASHEW LOOSE,RPC,SFG_blend,NB MASALA CASHEW LOOSE Bulk
+cfpl,NB MASALA RAISIN LOOSE,RPC,SFG_blend,NB MASALA RAISIN LOOSE Bulk
+cfpl,NB MILLENNIUM NUT MIX LOOSE,VA,SFG_reuse_intermediate,Millennium Nut Mix
+cfpl,NB MUNAKKA LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB PAAN RAISIN LOOSE,RPC,SFG_blend,NB PAAN RAISIN LOOSE Bulk
+cfpl,NB PECAN NUT LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB PERI-PERI CASHEW LOOSE,RPC,SFG_blend,NB PERI-PERI CASHEW LOOSE Bulk
+cfpl,NB PINENUT LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB PISTACHIO AKBARI LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB PISTACHIO IRANI LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB PISTACHIO KERNEL 5 STAR LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB PISTACHIO KERNEL PREMIUM LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB PRUNES DRIED LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB PUMPKIN SEED LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB RAISIN AFGHAN,RPC,NO_SFG_plain_repack,
+cfpl,NB RAISIN INDIAN PREMIUM LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB RAISIN SANDUKANI LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB ROASTED & SALTED ALMOND LOOSE,RPC,SFG_blend,NB ROASTED & SALTED ALMOND LOOSE Bulk
+cfpl,NB ROASTED & SALTED CASHEW LOOSE,RPC,SFG_blend,NB ROASTED & SALTED CASHEW LOOSE Bulk
+cfpl,NB ROASTED MACADAMIA INSHELL LOOSE,RPC,SFG_mint_va,Roasted Macadamia Whole - 320* Cut Bulk
+cfpl,NB SMOKED ALMOND LOOSE,RPC,SFG_blend,NB SMOKED ALMOND LOOSE Bulk
+cfpl,NB SRIRACHA CASHEW LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB SUNFLLOWER SEED LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB TRAIL MIX - POWER SEED LOOSE,VA,SFG_blend,NB TRAIL MIX - POWER SEED LOOSE Bulk
+cfpl,NB TRAIL MIX - PREMIUM NUT LOOSE,VA,SFG_blend,NB TRAIL MIX - PREMIUM NUT LOOSE Bulk
+cfpl,NB TRAIL MIX SALTED COCKTAIL LOOSE,VA,SFG_blend,NB TRAIL MIX SALTED COCKTAIL LOOSE Bulk
+cfpl,NB TRAIL MIX- EVERY HEALTH LOOSE,VA,SFG_blend,NB TRAIL MIX- EVERY HEALTH LOOSE Bulk
+cfpl,NB WALNUTS CHILEAN INSHELL LOOSE /P,RPC,NO_SFG_plain_repack,
+cfpl,NB WALNUTS CHILEAN LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NB WATERMELON SEED LOOSE,RPC,NO_SFG_plain_repack,
+cfpl,NNS Date Syrup 400 Gm,DATES ING,SFG_blend,Date Syrup Bulk
+cfpl,NOICE Choco Health Laddoo (18g*5),VA,SFG_reuse_intermediate,Coffee Laddoo
+cfpl,NOICE Date Bites (18g*5),VA,SFG_reuse_intermediate,Noice Classic Flavour Date Mewa (Semi Finished)
+cfpl,NUT BAR ALMOND BUTTER,VA,SFG_mint_va,American Almonds Running 25-27 count Bulk
+cfpl,NUT BAR PEANUT BUTTER,VA,SFG_mint_va,Peanuts Bulk
+cdpl,NUTRAJ KIMIA DATES 400 Gm,DATES RPC,NO_SFG_plain_repack,
+cdpl,NUTRAJ KIMIA DATES 500 Gm,DATES RPC,NO_SFG_plain_repack,
+cfpl,NUTWORKS FINGER LIME & JALAPENO 75G PCH,VA,SFG_reuse_intermediate,MACADAMIA FINGER LIME & JALAPENO
+cfpl,NUTWORKS ROAST SALT INSHELL 100G PCH,VA,SFG_reuse_intermediate,MACADAMIA NIS - ROASTED SEA SALT
+cfpl,NUTWORKS ROAST SALT INSHELL 200G PCH,VA,SFG_reuse_intermediate,MACADAMIA NIS - ROASTED SEA SALT
+cfpl,NUTWORKS ROSEMARY & SEASALT 75G PCH,VA,SFG_reuse_intermediate,MACADAMIA ROSEMARY & SEA SALT
+cfpl,NUTWORKS WASABI 75G PCH,VA,SFG_reuse_intermediate,WASABI MACADAMIA STYLE 4
+cfpl,Natch Glazed Nut Mix Chilli 120gm,VA,SFG_blend,Natch Glazed Nut Mix Chilli Bulk
+cfpl,Natch Glazed Nut Mix Cinnamon 120gm,VA,SFG_blend,Natch Glazed Nut Mix Cinnamon Bulk
+cfpl,Natch Glazed Nut Mix Cocoa 120gm,VA,SFG_blend,Natch Glazed Nut Mix Cocoa Bulk
+cfpl,Nature Dried Kiwi 200 Gm ( 1411658 ),RPC,NO_SFG_plain_repack,
+cfpl,Natures Almond Reg 500 Gm ( 1411652 ),RPC,NO_SFG_plain_repack,
+cfpl,Natures Almonds Reg 200 Gm (1411651),RPC,NO_SFG_plain_repack,
+cfpl,Natures American Almond 100g (1340528),RPC,NO_SFG_plain_repack,
+cfpl,Natures American Almond 250g (1340524),RPC,NO_SFG_plain_repack,
+cfpl,Natures American Almond 500g (1350926),RPC,NO_SFG_plain_repack,
+cfpl,Natures American Almonds 1 KG (1416275),RPC,NO_SFG_plain_repack,
+cfpl,Natures Black Raisin 200g (1340522),RPC,NO_SFG_plain_repack,
+cfpl,Natures California Pista Reg 200 Gm (1411656),RPC,NO_SFG_plain_repack,
+cfpl,Natures Cashew Reg 200 Gm ( 1411653 ),RPC,NO_SFG_plain_repack,
+cfpl,Natures Cashew Split 200g (1356008),RPC,NO_SFG_plain_repack,
+cfpl,Natures Cashew W 210 500g (1356007),RPC,NO_SFG_plain_repack,
+cfpl,Natures Cashew W210 100g (1340520),RPC,NO_SFG_plain_repack,
+cfpl,Natures Cashew W210 250g (1340525),RPC,NO_SFG_plain_repack,
+cfpl,Natures Dried Amla 200 Gm ( 1411660 ),RPC,NO_SFG_plain_repack,
+cfpl,Natures Dried Cherry 200 Gm ( 1411661 ),RPC,NO_SFG_plain_repack,
+cfpl,Natures Dried Pineapple 200 Gm ( 1411659 ),RPC,NO_SFG_plain_repack,
+cfpl,Natures Dried Strawberry 200 Gm (1411657),RPC,NO_SFG_plain_repack,
+cfpl,Natures Indian Raisin Reg 200 Gm (1411654),RPC,NO_SFG_plain_repack,
+cfpl,Natures Indian Raisin Reg 500 Gm (1411655),RPC,NO_SFG_plain_repack,
+cfpl,Natures Pista Iranian 100g (1340521),RPC,NO_SFG_plain_repack,
+cfpl,Natures Pista Iranian 250g (1340529),RPC,NO_SFG_plain_repack,
+cfpl,Natures Pistachia Iranian 500g (1340527),RPC,NO_SFG_plain_repack,
+cfpl,Natures Pisto Unshelled 200g (1340526),RPC,NO_SFG_plain_repack,
+cfpl,Natures Premium Mixed Dry Fruits 250g(1356314),VA,SFG_blend,Natures Premium Mixed Dry Fruits Bulk
+cfpl,Natures Raisin 100g (1340523),RPC,NO_SFG_plain_repack,
+cfpl,Natures Raisin 250g (1340519),RPC,NO_SFG_plain_repack,
+cfpl,Natures Raisin 500g (1356006),RPC,NO_SFG_plain_repack,
+cfpl,Noice Classic Flavour Date Mewa (Semi Finished),VA,SFG_already_bulk,Noice Classic Flavour Date Mewa (Semi Finished)
+cfpl,Noice Date Bites 18gm,VA,SFG_reuse_intermediate,Noice Classic Flavour Date Mewa (Semi Finished)
+cdpl,Not Use,NA,NO_SFG_plain_repack,
+cfpl,Nut Flex - Italian Herbs 33gm,VA,SFG_blend,Nut Flex - Italian Herbs Bulk
+cfpl,Nut Flex - Italian Herbs 35gm,VA,SFG_blend,Nut Flex - Italian Herbs Bulk
+cfpl,Nuts & Seed Mix,VA,SFG_blend,Nuts & Seed Mix Bulk
+cfpl,Nuts and Cardamom Date Balls 48 gms,VA,SFG_blend,Nuts and Cardamom Date Balls Bulk
+cfpl,OATS,Bulk,NO_SFG_rm_stockitem,
+cfpl,ON THE RUN Assorted Energy Bars (Pack of 6x30g),VA,SFG_blend,Assorted Energy Bars (Pack of 6x30g) Bulk
+cfpl,ON THE RUN Choco Crunch Energy Bars (Pack of 6x30g),VA,SFG_reuse_intermediate,Choco Crunch Energy Bars
+cfpl,ON THE RUN Choco Crunch Energy Bars 30g,VA,SFG_blend,Choco Crunch Energy Bars Bulk
+cfpl,ON THE RUN Fig and Date Energy Bar (Pack of 6x30 g),VA,SFG_blend,Fig and Date Energy Bar (Pack of g) Bulk
+cfpl,ON THE RUN Fig and Date Energy Bar 30g,VA,SFG_blend,Fig and Date Energy Bar Bulk
+cfpl,ON THE RUN Hazelnut Magic Energy Bar 30g,VA,SFG_blend,Hazelnut Magic Energy Bar Bulk
+cfpl,"ON THE RUN Oats, Apricot & Cranberry Energy Bar 30g",VA,SFG_blend,"Oats, Apricot & Cranberry Energy Bar Bulk"
+cfpl,Oman Dates 250g (1356292),DATES RPC,NO_SFG_plain_repack,
+cfpl,Omega Mix- Lemon Pepper 33gm,VA,SFG_blend,Omega Mix- Lemon Pepper Bulk
+cfpl,Omega Mix- Lemon Pepper 35gm,VA,SFG_blend,Omega Mix- Lemon Pepper Bulk
+cfpl,On the Run Coffee Bite (Semi Finished),VA,SFG_already_bulk,Coffee Bite (Semi Finished)
+cfpl,On the Run Coffee Bite 10g,VA,SFG_reuse_intermediate,Coffee Bite (Semi Finished)
+cfpl,Ontherun Coffee Bite (Pack of 15x10g),VA,SFG_reuse_intermediate,Coffee Bite (Semi Finished)
+cfpl,Ontherun Coffee Bite (Pack of 6*10g),VA,SFG_reuse_intermediate,Coffee Bite (Semi Finished)
+cfpl,Oriental Dates,DATES BULK,NO_SFG_rm_stockitem,
+cfpl,PEANUT BUTTER,VA,SFG_mint_va,Peanuts Bulk
+cfpl,PEPPER SNACK MIX,VA,SFG_blend,PEPPER SNACK MIX Bulk
+cfpl,PISTA PERI PERI,VA,SFG_blend,PISTA PERI PERI Bulk
+cfpl,PL CALIFORNIA PRUNES 200G,RPC,NO_SFG_plain_repack,
+cfpl,PL CLASSIC DATES 500G,DATES RPC,NO_SFG_plain_repack,
+cfpl,PL DRIED BLUEBERRIES 100G,RPC,NO_SFG_plain_repack,
+cfpl,PL SLICED CRANBERRIES 100G,RPC,NO_SFG_plain_repack,
+cfpl,PL TURKEY APRICOTS 200G,RPC,NO_SFG_plain_repack,
+cfpl,PL ZAHIDI DATES 500G,DATES RPC,NO_SFG_plain_repack,
+cfpl,PREMIA ALMONDS SMOKD-100G,VA,SFG_reuse_intermediate,Smoked Almonds Bulk
+cfpl,Pan Cranberry,RPC,SFG_blend,Pan Cranberry Bulk
+cfpl,Pan Raisin,RPC,SFG_blend,Pan Raisin Bulk
+cfpl,Panch Mewa Mix Loose,VA,SFG_blend,Panch Mewa Mix Loose Bulk
+cfpl,Peanut Coated Spanish Tomato,VA,SFG_blend,Peanut Coated Spanish Tomato Bulk
+cfpl,Peanut Crackers Chipotle Honey Bulk,VA,SFG_already_bulk,Peanut Crackers Chipotle Honey Bulk
+cfpl,Peanut Crackers Smokey BBQ Bulk,VA,SFG_already_bulk,Peanut Crackers Smokey BBQ Bulk
+cfpl,Peanuts Coated Masala Loose,VA,SFG_blend,Peanuts Coated Masala Loose Bulk
+cfpl,Pecan Grain Free Granola,VA,SFG_blend,Pecan Grain Free Granola Bulk
+cfpl,Pecan Maple Glazed,VA,SFG_blend,Pecan Maple Glazed Bulk
+cfpl,Pecan Nuts,Bulk,NO_SFG_rm_stockitem,
+cfpl,Pecan Nuts Kernel Split,Bulk,NO_SFG_rm_stockitem,
+cfpl,Pecannut Flavoured Rose Mary Loose,VA,SFG_blend,Pecannut Flavoured Rose Mary Loose Bulk
+cfpl,Pecans Roasted and Salted,VA,SFG_blend,Pecans Roasted and Salted Bulk
+cfpl,Peper Garlic Cashew,VA,SFG_blend,Peper Garlic Cashew Bulk
+cfpl,Pepper Cashew,VA,SFG_blend,Pepper Cashew Bulk
+cfpl,Pepper Pista 100g Pet,RPC,SFG_blend,Pepper Pista Pet Bulk
+cfpl,Pepper Pista Inshell,VA,SFG_blend,Pepper Pista Inshell Bulk
+cfpl,Peri Peri Cashew,VA,SFG_blend,Peri Peri Cashew Bulk
+cfpl,Peri Peri Cashew Bulk,VA,SFG_already_bulk,Peri Peri Cashew Bulk
+cfpl,Peri Peri Coated Peanuts 60gm,VA,SFG_blend,Peri Peri Coated Peanuts Bulk
+cfpl,Peri Peri Pecannut,VA,SFG_blend,Peri Peri Pecannut Bulk
+cfpl,Pine Nut Kernel,Bulk,NO_SFG_rm_stockitem,
+cfpl,Pink Salt Almonds Bulk,VA,SFG_already_bulk,Pink Salt Almonds Bulk
+cfpl,Pink Salt Pistachios 90gm,RPC,SFG_reuse_intermediate,California Pista Inshell Pink Salted
+cfpl,Pista Akbari Roasted and Salted,Bulk,SFG_blend,Pista Akbari Roasted and Salted Bulk
+cfpl,Pista Irani 101 Inshell Roasted and salted,Bulk,SFG_mint_va,Roasted & Salted Pista Irani 101 Inshell Bulk
+cfpl,Pista Irani Inshell Roasted and Salted,VA,SFG_mint_va,Roasted & Salted Pista Irani Inshell Bulk
+cfpl,Pista Kernal Roasted and Salted,Bulk,SFG_mint_va,Roasted & Salted Pista Kernel Bulk
+cfpl,Pista Kernel,Bulk,NO_SFG_rm_stockitem,
+cfpl,Pizza Flavoured Coated Peanuts,NA,SFG_blend,Pizza Flavoured Coated Peanuts Bulk
+cfpl,Pizza Flavoured Coated Peanuts 35gm,VA,SFG_blend,Pizza Flavoured Coated Peanuts Bulk
+cfpl,Plain Almonds 75gm,RPC,NO_SFG_plain_repack,
+cfpl,Plain Coated Peanuts,VA,SFG_blend,Plain Coated Peanuts Bulk
+cfpl,Planck Foods Multi Millet 5 GC puffs 210g,VA,SFG_blend,Planck Foods Multi Millet 5 GC puffs Bulk
+cfpl,"Popular Raisins, 500 g (B07GR3S1RR)",RPC,NO_SFG_plain_repack,
+cfpl,Premia Almond Salted 100 Gm,VA,SFG_reuse_intermediate,Roasted & Salted Almonds Bulk
+cfpl,Premia Breakfast Mix 100g (100005226),VA,SFG_reuse_intermediate,Premia Breakfast Mix Bulk
+cfpl,Premia Breakfast Mix Bulk,VA,SFG_already_bulk,Premia Breakfast Mix Bulk
+cfpl,Premia Cashew Black Pepper 100 Gm,VA,SFG_reuse_intermediate,Black Pepper Cashew Bulk
+cfpl,Premia Cashew Salted 100 Gm,VA,NO_SFG_assembly,
+cfpl,Premia Chatpata Cranberry 100gm,VA,SFG_blend,Premia Chatpata Cranberry Bulk
+cfpl,Premia Indian Raisin 100gm,RPC,SFG_blend,Premia Indian Raisin Bulk
+cfpl,Premia Nuts & Seeds Mix 100g (100005422),VA,SFG_reuse_intermediate,Premia Nuts & Seeds Mix Bulk
+cfpl,Premia Nuts & Seeds Mix Bulk,VA,SFG_already_bulk,Premia Nuts & Seeds Mix Bulk
+cfpl,Premia Prunes 100gm,RPC,NO_SFG_plain_repack,
+cfpl,Premia Trail Mix 100g (100005227),VA,SFG_reuse_intermediate,Premia Trail Mix Bulk
+cfpl,Premia Trail Mix Bulk,VA,SFG_already_bulk,Premia Trail Mix Bulk
+cfpl,Premium Trail Mix 100gm,VA,SFG_blend,Premium Trail Mix Bulk
+cfpl,Prunes 1KG (B07GR24VN1),RPC,NO_SFG_plain_repack,
+cfpl,Prunes 200G (B07GQWRZKN),RPC,NO_SFG_plain_repack,
+cfpl,Prunes 500G (B07GQZSS53),RPC,NO_SFG_plain_repack,
+cfpl,Pudina Cashew,VA,SFG_blend,Pudina Cashew Bulk
+cfpl,Pudina Makhana,VA,SFG_blend,Pudina Makhana Bulk
+cfpl,Pudina Makhana 50gm,VA,SFG_blend,Pudina Makhana Bulk
+cfpl,Pumpkin Seeds 500G (B07GQWST7Y) FBA,RPC,NO_SFG_plain_repack,
+cfpl,Pumpkin Seeds Roasted,Bulk,SFG_mint_va,Roasted Pumpkin Seed ( 5% ) Bulk
+cfpl,Pumpkin Seeds Roasted and Salted,Bulk,SFG_blend,Pumpkin Seeds Roasted and Salted Bulk
+cfpl,QWIKSNAX ALMONDS & CASHEWS MIX-25G,VA,SFG_blend,QWIKSNAX ALMONDS & CASHEWS MIX Bulk
+cfpl,QWIKSNAX CRANBERRIES CHTPTA MIX-30G,VA,SFG_blend,QWIKSNAX CRANBERRIES CHTPTA MIX Bulk
+cdpl,RD Safavi Dates 250g,DATES RPC,NO_SFG_plain_repack,
+cfpl,ROYAL TRADITIONS SHUBHKAMNA-300G (14179),VA,NO_SFG_assembly,
+cfpl,ROYAL TRADITON SNACK MASALA MIX 100G,VA,SFG_blend,ROYAL TRADITON SNACK MASALA MIX Bulk
+cfpl,ROYAL TRADITON SNACK MIX CHATPATA-100G,VA,SFG_blend,ROYAL TRADITON SNACK MIX CHATPATA Bulk
+cfpl,Raisins 200G (B07GRBFFMR) FBA,RPC,NO_SFG_plain_repack,
+cfpl,Red Dates Seedless 500 Gm,DATES RPC,NO_SFG_plain_repack,
+cfpl,Rhine Valley Almond & Coffee Date Bar 50gm,VA,SFG_blend,Rhine Valley Almond & Coffee Date Bar Bulk
+cfpl,Rhine Valley Almond & Cranberry Date Bar 50gm,VA,SFG_blend,Rhine Valley Almond & Cranberry Date Bar Bulk
+cfpl,Rhine Valley Almond & Orange Dark Chocolate Date Bar 50gm,VA,SFG_blend,Rhine Valley Almond & Orange Dark Chocolate Date Bar Bulk
+cfpl,Rhine Valley Barbeque Trail Mix 100gm,VA,SFG_blend,Rhine Valley Barbeque Trail Mix Bulk
+cfpl,Rhine Valley Black Pepper Trail Mix 100gm,VA,SFG_blend,Rhine Valley Black Pepper Trail Mix Bulk
+cfpl,Rhine Valley Fruit & Nut Date Bar 50gm,VA,SFG_blend,Rhine Valley Fruit & Nut Date Bar Bulk
+cfpl,Rhine Valley Himalayan Pink Salt Trail Mix 100gm,VA,SFG_blend,Rhine Valley Himalayan Pink Salt Trail Mix Bulk
+cfpl,Rhine Valley Masala Trail mix 100g,VA,SFG_blend,Rhine Valley Masala Trail mix Bulk
+cfpl,Rhine Valley Peri Peri Trail Mix 100gm,VA,SFG_blend,Rhine Valley Peri Peri Trail Mix Bulk
+cfpl,"Rhine Valley Raspberry, Almond & Dark Chocolate Date Bar 50gm",VA,SFG_blend,"Rhine Valley Raspberry, Almond & Dark Chocolate Date Bar Bulk"
+cfpl,Rhine Valley Rose & Pistachio Date Bar 50gm,VA,SFG_blend,Rhine Valley Rose & Pistachio Date Bar Bulk
+cfpl,Roasted & Salted Almonds,VA,SFG_blend,Roasted & Salted Almonds Bulk
+cfpl,Roasted & Salted Almonds 140g,VA,SFG_reuse_intermediate,Roasted & Salted Almonds Bulk
+cfpl,Roasted & Salted Almonds 75g,VA,SFG_reuse_intermediate,Roasted & Salted Almonds Bulk
+cfpl,Roasted & Salted Almonds 90g,VA,SFG_reuse_intermediate,Roasted & Salted Almonds Bulk
+cfpl,Roasted & Salted Almonds Bulk,VA,SFG_already_bulk,Roasted & Salted Almonds Bulk
+cfpl,Roasted & Salted Cashew,VA,SFG_blend,Roasted & Salted Cashew Bulk
+cfpl,Roasted & Salted Cashew  140g,VA,SFG_reuse_intermediate,Roasted & Salted Cashew Bulk
+cfpl,Roasted & Salted Cashew 75gm,VA,SFG_reuse_intermediate,Roasted & Salted Cashew Bulk
+cfpl,Roasted & Salted Cashew 90gm,VA,SFG_reuse_intermediate,Roasted & Salted Cashew Bulk
+cfpl,Roasted & Salted Cashew Bulk,VA,SFG_already_bulk,Roasted & Salted Cashew Bulk
+cfpl,Roasted & Salted Pecan Nuts 75gm,VA,SFG_blend,Roasted & Salted Pecan Nuts Bulk
+cfpl,Roasted & Salted Pista 230g,VA,SFG_mint_va,Roasted & Salted California Pista Inshell Bulk
+cfpl,Roasted & Salted Pista 75gm,VA,SFG_mint_va,Roasted & Salted California Pista Inshell Bulk
+cfpl,Roasted Black Sesame (Kale Til) Seeds,Bulk,SFG_mint_va,Roasted Black Sesame seeds - Kali Til Bulk
+cfpl,Roasted Cashew Bulk,RPC,SFG_already_bulk,Roasted Cashew Bulk
+cfpl,Roasted Flax Seeds,RPC,SFG_mint_va,Roasted Flax Seeds (Alsi) Bulk
+cfpl,Roasted Independence Almonds Bulk,RPC,SFG_already_bulk,Roasted Independence Almonds Bulk
+cfpl,Roasted Makhana,RPC,SFG_mint_va,Roasted Makhana 4+ Sutta Bulk
+cfpl,Roasted Peanuts,Bulk,NO_SFG_rm_stockitem,
+cfpl,Roasted Peanuts Split,RPC,SFG_blend,Roasted Peanuts Split Bulk
+cfpl,Roasted Poppy Seed,Bulk,SFG_mint_va,Roasted KHUS KHUS / POPPY SEEDS Bulk
+cfpl,Roasted Salted Flax Seeds,Bulk,SFG_mint_va,Roasted Flax Seeds (Alsi) Bulk
+cfpl,Roasted White Sesame (Safed Til) Seeds,Bulk,SFG_mint_va,Roasted Sesame Seeds (White Til) Bulk
+cfpl,Royal Delight Ajwa Dates 250 Gms,DATES RPC,NO_SFG_plain_repack,
+cdpl,Royal Delight Ajwa Dates 400gm,DATES RPC,NO_SFG_plain_repack,
+cdpl,Royal Delight Ajwa Dates 5 Kgs,DATES BULK,NO_SFG_rm_stockitem,
+cdpl,Royal Delight Ajwa Dates 500 Gm,DATES RPC,NO_SFG_plain_repack,
+cdpl,Royal Delight Ajwa Large 250g,DATES RPC,NO_SFG_plain_repack,
+cdpl,Royal Delight Arabian 250gm,DATES RPC,NO_SFG_plain_repack,
+cfpl,Royal Delight Arabian Dates 200gm,DATES RPC,NO_SFG_plain_repack,
+cfpl,Royal Delight Arabian Dates 250g,DATES RPC,NO_SFG_plain_repack,
+cfpl,Royal Delight Arabian Dates 300gm,DATES RPC,NO_SFG_plain_repack,
+cdpl,Royal Delight Arabian Dates 500g,DATES RPC,NO_SFG_plain_repack,
+cfpl,Royal Delight Arabian Dates 500gm,DATES RPC,NO_SFG_plain_repack,
+cfpl,Royal Delight Assorted Dates 500gm,DATES RPC,SFG_blend,Assorted Dates Bulk
+cfpl,Royal Delight Dates Ajwa 800g,DATES RPC,NO_SFG_plain_repack,
+cfpl,Royal Delight Dates Medjool Medium 250g,DATES RPC,SFG_blend,Dates Medjool Medium Bulk
+cdpl,Royal Delight Dates Oman 1 Kg,DATES RPC,NO_SFG_plain_repack,
+cdpl,Royal Delight Fard Dates 350g,DATES RPC,NO_SFG_plain_repack,
+cdpl,Royal Delight Kimia 350 Gm,DATES RPC,NO_SFG_plain_repack,
+cfpl,Royal Delight Kimia Dates 1kg,DATES RPC,NO_SFG_plain_repack,
+cfpl,Royal Delight Kimia Dates 350gm,DATES RPC,NO_SFG_plain_repack,
+cfpl,Royal Delight Mabroom Dates 250 Gms,DATES RPC,NO_SFG_plain_repack,
+cdpl,Royal Delight Mabroom Dates 5 Kgs,DATES BULK,NO_SFG_rm_stockitem,
+cdpl,Royal Delight Mazafati Dates 5 Kgs,DATES BULK,NO_SFG_rm_stockitem,
+cfpl,Royal Delight Medjool Dates 800g,DATES RPC,NO_SFG_plain_repack,
+cdpl,Royal Delight Medjool Large 800g,DATES RPC,SFG_reuse_intermediate,WET DATES MEDJOUL BULK LARGE (5)
+cdpl,Royal Delight Medjool Skin 400g,DATES RPC,NO_SFG_plain_repack,
+cfpl,Royal Delight Medjoul Dates 250 Gms,DATES RPC,NO_SFG_plain_repack,
+cdpl,Royal Delight Medjoul Dates 5 Kgs,DATES BULK,NO_SFG_rm_stockitem,
+cfpl,Royal Delight Oman Dates 1 Kgs,DATES RPC,NO_SFG_plain_repack,
+cfpl,Royal Delight Oman Dates 400 Gms,DATES RPC,NO_SFG_plain_repack,
+cdpl,Royal Delight Oman Dates 5 Kgs,DATES BULK,NO_SFG_rm_stockitem,
+cfpl,Royal Delight Safavi Dates 250 Gms,DATES RPC,NO_SFG_plain_repack,
+cfpl,Royal Delight Safavi Dates 5kg,DATES RPC,SFG_blend,Safavi Dates Bulk
+cfpl,Royal Delight Stuff Medjoul Dates 21 Pcs,VA,SFG_mint_va,Medjoul Dates Medium Bulk
+cfpl,Royal Delight Stuffed Medjoul Dates 12 Pcs,VA,SFG_blend,Stuffed Medjoul Dates Bulk
+cfpl,Royal Delight Stuffed Medjul Large Dates 12 Pieces,VA,SFG_blend,Stuffed Medjul Large Dates 12 Pieces Bulk
+cfpl,Royal Delight Zahidi Dates 900g,DATES RPC,NO_SFG_plain_repack,
+cfpl,Royal Traditions Almond 100g,RPC,NO_SFG_plain_repack,
+cfpl,Royal Traditions Almonds Salted 100g,VA,SFG_reuse_intermediate,Roasted & Salted Almonds Bulk
+cfpl,Royal Traditions Cashew 100g,RPC,NO_SFG_plain_repack,
+cfpl,Royal Traditions Cashew Black Pepper 100g,VA,SFG_reuse_intermediate,Black Pepper Cashew Bulk
+cfpl,Royal Traditions Cashew Salted 100g,VA,SFG_reuse_intermediate,Roasted & Salted Cashew Bulk
+cfpl,Royal Traditions Cranberries Chatpata 100g,VA,SFG_mint_va,Dried Cranberry Whole Bulk (Chatpata)
+cfpl,Royal Traditions Mahotsav Dry Fruits 500gm,VA,NO_SFG_assembly,
+cfpl,Royal Traditions Plain Raisins 100g,RPC,NO_SFG_plain_repack,
+cfpl,Royal Traditions Tyohar 400gm,VA,NO_SFG_assembly,
+cfpl,Royal Traditions Utsav 300g,VA,NO_SFG_assembly,
+cfpl,Royal delight Medjoul Dates 400gm,DATES RPC,NO_SFG_plain_repack,
+cfpl,SHAHI UPHAR 300gm,VA,NO_SFG_assembly,
+cfpl,SHUBHKAMANYEN 180gm,VA,NO_SFG_assembly,
+cfpl,SIGNATURE COLLECTIONS 600gm,VA,NO_SFG_assembly,
+cfpl,SPAR BANDHAN FESTIVE DRY FRUIT BOX 800G,VA,SFG_blend,SPAR BANDHAN FESTIVE DRY FRUIT BOX Bulk
+cfpl,SPAR SELECT ALMONDS 500G,RPC,NO_SFG_plain_repack,
+cfpl,STUFFED DERI DATES WITH ALMOND SINGLE,VA,SFG_blend,STUFFED DERI DATES WITH ALMOND SINGLE Bulk
+cfpl,STUFFED FARD DATES WITH ALMOND SINGLE,VA,SFG_blend,STUFFED FARD DATES WITH ALMOND SINGLE Bulk
+cfpl,SUPREME 800gm,VA,NO_SFG_assembly,
+cfpl,Safavi Dates Almond Praline Single Pc,VA,SFG_blend,Safavi Dates Almond Praline Single Pc Bulk
+cfpl,Safavi Dates Pistachio Praline Single Pc,VA,SFG_blend,Safavi Dates Pistachio Praline Single Pc Bulk
+cfpl,Salt and Pepper Cashew Bulk,VA,SFG_already_bulk,Salt and Pepper Cashew Bulk
+cfpl,Salted Peanuts Split,Bulk,SFG_blend,Salted Peanuts Split Bulk
+cfpl,Salted Premium Nut Mix,VA,SFG_blend,Salted Premium Nut Mix Bulk
+cfpl,Sea Salt Dry - Roasted Macadamia Nuts- Size 1,Bulk,SFG_mint_va,Roasted Macadamia Roasted - Size 1 Bulk (Sea Salt)
+cfpl,Seed Mix,VA,SFG_blend,Seed Mix Bulk
+cfpl,Seed Trail Mix,VA,SFG_blend,Seed Trail Mix Bulk
+cdpl,Seedless Fard Dates 500g,DATES RPC,NO_SFG_plain_repack,
+cfpl,Seedy Sheid- Lime Chilly 33gm,VA,SFG_blend,Seedy Sheid- Lime Chilly Bulk
+cfpl,Seedy Sheid- Lime Chilly 35gm,VA,SFG_blend,Seedy Sheid- Lime Chilly Bulk
+cfpl,Single Safavi Stuffed Dates,DATES RPC,SFG_blend,Single Safavi Stuffed Dates Bulk
+cfpl,Slivered Almonds,Bulk,NO_SFG_rm_stockitem,
+cfpl,Smoked Almonds,VA,SFG_blend,Smoked Almonds Bulk
+cfpl,Smoked Almonds Bulk,VA,SFG_already_bulk,Smoked Almonds Bulk
+cfpl,Smoked Paprika Pecan Nuts Loose,VA,SFG_blend,Smoked Paprika Pecan Nuts Loose Bulk
+cfpl,Smokey BBQ Cashew Bulk,VA,SFG_already_bulk,Smokey BBQ Cashew Bulk
+cfpl,Smokey BBQ Coated Peanuts 200g,VA,SFG_blend,Smokey BBQ Coated Peanuts Bulk
+cfpl,Smokey BBQ Coated Peanuts 70gm,VA,SFG_blend,Smokey BBQ Coated Peanuts Bulk
+cfpl,Snack Amor Black Pepper Cashew 170g,VA,SFG_reuse_intermediate,BLACK PEPPER CASHEW
+cfpl,Snack Amor Cranberry Slice 100 Gm,RPC,NO_SFG_plain_repack,
+cfpl,Snack Amor Diwali Gift Box 400gm,VA,NO_SFG_hamper,
+cfpl,Snack Amor Dried Apricot 200g,RPC,NO_SFG_plain_repack,
+cfpl,Snack Amor Dried Blueberry 100g,RPC,NO_SFG_plain_repack,
+cfpl,Snack Amor Dried Prunes 200g,RPC,NO_SFG_plain_repack,
+cfpl,Snack Amor Fruit N Nut Mix 200g,VA,SFG_blend,Snack Amor Fruit N Nut Mix Bulk
+cfpl,Snack Amor Kalmi Dates 250g,DATES RPC,NO_SFG_plain_repack,
+cfpl,Snack Amor Macadamia Nuts 50g,RPC,NO_SFG_plain_repack,
+cfpl,Snack Amor Omani Dates 250 Gm,DATES RPC,NO_SFG_plain_repack,
+cfpl,Snack Amor Popcorn Makhana 55 Gm,RPC,NO_SFG_plain_repack,
+cfpl,Snack Amor Roasted Cashew 170 Gm,RPC,SFG_reuse_intermediate,Roasted Cashew Bulk
+cfpl,"Snack Amor Seed Mix (Unroasted), 175g",VA,SFG_blend,Snack Amor Seed Mix (Unroasted) Bulk
+cfpl,Snack Amor Trail Mix 175g,VA,SFG_blend,Snack Amor Trail Mix Bulk
+cfpl,Snack Amor coated peanuts Tangy Thai 100g,VA,SFG_reuse_intermediate,Coated Peanuts Thai Flavour Bulk
+cfpl,SnackAmor Dried Blackcurrant 100g,RPC,NO_SFG_plain_repack,
+cfpl,SnackAmor Masala Cranberry 150g,VA,SFG_blend,SnackAmor Masala Cranberry Bulk
+cfpl,SnackAmor Paan Raisins 100g,VA,SFG_blend,SnackAmor Paan Raisins Bulk
+cfpl,SnackAmor Roasted Chia Seeds 200g,RPC,SFG_mint_va,Roasted Black Chia Seeds Bulk
+cfpl,SnackAmor Roasted Pumpkin Seeds 200g,RPC,SFG_mint_va,Roasted Pumpkin Seed ( 5% ) Bulk
+cfpl,SnackAmor Roasted Salted Almonds 170g,VA,SFG_reuse_intermediate,Roasted & Salted Almonds Bulk
+cfpl,SnackAmor Roasted Salted Pistachio 170g,VA,SFG_mint_va,Roasted California Pista Inshell Bulk
+cfpl,SnackAmor Seed Mix 175g,VA,SFG_blend,SnackAmor Seed Mix Bulk
+cfpl,Snackania Afghan Black Raisins 230g,RPC,NO_SFG_plain_repack,
+cfpl,Snackania Afghan Green Raisins 230g,RPC,NO_SFG_plain_repack,
+cfpl,Snackania Ajwa Dates 480g,DATES RPC,NO_SFG_plain_repack,
+cfpl,Snackania American Almonds 480g,RPC,NO_SFG_plain_repack,
+cfpl,Snackania Blueberry 230g,RPC,NO_SFG_plain_repack,
+cfpl,Snackania California Pistachio Roasted & Salted 230g,VA,SFG_mint_va,Roasted & Salted California Pista Inshell Bulk
+cfpl,Snackania Cashew 480g,RPC,NO_SFG_plain_repack,
+cfpl,Snackania Chile Walnut Kernel 230g,VA,SFG_mint_va,Chilean Walnut Kernel Bulk
+cfpl,Snackania Cocktail Mix 480g,VA,SFG_blend,Snackania Cocktail Mix Bulk
+cfpl,Snackania Cranberry 230g,RPC,NO_SFG_plain_repack,
+cfpl,Snackania Fard Dates Premium 480g,DATES RPC,NO_SFG_plain_repack,
+cfpl,Snackania Green Chilli Cashew 230g,VA,SFG_mint_va,Cashew 320 Bulk (Green Chilli & Chilli)
+cfpl,Snackania Irani Pistachio Roasted & Salted 230g,VA,SFG_mint_va,Roasted & Salted Pista Inshell Iranian 26-28 Bulk
+cfpl,Snackania Khalas Dates 480g,DATES RPC,NO_SFG_plain_repack,
+cfpl,Snackania Safavi Dates 480g,DATES RPC,NO_SFG_plain_repack,
+cfpl,Snacktive Green Chilli Cashew 250 gm,VA,SFG_blend,Snacktive Green Chilli Cashew Bulk
+cfpl,Solimo Cashew 250g (B01LPY9PHI)-FBA,RPC,NO_SFG_plain_repack,
+cfpl,Solimo Cashew 500g (B01LPY9UG4) FBA,RPC,NO_SFG_plain_repack,
+cfpl,Solimo Dates 500g (B085NTZMVR),DATES RPC,NO_SFG_plain_repack,
+cfpl,Solimo Fard Dates 500gm (B0CZ9MC4B3),DATES RPC,NO_SFG_plain_repack,
+cfpl,Solimo Figs 500g (B084429DVD) FBA,RPC,NO_SFG_plain_repack,
+cfpl,Solimo Preimum Almonds 1kg (B01LPY9P2I) - FBA,RPC,NO_SFG_plain_repack,
+cfpl,Solimo Premium Almonds 250g ( B01LPY9XY8 ),RPC,NO_SFG_plain_repack,
+cfpl,Solimo Premium Dried Apricots 500g 9B07PZWP8Z1,RPC,NO_SFG_plain_repack,
+cfpl,Solimo Premium Hazelnuts 250g (B07MLDJKTP) FBA,RPC,NO_SFG_plain_repack,
+cfpl,Solimo Premium Macadamia Nuts 250g (B07MLD6WFQ),RPC,NO_SFG_plain_repack,
+cfpl,"Solimo Premium Pecan Nuts, 250g (B07MF7K9HD)",RPC,NO_SFG_plain_repack,
+cfpl,"Solimo Premium Pine Nuts, 250g (B07MF7FRRG)",RPC,NO_SFG_plain_repack,
+cfpl,Solimo Premium Pista Kernels - Plain 250g (B07Q1Z293G),RPC,NO_SFG_plain_repack,
+cfpl,Solimo Premium Raisin 250g (B01LPYAB9O),RPC,NO_SFG_plain_repack,
+cfpl,"Solimo Premium Raisins, 500 g (B07RJXW87Z)",RPC,NO_SFG_plain_repack,
+cfpl,Solimo Premium Walnut Kernal 250g (B0754LKDJ4),RPC,NO_SFG_plain_repack,
+cfpl,Solimo Premium Walnut Kernels - Broken 500g B07LF8HCLL,RPC,NO_SFG_plain_repack,
+cfpl,Solimo Premium Walnut Kernels 500g (B07LFH2JNR),RPC,NO_SFG_plain_repack,
+cfpl,Solimo Premium Walnut Kernels 500g (Pack of 2) B07LF8HGDB,RPC,NO_SFG_plain_repack,
+cfpl,Solimo Walnut Kernels – Broken 500g (Pack of 2) B07LFJZR4G,RPC,NO_SFG_plain_repack,
+cfpl,Sour & Cream Cashew Bulk,VA,SFG_already_bulk,Sour & Cream Cashew Bulk
+cfpl,Stuffed Dates 1kg,VA,SFG_blend,Stuffed Dates Bulk
+cfpl,Stuffed Medjoul Dates Large Single Pc,VA,NO_SFG_assembly,
+cfpl,Stuffed Medjoul Large Pc,VA,SFG_blend,Stuffed Medjoul Large Pc Bulk
+cfpl,Stuffed Medjoul Large Pc with Almond,VA,SFG_blend,Stuffed Medjoul Large Pc with Almond Bulk
+cfpl,Stuffed Medjoul Large Pc with Cashew,VA,SFG_blend,Stuffed Medjoul Large Pc with Cashew Bulk
+cfpl,Stuffed Medjoul Large Pc with Dried Pomelo,VA,SFG_blend,Stuffed Medjoul Large Pc with Dried Pomelo Bulk
+cfpl,Stuffed Medjoul Large Pc with Hazel Nut,VA,SFG_blend,Stuffed Medjoul Large Pc with Hazel Nut Bulk
+cfpl,Stuffed Medjoul Large Pc with Macadamia,VA,SFG_blend,Stuffed Medjoul Large Pc with Macadamia Bulk
+cfpl,Stuffed Medjoul Large Pc with Orange Peel,VA,SFG_blend,Stuffed Medjoul Large Pc with Orange Peel Bulk
+cfpl,Stuffed Medjoul Large Pc with Pecan Nut,VA,SFG_blend,Stuffed Medjoul Large Pc with Pecan Nut Bulk
+cfpl,Stuffed Medjoul Large Pc with Pista,VA,SFG_blend,Stuffed Medjoul Large Pc with Pista Bulk
+cfpl,Stuffed Medjoul Large with Ginger Single Pc,VA,SFG_blend,Stuffed Medjoul Large with Ginger Single Pc Bulk
+cfpl,Sunflower Seed 100g (B07GR6G24J) FBA,RPC,NO_SFG_plain_repack,
+cfpl,Sunflower Seeds 200g (B07GQNLN8S) FBA,RPC,NO_SFG_plain_repack,
+cfpl,Sunflower Seeds Roasted,Bulk,SFG_mint_va,Roasted Sunflower Seeds Bulk
+cfpl,Sunflower Seeds Roasted and Salted,Bulk,NO_SFG_rm_stockitem,
+cfpl,Sweet Chilli Macadamias 100gm,VA,SFG_reuse_intermediate,Sweet Chilli Macadamia Nut
+cfpl,Sweet and Spicy Pecan,VA,SFG_blend,Sweet and Spicy Pecan Bulk
+cfpl,Tasties Brazil Nut - Gems Of South Africa 50 g,RPC,NO_SFG_plain_repack,
+cfpl,Tasties Chilli Almonds - Flavourful & Crunchy 75 g,VA,SFG_reuse_intermediate,Chilli Almonds Bulk
+cfpl,Tasties Chilli Garlic Cashew - Flavourful & Crunchy 75 g,VA,SFG_reuse_intermediate,Chilli Garlic Cashew Bulk
+cfpl,"Tasties Coated Peanuts - Pudina Patakha, Flavourful & Crispy 25 g",VA,SFG_blend,"Tasties Coated Peanuts - Pudina Patakha, Flavourful & Crispy Bulk"
+cfpl,"Tasties Coated Peanuts - Tandoori Masala, Flavourful & Crispy 25 g",VA,SFG_blend,"Tasties Coated Peanuts - Tandoori Masala, Flavourful & Crispy Bulk"
+cfpl,"Tasties Coated Peanuts - Thai Spice, Flavourful & Crispy 25 g",VA,SFG_blend,"Tasties Coated Peanuts - Thai Spice, Flavourful & Crispy Bulk"
+cfpl,Tasties Hazelnut - A Turkish Indulgence 50 g,RPC,NO_SFG_plain_repack,
+cfpl,Tasties Lemon Pepper Cashew - Flavourful & Crunchy 75 g,VA,SFG_reuse_intermediate,Lemon Pepper Cashew Bulk
+cfpl,Tasties Macadamia Nuts - From South Africa 50 g,RPC,NO_SFG_plain_repack,
+cfpl,Tasties Pecan Nuts - Iconic American Nut 50 g,RPC,NO_SFG_plain_repack,
+cfpl,Tasties Peri Peri Cashew - Flavourful & Crunchy 75 g,VA,SFG_reuse_intermediate,Peri Peri Cashew Bulk
+cfpl,Tasties Pink Salted Pistachio - Flavourful & Crunchy 75 g,VA,SFG_reuse_intermediate,California Pista Inshell Pink Salted
+cfpl,Tasties Roasted Almonds With Pink Salt - Flavourful & Crunchy 75 g,VA,SFG_reuse_intermediate,Pink Salt Almonds Bulk
+cfpl,Tasties Smoked Almonds - Flavourful & Crunchy 75 g,VA,SFG_reuse_intermediate,Smoked Almonds Bulk
+cfpl,Tasties Trail Mix - Mixed Berries 75 g,VA,SFG_blend,Tasties Trail Mix - Mixed Berries Bulk
+cfpl,Tasties Trail Mix - Mixed Dry Fruits 75 g,VA,SFG_blend,Tasties Trail Mix - Mixed Dry Fruits Bulk
+cfpl,Tasties Trail Mix - Wholesome Nut Mix 75 g,VA,SFG_blend,Tasties Trail Mix - Wholesome Nut Mix Bulk
+cfpl,Thai Chilly Coated Peanuts 60gm,VA,SFG_blend,Thai Chilly Coated Peanuts Bulk
+cdpl,The Origin - DEGLET NOUR DATES500gm,DATES RPC,NO_SFG_plain_repack,
+cfpl,Trail Mix,VA,SFG_blend,Trail Mix Bulk
+cfpl,Trail Mix - Every Health,VA,SFG_blend,Trail Mix - Every Health Bulk
+cfpl,Trail Mix Bulk,VA,SFG_already_bulk,Trail Mix Bulk
+cfpl,Turkey Apricot No 1,Bulk,NO_SFG_rm_stockitem,
+cdpl,UP Ajwa Dates 500gm,DATES RPC,NO_SFG_plain_repack,
+cdpl,UP Ameri Dates 500gm,DATES RPC,NO_SFG_plain_repack,
+cfpl,UP Berry Mix,VA,SFG_blend,UP Berry Mix Bulk
+cdpl,UP Deglet Dates 500gm,DATES RPC,NO_SFG_plain_repack,
+cdpl,UP Fardh Dates 500gm,DATES RPC,NO_SFG_plain_repack,
+cdpl,UP Khidri Dates 500gm,DATES RPC,NO_SFG_plain_repack,
+cdpl,UP Medjoul Dates 500gm,DATES RPC,SFG_reuse_intermediate,WET DATES MEDJOUL BULK LARGE (5)
+cdpl,UP Rabiya Dates 500gm,DATES RPC,NO_SFG_plain_repack,
+cdpl,UP Safavi Dates 500gm,DATES RPC,NO_SFG_plain_repack,
+cdpl,UP Segai Dates 500gm,DATES RPC,NO_SFG_plain_repack,
+cdpl,UP Stuff Medjoul Dates 9pcs,DATES RPC,SFG_reuse_intermediate,WET DATES MEDJOUL BULK MEDIUM(5)
+cdpl,UP Sukkary Dates 500gm,DATES RPC,NO_SFG_plain_repack,
+cfpl,UP Trail Mix Brazil Nut Based,VA,SFG_blend,UP Trail Mix Brazil Nut Based Bulk
+cfpl,UP Trail Mix Edamame Babsed,VA,SFG_blend,UP Trail Mix Edamame Babsed Bulk
+cfpl,UP Trail Mix Tandoori Tikka,VA,SFG_blend,UP Trail Mix Tandoori Tikka Bulk
+cfpl,Urban Platter Almond Blueberry Bar 45g,VA,SFG_blend,Almond Blueberry Bar Bulk
+cfpl,Urban Platter Chocolate Vanilla Bar 45g,VA,SFG_blend,Chocolate Vanilla Bar Bulk
+cfpl,Urban Platter Cranberry Orange Bar 45g,VA,SFG_blend,Cranberry Orange Bar Bulk
+cfpl,Urban Platter Mocha Bar 45g,VA,SFG_blend,Mocha Bar Bulk
+cfpl,Urban Platter Panchmewa,VA,SFG_blend,Panchmewa Bulk
+cfpl,Vedaka Almonds 100g (B07GQZ7ZTZ) FBA,RPC,SFG_reuse_intermediate,Roasted Independence Almonds Bulk
+cfpl,Vedaka Almonds 1kg (B07GQNM6N2),RPC,SFG_reuse_intermediate,Roasted Independence Almonds Bulk
+cfpl,Vedaka Almonds 500g (B07GQNQNJG),RPC,SFG_reuse_intermediate,Roasted Independence Almonds Bulk
+cfpl,"Vedaka Almonds, Raisins, Cashews, and Pista (4 X 200 gm)B0BVVV1SMF",VA,SFG_blend,"Almonds, Raisins, Cashews, and Pista ( gm)B0BVVV1SMF Bulk"
+cfpl,Vedaka Black Raisins - 500g (B0D9P37XTT),RPC,NO_SFG_plain_repack,
+cfpl,Vedaka Black pepper Cashew 200g (B0BTHWW69R),VA,SFG_reuse_intermediate,Black Pepper Cashew Bulk
+cfpl,Vedaka Broken Cashew 1kg (B0D9NZYHDC),RPC,NO_SFG_plain_repack,
+cfpl,Vedaka Cashew 200g (B07GQZSS48),RPC,NO_SFG_plain_repack,
+cfpl,Vedaka Cashews - Broken 500g (B0D9NYHTG1),RPC,NO_SFG_plain_repack,
+cfpl,Vedaka Chia Seeds 1kg ( B0D9P16WZQ ),RPC,NO_SFG_plain_repack,
+cfpl,Vedaka Dried Figs - 250g (B0D9NZ5GFV),RPC,NO_SFG_plain_repack,
+cfpl,Vedaka Dried Sweetened Blueberries 100gm (B07GR24VMZ),RPC,NO_SFG_plain_repack,
+cfpl,Vedaka Dry Dates powder 250gm (B0DRDCLY1Q),DATES ING,SFG_reuse_intermediate,DEHYDRATED DATE POWDER - BULK PACK
+cfpl,Vedaka Dry Dates powder 500g (B0DRD9F8G2),DATES ING,SFG_reuse_intermediate,DEHYDRATED DATE POWDER - BULK PACK
+cfpl,Vedaka Dry Fruit Combo - Almonds and Cashews (2 X 200 gm) (B0BVVRS2N7),VA,SFG_blend,Dry Fruit Combo - Almonds and Cashews ( gm) Bulk
+cfpl,Vedaka Dry Fruit Combo - Almonds and Raisins (2 X 200 gm) (B0BTHYWT53),VA,SFG_blend,Dry Fruit Combo - Almonds and Raisins ( gm) Bulk
+cfpl,Vedaka Dry Fruit Combo - Raisins and Cashews (2 X 200 gm) (B0BVVVGN99),VA,SFG_blend,Dry Fruit Combo - Raisins and Cashews ( gm) Bulk
+cfpl,Vedaka Fard Dates (Omani) - (500gm x 2) (B0D9NZY7RK),DATES RPC,NO_SFG_plain_repack,
+cfpl,Vedaka Fresh Dates 500g (102219254),DATES RPC,NO_SFG_plain_repack,
+cfpl,Vedaka Fresh Dates 500gm (Pack of 2) [B0D9P11T76],DATES RPC,NO_SFG_plain_repack,
+cfpl,Vedaka Healthy Seed Mix 200gm(B0B69L57PV),VA,SFG_blend,Healthy Seed Mix Bulk
+cfpl,Vedaka Peri Peri Cashew 200g (B0BVVRRYVC),VA,SFG_reuse_intermediate,Peri Peri Cashew Bulk
+cfpl,Vedaka Popular Cashew Broken 100g FBA(B07GR3S1RL),RPC,NO_SFG_plain_repack,
+cfpl,Vedaka Popular Cashew Broken 200g FBA(B07GQWS1BS),RPC,NO_SFG_plain_repack,
+cfpl,"Vedaka Popular Raisins, 1 kg (B07GR82XJR)",RPC,NO_SFG_plain_repack,
+cfpl,"Vedaka Popular Raisins, 100 g (B07GRBFFMS)",RPC,NO_SFG_plain_repack,
+cfpl,Vedaka Premium Black Raisins 100g B07GQVNVV8,RPC,NO_SFG_plain_repack,
+cfpl,Vedaka Premium Black Raisins 200g (B07GR346FX),RPC,NO_SFG_plain_repack,
+cfpl,Vedaka Premium Blueberries 1kg (B07GR82XK8),RPC,NO_SFG_plain_repack,
+cfpl,Vedaka Premium Blueberries 200g (B07GQWST7K),RPC,NO_SFG_plain_repack,
+cfpl,Vedaka Premium Dry Fruits Combo 1000 gm Gift Box ( B0BBDP8GR2 ),VA,SFG_blend,Premium Dry Fruits Combo Gift Box Bulk
+cfpl,Vedaka Premium Flavored Dry Fruits 500 gm Gift Box (B0CGVC7DF2),VA,SFG_blend,Premium Flavored Dry Fruits Gift Box Bulk
+cfpl,Vedaka Premium Inshell Walnuts 500g (Pack of 2)B07MSXKDNQ,RPC,NO_SFG_plain_repack,
+cfpl,Vedaka Premium Inshell Walnuts 500g(B07LFJZR46),RPC,NO_SFG_plain_repack,
+cfpl,Vedaka Premium Raw Pumpkin Seeds (B0D9NZ6BHJ),RPC,NO_SFG_plain_repack,
+cfpl,Vedaka Premium Roasted and Salted Almonds 200g B07GR346FM,VA,SFG_mint_va,Roasted & Salted American Almonds Running 25-27 count Bulk
+cfpl,Vedaka Premium Roasted and Salted Almonds100g B07GQQJP1N,VA,SFG_mint_va,Roasted & Salted American Almonds Running 25-27 count Bulk
+cfpl,Vedaka Premium Sunflower Seeds 500g (B07GR2G67L),RPC,NO_SFG_plain_repack,
+cfpl,Vedaka Premium Whole Cranberries 100g B07GR24VMV,RPC,NO_SFG_plain_repack,
+cfpl,Vedaka Premium Whole Cranberries 1kg (B07GR8351K),RPC,NO_SFG_plain_repack,
+cfpl,Vedaka Premium Whole Cranberries 200g (B07GR2G678),RPC,NO_SFG_plain_repack,
+cfpl,Vedaka Premium Whole Cranberries 500g (B07GQS1669),RPC,NO_SFG_plain_repack,
+cfpl,Vedaka Raw Flaxseed 1kg (B0D9NZS3JT),RPC,NO_SFG_plain_repack,
+cfpl,Vedaka Roasted and Salted California Pistachios 500g (B0D9NY8F36),RPC,SFG_mint_va,Roasted & Salted California Pista Inshell Roasted and Salted Bulk
+cfpl,Vedaka Salted Peanuts - 200g (B0CZ9GZ9F2),RPC,SFG_blend,Salted Peanuts Bulk
+cfpl,Vedaka Salted Peanuts 200 gm (102219262),VA,SFG_blend,Salted Peanuts Bulk
+cfpl,Vedaka Turkish Dried Apricots (500gm x 2) (B0D9P1DS9Q),RPC,NO_SFG_plain_repack,
+cfpl,Vedaka Whole California Pista Kernels 500gm [B0D9NY1V9X],RPC,NO_SFG_plain_repack,
+cfpl,Vedaka Whole Cashews (Grade W320) 1kg (B0D9NY9M32),RPC,NO_SFG_plain_repack,
+cfpl,Walnut Flavoured Salt & Pepper (Quarters) Loose,VA,SFG_blend,Walnut Flavoured Salt & Pepper (Quarters) Loose Bulk
+cfpl,Walnut Tukda,Bulk,NO_SFG_rm_stockitem,
+cfpl,Wasabi Makhana,VA,SFG_mint_va,Makhana Bulk
+cfpl,Watermelon Seeds Roasted,Bulk,NO_SFG_rm_stockitem,
+cdpl,Wet Dates Lulu,DATES BULK,NO_SFG_rm_stockitem,
+cfpl,Wheat Starch - TPL,Bulk,NO_SFG_rm_stockitem,
+cfpl,White Almond Draggies,VA,SFG_blend,White Almond Draggies Bulk
+cfpl,Wholesome Millet LadduBar Pack of 6,VA,SFG_reuse_intermediate,Wholesome millet laddu bar
+cfpl,Wholesome millet laddu bar (semi finished),VA,SFG_already_bulk,Wholesome millet laddu bar (semi finished)
+cfpl,Wholesome millet laddu bar 35gm,VA,SFG_blend,Wholesome millet laddu bar Bulk
+cfpl,YUMASANA CASHEWS- BARBEQUE 150g,VA,SFG_reuse_intermediate,Barbeque Cashew Bulk
+cfpl,YUMASANA CASHEWS- PEPPER 150g,VA,SFG_reuse_intermediate,Black Pepper Cashew Bulk
+cfpl,YUMASANA CASHEWS- SALTED 150g,VA,SFG_reuse_intermediate,Roasted & Salted Cashew Bulk
+cfpl,YUMASANA CASHEWS- SOUR CREAM 150g,VA,SFG_reuse_intermediate,Sour & Cream Cashew Bulk
+cfpl,YUMASANA COATED PEANUTS - BARB EQUE 150g,VA,SFG_blend,YUMASANA COATED PEANUTS - BARB EQUE Bulk
+cfpl,YUMASANA COATED PEANUTS - CHILLI GARLIC 150g,VA,SFG_blend,YUMASANA COATED PEANUTS - CHILLI GARLIC Bulk
+cfpl,YUMASANA COATED PEANUTS - PERI PERI 150g,VA,SFG_blend,YUMASANA COATED PEANUTS - PERI PERI Bulk
+cfpl,YUMASANA COATED PEANUTS - THAI CHILLI 150g,VA,SFG_blend,YUMASANA COATED PEANUTS - THAI CHILLI Bulk
+cfpl,YUMSANA CHOCO HAZELNUT SPREAD 340GM,VA,SFG_mint_va,Hazelnut Chocolate Spread Bulk
+cfpl,Zorro Maple Glazed Pecans 100g,VA,SFG_blend,Zorro Maple Glazed Pecans Bulk
+cfpl,Zorro Pecan 100g,VA,SFG_mint_va,Pecan Nuts Bulk
+cfpl,Zorro Pecan Grain Free Granola 100g,VA,SFG_blend,Zorro Pecan Grain Free Granola Bulk
+cfpl,Zorro Roasted & Lightly Salted Pecans 100g,VA,SFG_blend,Zorro Roasted & Lightly Salted Pecans Bulk
+cfpl,Zorro Sweet & Spicy Pecan 100g,VA,SFG_blend,Zorro Sweet & Spicy Pecan Bulk
+cfpl,snack amor Coated Peanuts Pudina Patakha 100g,VA,SFG_blend,snack amor Coated Peanuts Pudina Patakha Bulk

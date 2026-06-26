@@ -1508,6 +1508,17 @@ async def run_master_ingest(pool, data_dir: Path, master_items: list) -> dict | 
                 resolution_result = await ingest_sfg_resolution_map(conn)
         logger.info("Backfilled SFG companion data: attrs=%s stage_catalog=%s input_map=%s resolution=%s",
                     attrs_result, stage_cat_result, input_map_result, resolution_result)
+
+        # 068: FG → canonical SFG catalogue (data/sfg_canonical_map.csv). One-time
+        # load — skip when already populated so it doesn't slow every boot.
+        from app.modules.production.services.sfg_canonical import ingest_canonical_map
+        canon_count = await pool.fetchval("SELECT COUNT(*) FROM sfg_canonical_map") \
+            if await pool.fetchval("SELECT to_regclass('sfg_canonical_map')") else None
+        if canon_count == 0:
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    canon_result = await ingest_canonical_map(conn)
+                logger.info("Backfilled SFG canonical map: %s", canon_result)
         return None
 
     fg_file = data_dir / "FG_Master_Completion.xlsx"

@@ -233,6 +233,90 @@ async def list_pending_transfers(conn, *, from_site=None, to_site=None, company=
     }
 
 
+async def pending_by_lot(conn, *, lot_no=None, item_description=None,
+                         from_site=None, from_company=None) -> dict:
+    """In-transit (pending) cartons/kg + per-challan breakdown for a lot+item, used by the
+    cold-stock picker's '+N in transit' hover (doc 08). Ported from pending_stock_tools.
+    NOTE: these boxes are already removed from cold_stocks at dispatch — this is display
+    context only; callers must NOT subtract it from the displayed available stock."""
+    if not await _table_exists(conn, "pending_transfer_stock"):
+        return {"pending_cartons": 0.0, "pending_kg": 0.0, "box_count": 0, "transfers": []}
+
+    clauses = ["pts.status = 'In Transit'"]
+    args: list = []
+    if lot_no:
+        args.append(lot_no); clauses.append(f"pts.lot_no = ${len(args)}")
+    if item_description:
+        args.append(item_description); clauses.append(f"pts.item_description = ${len(args)}")
+    if from_site:
+        args.append(from_site); clauses.append(f"pts.from_site = ${len(args)}")
+    if from_company:
+        args.append(str(from_company).lower()); clauses.append(f"pts.from_company = ${len(args)}")
+    where = " AND ".join(clauses)
+
+    total = await conn.fetchrow(
+        f"""SELECT COALESCE(SUM(pts.no_of_cartons), 0) AS pending_cartons,
+                   COALESCE(SUM(pts.weight_kg), 0)     AS pending_kg,
+                   COUNT(*)                             AS box_count
+            FROM pending_transfer_stock pts WHERE {where}""",
+        *args,
+    )
+
+    rows = await conn.fetch(
+        f"""
+        SELECT pts.transfer_out_id, pts.transfer_out_challan_no,
+               MIN(pts.dispatched_at)             AS dispatched_at,
+               pts.from_site, pts.to_site, pts.from_storage_type, pts.to_storage_type,
+               COUNT(*)                            AS box_count,
+               COALESCE(SUM(pts.no_of_cartons), 0) AS cartons,
+               COALESCE(SUM(pts.weight_kg), 0)     AS weight_kg,
+               MIN(pts.dispatched_by)             AS dispatched_by,
+               MIN(h.vehicle_no)                  AS vehicle_no,
+               MIN(h.driver_name)                 AS driver_name,
+               MIN(h.approved_by)                 AS approved_by,
+               MIN(h.remark)                      AS remark,
+               MIN(h.reason_code)                 AS reason_code,
+               MIN(h.status)                      AS transfer_status,
+               BOOL_OR(COALESCE(h.has_variance, false)) AS has_variance,
+               MAX(h.edited_at)                   AS updated_ts
+        FROM pending_transfer_stock pts
+        LEFT JOIN interunit_transfers_header h ON h.id = pts.transfer_out_id
+        WHERE {where}
+        GROUP BY pts.transfer_out_id, pts.transfer_out_challan_no,
+                 pts.from_site, pts.to_site, pts.from_storage_type, pts.to_storage_type
+        ORDER BY MIN(pts.dispatched_at) DESC
+        """,
+        *args,
+    )
+
+    return {
+        "pending_cartons": float(total["pending_cartons"] or 0),
+        "pending_kg": float(total["pending_kg"] or 0),
+        "box_count": int(total["box_count"] or 0),
+        "transfers": [{
+            "transfer_out_id": r["transfer_out_id"],
+            "challan_no": r["transfer_out_challan_no"],
+            "dispatched_at": r["dispatched_at"].isoformat() if r["dispatched_at"] else None,
+            "from_site": _normalize_site(r["from_site"]),
+            "to_site": _normalize_site(r["to_site"]),
+            "from_storage_type": r["from_storage_type"],
+            "to_storage_type": r["to_storage_type"],
+            "box_count": int(r["box_count"] or 0),
+            "cartons": float(r["cartons"] or 0),
+            "weight_kg": float(r["weight_kg"] or 0),
+            "dispatched_by": r["dispatched_by"] or "",
+            "vehicle_no": r["vehicle_no"] or "",
+            "driver_name": r["driver_name"] or "",
+            "approved_by": r["approved_by"] or "",
+            "remark": r["remark"] or "",
+            "reason_code": r["reason_code"] or "",
+            "transfer_status": r["transfer_status"] or "",
+            "has_variance": bool(r["has_variance"]),
+            "updated_ts": r["updated_ts"].isoformat() if r["updated_ts"] else None,
+        } for r in rows],
+    }
+
+
 async def backfill_pending_from_existing_transfers(conn) -> dict:
     # Destructive: parks boxes from existing transfers into pending + deducts source.
     from app.modules.transfer.services import reversal_service

@@ -31,7 +31,7 @@ import logging
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from asyncpg.exceptions import UndefinedColumnError
+from asyncpg.exceptions import CheckViolationError, UndefinedColumnError
 
 from app.core.helpers import insert_with_pk_retry, new_short_time_id
 from app.core.warehouse_scope import WAREHOUSE_NORM_ANY_SQL, WAREHOUSE_NORM_SQL
@@ -1242,9 +1242,27 @@ async def get_line_job_card_config(conn, plan_line_id: int) -> dict:
     `editable=False` when any card has progressed beyond locked/unlocked.
     The last card in the chain is Packaging; the rest are the WIP processes.
     """
+    # Canonical SFG for this line's FG (design §5.4) — used to auto-fill the
+    # SFG output field in the Create/Edit Job-Card modal (stays editable).
+    from app.modules.production.services.sfg_canonical import resolve_canonical_sfg_db
+    meta = await conn.fetchrow(
+        """
+        SELECT l.fg_sku_name, p.entity
+        FROM production_plan_line_v2 l
+        JOIN production_plan_v2 p ON p.plan_id = l.plan_id
+        WHERE l.plan_line_id = $1
+        """,
+        plan_line_id,
+    )
+    canonical_sfg = await resolve_canonical_sfg_db(
+        conn,
+        meta["fg_sku_name"] if meta else None,
+        meta["entity"] if meta else None,
+    )
+
     rows = await conn.fetch(
         """
-        SELECT step_number, process_name, floor, output_code,
+        SELECT job_card_id, step_number, process_name, floor, output_code,
                planned_qty_kg, planned_qty_units, status
         FROM job_card_v2
         WHERE plan_line_id = $1 AND deleted_at IS NULL
@@ -1253,7 +1271,7 @@ async def get_line_job_card_config(conn, plan_line_id: int) -> dict:
         plan_line_id,
     )
     if not rows:
-        return {"exists": False}
+        return {"exists": False, "canonical_sfg": canonical_sfg}
 
     started = any(r["status"] not in _JC_EDITABLE_STATUSES for r in rows)
     wip_rows = rows[:-1]          # every stage except the terminating Packaging
@@ -1261,19 +1279,30 @@ async def get_line_job_card_config(conn, plan_line_id: int) -> dict:
     first    = rows[0]
     return {
         "exists": True,
+        "canonical_sfg": canonical_sfg,
+        # `editable` keeps its original meaning (whole chain still replaceable
+        # via the delete+recreate path). The live-edit path (apply-edits) works
+        # even when started=True — the frontend uses per-step `started` to gate
+        # which actions are allowed.
         "editable": not started,
         "started": started,
         "qty_kg": float(first["planned_qty_kg"]) if first["planned_qty_kg"] is not None else None,
         "qty_units": float(first["planned_qty_units"]) if first["planned_qty_units"] is not None else None,
         "wip_steps": [
             {
+                "job_card_id": r["job_card_id"],
                 "process": r["process_name"],
                 "floor": r["floor"],
                 "sfg_output": r["output_code"],
+                "status": r["status"],
+                "started": r["status"] not in _JC_EDITABLE_STATUSES,
             }
             for r in wip_rows
         ],
         "pkg_floor": pkg_row["floor"],
+        "pkg_job_card_id": pkg_row["job_card_id"],
+        "pkg_status": pkg_row["status"],
+        "pkg_started": pkg_row["status"] not in _JC_EDITABLE_STATUSES,
     }
 
 
@@ -1326,6 +1355,506 @@ async def replace_job_cards_for_line(
     if "error" not in result:
         result["replaced"] = len(existing)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Live (started-chain) edit — constrained mirror of Create
+# ---------------------------------------------------------------------------
+#
+# replace_job_cards_for_line is all-or-nothing and refuses once any stage starts.
+# apply_live_job_card_edits is the constrained alternative that works on a chain
+# that has ALREADY started: floor + qty changes anytime, add a process in the
+# un-started tail, and remove a process (un-started → snapshot+cancel; in-progress
+# → force-record the JC's full data then cancel). Qty changes propagate to the
+# linked SO (ledger + so_line) via sync_so_from_qty_delta. Every action is logged
+# to job_card_edit_log_v2.
+
+# Pre-start statuses (chain still freely replaceable).
+_LIVE_TERMINAL = ('completed', 'closed', 'cancelled')
+
+
+async def _force_record_and_cancel_jc(conn, *, job_card_id: int,
+                                      reason: str, deleted_by: str | None) -> dict:
+    """Snapshot a job card's FULL current data into cancelled_snapshot, close any
+    open shift/batch, then soft-cancel it — the 'record the job-card data, then
+    remove' path for a removed process. Works for any non-terminal status
+    (un-started or in-progress). Rejects terminal JCs. Returns the snapshot.
+    """
+    import json
+    jc = await conn.fetchrow(
+        """SELECT status FROM job_card_v2
+           WHERE job_card_id=$1 AND deleted_at IS NULL FOR UPDATE""",
+        job_card_id,
+    )
+    if not jc:
+        return {"error": "job_card_not_found"}
+    if jc["status"] in _LIVE_TERMINAL:
+        return {"error": "cannot_remove_terminal",
+                "message": f"Cannot remove a process in '{jc['status']}' status."}
+
+    # Snapshot mirrors GET /job-cards-v2/{id} so the cancelled JC keeps its real
+    # outputs/batches/consumption even after the row is soft-deleted. A failure
+    # here is fatal (rolls the txn back) — a silent drop would defeat the point.
+    snapshot_payload = await get_job_card(conn, job_card_id)
+    snapshot_json = json.dumps(snapshot_payload, default=str, ensure_ascii=False)
+    rsn = (reason or "Removed via live edit").strip()
+
+    # Close any open shift segment + open batch (no-op when un-started).
+    await conn.execute(
+        """UPDATE job_card_shift_log_v2
+              SET end_at = NOW(),
+                  notes  = COALESCE(notes || E'\n', '') || 'Closed by live-edit remove: ' || $2
+            WHERE job_card_id = $1 AND end_at IS NULL""",
+        job_card_id, rsn,
+    )
+    await conn.execute(
+        """UPDATE job_card_batch_v2
+              SET status='cancelled', ended_at=COALESCE(ended_at, NOW()),
+                  closed_at=NOW(), closed_by=$2,
+                  notes=COALESCE(notes || E'\n', '') || 'Cancelled by live-edit remove: ' || $3
+            WHERE job_card_id = $1 AND status = 'open'""",
+        job_card_id, deleted_by, rsn,
+    )
+    await conn.execute(
+        """UPDATE job_card_v2
+              SET status='cancelled', deleted_at=NOW(), deleted_by=$2,
+                  cancellation_reason='[EDIT_REMOVE] ' || $3,
+                  cancelled_snapshot=$4::jsonb
+            WHERE job_card_id=$1""",
+        job_card_id, deleted_by, rsn, snapshot_json,
+    )
+    return {"removed": True, "snapshot": snapshot_payload}
+
+
+async def sync_so_from_qty_delta(conn, plan_line_id: int, *,
+                                 delta_kg, delta_units,
+                                 user: str | None = None, reason: str | None = None) -> dict:
+    """Propagate a plan-line qty change to the linked Sales Order — BOTH the
+    demand ledger (so_fulfillment_v2.planned_qty_*) AND the so_line rows shown on
+    the SO-creation page. Signed delta: positive increments, negative decrements.
+    Mirrors create_plan's ledger reserve (+= planned) and cancel_plan's release
+    (GREATEST(0, ...)). Returns a sync summary for the audit log.
+    """
+    dk = float(delta_kg or 0)
+    du = float(delta_units or 0)
+    if abs(dk) < 1e-9 and abs(du) < 1e-9:
+        return {"synced": False, "reason": "no_delta"}
+
+    line = await conn.fetchrow(
+        "SELECT linked_so_fulfillment_ids FROM production_plan_line_v2 WHERE plan_line_id=$1",
+        plan_line_id,
+    )
+    fids = list(line["linked_so_fulfillment_ids"] or []) if line else []
+    if not fids:
+        return {"synced": False, "reason": "no_linked_fulfillments"}
+
+    # ── Ledger: bump planned_qty on each linked fulfillment (mirror create_plan).
+    try:
+        await conn.execute(
+            """UPDATE so_fulfillment_v2
+                  SET planned_qty_kg    = GREATEST(0, planned_qty_kg    + $1),
+                      planned_qty_units = GREATEST(0, planned_qty_units + $2)
+                WHERE so_fulfillment_id = ANY($3)""",
+            dk, du, fids,
+        )
+    except CheckViolationError as exc:
+        # chk_pending_*_nonneg — the increase would over-allocate. Roll back.
+        raise ValueError(
+            f"Qty change would over-allocate fulfillment(s) {fids}: pending isn't "
+            f"enough for {dk:+.3f} kg / {du:+.3f} pcs. "
+            f"({getattr(exc, 'constraint_name', None)})"
+        ) from exc
+
+    for fid in fids:
+        if abs(dk) >= 1e-9:
+            await conn.execute(
+                """INSERT INTO so_revision_log_v2
+                       (so_fulfillment_id, revision_type, old_value, new_value, reason, revised_by)
+                   VALUES ($1, 'qty_change', NULL, $2, $3, $4)""",
+                fid, f"{dk:+.3f} kg (planned)", reason or "Live job-card edit", user,
+            )
+        if abs(du) >= 1e-9:
+            await conn.execute(
+                """INSERT INTO so_revision_log_v2
+                       (so_fulfillment_id, revision_type, old_value, new_value, reason, revised_by)
+                   VALUES ($1, 'units_change', NULL, $2, $3, $4)""",
+                fid, f"{du:+.3f} pcs (planned)", reason or "Live job-card edit", user,
+            )
+
+    # ── so_line writeback: resolve fulfillments → so_lines, apportion the delta.
+    frows = await conn.fetch(
+        """SELECT DISTINCT so_line_id FROM so_fulfillment_v2
+           WHERE so_fulfillment_id = ANY($1) AND so_line_id IS NOT NULL""",
+        fids,
+    )
+    so_line_ids = [r["so_line_id"] for r in frows]
+    updated_lines: list[dict] = []
+    if so_line_ids:
+        lrows = await conn.fetch(
+            "SELECT so_line_id, quantity, quantity_units FROM so_line WHERE so_line_id = ANY($1)",
+            so_line_ids,
+        )
+        # Apportion proportionally to each line's current kg; equal split when all
+        # are zero. so_line.quantity_units is INT (kg) so kg rounds; quantity (pcs)
+        # is NUMERIC. Clamp at zero so a decrement can't go negative.
+        total_kg = sum(float(r["quantity_units"] or 0) for r in lrows)
+        nlines = len(lrows)
+        for r in lrows:
+            cur_kg = float(r["quantity_units"] or 0)
+            cur_pcs = float(r["quantity"] or 0)
+            share = (cur_kg / total_kg) if total_kg > 0 else (1.0 / nlines)
+            new_kg = max(0, round(cur_kg + dk * share))
+            new_pcs = max(0.0, cur_pcs + du * share)
+            await conn.execute(
+                "UPDATE so_line SET quantity_units=$1, quantity=$2 WHERE so_line_id=$3",
+                int(new_kg), new_pcs, r["so_line_id"],
+            )
+            updated_lines.append({
+                "so_line_id": r["so_line_id"],
+                "new_kg": int(new_kg), "new_pcs": new_pcs,
+            })
+
+    return {
+        "synced": True,
+        "fulfillment_ids": fids,
+        "so_line_ids": so_line_ids,
+        "delta_kg": dk,
+        "delta_units": du,
+        "so_lines": updated_lines,
+    }
+
+
+async def apply_live_job_card_edits(
+    conn, plan_line_id: int, *,
+    qty_kg, qty_units=None,
+    steps: list[dict],
+    pkg_floor: str | None = None,
+    pkg_job_card_id: int | None = None,
+    user: str | None = None,
+    remove_reasons: dict | None = None,
+) -> dict:
+    """Constrained live edit of a STARTED job-card chain. `steps` are the desired
+    WIP processes in order; existing ones carry job_card_id, new ones have
+    job_card_id=None. Any existing WIP JC absent from `steps` is a removal.
+    Packaging stays the terminal stage. MUST run inside an outer transaction.
+
+    Rules (the started cards form a contiguous prefix — stage 1 starts first):
+      * floor change: allowed on any non-terminal card (incl. in-progress);
+      * qty change: allowed anytime, synced to the SO (ledger + so_line);
+      * add process: only in the un-started tail (after the started prefix);
+      * remove process: terminal cards can't be removed; a started card can only
+        be removed if it's the latest running stage (no started downstream); the
+        removed card is force-recorded (snapshot) then cancelled.
+    """
+    import json
+    EDITABLE = _JC_EDITABLE_STATUSES        # ('locked', 'unlocked')
+    remove_reasons = remove_reasons or {}
+    actor = user or None
+
+    rows = await conn.fetch(
+        """SELECT job_card_id, step_number, process_name, stage, floor, status,
+                  planned_qty_kg, planned_qty_units, output_code, plan_step_id, plan_id
+           FROM job_card_v2
+           WHERE plan_line_id=$1 AND deleted_at IS NULL
+           ORDER BY step_number""",
+        plan_line_id,
+    )
+    if not rows:
+        return {"error": "no_job_cards",
+                "message": "This line has no job cards — use Create instead."}
+    plan_id = rows[0]["plan_id"]
+    wip_rows = list(rows[:-1])
+    pkg_row = rows[-1]
+    existing_by_id = {r["job_card_id"]: r for r in rows}
+
+    submitted = list(steps or [])
+    submitted_id_set = {s.get("job_card_id") for s in submitted if s.get("job_card_id")}
+    wip_ids_order = [r["job_card_id"] for r in wip_rows]
+    removed_ids = [jid for jid in wip_ids_order if jid not in submitted_id_set]
+
+    # Started prefix = contiguous run of started (non-EDITABLE) WIP cards.
+    started_prefix_ids: list[int] = []
+    for r in wip_rows:
+        if r["status"] in EDITABLE:
+            break
+        started_prefix_ids.append(r["job_card_id"])
+
+    # ── validate removals ────────────────────────────────────────────────
+    for jid in removed_ids:
+        r = existing_by_id[jid]
+        if r["status"] in _LIVE_TERMINAL:
+            return {"error": "cannot_remove_terminal",
+                    "message": f"Process '{r['process_name']}' is {r['status']} and can't be removed."}
+        if started_prefix_ids and jid in started_prefix_ids and jid != started_prefix_ids[-1]:
+            return {"error": "cannot_remove_started_midchain",
+                    "message": (f"Process '{r['process_name']}' has started and has started "
+                                "downstream stages — only the latest running stage can be removed.")}
+
+    # ── validate the started region stays the leading prefix, in order ────
+    surviving_started = [jid for jid in started_prefix_ids if jid not in removed_ids]
+    leading = [s.get("job_card_id") for s in submitted[:len(surviving_started)]]
+    if leading != surviving_started:
+        return {"error": "cannot_reorder_started_region",
+                "message": "Started processes must stay first and in order; only the un-started tail can change."}
+
+    audit: list[tuple] = []   # (action, job_card_id, before, after, reason)
+
+    # ── qty change + SO sync (computed against current, before structural ops)
+    base_kg = wip_rows[0]["planned_qty_kg"] if wip_rows else pkg_row["planned_qty_kg"]
+    base_units = wip_rows[0]["planned_qty_units"] if wip_rows else pkg_row["planned_qty_units"]
+    cur_kg = float(base_kg) if base_kg is not None else 0.0
+    cur_units = float(base_units) if base_units is not None else None
+    try:
+        new_kg = float(qty_kg)
+    except (TypeError, ValueError):
+        new_kg = cur_kg
+    if new_kg <= 0:
+        return {"error": "invalid_qty", "message": "Quantity (kg) must be greater than 0"}
+    eff_units = None
+    if qty_units not in (None, ""):
+        try:
+            _v = float(qty_units)
+            eff_units = _v if _v > 0 else None
+        except (TypeError, ValueError):
+            eff_units = None
+
+    so_sync = {"synced": False}
+    delta_kg = new_kg - cur_kg
+    delta_units = ((eff_units if eff_units is not None else (cur_units or 0)) - (cur_units or 0))
+    if abs(delta_kg) > 1e-9 or abs(delta_units) > 1e-9:
+        await conn.execute(
+            """UPDATE job_card_v2
+                  SET planned_qty_kg=$1,
+                      planned_qty_units=COALESCE($2, planned_qty_units),
+                      updated_by=$3, updated_at=NOW()
+                WHERE plan_line_id=$4 AND deleted_at IS NULL
+                  AND status NOT IN ('completed','closed','cancelled')""",
+            new_kg, eff_units, actor, plan_line_id,
+        )
+        await conn.execute(
+            """UPDATE production_plan_line_v2
+                  SET planned_qty_kg=$1,
+                      planned_qty_units=COALESCE($2, planned_qty_units)
+                WHERE plan_line_id=$3""",
+            new_kg, eff_units, plan_line_id,
+        )
+        so_sync = await sync_so_from_qty_delta(
+            conn, plan_line_id, delta_kg=delta_kg, delta_units=delta_units,
+            user=actor, reason=f"Live job-card edit (line {plan_line_id})",
+        )
+        audit.append(("qty_change", None,
+                      {"qty_kg": cur_kg, "qty_units": cur_units},
+                      {"qty_kg": new_kg, "qty_units": eff_units}, None))
+
+    # ── removals: force-record + cancel ──────────────────────────────────
+    for jid in removed_ids:
+        rsn = remove_reasons.get(jid) or remove_reasons.get(str(jid)) or "Removed via live edit"
+        res = await _force_record_and_cancel_jc(
+            conn, job_card_id=jid, reason=rsn, deleted_by=actor)
+        if res.get("error"):
+            return res
+        audit.append(("remove_process", jid, res.get("snapshot"), None, rsn))
+
+    # ── additions: create new WIP JCs (locked/awaiting) in the un-started tail
+    meta = await conn.fetchrow(
+        """SELECT l.bom_id, l.fg_sku_name, l.customer_name, p.entity, p.warehouse
+           FROM production_plan_line_v2 l
+           JOIN production_plan_v2 p ON p.plan_id = l.plan_id
+           WHERE l.plan_line_id = $1""",
+        plan_line_id,
+    )
+    factory, entity = meta["warehouse"], meta["entity"]
+    fg_sku_name, customer_name, bom_id = meta["fg_sku_name"], meta["customer_name"], meta["bom_id"]
+
+    # New steps are inserted at a temporary high step_order (above every current
+    # order on the line) so the INSERT can't collide with an existing survivor's
+    # order; the final 1..n renumber happens in the two-pass below. The
+    # uq_pps_v2_line_order constraint is DEFERRABLE INITIALLY IMMEDIATE, so we
+    # must never pass through a duplicate order at any statement boundary.
+    step_order_base = int(await conn.fetchval(
+        "SELECT COALESCE(MAX(step_order), 0) FROM production_plan_step_v2 WHERE plan_line_id=$1",
+        plan_line_id,
+    ) or 0)
+
+    final_wip_ids: list[int] = []
+    step_for: dict[int, dict] = {}
+    for pos, s in enumerate(submitted):
+        jid = s.get("job_card_id")
+        if jid:
+            final_wip_ids.append(jid)
+            step_for[jid] = s
+            continue
+        proc = (s.get("process") or "").strip() or "WIP"
+        stage = proc.lower().replace(" ", "_") or "wip"
+        floor = (s.get("floor") or "").strip() or None
+
+        async def _ins_step(_p=proc, _st=stage, _fl=floor, _ord=step_order_base + 1 + pos):
+            return await conn.fetchval(
+                """INSERT INTO production_plan_step_v2
+                       (step_id, plan_line_id, step_order, process_name, stage, floor)
+                   VALUES ($1,$2,$3,$4,$5,$6) RETURNING step_id""",
+                new_short_time_id(), plan_line_id, _ord, _p, _st, _fl,
+            )
+        new_step_id = await insert_with_pk_retry(conn, _ins_step)
+
+        async def _ins_jc(_sid=new_step_id, _p=proc, _st=stage, _fl=floor, _ord=pos + 1):
+            return await conn.fetchval(
+                """INSERT INTO job_card_v2 (
+                       job_card_id, job_card_number, plan_id, plan_line_id, plan_step_id, bom_id,
+                       step_number, process_name, stage, fg_sku_name, customer_name, batch_number,
+                       planned_qty_kg, planned_qty_units, uom, input_kind, output_kind,
+                       factory, floor, entity, is_locked, locked_reason, status
+                   ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'KGS','SFG','WIP',
+                             $15,$16,$17,TRUE,'awaiting_previous_stage','locked')
+                   RETURNING job_card_id""",
+                new_short_time_id(), f"PLAN-{plan_id}-L{plan_line_id}-ADD{_ord}",
+                plan_id, plan_line_id, _sid, bom_id,
+                _ord, _p, _st, fg_sku_name, customer_name,
+                _batch_number(plan_id, plan_line_id, _ord),
+                new_kg, eff_units, factory, _fl, entity,
+            )
+        new_jc_id = await insert_with_pk_retry(conn, _ins_jc)
+        final_wip_ids.append(new_jc_id)
+        step_for[new_jc_id] = s
+        audit.append(("add_process", new_jc_id, None, {"process": proc, "floor": floor}, None))
+
+    if not final_wip_ids:
+        return {"error": "no_wip_steps", "message": "At least one WIP process is required"}
+
+    # ── relink the surviving + new chain (WIP order) + packaging ──────────
+    full_chain = final_wip_ids + [pkg_row["job_card_id"]]
+    n = len(full_chain)
+    chain_rows = await conn.fetch(
+        """SELECT job_card_id, status, floor, process_name, stage, output_code, plan_step_id
+           FROM job_card_v2 WHERE job_card_id = ANY($1)""",
+        full_chain,
+    )
+    by_id = {r["job_card_id"]: r for r in chain_rows}
+
+    prev_output_code: str | None = None
+    for i, jid in enumerate(full_chain):
+        r = by_id[jid]
+        is_first = i == 0
+        is_last = i == n - 1
+        prev_id = full_chain[i - 1] if i > 0 else None
+        next_id = full_chain[i + 1] if i < n - 1 else None
+        started = r["status"] not in EDITABLE       # started or terminal → preserve seam
+
+        if is_last:
+            desired_floor = (str(pkg_floor).strip() if pkg_floor else None) or r["floor"]
+            desired_proc = r["process_name"]
+            desired_stage = r["stage"]
+            sfg_out = None
+        else:
+            s = step_for[jid]
+            desired_floor = ((s.get("floor") or "").strip() or None) or r["floor"]
+            desired_proc = (s.get("process") or "").strip() or r["process_name"]
+            desired_stage = (desired_proc or "").strip().lower().replace(" ", "_") or "wip"
+            sfg_out = (s.get("sfg_output") or "").strip() or None
+
+        floor_changed = desired_floor != r["floor"] and r["status"] not in _LIVE_TERMINAL
+
+        if started:
+            # Preserve process/kinds/codes (real material flow); allow a floor
+            # change unless terminal. Only reposition pointers + step number.
+            floor_to_set = desired_floor if r["status"] not in _LIVE_TERMINAL else r["floor"]
+            await conn.execute(
+                """UPDATE job_card_v2
+                      SET step_number=$1, prev_job_card_id=$2, next_job_card_id=$3,
+                          floor=$4, updated_by=$5, updated_at=NOW()
+                    WHERE job_card_id=$6""",
+                i + 1, prev_id, next_id, floor_to_set, actor, jid,
+            )
+            await conn.execute(
+                "UPDATE production_plan_step_v2 SET floor=$1 WHERE step_id=$2",
+                floor_to_set, r["plan_step_id"],
+            )
+            prev_output_code = r["output_code"]
+        else:
+            output_code = sfg_out if (not is_last and sfg_out) else None
+            output_kind = 'SFG' if output_code else ('FG' if is_last else 'WIP')
+            input_kind = 'RM' if is_first else 'SFG'
+            await conn.execute(
+                """UPDATE job_card_v2
+                      SET step_number=$1, prev_job_card_id=$2, next_job_card_id=$3,
+                          floor=$4, process_name=$5, stage=$6,
+                          input_kind=$7, output_kind=$8, input_code=$9, output_code=$10,
+                          updated_by=$11, updated_at=NOW()
+                    WHERE job_card_id=$12""",
+                i + 1, prev_id, next_id, desired_floor, desired_proc, desired_stage,
+                input_kind, output_kind, prev_output_code, output_code, actor, jid,
+            )
+            await conn.execute(
+                """UPDATE production_plan_step_v2
+                      SET process_name=$1, stage=$2, floor=$3
+                    WHERE step_id=$4""",
+                desired_proc, desired_stage, desired_floor, r["plan_step_id"],
+            )
+            prev_output_code = output_code
+
+        if floor_changed:
+            audit.append(("floor_change", jid, {"floor": r["floor"]}, {"floor": desired_floor}, None))
+
+    # ── renumber plan_step.step_order: two-pass park→final so the DEFERRABLE
+    # INITIALLY IMMEDIATE uq_pps_v2_line_order never sees a duplicate. Pass 1
+    # parks EVERY step on the line (incl. removed ones) above the current max;
+    # Pass 2 sets the surviving chain to 1..n (removed steps stay parked high,
+    # out of the 1..n range). Mirrors plan_v2.reorder_steps.
+    line_steps = await conn.fetch(
+        "SELECT step_id FROM production_plan_step_v2 WHERE plan_line_id=$1", plan_line_id,
+    )
+    park = int(await conn.fetchval(
+        "SELECT COALESCE(MAX(step_order), 0) FROM production_plan_step_v2 WHERE plan_line_id=$1",
+        plan_line_id,
+    ) or 0)
+    for srow in line_steps:
+        park += 1
+        await conn.execute(
+            "UPDATE production_plan_step_v2 SET step_order=$2 WHERE step_id=$1",
+            srow["step_id"], park,
+        )
+    for i, jid in enumerate(full_chain):
+        await conn.execute(
+            "UPDATE production_plan_step_v2 SET step_order=$2 WHERE step_id=$1",
+            by_id[jid]["plan_step_id"], i + 1,
+        )
+
+    # If the previously-running stage was removed, the new head may be a locked
+    # card with nothing upstream to release it — unlock it so work can resume.
+    head_id = full_chain[0]
+    if by_id[head_id]["status"] == 'locked':
+        await conn.execute(
+            """UPDATE job_card_v2
+                  SET status='unlocked', is_locked=FALSE, locked_reason=NULL, updated_at=NOW()
+                WHERE job_card_id=$1 AND status='locked'""",
+            head_id,
+        )
+
+    # ── audit log ─────────────────────────────────────────────────────────
+    for action, jid, before, after, rsn in audit:
+        so_blob = (json.dumps(so_sync, default=str)
+                   if action == 'qty_change' and so_sync.get("synced") else None)
+        await conn.execute(
+            """INSERT INTO job_card_edit_log_v2
+                   (edit_log_id, plan_id, plan_line_id, job_card_id, action,
+                    before_value, after_value, so_sync, reason, edited_by)
+               VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8::jsonb,$9,$10)""",
+            new_short_time_id(), plan_id, plan_line_id, jid, action,
+            json.dumps(before, default=str) if before is not None else None,
+            json.dumps(after, default=str) if after is not None else None,
+            so_blob, rsn, actor,
+        )
+
+    return {
+        "plan_id": plan_id,
+        "plan_line_id": plan_line_id,
+        "job_card_ids": full_chain,
+        "removed": len(removed_ids),
+        "added": sum(1 for a in audit if a[0] == 'add_process'),
+        "floors_changed": sum(1 for a in audit if a[0] == 'floor_change'),
+        "qty_changed": any(a[0] == 'qty_change' for a in audit),
+        "so_sync": so_sync,
+    }
 
 
 # ---------------------------------------------------------------------------

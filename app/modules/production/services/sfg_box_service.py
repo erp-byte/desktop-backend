@@ -150,15 +150,6 @@ async def create_wip_boxes(
             "message": f"Job card {job_card_id} already has {already} box(es)",
         }
 
-    # Phase 7 (LOT STAMP): resolve the source WIP batch's lot so every box
-    # carries it. Absent/NULL → leave NULL (don't fabricate).
-    lot_number = None
-    if source_inventory_batch_id:
-        lot_number = await conn.fetchval(
-            "SELECT lot_number FROM inventory_batch WHERE batch_id = $1",
-            source_inventory_batch_id,
-        )
-
     # Phase 7 (PARENT LINKAGE): normalise the optional box→box parents. Round-robin
     # by index so any N-new → M-parent re-box is covered (1:1 when counts match).
     parents: list[int] | None = None
@@ -172,30 +163,29 @@ async def create_wip_boxes(
         if not parents:
             parents = None
 
-    total_boxes = len(clean)
     stage_bucket = jc["stage"] or "Create WIP"
     created: list[dict] = []
     for n, (nw, gw) in enumerate(clean, 1):
         parent_box_id = parents[(n - 1) % len(parents)] if parents else None
         # new_short_time_id() re-evaluated each retry so a same-ms PK collision
-        # resolves with a fresh id; ON CONFLICT (box_id) is the PK so a true
-        # collision raises *_pkey and insert_with_pk_retry retries.
-        async def _insert(_n=n, _nw=nw, _gw=gw, _parent=parent_box_id):
+        # resolves with a fresh id; carton_id is the PK so a true collision
+        # raises *_pkey and insert_with_pk_retry retries.
+        async def _insert(_nw=nw, _gw=gw, _parent=parent_box_id):
             return await conn.fetchrow(
                 """
                 INSERT INTO sfg_box (
-                    box_id, job_card_id, job_card_number, sfg_code, entity, floor,
-                    stage_bucket, box_number, total_boxes, net_weight, gross_weight,
-                    status, source_inventory_batch_id, lot_number, parent_box_id
-                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
-                RETURNING box_id, box_number, total_boxes, net_weight, gross_weight,
+                    carton_id, item_type, job_card_id, job_card_number, sfg_code,
+                    entity, floor, stage_bucket, net_weight, gross_weight,
+                    status, source_inventory_batch_id, parent_box_id
+                ) VALUES ($1,'sfg',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                RETURNING carton_id AS box_id, net_weight, gross_weight,
                           sfg_code, job_card_id, job_card_number, entity, floor,
-                          stage_bucket, status, lot_number, parent_box_id,
+                          stage_bucket, status, parent_box_id,
                           source_inventory_batch_id
                 """,
                 new_short_time_id(), job_card_id, jc["job_card_number"], sfg_code,
-                jc["entity"], jc["floor"], stage_bucket, _n, total_boxes, _nw, _gw,
-                _BOX_OPEN_STATUS, source_inventory_batch_id, lot_number, _parent,
+                jc["entity"], jc["floor"], stage_bucket, _nw, _gw,
+                _BOX_OPEN_STATUS, source_inventory_batch_id, _parent,
             )
 
         row = await insert_with_pk_retry(conn, _insert, max_retries=5)
@@ -203,7 +193,7 @@ async def create_wip_boxes(
 
     logger.info(
         "SFG boxes: JC %s split into %d box(es), Σ=%.3f kg (%s)",
-        job_card_id, total_boxes, total_net, sfg_code,
+        job_card_id, len(clean), total_net, sfg_code,
     )
     return {
         "job_card_id": job_card_id,
@@ -274,7 +264,7 @@ async def scan_receive_sfg_box(
             continue
         seen.add(bid)
 
-        box = await conn.fetchrow("SELECT * FROM sfg_box WHERE box_id = $1", bid)
+        box = await conn.fetchrow("SELECT * FROM sfg_box WHERE carton_id = $1", bid)
         if not box:
             rejected.append({"box_id": bid, "reason": "Box not found in system"})
             continue
@@ -302,7 +292,7 @@ async def scan_receive_sfg_box(
             """
             UPDATE sfg_box
                SET status = 'RECEIVED', received_into_job_card_id = $2
-             WHERE box_id = $1 AND status IN ('PRINTED', 'DISPATCHED')
+             WHERE carton_id = $1 AND status IN ('PRINTED', 'DISPATCHED')
             """,
             bid, downstream_job_card_id,
         )
@@ -330,7 +320,7 @@ async def scan_receive_sfg_box(
             "source_job_card_id": box["job_card_id"],
             # Phase 7 breadcrumbs for the aggregated issue note (not in API shape).
             "_source_inventory_batch_id": box["source_inventory_batch_id"],
-            "_lot_number": box["lot_number"],
+            "_lot_number": None,  # lot_number dropped from sfg_box (mig 067)
             "_source_floor": box["floor"],
         })
 
@@ -422,13 +412,14 @@ async def get_boxes_for_jc(conn, job_card_id: int) -> dict:
     """All boxes produced by a WIP-stage JC + their reconciliation total."""
     rows = await conn.fetch(
         """
-        SELECT box_id, job_card_id, job_card_number, sfg_code, entity, floor,
-               stage_bucket, box_number, total_boxes, net_weight, gross_weight,
+        SELECT carton_id AS box_id, item_type, job_card_id, job_card_number, sfg_code,
+               fg_sku_name, entity, floor, stage_bucket, batch_id, batch_code,
+               net_weight, gross_weight, units,
                status, source_inventory_batch_id, received_into_job_card_id,
-               lot_number, parent_box_id, created_at
+               parent_box_id, so_number, created_by, created_at
           FROM sfg_box
-         WHERE job_card_id = $1
-         ORDER BY box_number
+         WHERE job_card_id = $1 AND item_type = 'sfg'
+         ORDER BY carton_id
         """,
         job_card_id,
     )
@@ -442,8 +433,10 @@ async def get_boxes_for_jc(conn, job_card_id: int) -> dict:
 
 
 async def get_box(conn, box_id: int) -> dict | None:
-    """Single box lookup (mirror of GET /boxes/{box_id} for po_box)."""
-    row = await conn.fetchrow("SELECT * FROM sfg_box WHERE box_id = $1", box_id)
+    """Single box/carton lookup (mirror of GET /boxes/{box_id} for po_box)."""
+    row = await conn.fetchrow(
+        "SELECT *, carton_id AS box_id FROM sfg_box WHERE carton_id = $1", box_id
+    )
     return dict(row) if row else None
 
 
@@ -457,9 +450,9 @@ _GENEALOGY_MAX_DEPTH = 25
 
 # The canonical box projection used by both genealogy endpoints.
 _BOX_GENEALOGY_COLS = (
-    "box_id, sfg_code, lot_number, parent_box_id, net_weight, status, "
+    "carton_id AS box_id, sfg_code, parent_box_id, net_weight, status, "
     "source_inventory_batch_id, job_card_id, received_into_job_card_id, "
-    "job_card_number, floor, entity, box_number, total_boxes"
+    "job_card_number, floor, entity, item_type, batch_id, batch_code"
 )
 
 
@@ -488,12 +481,12 @@ async def get_jc_genealogy(conn, job_card_id: int,
     scope = set(allowed_entities) if allowed_entities else None
     produced_rows = await conn.fetch(
         f"SELECT {_BOX_GENEALOGY_COLS} FROM sfg_box "
-        f"WHERE job_card_id = $1 ORDER BY box_number",
+        f"WHERE job_card_id = $1 ORDER BY carton_id",
         job_card_id,
     )
     consumed_rows = await conn.fetch(
         f"SELECT {_BOX_GENEALOGY_COLS} FROM sfg_box "
-        f"WHERE received_into_job_card_id = $1 ORDER BY job_card_id, box_number",
+        f"WHERE received_into_job_card_id = $1 ORDER BY job_card_id, carton_id",
         job_card_id,
     )
     produced = [_box_dict(r) for r in produced_rows
@@ -536,7 +529,7 @@ async def get_box_genealogy(conn, box_id: int,
         return scope is None or r["entity"] in scope
 
     start = await conn.fetchrow(
-        f"SELECT {_BOX_GENEALOGY_COLS} FROM sfg_box WHERE box_id = $1", box_id
+        f"SELECT {_BOX_GENEALOGY_COLS} FROM sfg_box WHERE carton_id = $1", box_id
     )
     if not start:
         return None
@@ -572,7 +565,7 @@ async def get_box_genealogy(conn, box_id: int,
         parent_id = row["parent_box_id"]
         if parent_id is not None and parent_id not in visited:
             prow = await conn.fetchrow(
-                f"SELECT {_BOX_GENEALOGY_COLS} FROM sfg_box WHERE box_id = $1",
+                f"SELECT {_BOX_GENEALOGY_COLS} FROM sfg_box WHERE carton_id = $1",
                 parent_id,
             )
             if prow and _in_scope(prow):
@@ -591,7 +584,7 @@ async def get_box_genealogy(conn, box_id: int,
             producer_jc = await conn.fetchval(
                 "SELECT job_card_id FROM sfg_box "
                 "WHERE source_inventory_batch_id = $1 "
-                "ORDER BY job_card_id, box_number LIMIT 1",
+                "ORDER BY job_card_id, carton_id LIMIT 1",
                 src_batch,
             )
             # Fall back to THIS box's own producing JC (boxes from the same batch
@@ -601,7 +594,7 @@ async def get_box_genealogy(conn, box_id: int,
             if producer_jc is not None:
                 upstream_rows = await conn.fetch(
                     f"SELECT {_BOX_GENEALOGY_COLS} FROM sfg_box "
-                    f"WHERE received_into_job_card_id = $1 ORDER BY job_card_id, box_number",
+                    f"WHERE received_into_job_card_id = $1 ORDER BY job_card_id, carton_id",
                     producer_jc,
                 )
                 for urow in upstream_rows:
@@ -609,3 +602,219 @@ async def get_box_genealogy(conn, box_id: int,
                         frontier.append((urow, next_level))
 
     return {"box_id": box_id, "chain": chain, "truncated": truncated}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  FG CARTONS (item_type='fg') — packing-stage sibling of the WIP box flow
+# ══════════════════════════════════════════════════════════════════════════
+
+_FG_OUTPUT_KIND = "FG"
+
+
+async def create_fg_cartons(
+    conn, job_card_id: int, cartons: list[dict], *,
+    batch_id: int | None = None, batch_code: str | None = None,
+    expected_net_kg: float | None = None, created_by: str | None = None,
+) -> dict:
+    """Mint ``sfg_box`` rows (item_type='fg') for a packing-stage JC's carton split.
+
+    ``cartons``: list of ``{"net_weight": float, "units": int | None,
+    "gross_weight": float | None}``. Each row gets an 8-digit ``carton_id`` (the
+    QR payload). Mirrors ``create_wip_boxes`` but for the terminal FG/packing
+    stage (output_kind FG); stamps ``units``/``batch_id``/``batch_code``/
+    ``fg_sku_name``/``created_by``. MUST run inside an outer transaction.
+    """
+    await conn.execute("SELECT pg_advisory_xact_lock($1)", job_card_id)
+    jc = await conn.fetchrow(
+        """
+        SELECT job_card_id, job_card_number, fg_sku_name, output_kind, output_code,
+               entity, floor, stage, status
+          FROM job_card_v2
+         WHERE job_card_id = $1 AND deleted_at IS NULL
+        """,
+        job_card_id,
+    )
+    if not jc:
+        return {"error": "not_found", "message": f"Job card {job_card_id} not found"}
+    if (jc["output_kind"] or "").upper() != _FG_OUTPUT_KIND:
+        return {
+            "error": "not_a_fg_stage",
+            "message": "Cartons are packed only at a terminal FG (packing) stage "
+                       "(output_kind FG), not a WIP/intermediate stage.",
+        }
+    if (jc["status"] or "") in _NOT_PRODUCING_STATUSES:
+        return {
+            "error": "not_producing",
+            "message": f"Job card status '{jc['status']}' cannot pack cartons "
+                       "(not started yet, or cancelled).",
+        }
+    # The generic item code stored in sfg_code: prefer an explicit FG code,
+    # else fall back to the FG name so the NOT-NULL column always carries a value.
+    fg_code = jc["output_code"] or jc["fg_sku_name"] or "FG"
+
+    clean: list[tuple[float, float | None, int | None]] = []
+    for i, c in enumerate(cartons or [], 1):
+        try:
+            nw = round(float(c.get("net_weight")), 3)
+        except (TypeError, ValueError):
+            return {"error": "bad_weight", "message": f"Carton {i}: net_weight is not a number"}
+        if nw <= 0:
+            return {"error": "bad_weight", "message": f"Carton {i}: net_weight must be > 0"}
+        gw_raw = c.get("gross_weight")
+        gw = None
+        if gw_raw not in (None, ""):
+            try:
+                gw = round(float(gw_raw), 3)
+            except (TypeError, ValueError):
+                return {"error": "bad_weight", "message": f"Carton {i}: gross_weight is not a number"}
+            if gw < nw:
+                return {"error": "bad_weight", "message": f"Carton {i}: gross_weight < net_weight"}
+        u_raw = c.get("units")
+        u = None
+        if u_raw not in (None, ""):
+            try:
+                u = int(u_raw)
+            except (TypeError, ValueError):
+                return {"error": "bad_units", "message": f"Carton {i}: units is not an integer"}
+            if u < 0:
+                return {"error": "bad_units", "message": f"Carton {i}: units must be >= 0"}
+        clean.append((nw, gw, u))
+    if not clean:
+        return {"error": "no_cartons", "message": "No cartons supplied"}
+
+    total_net = round(sum(nw for nw, _, _ in clean), 3)
+    if expected_net_kg is not None:
+        try:
+            exp = round(float(expected_net_kg), 3)
+        except (TypeError, ValueError):
+            exp = None
+        if exp is not None and abs(total_net - exp) > WEIGHT_TOLERANCE_KG:
+            return {
+                "error": "weight_mismatch",
+                "message": f"Σ carton weights {total_net} kg differs from expected net "
+                           f"{exp} kg by more than {WEIGHT_TOLERANCE_KG} kg",
+            }
+
+    stage_bucket = jc["stage"] or "Packing"
+    created: list[dict] = []
+    for (nw, gw, u) in clean:
+        async def _insert(_nw=nw, _gw=gw, _u=u):
+            return await conn.fetchrow(
+                """
+                INSERT INTO sfg_box (
+                    carton_id, item_type, job_card_id, job_card_number, sfg_code,
+                    fg_sku_name, entity, floor, stage_bucket, batch_id, batch_code,
+                    net_weight, gross_weight, units, status, created_by
+                ) VALUES ($1,'fg',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'PRINTED',$14)
+                RETURNING carton_id, net_weight, gross_weight, units, sfg_code,
+                          fg_sku_name, job_card_id, job_card_number, entity, floor,
+                          stage_bucket, batch_id, batch_code, status, created_at
+                """,
+                new_short_time_id(), job_card_id, jc["job_card_number"], fg_code,
+                jc["fg_sku_name"], jc["entity"], jc["floor"], stage_bucket,
+                batch_id, batch_code, _nw, _gw, _u, created_by,
+            )
+
+        row = await insert_with_pk_retry(conn, _insert, max_retries=5)
+        created.append(dict(row))
+
+    logger.info(
+        "FG cartons: JC %s packed %d carton(s), Σ=%.3f kg (%s)",
+        job_card_id, len(clean), total_net, fg_code,
+    )
+    return {
+        "job_card_id": job_card_id,
+        "fg_code": fg_code,
+        "total_net_kg": total_net,
+        "carton_ids": [r["carton_id"] for r in created],
+        "created": created,
+    }
+
+
+async def get_cartons_for_jc(conn, job_card_id: int) -> dict:
+    """All FG cartons packed by a packing-stage JC + their reconciliation total.
+    ``net_weight`` is surfaced as ``net_weight_kg`` to match the FE carton shape."""
+    rows = await conn.fetch(
+        """
+        SELECT carton_id, item_type, job_card_id, job_card_number, sfg_code,
+               fg_sku_name, entity, floor, stage_bucket, batch_id, batch_code,
+               net_weight AS net_weight_kg, gross_weight, units,
+               status, so_number, created_by, created_at
+          FROM sfg_box
+         WHERE job_card_id = $1 AND item_type = 'fg'
+         ORDER BY carton_id
+        """,
+        job_card_id,
+    )
+    cartons: list[dict] = []
+    for r in rows:
+        d = dict(r)
+        if d.get("net_weight_kg") is not None:
+            d["net_weight_kg"] = float(d["net_weight_kg"])
+        cartons.append(d)
+    return {
+        "job_card_id": job_card_id,
+        "count": len(cartons),
+        "total_net_kg": round(sum((c["net_weight_kg"] or 0) for c in cartons), 3),
+        "cartons": cartons,
+    }
+
+
+async def get_carton_genealogy(conn, carton_id: int,
+                               allowed_entities: list[str] | None = None) -> dict | None:
+    """Upstream trace for an FG carton: carton → the SFG boxes consumed into its
+    packing JC → each box's own box→lot lineage (reuses ``get_box_genealogy``).
+    Returns ``{"carton_id", "chain":[node+level], "truncated"}`` or None."""
+    scope = set(allowed_entities) if allowed_entities else None
+    start = await conn.fetchrow(
+        """
+        SELECT carton_id, sfg_code, fg_sku_name, job_card_id, job_card_number,
+               batch_id, batch_code, net_weight, status, entity
+          FROM sfg_box WHERE carton_id = $1 AND item_type = 'fg'
+        """,
+        carton_id,
+    )
+    if not start:
+        return None
+    if scope is not None and start["entity"] not in scope:
+        return None
+
+    chain: list[dict] = [{
+        "level": 0,
+        "carton_id": start["carton_id"],
+        "sfg_code": start["sfg_code"],
+        "label": start["fg_sku_name"] or "FG carton",
+        "batch_id": start["batch_id"],
+        "net_weight": float(start["net_weight"]) if start["net_weight"] is not None else None,
+        "producer_job_card_id": start["job_card_id"],
+    }]
+    truncated = False
+
+    # The SFG boxes scanned INTO this carton's packing JC are its direct inputs.
+    consumed = await conn.fetch(
+        f"SELECT {_BOX_GENEALOGY_COLS} FROM sfg_box "
+        f"WHERE received_into_job_card_id = $1 AND item_type = 'sfg' "
+        f"ORDER BY job_card_id, carton_id",
+        start["job_card_id"],
+    )
+    seen: set[int] = set()
+    for box in consumed:
+        if scope is not None and box["entity"] not in scope:
+            continue
+        if box["box_id"] in seen:
+            continue
+        # Reuse the SFG box walker for each consumed box's full upstream lineage,
+        # offsetting its levels so they nest under the carton (level >= 1).
+        sub = await get_box_genealogy(conn, box["box_id"], allowed_entities)
+        if not sub:
+            continue
+        if sub.get("truncated"):
+            truncated = True
+        for node in sub["chain"]:
+            nid = node.get("box_id")
+            if nid in seen:
+                continue
+            seen.add(nid)
+            chain.append({**node, "level": node.get("level", 0) + 1})
+
+    return {"carton_id": carton_id, "chain": chain, "truncated": truncated}

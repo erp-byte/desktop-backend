@@ -232,7 +232,7 @@ def _build_where_clause(
     search, status, company, voucher_type, customer_name, common_customer_name,
     date_from, date_to, item_category, sub_category, uom, grp_code,
     rate_type, item_type, sales_group, match_source, line_status,
-    article=None, so_number=None,
+    article=None, so_number=None, fulfillment_status=None,
 ) -> tuple[str, list]:
     """Build a WHERE clause and params list from filter values."""
     conditions = []
@@ -342,6 +342,27 @@ def _build_where_clause(
                 "NOT EXISTS (SELECT 1 FROM so_gst_reconciliation g WHERE g.so_id = h.so_id AND g.status = 'mismatch')"
                 " AND NOT EXISTS (SELECT 1 FROM so_gst_reconciliation g WHERE g.so_id = h.so_id AND g.status = 'warning')"
             )
+
+    # Fulfillment-availability filter (Pending / Fulfilled). so_fulfillment_v2
+    # has no so_id column — it joins so_line by so_line_id, and pending_qty_kg
+    # is a GENERATED column (original − dispatched − planned). "pending" keeps
+    # SOs with any line still having pending qty; "fulfilled" keeps SOs that
+    # have fulfillment rows but none pending (un-synced SOs match neither).
+    _PENDING_EXISTS = (
+        "EXISTS (SELECT 1 FROM so_fulfillment_v2 f"
+        " JOIN so_line sl ON sl.so_line_id = f.so_line_id"
+        " WHERE sl.so_id = h.so_id"
+        " AND (f.pending_qty_kg > 0 OR COALESCE(f.pending_qty_units, 0) > 0))"
+    )
+    _HAS_FULFILLMENT = (
+        "EXISTS (SELECT 1 FROM so_fulfillment_v2 f"
+        " JOIN so_line sl ON sl.so_line_id = f.so_line_id"
+        " WHERE sl.so_id = h.so_id)"
+    )
+    if fulfillment_status == "pending":
+        conditions.append(_PENDING_EXISTS)
+    elif fulfillment_status == "fulfilled":
+        conditions.append(f"{_HAS_FULFILLMENT} AND NOT {_PENDING_EXISTS}")
 
     where_clause = (" AND ".join(conditions)) if conditions else "TRUE"
     return where_clause, params
@@ -591,6 +612,7 @@ async def view_all_sos(
     line_status: str = Query(None),
     article: str = Query(None),
     so_number: str = Query(None),
+    fulfillment_status: str = Query(None, pattern="^(pending|fulfilled)$"),
     user=Depends(get_current_user),
 ):
     """View Sales Orders with server-side pagination, filtering, sorting, and search.
@@ -615,7 +637,7 @@ async def view_all_sos(
         sub_category=sub_category, uom=uom, grp_code=grp_code,
         rate_type=rate_type, item_type=item_type, sales_group=sales_group,
         match_source=match_source, line_status=line_status, article=article,
-        so_number=so_number,
+        so_number=so_number, fulfillment_status=fulfillment_status,
     )
 
     # --- Global summary across ALL filtered SOs ---
@@ -631,7 +653,9 @@ async def view_all_sos(
             COALESCE(SUM(lc.gst_warning), 0) AS gst_warning,
             COUNT(*) FILTER (WHERE lc.gst_mismatch > 0) AS so_mismatch,
             COUNT(*) FILTER (WHERE lc.gst_mismatch = 0 AND lc.gst_warning > 0) AS so_warning,
-            COUNT(*) FILTER (WHERE lc.gst_mismatch = 0 AND lc.gst_warning = 0) AS so_ok
+            COUNT(*) FILTER (WHERE lc.gst_mismatch = 0 AND lc.gst_warning = 0) AS so_ok,
+            COUNT(*) FILTER (WHERE fc.has_pending) AS so_pending,
+            COUNT(*) FILTER (WHERE fc.has_fulfillment AND NOT fc.has_pending) AS so_fulfilled
         FROM so_header h
         LEFT JOIN LATERAL (
             SELECT
@@ -645,6 +669,16 @@ async def view_all_sos(
             LEFT JOIN so_gst_reconciliation r ON r.so_line_id = l.so_line_id
             WHERE l.so_id = h.so_id
         ) lc ON TRUE
+        -- Separate LATERAL for fulfillment availability so the per-FY rows in
+        -- so_fulfillment_v2 can't multiply the GST line counts above.
+        LEFT JOIN LATERAL (
+            SELECT
+                COALESCE(BOOL_OR(f.pending_qty_kg > 0 OR COALESCE(f.pending_qty_units, 0) > 0), FALSE) AS has_pending,
+                COUNT(*) > 0 AS has_fulfillment
+            FROM so_fulfillment_v2 f
+            JOIN so_line sl ON sl.so_line_id = f.so_line_id
+            WHERE sl.so_id = h.so_id
+        ) fc ON TRUE
         WHERE {where_clause}
         """,
         *params,
@@ -662,6 +696,8 @@ async def view_all_sos(
         "gst_mismatch": summary_row["gst_mismatch"],
         "gst_warning": summary_row["gst_warning"],
         "so_ok": summary_row["so_ok"],
+        "so_pending": summary_row["so_pending"],
+        "so_fulfilled": summary_row["so_fulfilled"],
         "so_mismatch": summary_row["so_mismatch"],
         "so_warning": summary_row["so_warning"],
     }
@@ -729,6 +765,7 @@ async def export_sos(
     line_status: str = Query(None),
     article: str = Query(None),
     so_number: str = Query(None),
+    fulfillment_status: str = Query(None, pattern="^(pending|fulfilled)$"),
     limit: int = Query(10000, ge=1, le=50000),
     user=Depends(get_current_user),
 ):
@@ -753,7 +790,7 @@ async def export_sos(
         sub_category=sub_category, uom=uom, grp_code=grp_code,
         rate_type=rate_type, item_type=item_type, sales_group=sales_group,
         match_source=match_source, line_status=line_status, article=article,
-        so_number=so_number,
+        so_number=so_number, fulfillment_status=fulfillment_status,
     )
 
     sort_col = _sort_col(sort_by)

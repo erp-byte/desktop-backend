@@ -509,11 +509,17 @@ async def _lock_check_via_batch(conn, batch_id: int):
 # ---------------------------------------------------------------------------
 
 async def list_batches(conn, job_card_id: int) -> list[dict]:
+    # produced_qty_cartons = count of FG cartons (sfg_box item_type='fg') packed
+    # against each batch, so the Output tab's Cartons column + totals are real.
     rows = await conn.fetch(
         """
-        SELECT * FROM job_card_batch_v2
-        WHERE  job_card_id=$1
-        ORDER  BY batch_number
+        SELECT b.*,
+               (SELECT COUNT(*) FROM sfg_box c
+                 WHERE c.batch_id = b.batch_id AND c.item_type = 'fg')
+                 AS produced_qty_cartons
+        FROM job_card_batch_v2 b
+        WHERE  b.job_card_id=$1
+        ORDER  BY b.batch_number
         """,
         job_card_id,
     )
