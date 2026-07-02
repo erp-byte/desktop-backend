@@ -140,3 +140,41 @@ def _map_box_row(r: dict) -> dict:
         "created_at": r.get("created_at"),
         "updated_at": r.get("updated_at"),
     }
+
+
+from app.modules.customer_returns.tables import cr_table_names
+
+
+async def _fetch_lines(conn, tables: dict, cr_id: str) -> list:
+    rows = await conn.fetch(
+        f"SELECT {LINE_COLS} FROM {tables['lines']} WHERE rtv_id = $1 ORDER BY item_description",
+        cr_id,
+    )
+    return [_map_line_row(dict(r)) for r in rows]
+
+
+async def _fetch_boxes(conn, tables: dict, cr_id: str) -> list:
+    rows = await conn.fetch(
+        f"SELECT {BOX_COLS} FROM {tables['boxes']} WHERE rtv_id = $1 "
+        "ORDER BY article_description, box_number",
+        cr_id,
+    )
+    return [_map_box_row(dict(r)) for r in rows]
+
+
+async def get_cr(conn, company: str, cr_id: str) -> dict:
+    tables = cr_table_names(company)
+    hdr = await conn.fetchrow(
+        f"SELECT {HEADER_COLS} FROM {tables['header']} WHERE rtv_id = $1", cr_id
+    )
+    if not hdr:
+        raise HTTPException(
+            404,
+            detail={"error": "customer_return_not_found",
+                    "message": f"No customer return {cr_id}",
+                    "details": {"rtv_id": cr_id}},
+        )
+    result = _map_header_row(dict(hdr))
+    result["lines"] = await _fetch_lines(conn, tables, cr_id)
+    result["boxes"] = await _fetch_boxes(conn, tables, cr_id)
+    return result
