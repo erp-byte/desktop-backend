@@ -90,3 +90,84 @@ async def create_cr(conn, company: str, data: schemas.CRCreate, created_by: str)
             await _insert_line(conn, tables, cr_id, line)
     # Read back AFTER commit so the response matches get/list exactly.
     return await q.get_cr(conn, company, cr_id)
+
+
+_HEADER_UPDATABLE = [
+    "factory_unit", "customer", "invoice_number", "challan_no", "dn_no", "conversion",
+    "sales_poc", "sales_poc_email", "business_head", "remark", "status",
+    "vehicle_number", "transporter_name", "driver_name", "inward_manager",
+]
+
+
+async def update_cr(conn, company: str, cr_id: str, data: schemas.CRHeaderUpdate) -> dict:
+    tables = cr_table_names(company)
+    provided = data.model_dump(exclude_none=True)
+    if not provided:
+        raise HTTPException(
+            400,
+            detail={"error": "empty_update", "message": "Provide at least one field to update"},
+        )
+    sets: list[str] = []
+    args: list = []
+    for col in _HEADER_UPDATABLE:
+        if col in provided:
+            val = provided[col]
+            if col == "conversion":
+                val = q._to_float(val) or 0.0
+            args.append(val); sets.append(f"{col} = ${len(args)}")
+    sets.append("updated_at = NOW()")
+    args.append(cr_id)
+    row = await conn.fetchrow(
+        f"UPDATE {tables['header']} SET {', '.join(sets)} WHERE rtv_id = ${len(args)} "
+        f"RETURNING {q.HEADER_COLS}",
+        *args,
+    )
+    if not row:
+        raise HTTPException(
+            404,
+            detail={"error": "customer_return_not_found",
+                    "message": f"No customer return {cr_id}", "details": {"rtv_id": cr_id}},
+        )
+    return q._map_header_row(dict(row))
+
+
+async def update_cr_lines(conn, company: str, cr_id: str,
+                          data: schemas.CRLinesUpdateRequest) -> dict:
+    tables = cr_table_names(company)
+    exists = await conn.fetchval(
+        f"SELECT 1 FROM {tables['header']} WHERE rtv_id = $1", cr_id
+    )
+    if not exists:
+        raise HTTPException(
+            404,
+            detail={"error": "customer_return_not_found",
+                    "message": f"No customer return {cr_id}", "details": {"rtv_id": cr_id}},
+        )
+    async with conn.transaction():
+        await conn.execute(f"DELETE FROM {tables['lines']} WHERE rtv_id = $1", cr_id)
+        for line in data.lines:
+            await _insert_line(conn, tables, cr_id, line)
+    return {"status": "updated", "rtv_id": cr_id, "lines_count": len(data.lines)}
+
+
+async def delete_cr(conn, company: str, cr_id: str) -> dict:
+    tables = cr_table_names(company)
+    hdr = await conn.fetchrow(
+        f"SELECT rtv_id FROM {tables['header']} WHERE rtv_id = $1", cr_id
+    )
+    if not hdr:
+        raise HTTPException(
+            404,
+            detail={"error": "customer_return_not_found",
+                    "message": f"No customer return {cr_id}", "details": {"rtv_id": cr_id}},
+        )
+    lines_count = await conn.fetchval(
+        f"SELECT COUNT(*) FROM {tables['lines']} WHERE rtv_id = $1", cr_id)
+    boxes_count = await conn.fetchval(
+        f"SELECT COUNT(*) FROM {tables['boxes']} WHERE rtv_id = $1", cr_id)
+    async with conn.transaction():
+        # FK ON DELETE CASCADE removes lines/boxes with the header.
+        await conn.execute(f"DELETE FROM {tables['header']} WHERE rtv_id = $1", cr_id)
+    return {"success": True, "message": f"Customer return {cr_id} deleted",
+            "rtv_id": cr_id, "lines_count": int(lines_count or 0),
+            "boxes_count": int(boxes_count or 0)}
