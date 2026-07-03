@@ -242,3 +242,8 @@ class CRBoxEditLogRequest(BaseModel):
     box_id: str
     rtv_id: str
     changes: List[CRBoxEditLogEntry]
+
+
+class CRBoxEditLogResponse(BaseModel):
+    status: str
+    entries: int
