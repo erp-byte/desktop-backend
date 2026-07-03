@@ -83,6 +83,13 @@ async def _insert_header(conn, tables: dict, header: schemas.CRHeaderCreate,
 
 
 async def create_cr(conn, company: str, data: schemas.CRCreate, created_by: str) -> dict:
+    if data.company.upper() != (company or "").strip().upper():
+        raise HTTPException(
+            400,
+            detail={"error": "company_mismatch",
+                    "message": "path company and body company differ",
+                    "details": {"path": company, "body": data.company}},
+        )
     tables = cr_table_names(company)
     async with conn.transaction():
         cr_id = await _insert_header(conn, tables, data.header, created_by)
@@ -143,11 +150,12 @@ async def update_cr_lines(conn, company: str, cr_id: str,
             detail={"error": "customer_return_not_found",
                     "message": f"No customer return {cr_id}", "details": {"rtv_id": cr_id}},
         )
+    lines_count = len({l.item_description for l in data.lines})
     async with conn.transaction():
         await conn.execute(f"DELETE FROM {tables['lines']} WHERE rtv_id = $1", cr_id)
         for line in data.lines:
             await _insert_line(conn, tables, cr_id, line)
-    return {"status": "updated", "rtv_id": cr_id, "lines_count": len(data.lines)}
+    return {"status": "updated", "rtv_id": cr_id, "lines_count": lines_count}
 
 
 async def delete_cr(conn, company: str, cr_id: str) -> dict:

@@ -41,6 +41,14 @@ async def main() -> None:
         assert by_desc["ALMOND W-320"]["value"] == "40"   # computed qty*rate
         assert by_desc["CASHEW W-240"]["value"] == "45"   # supplied
         assert by_desc["ALMOND W-320"]["material_type"] == "RM"  # uppercased
+
+        # company path/body mismatch is rejected (Fix 2)
+        from fastapi import HTTPException as _HTTPExc
+        try:
+            await create_service.create_cr(conn, "CDPL", payload, "tester@candorfoods.in")
+            raise AssertionError("expected 400 on company mismatch")
+        except _HTTPExc as e:
+            assert e.status_code == 400 and e.detail["error"] == "company_mismatch"
         print("ASSERTIONS PASSED")
     finally:
         await tx.rollback()

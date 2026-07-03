@@ -2,6 +2,7 @@
     PYTHONPATH=. python tests/services/test_cr_helpers.py
 """
 from datetime import date
+from decimal import Decimal
 from fastapi import HTTPException
 from app.modules.customer_returns.services import query_service as q
 
@@ -25,6 +26,9 @@ def main() -> None:
 
     # numeric->string with '0' default; mapper produces string numerics.
     assert q._num_str(None) == "0" and q._num_str(12) == "12"
+    assert q._num_str(10.0) == "10"          # integral float drops .0
+    assert q._num_str(3.5) == "3.5"          # non-integral float, no sci notation
+    assert q._num_str(Decimal("25.750")) == "25.75"  # Decimal trailing-zero strip
     row = {"rtv_id": "CR-1", "item_description": "A", "material_type": "RM",
            "item_category": "N", "sub_category": "S", "uom": "KG",
            "qty": 4, "rate": 10, "value": 40, "net_weight": 25, "carton_weight": 0,

@@ -1,5 +1,5 @@
-"""Customer-Returns read side: column constants, row mappers, pure helpers.
-Async list/get functions are added in later tasks of the same module.
+"""Customer-Returns read side: column constants, row mappers, pure helpers,
+and the async get_cr/list_crs functions.
 """
 from __future__ import annotations
 
@@ -8,6 +8,8 @@ from decimal import Decimal
 from typing import Any, Optional
 
 from fastapi import HTTPException
+
+from app.modules.customer_returns.tables import cr_table_names
 
 HEADER_COLS = (
     "rtv_id, rtv_date, factory_unit, customer, invoice_number, challan_no, dn_no, "
@@ -59,6 +61,11 @@ def _num_str(v: Any) -> str:
             s = s.rstrip("0").rstrip(".")
         return s or "0"
     return str(v)
+
+
+def _like_escape(term: str) -> str:
+    """Escape LIKE/ILIKE wildcards so a filter term matches literally."""
+    return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _convert_date(s: Optional[str]) -> Optional[date]:
@@ -142,9 +149,6 @@ def _map_box_row(r: dict) -> dict:
     }
 
 
-from app.modules.customer_returns.tables import cr_table_names
-
-
 async def _fetch_lines(conn, tables: dict, cr_id: str) -> list:
     rows = await conn.fetch(
         f"SELECT {LINE_COLS} FROM {tables['lines']} WHERE rtv_id = $1 ORDER BY item_description",
@@ -204,7 +208,8 @@ async def list_crs(conn, *, company: str, page: int, per_page: int,
     if factory_unit:
         args.append(factory_unit); clauses.append(f"h.factory_unit = ${len(args)}")
     if customer:
-        args.append(f"%{customer}%"); clauses.append(f"h.customer ILIKE ${len(args)}")
+        args.append(f"%{_like_escape(customer)}%")
+        clauses.append(f"h.customer ILIKE ${len(args)} ESCAPE '\\'")
     df = _convert_date(from_date)
     if df:
         args.append(df); clauses.append(f"h.rtv_date >= ${len(args)}")
@@ -232,7 +237,7 @@ async def list_crs(conn, *, company: str, page: int, per_page: int,
                (SELECT COALESCE(SUM(b.net_weight),0) FROM {tables['boxes']} b WHERE b.rtv_id = h.rtv_id) AS total_net_weight
           FROM {tables['header']} h
          WHERE {where}
-         ORDER BY h.{col} {direction}
+         ORDER BY h.{col} {direction}, h.rtv_id {direction}
          LIMIT ${len(args) + 1} OFFSET ${len(args) + 2}
         """,
         *args, per_page, offset,
