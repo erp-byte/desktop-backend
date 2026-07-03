@@ -256,3 +256,116 @@ async def list_crs(conn, *, company: str, page: int, per_page: int,
     total_pages = (total + per_page - 1) // per_page
     return {"records": records, "total": total, "page": page,
             "per_page": per_page, "total_pages": total_pages}
+
+
+# Canonical export column order (33). export_cr_records builds dicts with exactly
+# these keys; export_xlsx uses this for the header row.
+EXPORT_COLUMNS = [
+    "RTV ID", "RTV Date", "Factory Unit", "Customer", "Invoice Number", "Challan No",
+    "DN No", "Conversion", "Sales POC", "Business Head", "Remark", "Status",
+    "Created By", "Created At",
+    "Material Type", "Item Category", "Sub Category", "Item Description", "UOM",
+    "Qty", "Rate", "Value", "Line Net Weight", "Line Carton Weight",
+    "Box ID", "Box Article", "Box Number", "Box UOM", "Box Conversion",
+    "Box Net Weight", "Box Gross Weight", "Box Lot Number", "Box Count",
+]
+
+
+def _export_row(r: dict) -> dict:
+    """Flatten one joined header/line/box record into the 33-col export dict."""
+    return {
+        "RTV ID": r.get("rtv_id") or "",
+        "RTV Date": str(r.get("rtv_date") or ""),
+        "Factory Unit": r.get("factory_unit") or "",
+        "Customer": r.get("customer") or "",
+        "Invoice Number": r.get("invoice_number") or "",
+        "Challan No": r.get("challan_no") or "",
+        "DN No": r.get("dn_no") or "",
+        "Conversion": str(r.get("conversion")) if r.get("conversion") is not None else "",
+        "Sales POC": r.get("sales_poc") or "",
+        "Business Head": r.get("business_head") or "",
+        "Remark": r.get("remark") or "",
+        "Status": r.get("status") or "",
+        "Created By": r.get("created_by") or "",
+        "Created At": str(r.get("created_ts") or ""),
+        "Material Type": r.get("material_type") or "",
+        "Item Category": r.get("item_category") or "",
+        "Sub Category": r.get("sub_category") or "",
+        "Item Description": r.get("item_description") or "",
+        "UOM": r.get("uom") or "",
+        "Qty": float(r["qty"]) if r.get("qty") is not None else "",
+        "Rate": float(r["rate"]) if r.get("rate") is not None else "",
+        "Value": float(r["value"]) if r.get("value") is not None else "",
+        "Line Net Weight": float(r["line_net_weight"]) if r.get("line_net_weight") is not None else "",
+        "Line Carton Weight": float(r["line_carton_weight"]) if r.get("line_carton_weight") is not None else "",
+        "Box ID": r.get("box_id") or "",
+        "Box Article": r.get("box_article") or "",
+        "Box Number": r.get("box_number") if r.get("box_number") is not None else "",
+        "Box UOM": r.get("box_uom") or "",
+        "Box Conversion": r.get("box_conversion") or "",
+        "Box Net Weight": float(r["box_net_weight"]) if r.get("box_net_weight") is not None else "",
+        "Box Gross Weight": float(r["box_gross_weight"]) if r.get("box_gross_weight") is not None else "",
+        "Box Lot Number": r.get("box_lot_number") or "",
+        "Box Count": int(r["box_count"]) if r.get("box_count") is not None else "",
+    }
+
+
+async def export_cr_records(conn, *, company: str, status=None, customer=None,
+                            factory_unit=None, from_date=None, to_date=None,
+                            sort_by="created_ts", sort_order="desc") -> list:
+    """Flattened header⋈line⋈box rows for Excel export. Boxes are scoped to their
+    matching line (article_description = item_description) per the design; a box
+    with no matching line does not appear."""
+    tables = cr_table_names(company)
+    clauses, args = ["1=1"], []
+    if status:
+        args.append(status); clauses.append(f"h.status = ${len(args)}")
+    if factory_unit:
+        args.append(factory_unit); clauses.append(f"h.factory_unit = ${len(args)}")
+    if customer:
+        args.append(f"%{_like_escape(customer)}%")
+        clauses.append(f"h.customer ILIKE ${len(args)} ESCAPE '\\'")
+    df = _convert_date(from_date)
+    if df:
+        args.append(df); clauses.append(f"h.rtv_date >= ${len(args)}")
+    dt = _convert_date(to_date)
+    if dt:
+        args.append(dt); clauses.append(f"h.rtv_date < (${len(args)}::date + 1)")
+    where = " AND ".join(clauses)
+
+    col = _SORTABLE.get(sort_by, "created_ts")
+    direction = "ASC" if str(sort_order).lower() == "asc" else "DESC"
+
+    rows = await conn.fetch(
+        f"""
+        SELECT h.rtv_id, h.rtv_date, h.factory_unit, h.customer, h.invoice_number,
+               h.challan_no, h.dn_no, h.conversion, h.sales_poc, h.business_head,
+               h.remark, h.status, h.created_by, h.created_ts,
+               l.material_type, l.item_category, l.sub_category, l.item_description, l.uom,
+               l.qty, l.rate, l.value,
+               l.net_weight AS line_net_weight, l.carton_weight AS line_carton_weight,
+               b.box_id, b.article_description AS box_article, b.box_number,
+               b.uom AS box_uom, b.conversion AS box_conversion,
+               b.net_weight AS box_net_weight, b.gross_weight AS box_gross_weight,
+               b.lot_number AS box_lot_number, b.count AS box_count
+          FROM {tables['header']} h
+          LEFT JOIN {tables['lines']} l ON l.rtv_id = h.rtv_id
+          LEFT JOIN {tables['boxes']} b
+                 ON b.rtv_id = h.rtv_id AND b.article_description = l.item_description
+         WHERE {where}
+         ORDER BY h.{col} {direction}, l.item_description ASC, b.box_number ASC
+        """,
+        *args,
+    )
+    return [_export_row(dict(r)) for r in rows]
+
+
+async def get_edited_cells(conn, rtv_ids: list) -> set:
+    """(box_id, field_name) pairs edited for the given CRs, for export highlighting."""
+    if not rtv_ids:
+        return set()
+    rows = await conn.fetch(
+        "SELECT box_id, field_name FROM box_edit_logs WHERE transaction_no = ANY($1)",
+        rtv_ids,
+    )
+    return {(r["box_id"], r["field_name"]) for r in rows}
