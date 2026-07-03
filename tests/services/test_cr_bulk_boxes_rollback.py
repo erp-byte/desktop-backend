@@ -58,6 +58,21 @@ async def main() -> None:
         st = await conn.fetchval(
             "SELECT status FROM cfpl_customer_return_header WHERE rtv_id=$1", cr_id)
         assert st == "Submitted", st
+
+        # empty box sync is guarded (Fix): 400 unless allow_clear=True
+        from fastapi import HTTPException as _HTTPExc
+        try:
+            await box_service.bulk_save_boxes(conn, "CFPL", cr_id,
+                schemas.CRBulkBoxUpdateRequest(boxes=[]))
+            raise AssertionError("expected 400 on empty box sync")
+        except _HTTPExc as e:
+            assert e.status_code == 400 and e.detail["error"] == "empty_box_sync"
+        # explicit allow_clear=True deletes all boxes
+        r_clear = await box_service.bulk_save_boxes(conn, "CFPL", cr_id,
+            schemas.CRBulkBoxUpdateRequest(boxes=[]), allow_clear=True)
+        assert r_clear["deleted"] >= 1 and r_clear["inserted"] == 0
+        got_after = await query_service.get_cr(conn, "CFPL", cr_id)
+        assert got_after["boxes"] == []
         print("ASSERTIONS PASSED")
     finally:
         await tx.rollback()

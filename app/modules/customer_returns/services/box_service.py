@@ -79,13 +79,23 @@ async def upsert_box(conn, company: str, cr_id: str,
 
 async def bulk_save_boxes(conn, company: str, cr_id: str,
                           data: schemas.CRBulkBoxUpdateRequest,
-                          notify_discrepancy: bool = True) -> dict:
+                          notify_discrepancy: bool = True,
+                          allow_clear: bool = False) -> dict:
     """State-aware full sync of the CR's box set: insert new, update existing
     (preserving box_id), delete boxes no longer present. Flips header status to
     'Submitted' ONLY from Approved/Submitted. `notify_discrepancy` is a reserved
     no-op (kept for signature parity). Cold-stock mirror is wired in Phase 4."""
     tables = cr_table_names(company)
     await _assert_cr_exists(conn, tables["header"], cr_id)
+
+    if not data.boxes and not allow_clear:
+        raise HTTPException(
+            400,
+            detail={"error": "empty_box_sync",
+                    "message": "Refusing to delete all boxes for this return; "
+                               "pass allow_clear=true to intentionally clear them.",
+                    "details": {"rtv_id": cr_id}},
+        )
 
     # dedupe incoming by (article, box_number), keep last occurrence
     seen: dict = {}

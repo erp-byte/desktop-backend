@@ -177,9 +177,11 @@ async def bulk_save_customer_return_boxes(
     body: schemas.CRBulkBoxUpdateRequest,
     request: Request,
     notify_discrepancy: bool = Query(True),
+    allow_clear: bool = Query(False),
     user: AuthUser = Depends(get_current_user),
 ):
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
         return await box_service.bulk_save_boxes(
-            conn, company, cr_id, body, notify_discrepancy=notify_discrepancy)
+            conn, company, cr_id, body,
+            notify_discrepancy=notify_discrepancy, allow_clear=allow_clear)
