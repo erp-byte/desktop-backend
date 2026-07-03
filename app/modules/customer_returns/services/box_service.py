@@ -74,3 +74,83 @@ async def upsert_box(conn, company: str, cr_id: str,
     status = "inserted" if row["inserted"] else "updated"
     return {"status": status, "box_id": row["box_id"], "rtv_id": cr_id,
             "article_description": payload.article_description, "box_number": payload.box_number}
+
+
+async def bulk_save_boxes(conn, company: str, cr_id: str,
+                          data: schemas.CRBulkBoxUpdateRequest,
+                          notify_discrepancy: bool = True) -> dict:
+    """State-aware full sync of the CR's box set: insert new, update existing
+    (preserving box_id), delete boxes no longer present. Flips header status to
+    'Submitted' ONLY from Approved/Submitted. `notify_discrepancy` is a reserved
+    no-op (kept for signature parity). Cold-stock mirror is wired in Phase 4."""
+    tables = cr_table_names(company)
+    await _assert_cr_exists(conn, tables["header"], cr_id)
+
+    # dedupe incoming by (article, box_number), keep last occurrence
+    seen: dict = {}
+    for b in data.boxes:
+        seen[(b.article_description, b.box_number)] = b
+    incoming = seen  # key -> item, insertion order preserved
+    incoming_keys = set(incoming.keys())
+
+    existing_rows = await conn.fetch(
+        f"SELECT article_description, box_number, box_id FROM {tables['boxes']} WHERE rtv_id = $1",
+        cr_id,
+    )
+    existing_keys = {(r["article_description"], r["box_number"]) for r in existing_rows}
+
+    inserted = updated = deleted = 0
+    async with conn.transaction():
+        for (art, num), b in incoming.items():
+            if (art, num) in existing_keys:
+                await conn.execute(
+                    f"""
+                    UPDATE {tables['boxes']} SET
+                        uom = COALESCE($4, uom),
+                        conversion = COALESCE($5, conversion),
+                        net_weight = COALESCE($6::numeric, net_weight),
+                        gross_weight = COALESCE($7::numeric, gross_weight),
+                        lot_number = COALESCE($8, lot_number),
+                        item_mark = COALESCE($9, item_mark),
+                        spl_remarks = COALESCE($10, spl_remarks),
+                        vakkal = COALESCE($11, vakkal),
+                        count = COALESCE($12::int, count),
+                        updated_at = NOW()
+                    WHERE rtv_id = $1 AND article_description = $2 AND box_number = $3
+                    """,
+                    cr_id, art, num, b.uom, b.conversion, b.net_weight, b.gross_weight,
+                    b.lot_number, b.item_mark, b.spl_remarks, b.vakkal, b.count,
+                )
+                updated += 1
+            else:
+                box_id = f"{_base8()}-{num}-{inserted}"
+                await conn.execute(
+                    f"""
+                    INSERT INTO {tables['boxes']}
+                        (rtv_id, article_description, box_number, box_id, uom, conversion,
+                         net_weight, gross_weight, lot_number, item_mark, spl_remarks, vakkal, count)
+                    VALUES ($1,$2,$3,$4,$5,$6,
+                            COALESCE($7::numeric, 0), COALESCE($8::numeric, 0),
+                            $9,$10,$11,$12,$13)
+                    """,
+                    cr_id, art, num, box_id, b.uom, b.conversion, b.net_weight, b.gross_weight,
+                    b.lot_number, b.item_mark, b.spl_remarks, b.vakkal, b.count,
+                )
+                inserted += 1
+
+        for (art, num) in existing_keys - incoming_keys:
+            await conn.execute(
+                f"DELETE FROM {tables['boxes']} "
+                "WHERE rtv_id = $1 AND article_description = $2 AND box_number = $3",
+                cr_id, art, num,
+            )
+            deleted += 1
+
+        await conn.execute(
+            f"UPDATE {tables['header']} SET status = 'Submitted', updated_at = NOW() "
+            "WHERE rtv_id = $1 AND status IN ('Approved', 'Submitted')",
+            cr_id,
+        )
+
+    return {"status": "synced", "rtv_id": cr_id, "inserted": inserted,
+            "updated": updated, "unchanged": 0, "deleted": deleted}
