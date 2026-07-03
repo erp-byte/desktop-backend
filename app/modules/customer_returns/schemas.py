@@ -6,7 +6,8 @@ numeric fields are kept as strings in responses to match the production API.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import List, Literal, Optional
+from decimal import Decimal
+from typing import Annotated, List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -175,3 +176,69 @@ class CRLinesUpdateResponse(BaseModel):
     status: str
     rtv_id: str
     lines_count: int
+
+
+# ── box models (Phase 2) ────────────────────────────────────────────────
+Decimal18_3 = Annotated[Decimal, Field(max_digits=18, decimal_places=3)]
+
+
+class CRBoxUpsertRequest(BaseModel):
+    article_description: str
+    box_number: int = Field(..., ge=1)
+    uom: Optional[str] = None
+    conversion: Optional[str] = None
+    net_weight: Optional[Decimal18_3] = None
+    gross_weight: Optional[Decimal18_3] = None
+    lot_number: Optional[str] = None
+    item_mark: Optional[str] = None
+    spl_remarks: Optional[str] = None
+    vakkal: Optional[str] = None
+    count: Optional[int] = None
+
+
+class CRBoxUpsertResponse(BaseModel):
+    status: str
+    box_id: str
+    rtv_id: str
+    article_description: str
+    box_number: int
+
+
+class CRBulkBoxItem(BaseModel):
+    article_description: str
+    box_number: int = Field(..., ge=1)
+    uom: Optional[str] = None
+    conversion: Optional[str] = None
+    lot_number: Optional[str] = None
+    item_mark: Optional[str] = None
+    spl_remarks: Optional[str] = None
+    vakkal: Optional[str] = None
+    net_weight: Optional[Decimal18_3] = None
+    gross_weight: Optional[Decimal18_3] = None
+    count: Optional[int] = None
+
+
+class CRBulkBoxUpdateRequest(BaseModel):
+    boxes: List[CRBulkBoxItem] = Field(default_factory=list)
+
+
+class CRBulkBoxUpdateResponse(BaseModel):
+    status: str
+    rtv_id: str
+    inserted: int = 0
+    updated: int = 0
+    unchanged: int = 0
+    deleted: int = 0
+
+
+class CRBoxEditLogEntry(BaseModel):
+    field_name: str
+    old_value: Optional[str] = None
+    new_value: Optional[str] = None
+
+
+class CRBoxEditLogRequest(BaseModel):
+    email_id: str  # accepted for FE compat; the SERVICE ignores it and uses user.email (JWT)
+    box_id: str
+    rtv_id: str
+    changes: List[CRBoxEditLogEntry]
