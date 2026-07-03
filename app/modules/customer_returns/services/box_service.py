@@ -5,6 +5,7 @@ box_number); box_id is NULL until Print and never regenerated once set.
 from __future__ import annotations
 
 import time
+from datetime import datetime, timezone
 
 from fastapi import HTTPException
 
@@ -154,3 +155,24 @@ async def bulk_save_boxes(conn, company: str, cr_id: str,
 
     return {"status": "synced", "rtv_id": cr_id, "inserted": inserted,
             "updated": updated, "unchanged": 0, "deleted": deleted}
+
+
+async def log_box_edits(conn, payload: schemas.CRBoxEditLogRequest, email_id: str) -> dict:
+    """Append one audit row per change to the global box_edit_logs table.
+    `email_id` is the JWT actor (payload.email_id is ignored — hardening).
+    No CR/box existence check (append-only log, matches source)."""
+    edited_at = datetime.now(timezone.utc)  # one shared timestamp per call
+    async with conn.transaction():
+        for ch in payload.changes:
+            description = f"Changed {ch.field_name} from '{ch.old_value}' to '{ch.new_value}'"
+            await conn.execute(
+                """
+                INSERT INTO box_edit_logs
+                    (email_id, description, transaction_no, box_id, field_name,
+                     old_value, new_value, edited_at)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                """,
+                email_id, description, payload.rtv_id, payload.box_id,
+                ch.field_name, ch.old_value, ch.new_value, edited_at,
+            )
+    return {"status": "logged", "entries": len(payload.changes)}
