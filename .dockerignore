@@ -1,0 +1,29 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.env
+.env.*
+tests/
+docs/
+*.md
+.vscode/
+.claude/
+scripts/
+planning_structure.json
+so_pdfs/
+# NOTE: data/ is intentionally NOT ignored — the Dockerfile COPYs it so the
+# app/main.py lifespan can ingest master data at startup.
+
+# Extra build-context trimming. Only DIRECTORIES / specific files here — NO
+# extension globs (e.g. *.xlsx), because the Dockerfile COPYs data/, which is
+# full of .xlsx master-data files that an extension glob would strip.
+.venv*/
+tmp/
+scratch/
+Plan/
+uv.lock
+package-lock.json
+Dockerfile.lambda
+docker-compose.yml

@@ -1,0 +1,149 @@
+/* Component: layout — canonical selectors per 01-UI-SPEC.md §4.
+   Page-level structure: .layout, .main-content, .page-header, .page-title,
+   .page-subtitle, .sticky-action-bar, .side-pane. Note that sidebar.css
+   also declares .layout (flex + 40px top padding for titlebar); both
+   declarations are compatible — whichever loads later wins per cascade. */
+
+/* ── Layout root ── */
+.layout {
+  display: flex;
+  padding-top: 40px; /* titlebar height — matches titlebar.css */
+  min-height: 100vh;
+}
+
+/* ── Main content area ── */
+.main-content {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  padding: var(--space-page-y) var(--space-page-x);
+  background: var(--color-surface-page);
+  max-width: 100%;
+}
+
+.main-content > * + * {
+  margin-top: var(--space-5);
+}
+
+.main-content__inner {
+  max-width: 1440px;
+  margin: 0 auto;
+}
+
+/* ── Page header — H1 + subtitle on left, actions on right ── */
+.page-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: var(--space-4);
+  margin-bottom: var(--space-6);
+  flex-wrap: wrap;
+}
+
+.page-header__left {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.page-header__actions,
+.page-header-right,
+.page-header-actions {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+/* ── Page title — canonical 22px; typography.css supplies font/weight ── */
+.page-title {
+  font-family: var(--font-display);
+  font-size: var(--font-h1);
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--line-height-tight);
+  letter-spacing: var(--tracking-tight);
+  color: var(--color-text-primary);
+  margin: 0;
+}
+
+.page-subtitle {
+  font-size: var(--font-body-sm);
+  color: var(--color-text-secondary);
+  margin-top: var(--space-1);
+  line-height: var(--line-height-normal);
+}
+
+.eyebrow {
+  font-size: var(--font-overline);
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: var(--tracking-wider);
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+  margin-bottom: var(--space-1);
+}
+
+/* ── Sticky action bar — footer of selection-driven screens ── */
+.sticky-action-bar {
+  position: sticky;
+  bottom: 0;
+  z-index: var(--z-sticky);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-3) var(--space-5);
+  background: var(--color-surface-raised);
+  border: 1px solid var(--color-border-card);
+  border-radius: 0 0 var(--radius-lg) var(--radius-lg);
+  box-shadow: 0 -4px 12px rgba(0,0,0,0.04); /* token-exempt: one-off upward-casting shadow not in --shadow-* family */
+}
+
+.sticky-action-bar__count {
+  font-size: var(--font-body-sm);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-secondary);
+}
+
+.sticky-action-bar__actions {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+}
+
+/* ── Side pane — sliding right-side panel (pane-controller.js) ── */
+.side-pane {
+  position: fixed;
+  top: 40px;
+  right: 0;
+  bottom: 0;
+  width: min(560px, 90vw);
+  background: var(--color-surface-raised);
+  border-left: 1px solid var(--color-border-subtle);
+  box-shadow: var(--shadow-lg);
+  transform: translateX(100%);
+  transition: transform var(--duration-slow) var(--easing-emphasized);
+  z-index: var(--z-modal);
+}
+
+.side-pane.is-open {
+  transform: translateX(0);
+}
+
+.side-pane__header {
+  padding: var(--space-5) var(--space-6);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+
+.side-pane__body {
+  padding: var(--space-6);
+  overflow-y: auto;
+  height: calc(100% - 72px); /* token-exempt: header 56 + divider 1 = 57 reserved; legacy value preserved */
+}
+
+/* ── Transitional: restore pre-migration .page-title sizing on pages that
+   haven't opted into `.page-title--canonical` yet. Remove in Plan 10. ── */
+:where(.page-header) .page-title:not(.page-title--canonical) {
+  font-size: 26px; /* token-exempt: transitional legacy size — Plan 10 removes the whole override */
+}

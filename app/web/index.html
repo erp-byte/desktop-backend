@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Candor — Vendor Onboarding</title>
+</head>
+<body>
+  <script src="js/web-shims.js"></script>
+  <script>
+    // Entry point for /app/ — route to the wizard when a session exists,
+    // otherwise to the login page.
+    (function () {
+      const signedIn = window.CandorAuth.accessToken() && window.CandorAuth.me();
+      window.location.replace(signedIn ? 'vendor-new.html' : 'login.html');
+    })();
+  </script>
+</body>
+</html>

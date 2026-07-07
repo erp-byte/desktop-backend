@@ -1,0 +1,78 @@
+/* Component: badge — canonical selectors per 01-UI-SPEC.md §3.10.
+   Small status chip used in tables, cards, and inline text.
+   Legacy .badge.ok/.mismatch/.warning/.info aliases route through the
+   semantic variant rules. */
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 2px var(--space-2); /* token-exempt: hairline vertical padding on dense chip */
+  border-radius: var(--radius-sm);
+  font-family: var(--font-sans);
+  font-size: var(--font-caption);
+  font-weight: var(--font-weight-medium);
+  border: 1px solid transparent;
+  white-space: nowrap;
+  line-height: var(--line-height-tight);
+}
+
+/* ── Variants ── */
+.badge--success,
+.badge.ok {
+  color: var(--color-success-fg);
+  background: var(--color-success-bg);
+  border-color: var(--color-success-border);
+}
+
+.badge--warning,
+.badge.warning {
+  color: var(--color-warning-fg);
+  background: var(--color-warning-bg);
+  border-color: var(--color-warning-border);
+}
+
+.badge--danger,
+.badge.mismatch {
+  color: var(--color-danger-fg);
+  background: var(--color-danger-bg);
+  border-color: var(--color-danger-border);
+}
+
+.badge--info,
+.badge.info {
+  color: var(--color-info-fg);
+  background: var(--color-info-bg);
+  border-color: var(--color-info-border);
+}
+
+.badge--neutral {
+  color: var(--color-neutral-fg);
+  background: var(--color-neutral-bg);
+  border-color: var(--color-neutral-border);
+}
+
+.badge--accent {
+  color: var(--color-accent);
+  background: var(--color-accent-glow);
+  border-color: var(--color-accent-strong);
+}
+
+/* ── Shape modifier ── */
+.badge--pill {
+  border-radius: var(--radius-pill);
+}
+
+/* ── Font modifier — numeric / code badges ── */
+.badge.mono {
+  font-family: var(--font-mono);
+  font-size: var(--font-mono-sm);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Icon slot ── */
+.badge svg {
+  width: 12px; /* token-exempt: badge icon sized below canonical 15px for dense chip */
+  height: 12px;
+  flex-shrink: 0;
+}

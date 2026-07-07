@@ -1,0 +1,96 @@
+@startuml
+title Purchase Orders and Goods Receipt
+
+skinparam entity {
+  BackgroundColor #F0F4FF
+  BorderColor #3A5A8C
+  HeaderBackgroundColor #3A5A8C
+  FontColor white
+  FontSize 11
+  AttributeFontColor black
+  AttributeFontSize 10
+}
+skinparam ArrowColor #3A5A8C
+skinparam NoteBackgroundColor #FFFDE7
+skinparam NoteBorderColor #E6A817
+skinparam shadowing false
+
+entity "PO Header" as POH {
+  * transaction_no
+  --
+  vendor_name
+  PO_date
+  PO_number
+  invoice_number
+  GRN_number
+  vehicle_number
+  transporter_name
+  warehouse
+  total_amount
+  status
+}
+
+entity "PO Line" as POL {
+  * line_number
+  --
+  product_name
+  item_type
+  quantity
+  rate
+  amount
+  GST_rate
+}
+
+entity "PO Section (Lot)" as POS {
+  * section_number
+  --
+  lot_number
+  box_count
+  manufacturing_date
+  expiry_date
+}
+
+entity "PO Box (Carton)" as POB {
+  * box_id
+  --
+  lot_number
+  net_weight
+  gross_weight
+  box_number
+}
+
+entity "RM Indent (ref)" as JCRM {
+  * rm_indent_id
+  --
+  scanned_box_ids
+}
+
+entity "Floor Movement (ref)" as FM {
+  * movement_id
+  --
+  scanned_qr_codes
+}
+
+POH  ||--o{ POL  : "has lines"
+POL  ||--o{ POS  : "lot sections"
+POS  ||--o{ POB  : "carton boxes"
+JCRM ..>   POB  : "scanned at issue"
+FM   ..>   POB  : "scanned at movement"
+
+note right of POH
+  Imported from Tally. transaction_no is the natural key.
+  Two-phase: Purchase team fills financial details,
+  Stores team fills GRN, vehicle, and warehouse on receipt.
+end note
+
+note right of POS
+  Groups boxes sharing the same lot/batch within a PO line.
+  One line may have multiple lots (different manufacturing dates).
+end note
+
+note right of POB
+  Each physical carton has a QR code (box_id).
+  Scanned at: receiving, RM issue, floor transfers, day-end count.
+end note
+
+@enduml

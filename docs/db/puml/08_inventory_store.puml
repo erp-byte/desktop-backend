@@ -1,0 +1,122 @@
+@startuml
+title Inventory and Store Operations
+
+skinparam entity {
+  BackgroundColor #F0F4FF
+  BorderColor #3A5A8C
+  HeaderBackgroundColor #3A5A8C
+  FontColor white
+  FontSize 11
+  AttributeFontColor black
+  AttributeFontSize 10
+}
+skinparam ArrowColor #3A5A8C
+skinparam NoteBackgroundColor #FFFDE7
+skinparam NoteBorderColor #E6A817
+skinparam shadowing false
+
+entity "Floor Inventory" as FI {
+  * inventory_id
+  --
+  product_name
+  item_type
+  floor_location
+  quantity_kg
+  lot_number
+  last_updated
+}
+
+entity "Floor Movement" as FM {
+  * movement_id
+  --
+  product_name
+  from_location
+  to_location
+  quantity_kg
+  reason
+  moved_by
+}
+
+entity "Offgrade Inventory" as OGI {
+  * offgrade_id
+  --
+  source_product
+  product_group
+  grade
+  available_qty_kg
+  production_date
+  expiry_date
+  status
+}
+
+entity "Offgrade Reuse Rule" as OGR {
+  * rule_id
+  --
+  source_product_group
+  target_product_group
+  max_substitution_pct
+  is_active
+}
+
+entity "Offgrade Consumption" as OGC {
+  * consumption_id
+  --
+  qty_used_kg
+  consumed_at
+}
+
+entity "Purchase Indent" as PI {
+  * indent_id
+  --
+  material_name
+  required_qty_kg
+  required_by_date
+  priority
+  status
+}
+
+entity "Store Alert" as SA {
+  * alert_id
+  --
+  alert_type
+  message
+  target_team
+  is_read
+}
+
+entity "SO Fulfillment Floor Stock" as FFS {
+  * floor_stock_id
+  --
+  material_name
+  item_type
+  quantity_kg
+  floor_location
+  added_by
+}
+
+FM   }o--|| FI  : "updates inventory"
+OGI  ||--o{ OGC : "consumed"
+OGC  ..>   FM   : "triggers movement"
+PI   ..>   SA   : "raises store alert"
+
+note right of FI
+  item_type: RM | PM | WIP | FG
+  floor_location: RM Store | PM Store | Production Floor | FG Store
+end note
+
+note right of OGR
+  Governs how much offgrade material
+  can be substituted in a BOM (e.g. max 20%).
+end note
+
+note right of SA
+  Automatic notifications to purchase / stores / production / QC teams.
+  alert_type: shortage | indent raised | material received | anomaly
+end note
+
+note right of FFS
+  Manual entry for floor materials not yet scanned.
+  Used in MRP availability check before planning.
+end note
+
+@enduml

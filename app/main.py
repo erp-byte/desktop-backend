@@ -10,6 +10,7 @@ import hmac as _hmac
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from mangum import Mangum
 from pydantic import BaseModel
 
@@ -150,6 +151,16 @@ app.include_router(packing_router)
 app.include_router(customer_returns_router)
 app.include_router(webhook_router)
 app.include_router(ws_router)
+
+
+# ── Static web frontend ──
+# Serves the browser port of the Vendor Onboarding module (ported from the
+# Electron renderer). Mounted AFTER the API routers so it never shadows an
+# /api/* route. `html=True` serves app/web/index.html at /app/ and resolves
+# directory paths to their index.html. Reachable at /app/vendor-new.html.
+_web_dir = Path(__file__).parent / "web"
+if _web_dir.exists():
+    app.mount("/app", StaticFiles(directory=str(_web_dir), html=True), name="web")
 
 
 @app.get("/health")

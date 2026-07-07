@@ -1,0 +1,177 @@
+/* Component: form — canonical selectors per 01-UI-SPEC.md §3.2.
+   Canonical `.form-input` at 36px. Legacy aliases (`.search-input`, `.fd-input`,
+   etc.) preserve today's 40px heights until each module migrates. */
+
+/* ── Field wrapper + label + helper/error ── */
+.form-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.form-label {
+  display: block;
+  font-size: var(--font-overline);
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: var(--tracking-wider);
+  text-transform: uppercase;
+  color: var(--color-text-secondary);
+  margin-bottom: var(--space-1);
+}
+
+.form-label__required {
+  color: var(--color-danger-fg);
+  margin-left: 2px; /* token-exempt: hairline gap on required asterisk */
+}
+
+.form-helper {
+  font-size: var(--font-caption);
+  color: var(--color-text-muted);
+  line-height: var(--line-height-snug);
+}
+
+.form-error {
+  font-size: var(--font-caption);
+  color: var(--color-danger-fg);
+  line-height: var(--line-height-snug);
+}
+
+/* ── Input (select, textarea) ── */
+.form-input {
+  height: 36px;
+  padding: 0 var(--space-input-x);
+  background: var(--color-surface-sunken);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-md);
+  font-family: var(--font-sans);
+  font-size: var(--font-body);
+  color: var(--color-text-primary);
+  color-scheme: light;
+  outline: none;
+  transition:
+    border-color var(--duration-fast) var(--easing-standard),
+    box-shadow var(--duration-fast) var(--easing-standard);
+}
+
+.form-input::placeholder {
+  color: var(--color-text-placeholder);
+}
+
+.form-input:hover:not(:disabled):not([readonly]) {
+  border-color: var(--color-border-strong);
+}
+
+.form-input:focus,
+.form-input:focus-visible {
+  border-color: var(--color-border-focus);
+  box-shadow: var(--focus-ring);
+}
+
+.form-input.has-error {
+  border-color: var(--color-danger-fg);
+  background: var(--color-danger-bg);
+}
+
+.form-input.has-error:focus {
+  box-shadow: var(--focus-ring-danger);
+}
+
+.form-input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  background: var(--color-surface-page);
+}
+
+.form-input[readonly] {
+  background: var(--color-surface-sunken);
+  cursor: text;
+}
+
+.form-input.mono {
+  font-family: var(--font-mono);
+  font-size: var(--font-mono-body);
+}
+
+.form-input--sm {
+  height: 32px;
+  font-size: var(--font-body-sm);
+}
+
+.form-input--lg {
+  height: 42px;
+}
+
+/* ── Textarea — auto height with floor ── */
+textarea.form-input {
+  height: auto;
+  min-height: calc(36px * 2);
+  padding: var(--space-2) var(--space-input-x);
+  line-height: var(--line-height-normal);
+  resize: vertical;
+}
+
+/* ── Select — custom chevron SVG ── */
+select.form-input {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: var(--space-8);
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%236b6b70' stroke-width='1.5'><path d='M6 9l6 6 6-6'/></svg>");
+  background-position: right var(--space-3) center;
+  background-repeat: no-repeat;
+}
+
+/* ── Checkbox — native with accent color ── */
+input[type="checkbox"] {
+  accent-color: var(--color-accent);
+  width: 16px; /* token-exempt: checkbox sizing is native control dimension */
+  height: 16px; /* token-exempt: native control dimension */
+  cursor: pointer;
+}
+
+/* ── Grid layout for form sections ── */
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: var(--space-5);
+}
+
+/* ── Legacy aliases — preserve 40px height for unmigrated markup ── */
+.search-input,
+.fd-input,
+.td-input,
+.date-filter-input,
+.wizard-search-input,
+.plan-config-field input {
+  height: 40px; /* legacy height — Plan 10 drops to 36px when each consumer migrates to .form-input markup */
+  padding: 0 var(--space-input-x);
+  background: var(--color-surface-sunken);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-md);
+  font-family: var(--font-sans);
+  font-size: var(--font-body);
+  color: var(--color-text-primary);
+  color-scheme: light;
+  outline: none;
+  transition:
+    border-color var(--duration-fast) var(--easing-standard),
+    box-shadow var(--duration-fast) var(--easing-standard);
+}
+
+.search-input::placeholder,
+.fd-input::placeholder,
+.td-input::placeholder,
+.date-filter-input::placeholder,
+.wizard-search-input::placeholder,
+.plan-config-field input::placeholder {
+  color: var(--color-text-placeholder);
+}
+
+.search-input:focus,
+.fd-input:focus,
+.td-input:focus,
+.date-filter-input:focus,
+.wizard-search-input:focus,
+.plan-config-field input:focus {
+  border-color: var(--color-border-focus);
+  box-shadow: var(--focus-ring);
+}

@@ -1,0 +1,85 @@
+@startuml
+title User Access and Permissions
+
+skinparam entity {
+  BackgroundColor #F0F4FF
+  BorderColor #3A5A8C
+  HeaderBackgroundColor #3A5A8C
+  FontColor white
+  FontSize 11
+  AttributeFontColor black
+  AttributeFontSize 10
+}
+skinparam ArrowColor #3A5A8C
+skinparam NoteBackgroundColor #FFFDE7
+skinparam NoteBorderColor #E6A817
+skinparam shadowing false
+
+entity "Role" as ROLE {
+  * role_id
+  --
+  role_name
+  description
+  is_admin
+}
+
+entity "User" as USR {
+  * user_id
+  --
+  full_name
+  phone
+  email
+  entity
+  is_active
+  last_login
+}
+
+entity "Permission" as PERM {
+  * permission_id
+  --
+  module
+  sub_module
+  action
+  description
+}
+
+entity "Role Permission" as RRP {
+  * role_id
+  * permission_id
+  --
+  allowed_entities
+  allowed_warehouses
+  allowed_floors
+}
+
+entity "Session" as SESS {
+  * session_id
+  --
+  user_id
+  created_at
+  expires_at
+  is_active
+}
+
+ROLE ||--o{ USR  : "assigned to user"
+ROLE ||--o{ RRP  : "has permissions"
+PERM ||--o{ RRP  : "granted via role"
+USR  ||--o{ SESS : "login sessions"
+
+note right of PERM
+  3-level hierarchy: module > sub_module > action
+  action: view | create | edit | delete
+end note
+
+note right of RRP
+  Scope arrays restrict access to specific entities, warehouses, or floors.
+  Empty = no restriction (all allowed).
+  e.g. allowed_entities = [cfpl] restricts to CFPL entity only.
+end note
+
+note right of SESS
+  Sessions expire automatically.
+  Revoked by setting is_active = false on logout.
+end note
+
+@enduml

@@ -1,0 +1,74 @@
+@startuml
+title Production Orders
+
+skinparam entity {
+  BackgroundColor #F0F4FF
+  BorderColor #3A5A8C
+  HeaderBackgroundColor #3A5A8C
+  FontColor white
+  FontSize 11
+  AttributeFontColor black
+  AttributeFontSize 10
+}
+skinparam ArrowColor #3A5A8C
+skinparam NoteBackgroundColor #FFFDE7
+skinparam NoteBorderColor #E6A817
+skinparam shadowing false
+
+entity "Plan Line" as PPL {
+  * plan_line_id
+  --
+  product_name
+  planned_qty_kg
+  status
+}
+
+entity "Bill of Materials" as BOMH {
+  * bom_id
+  --
+  product_name
+  pack_size_kg
+}
+
+entity "Production Order" as PO {
+  * prod_order_id
+  --
+  order_number
+  product_name
+  customer_name
+  batch_number
+  batch_size_kg
+  best_before_date
+  total_stages
+  factory
+  floor
+  status
+}
+
+entity "Job Card" as JC {
+  * job_card_id
+  --
+  job_number
+  step_number
+  stage
+  batch_number
+  status
+}
+
+PPL  ||--o{ PO   : "generates order"
+BOMH ||--o{ PO   : "BOM locked at creation"
+PO   ||--o{ JC   : "one per stage"
+
+note right of PO
+  Created from an approved plan line.
+  BOM is locked at this point - no changes allowed mid-production.
+  status: created -> job cards issued -> in progress -> completed
+end note
+
+note right of JC
+  One job card is created per BOM process step.
+  Example: 4-step BOM = 4 job cards per production order.
+  Job cards are linked in a chain (each stage feeds the next).
+end note
+
+@enduml

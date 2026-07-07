@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Candor — Sign in</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,300&family=Playfair+Display:wght@400;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/variables.css">
+  <link rel="stylesheet" href="css/reset.css">
+  <link rel="stylesheet" href="css/toast.css">
+  <link rel="stylesheet" href="css/animations.css">
+  <link rel="stylesheet" href="css/typography.css">
+  <link rel="stylesheet" href="css/button.css">
+  <link rel="stylesheet" href="css/form.css">
+  <link rel="stylesheet" href="css/card.css">
+  <style>
+    body {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--bg, #0f1115);
+      padding: 24px;
+    }
+    .login-card {
+      width: 100%;
+      max-width: 380px;
+      background: var(--surface, #181b21);
+      border: 1px solid var(--border, #2a2f3a);
+      border-radius: 14px;
+      padding: 32px 28px;
+      box-shadow: 0 12px 40px rgba(0,0,0,.35);
+    }
+    .login-brand {
+      font-family: 'Playfair Display', serif;
+      font-size: 26px;
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+    .login-sub { color: var(--text-muted, #8b93a1); font-size: 13px; margin-bottom: 24px; }
+    .login-card .form-field { margin-bottom: 16px; }
+    #loginBtn { width: 100%; margin-top: 8px; }
+    .login-hint { color: var(--text-muted, #8b93a1); font-size: 12px; margin-top: 18px; text-align: center; }
+  </style>
+</head>
+<body>
+  <div class="login-card">
+    <div class="login-brand">Candor</div>
+    <div class="login-sub">Vendor Onboarding · sign in to continue</div>
+
+    <form id="loginForm" autocomplete="on">
+      <div class="form-field">
+        <label class="form-label" for="phone">Phone</label>
+        <input class="form-input" id="phone" name="phone" inputmode="tel" placeholder="Registered phone" autocomplete="username" required />
+      </div>
+      <div class="form-field">
+        <label class="form-label" for="password">Password</label>
+        <input class="form-input" id="password" name="password" type="password" placeholder="Password" autocomplete="current-password" required />
+      </div>
+      <button class="btn btn--primary" id="loginBtn" type="submit">Sign in</button>
+    </form>
+
+    <div class="login-hint">You'll be taken to the New Vendor wizard after signing in.</div>
+  </div>
+
+  <div class="toast" id="toast"><span id="toastIcon"></span><span id="toastMsg"></span></div>
+
+  <script src="js/web-shims.js"></script>
+  <script src="js/toast.js"></script>
+  <script src="js/login.js"></script>
+</body>
+</html>

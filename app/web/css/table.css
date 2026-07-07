@@ -1,0 +1,149 @@
+/* Component: table — canonical selectors per 01-UI-SPEC.md §3.4.
+   Canonical `.data-table` + scroll container + sort/selection/density
+   modifiers. Module-specific tables (.jc-table, .ful-table, .td-table,
+   .pb-bom-table, etc.) stay in their module stylesheets until each
+   module migrates its markup to `.data-table`. */
+
+/* ── Scroll container — owns the border + radius ── */
+.data-table-scroll {
+  position: relative;
+  max-height: 65vh;
+  overflow: auto;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface-raised);
+}
+
+/* ── Table root ── */
+.data-table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-family: var(--font-sans);
+  font-size: var(--font-body);
+}
+
+/* ── Header ── */
+.data-table thead th {
+  font-size: var(--font-overline);
+  font-weight: var(--font-weight-semibold);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-wider);
+  color: var(--color-text-muted);
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--color-border-subtle);
+  text-align: left;
+  background: var(--color-surface-page);
+  white-space: nowrap;
+}
+
+.data-table--sticky thead th {
+  position: sticky;
+  top: 0;
+  z-index: var(--z-sticky);
+}
+
+/* ── Body rows ── */
+.data-table tbody td {
+  padding: var(--space-3) var(--space-4);
+  font-size: var(--font-body);
+  color: var(--color-text-primary);
+  border-bottom: 1px solid var(--color-border-subtle);
+  vertical-align: middle;
+}
+
+.data-table tbody tr {
+  cursor: default;
+  transition: background var(--duration-fast) var(--easing-standard);
+}
+
+.data-table tbody tr.is-interactive,
+.data-table tbody tr[data-id] {
+  cursor: pointer;
+}
+
+.data-table tbody tr:hover {
+  background: var(--color-surface-hover);
+}
+
+/* ── Row selection / disabled ── */
+.data-table tr.is-selected {
+  background: var(--color-accent-glow);
+}
+
+.data-table tr.is-selected td:first-child {
+  box-shadow: inset 3px 0 0 var(--color-accent);
+}
+
+.data-table tr.is-disabled {
+  opacity: 0.45;
+  pointer-events: none;
+}
+
+/* ── Cell modifiers ── */
+.data-table td.mono {
+  font-family: var(--font-mono);
+  font-size: var(--font-mono-body);
+  font-variant-numeric: tabular-nums;
+}
+
+.data-table td.numeric {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Density modifier ── */
+.data-table--dense thead th {
+  padding: var(--space-2) var(--space-3);
+}
+
+.data-table--dense tbody td {
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--font-body-sm);
+}
+
+/* ── Sortable header ── */
+.data-table th.is-sortable {
+  cursor: pointer;
+  user-select: none;
+}
+
+.data-table th.is-sortable::after {
+  content: '';
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin-left: var(--space-1);
+  opacity: 0;
+  transition:
+    opacity var(--duration-fast) var(--easing-standard),
+    transform var(--duration-fast) var(--easing-standard);
+}
+
+.data-table th.is-sorted-asc::after {
+  opacity: 1;
+  border-left: 3px solid transparent;
+  border-right: 3px solid transparent;
+  border-bottom: 4px solid var(--color-accent);
+  width: 0;
+  height: 0;
+}
+
+.data-table th.is-sorted-desc::after {
+  opacity: 1;
+  border-left: 3px solid transparent;
+  border-right: 3px solid transparent;
+  border-top: 4px solid var(--color-accent);
+  border-bottom: 0;
+  width: 0;
+  height: 0;
+}
+
+/* ── Empty row — pairs with .empty-state from state.css ── */
+.data-table__empty td {
+  padding: 0;
+}
+
+.data-table__empty .empty-state {
+  display: flex;
+}

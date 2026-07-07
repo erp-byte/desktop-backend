@@ -1,0 +1,11 @@
+# Local run of the App Runner image (mirrors ../../backend/docker-compose.yml).
+# Reads secrets from .env for local dev; on App Runner you supply these as
+# service environment variables instead (never baked into the image).
+services:
+  backend:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    restart: unless-stopped

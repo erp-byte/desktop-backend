@@ -1,0 +1,164 @@
+{
+  "$schema": "Candor Production Planner — Expected AI Response Structure",
+  "description": "JSON structures that Claude must return when generating production plans via MCP tools",
+
+  "daily_plan": {
+    "description": "Single-day production schedule. Pass schedule array to save_production_plan as schedule_json.",
+    "schedule": [
+      {
+        "fg_sku_name": "Product Name 500g",
+        "customer_name": "Customer Ltd.",
+        "qty_kg": 500,
+        "qty_units": 2000,
+        "bom_id": 15,
+        "production_type": "production",
+        "machine_name": "Machine Name",
+        "priority": 1,
+        "shift": "day",
+        "stage_sequence": ["sorting", "roasting", "packaging"],
+        "estimated_hours": 5.0,
+        "linked_fulfillment_ids": [42],
+        "reasoning": "Earliest deadline, sufficient RM stock on hand"
+      }
+    ],
+    "material_check": [
+      {
+        "material": "Raw Material Name",
+        "type": "rm",
+        "needed_kg": 525.0,
+        "available_kg": 2000.0,
+        "status": "SUFFICIENT"
+      }
+    ],
+    "risk_flags": [
+      {
+        "flag": "Short description of risk",
+        "severity": "warning",
+        "details": "Extended explanation of the risk and suggested action"
+      }
+    ]
+  },
+
+  "weekly_plan": {
+    "description": "Multi-day schedule spanning a week. Each item includes a date field.",
+    "schedule": [
+      {
+        "date": "2026-04-14",
+        "fg_sku_name": "Product Name 500g",
+        "customer_name": "Customer Ltd.",
+        "qty_kg": 500,
+        "qty_units": 2000,
+        "bom_id": 15,
+        "production_type": "production",
+        "machine_name": "Machine Name",
+        "priority": 1,
+        "shift": "day",
+        "stage_sequence": ["sorting", "roasting", "packaging"],
+        "estimated_hours": 5.0,
+        "linked_fulfillment_ids": [42],
+        "reasoning": "Grouped with similar products on Monday to minimise changeover"
+      }
+    ],
+    "material_check": [
+      {
+        "material": "Raw Material Name",
+        "type": "rm",
+        "needed_kg": 525.0,
+        "available_kg": 2000.0,
+        "status": "SUFFICIENT"
+      }
+    ],
+    "risk_flags": [
+      {
+        "flag": "Risk description",
+        "severity": "warning",
+        "details": "Details and recommended action"
+      }
+    ]
+  },
+
+  "plan_revision": {
+    "description": "Revision of an existing approved plan. Each item has an action field.",
+    "actions": ["keep", "reschedule", "cancel", "add"],
+    "revised_schedule": [
+      {
+        "action": "keep",
+        "plan_line_id": 1,
+        "reasoning": "Already in_progress, no change needed"
+      },
+      {
+        "action": "reschedule",
+        "plan_line_id": 2,
+        "new_priority": 3,
+        "new_machine_name": "Machine B",
+        "new_shift": "night",
+        "reasoning": "Moved to night shift to accommodate adhoc order"
+      },
+      {
+        "action": "cancel",
+        "plan_line_id": 3,
+        "reasoning": "Material failed QC, cannot fulfil this line"
+      },
+      {
+        "action": "add",
+        "fg_sku_name": "New Product 500g",
+        "customer_name": "Customer Ltd.",
+        "qty_kg": 300,
+        "bom_id": 42,
+        "machine_name": "Machine A",
+        "priority": 1,
+        "shift": "day",
+        "stage_sequence": ["sorting", "packaging"],
+        "estimated_hours": 3.0,
+        "linked_fulfillment_ids": [99],
+        "reasoning": "Adhoc order inserted, urgent customer deadline"
+      }
+    ],
+    "material_check": [
+      {
+        "material": "Raw Material Name",
+        "type": "rm",
+        "needed_kg": 300.0,
+        "available_kg": 500.0,
+        "status": "SUFFICIENT"
+      }
+    ],
+    "risk_flags": [
+      {
+        "flag": "Risk description",
+        "severity": "warning",
+        "details": "Details and recommended action"
+      }
+    ]
+  },
+
+  "field_reference": {
+    "schedule_item": {
+      "fg_sku_name":              "string — exact FG SKU name from BOM",
+      "customer_name":            "string — customer name from SO",
+      "qty_kg":                   "number — planned production quantity in kg",
+      "qty_units":                "number | null — planned units (if applicable)",
+      "bom_id":                   "integer — BOM ID from get_planning_context",
+      "production_type":          "enum: production | repackaging",
+      "machine_name":             "string — machine_name from machine master",
+      "priority":                 "integer 1–10, 1 = highest urgency",
+      "shift":                    "enum: day | night",
+      "stage_sequence":           "array of strings — e.g. [sorting, roasting, packaging]",
+      "estimated_hours":          "number — total machine hours required",
+      "linked_fulfillment_ids":   "array of integers — fulfillment_id values from so_fulfillment",
+      "reasoning":                "string — brief justification for scheduling decision"
+    },
+    "material_check_item": {
+      "material":     "string — SKU name",
+      "type":         "enum: rm | pm | fg",
+      "needed_kg":    "number — gross requirement after loss factor",
+      "available_kg": "number — current on-hand quantity",
+      "status":       "enum: SUFFICIENT | SHORTAGE"
+    },
+    "risk_flag_item": {
+      "flag":     "string — short title",
+      "severity": "enum: info | warning | error",
+      "details":  "string — explanation and recommended action"
+    }
+  }
+}

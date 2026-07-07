@@ -1,0 +1,118 @@
+@startuml
+title Production Planning
+
+skinparam entity {
+  BackgroundColor #F0F4FF
+  BorderColor #3A5A8C
+  HeaderBackgroundColor #3A5A8C
+  FontColor white
+  FontSize 11
+  AttributeFontColor black
+  AttributeFontSize 10
+}
+skinparam ArrowColor #3A5A8C
+skinparam NoteBackgroundColor #FFFDE7
+skinparam NoteBorderColor #E6A817
+skinparam shadowing false
+
+entity "SO Fulfillment" as SF {
+  * fulfillment_id
+  --
+  product_name
+  pending_qty_kg
+  priority
+  order_status
+}
+
+entity "Bill of Materials" as BOM {
+  * bom_id
+  --
+  product_name
+  pack_size_kg
+}
+
+entity "Machine" as MACH {
+  * machine_id
+  --
+  machine_name
+  floor
+}
+
+entity "Production Plan" as PP {
+  * plan_id
+  --
+  plan_name
+  plan_type
+  plan_date
+  AI_generated
+  approved_by
+  status
+}
+
+entity "Plan Line" as PPL {
+  * plan_line_id
+  --
+  product_name
+  customer_name
+  planned_qty_kg
+  machine
+  shift
+  estimated_hours
+  priority
+  stage_sequence
+  status
+}
+
+entity "Production Order" as PO {
+  * prod_order_id
+  --
+  order_number
+  batch_number
+  product_name
+  status
+}
+
+entity "Purchase Indent" as PI {
+  * indent_id
+  --
+  material_name
+  required_qty_kg
+  status
+}
+
+entity "AI Recommendation" as AI {
+  * recommendation_id
+  --
+  recommendation_type
+  AI_model
+  status
+  feedback
+}
+
+PP  ||--o{ PPL : "has lines"
+PP  ||--o{ PP  : "revision chain"
+PPL }o--|| BOM  : "uses BOM"
+PPL }o--|| MACH : "on machine"
+PPL }o..o{ SF   : "linked SO fulfillments"
+PPL ||--o{ PO   : "generates order"
+PPL ||--o{ PI   : "triggers indent"
+PP  ||--o{ AI   : "AI suggestions"
+
+note right of PP
+  Daily / weekly / full plans.
+  AI-assisted scheduling based on demand, machine capacity, and BOM.
+  status: draft -> approved -> executed
+end note
+
+note right of PPL
+  Each line = one product run on one machine.
+  stage_sequence drives the job card order
+  (e.g. sorting -> weighing -> sealing -> metal detection).
+end note
+
+note right of AI
+  Claude AI analyses demand vs capacity
+  and suggests optimal plan lines.
+end note
+
+@enduml

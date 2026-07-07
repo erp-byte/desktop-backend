@@ -1,0 +1,159 @@
+@startuml
+title Job Cards and Quality Checks
+
+skinparam entity {
+  BackgroundColor #F0F4FF
+  BorderColor #3A5A8C
+  HeaderBackgroundColor #3A5A8C
+  FontColor white
+  FontSize 11
+  AttributeFontColor black
+  AttributeFontSize 10
+}
+skinparam ArrowColor #3A5A8C
+skinparam NoteBackgroundColor #FFFDE7
+skinparam NoteBorderColor #E6A817
+skinparam shadowing false
+
+entity "Production Order" as PO {
+  * prod_order_id
+  --
+  order_number
+  batch_number
+}
+
+entity "Machine" as MACH {
+  * machine_id
+  --
+  machine_name
+  floor
+}
+
+entity "Job Card" as JC {
+  * job_card_id
+  --
+  job_number
+  stage
+  process_name
+  product_name
+  batch_number
+  team_leader
+  start_time
+  end_time
+  qty_received_from_prev_stage
+  qty_dispatched_to_next_stage
+  status
+}
+
+entity "Partial Dispatch" as JCPD {
+  * dispatch_id
+  --
+  from_job_card
+  to_job_card
+  qty_kg
+  dispatched_by
+}
+
+entity "Raw Material Indent" as JCRM {
+  * rm_indent_id
+  --
+  material_name
+  required_qty
+  issued_qty
+  scanned_boxes
+  status
+}
+
+entity "Packaging Material Indent" as JCPM {
+  * pm_indent_id
+  --
+  material_name
+  required_qty
+  issued_qty
+  status
+}
+
+entity "Process Steps" as JCPS {
+  * step_id
+  --
+  step_number
+  process_name
+  machine_name
+  operator_name
+  status
+}
+
+entity "Job Card Output" as JCO {
+  * output_id
+  --
+  expected_units
+  actual_units
+  expected_kg
+  actual_kg
+  process_loss_kg
+  yield_pct
+}
+
+entity "Metal Detection" as JCMD {
+  * detection_id
+  --
+  check_type
+  ferrous_pass
+  non_ferrous_pass
+  stainless_pass
+  failed_units
+  remarks
+}
+
+entity "Weight Check" as JCWC {
+  * check_id
+  --
+  sample_number
+  net_weight
+  gross_weight
+  leak_test_pass
+}
+
+entity "Loss Reconciliation" as JCLR {
+  * recon_id
+  --
+  loss_category
+  budgeted_loss_kg
+  actual_loss_kg
+  variance_kg
+}
+
+entity "Remarks" as JCRK {
+  * remark_id
+  --
+  remark_type
+  content
+  recorded_by
+}
+
+PO   ||--o{ JC    : "job cards"
+MACH ||--o{ JC    : "runs on"
+JC   ||--o{ JC    : "stage chain (next / prev)"
+JC   ||--o{ JCPD  : "partial dispatches"
+JC   ||--o{ JCRM  : "RM issued"
+JC   ||--o{ JCPM  : "PM issued"
+JC   ||--o{ JCPS  : "process steps"
+JC   ||--|| JCO   : "output record"
+JC   ||--o{ JCMD  : "metal detection checks"
+JC   ||--o{ JCWC  : "weight samples"
+JC   ||--o{ JCLR  : "loss reconciliation"
+JC   ||--o{ JCRK  : "remarks"
+
+note right of JC
+  status: locked | assigned | material received
+    | in progress | completed | closed
+  Material is scanned (QR / barcode) at issue.
+  Partial dispatches allow next stage to start early.
+end note
+
+note right of JCO
+  One output record per job card (1-to-1).
+  yield_pct = actual_kg / expected_kg * 100
+end note
+
+@enduml

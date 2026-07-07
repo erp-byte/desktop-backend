@@ -1,0 +1,116 @@
+/* Component: card — canonical selectors per 01-UI-SPEC.md §3.5.
+   Canonical `.card` BEM + `.summary-card` specialization for dashboard
+   KPI tiles. `.summary-card::before` accent bar consumes inline
+   --summary-accent custom property (e.g. style="--summary-accent:var(--clr-ok)"). */
+
+/* ── Canonical card ── */
+.card {
+  background: var(--color-surface-raised);
+  border: 1px solid var(--color-border-card);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+
+.card__header {
+  padding: var(--space-4) var(--space-5);
+  border-bottom: 1px solid var(--color-border-subtle);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.card__title {
+  font-family: var(--font-sans);
+  font-size: var(--font-h3);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-primary);
+  margin: 0;
+}
+
+.card__body {
+  padding: var(--space-5);
+}
+
+.card__footer {
+  padding: var(--space-4) var(--space-5);
+  border-top: 1px solid var(--color-border-subtle);
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+.card.is-elevated {
+  box-shadow: var(--shadow-sm);
+}
+
+.card.is-interactive {
+  cursor: pointer;
+  transition: border-color var(--duration-fast) var(--easing-standard);
+}
+
+.card.is-interactive:hover {
+  border-color: var(--color-border-strong);
+}
+
+/* ── Summary grid — dashboard KPI layout ── */
+.summary-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: var(--space-4);
+}
+
+/* ── Summary card — KPI tile with top accent bar ── */
+.summary-card {
+  position: relative;
+  background: var(--color-surface-raised);
+  border: 1px solid var(--color-border-card);
+  border-radius: var(--radius-lg);
+  padding: var(--space-5) var(--space-6);
+  overflow: hidden;
+  transition: border-color var(--duration-fast) var(--easing-standard);
+}
+
+.summary-card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: var(--summary-accent, var(--color-accent));
+}
+
+.summary-card:hover {
+  border-color: var(--color-border-strong);
+}
+
+.summary-card.active {
+  border-color: var(--color-accent-strong);
+}
+
+.summary-label,
+.summary-card__label {
+  font-size: var(--font-overline);
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: var(--tracking-wider);
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+  margin-bottom: var(--space-2);
+}
+
+.summary-value,
+.summary-card__value {
+  font-family: var(--font-mono);
+  font-size: var(--font-mono-value);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-primary);
+  line-height: var(--line-height-tight);
+}
+
+.summary-sub,
+.summary-card__sub {
+  font-size: var(--font-caption);
+  color: var(--color-text-muted);
+  margin-top: var(--space-2);
+}

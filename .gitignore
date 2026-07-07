@@ -1,0 +1,29 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Environment (.env and .env.example kept local only — never committed)
+.env*
+
+# Uploaded files
+so_pdfs/
+
+# Git worktrees
+.worktrees/
+
+# Temp/test files
+planning_prompt*.txt
+sample_planning_prompt.txt
+test_plan_generation.py
+gen_pdf.py
+
+# Local business data + scratch (never publish to shared remote)
+scratch/
+data/

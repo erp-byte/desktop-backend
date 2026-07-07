@@ -1,0 +1,116 @@
+/* Will shrink to true-reset in Plan 10 once all modules migrate to
+   /shared/css/{button,form,table,card,modal,state,toolbar,layout}.css.
+   Do not remove rules here until then.
+
+   Reconstructed after ventoy-transfer corruption — MINIMAL VIABLE rules:
+   basic CSS reset + body font-family + heading resets. The heavier
+   de-facto component rules the pre-phase file carried (`.btn-primary`,
+   `.form-input`, `.modal`, `.empty-state`, `.summary-card`, `.entity-btn`,
+   etc.) now live in their canonical shared component files, whose
+   legacy-alias blocks cover the same selectors. Plan 10 would delete
+   those duplicates from reset.css anyway — this reconstruction ships the
+   cleaner shape.
+*/
+
+/* ── Reset — box sizing, margins, line-height ── */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  font-family: var(--font-sans);
+  font-size: var(--font-body);
+  font-weight: var(--font-weight-regular);
+  line-height: var(--line-height-normal);
+  color: var(--color-text-primary);
+  background: var(--color-surface-page);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  overflow: hidden; /* Electron desktop app — titlebar + layout own scrolling */
+}
+
+img,
+picture,
+video,
+canvas,
+svg {
+  display: block;
+  max-width: 100%;
+}
+
+input,
+button,
+textarea,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+ul,
+ol {
+  list-style: none;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+/* ── Focus management — never strip focus without providing a ring ── */
+:focus-visible {
+  outline: 2px solid var(--color-border-focus);
+  outline-offset: 2px;
+}
+
+button:focus,
+input:focus,
+select:focus,
+textarea:focus {
+  outline: none; /* component files supply the focus ring via box-shadow */
+}
+
+/* ── Scrollbars — Electron Windows/macOS tuned ── */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-border-subtle);
+  border-radius: var(--radius-pill);
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-border-strong);
+  background-clip: content-box;
+}
+
+::selection {
+  background: var(--color-accent-strong);
+  color: var(--color-text-primary);
+}

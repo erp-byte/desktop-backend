@@ -1,0 +1,87 @@
+@startuml
+title Sales Order (SO) Creation
+
+skinparam entity {
+  BackgroundColor #F0F4FF
+  BorderColor #3A5A8C
+  HeaderBackgroundColor #3A5A8C
+  FontColor white
+  FontSize 11
+  AttributeFontColor black
+  AttributeFontSize 10
+}
+skinparam ArrowColor #3A5A8C
+skinparam NoteBackgroundColor #FFFDE7
+skinparam NoteBorderColor #E6A817
+skinparam shadowing false
+
+entity "Sales Order" as SOH {
+  * so_id
+  --
+  so_number
+  so_date
+  customer_name
+  company
+  status
+}
+
+entity "SO Line" as SOL {
+  * so_line_id
+  --
+  product_name
+  category
+  quantity
+  rate
+  total_amount
+  status
+}
+
+entity "Product Master (SKU)" as SKU {
+  * sku_id
+  --
+  product_name
+  item_type
+  item_group
+  GST_rate
+}
+
+entity "GST Reconciliation" as GST {
+  * recon_id
+  --
+  expected_GST_rate
+  actual_GST_rate
+  GST_difference
+  status
+}
+
+entity "Audit Log" as LOG {
+  * log_id
+  --
+  table_name
+  field_changed
+  old_value
+  new_value
+  changed_by
+  changed_at
+}
+
+SOH ||--o{ SOL : "has lines"
+SOH ||--o{ GST : "GST check"
+SOL ||--o| GST : "per line"
+SOL ..> SKU   : "product lookup (soft)"
+
+note right of SOH
+  Imported from Tally / SAP.
+  status: pending | matched | released
+end note
+
+note right of GST
+  Auto-validated on import.
+  Flags mismatches for review.
+end note
+
+note right of LOG
+  Tracks every manual edit to any SO field.
+end note
+
+@enduml

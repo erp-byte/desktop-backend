@@ -1,0 +1,98 @@
+@startuml
+title Bill of Materials (BOM) Master Data
+
+skinparam entity {
+  BackgroundColor #F0F4FF
+  BorderColor #3A5A8C
+  HeaderBackgroundColor #3A5A8C
+  FontColor white
+  FontSize 11
+  AttributeFontColor black
+  AttributeFontSize 10
+}
+skinparam ArrowColor #3A5A8C
+skinparam NoteBackgroundColor #FFFDE7
+skinparam NoteBorderColor #E6A817
+skinparam shadowing false
+
+entity "Product Master (SKU)" as SKU {
+  * sku_id
+  --
+  product_name
+  item_type
+  item_group
+  sub_group
+  GST_rate
+}
+
+entity "BOM Header" as BOMH {
+  * bom_id
+  --
+  finished_product
+  customer_name
+  pack_size_kg
+  version
+  is_active
+  effective_from
+  effective_to
+}
+
+entity "BOM Material Line" as BOML {
+  * bom_line_id
+  --
+  material_name
+  material_type
+  qty_per_unit
+  expected_loss_pct
+  store_location
+  can_use_offgrade
+}
+
+entity "Process Route (Steps)" as BPR {
+  * route_id
+  --
+  step_number
+  process_name
+  stage
+  std_time_min
+  machine_type
+  QC_check_required
+}
+
+entity "Plan Line (ref)" as PPL {
+  * plan_line_id
+  --
+  planned_qty_kg
+}
+
+entity "Production Order (ref)" as PO {
+  * prod_order_id
+  --
+  batch_number
+}
+
+BOMH ||--o{ BOML : "materials (RM + PM)"
+BOMH ||--o{ BPR  : "process steps"
+PPL  }o--|| BOMH : "plan uses BOM"
+PO   }o--|| BOMH : "order locks BOM"
+SKU  ..>   BOMH  : "product lookup"
+SKU  ..>   BOML  : "material lookup"
+
+note right of BOMH
+  One BOM per product + customer + pack size combination.
+  customer_name = blank means generic (applies to all customers).
+  Only active BOMs are used in planning.
+end note
+
+note right of BOML
+  material_type: Raw Material (RM) or Packaging Material (PM).
+  Offgrade substitution allowed up to a configured max percentage.
+end note
+
+note right of BPR
+  Each step in the process route becomes one Job Card
+  when a production order is created.
+  Steps are executed in order: sorting -> weighing -> sealing -> QC.
+end note
+
+@enduml

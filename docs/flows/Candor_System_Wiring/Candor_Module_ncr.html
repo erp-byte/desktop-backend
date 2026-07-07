@@ -1,0 +1,317 @@
+<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Candor · NCR · Non-Conformance</title><link rel='preconnect' href='https://fonts.googleapis.com'><link rel='preconnect' href='https://fonts.gstatic.com' crossorigin><link href='https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,700;12..96,800&family=JetBrains+Mono:wght@400;500;700&display=swap' rel='stylesheet'><style>
+:root{--bg:#0a0e16;--panel:#111a2b;--panel2:#0e1626;--line:rgba(120,160,210,.11);--ink:#e8eef7;--mut:#8593ab;
+--cyan:#34e0d0;--amber:#f6a833;--green:#5ed98a;--coral:#ff7b86;--slate:#6f93c4;--violet:#a98bff;}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--ink);font-family:"Bricolage Grotesque",system-ui,sans-serif;-webkit-font-smoothing:antialiased;line-height:1.5}
+body::before{content:"";position:fixed;inset:0;z-index:-2;background:radial-gradient(900px 520px at 10% -8%,rgba(52,224,208,.10),transparent 60%),radial-gradient(900px 600px at 108% 6%,rgba(246,168,51,.07),transparent 55%),linear-gradient(180deg,#0a0e16,#070a11)}
+body::after{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;opacity:.5;background-image:linear-gradient(var(--line) 1px,transparent 1px),linear-gradient(90deg,var(--line) 1px,transparent 1px);background-size:34px 34px;mask-image:radial-gradient(circle at 50% 25%,#000,transparent 95%)}
+.wrap{max-width:1720px;margin:0 auto;padding:22px 20px 60px}
+header{display:flex;flex-wrap:wrap;align-items:flex-end;gap:12px 26px;border-bottom:1px solid var(--line);padding-bottom:14px}
+.kick{font-family:"JetBrains Mono",monospace;font-size:10.5px;letter-spacing:.34em;color:var(--cyan);text-transform:uppercase}
+h1{font-size:clamp(22px,3vw,36px);font-weight:800;letter-spacing:-.02em;line-height:1.04}
+h1 .am{color:var(--amber)}h1 .cy{color:var(--cyan)}
+.meta{font-family:"JetBrains Mono",monospace;font-size:10px;color:var(--mut);margin-left:auto;text-align:right}
+.modtabs{display:flex;gap:6px;flex-wrap:wrap;margin:14px 0 8px}
+.mtab{font-family:"JetBrains Mono",monospace;font-size:11.5px;letter-spacing:.04em;color:var(--mut);background:rgba(255,255,255,.02);border:1px solid var(--line);border-radius:9px;padding:8px 12px;cursor:pointer;transition:.18s;white-space:nowrap}
+.mtab:hover{color:var(--ink);border-color:rgba(52,224,208,.45)}
+.mtab.active{color:#06121a;background:linear-gradient(120deg,var(--cyan),#7af0e4);border-color:transparent;font-weight:700}
+.mtab.ov.active{background:linear-gradient(120deg,var(--violet),#c4b0ff)}
+.bar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:6px 0 10px}
+.subtabs{display:flex;gap:6px}
+.stab{font-family:"JetBrains Mono",monospace;font-size:11.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--mut);background:transparent;border:1px solid var(--line);border-radius:8px;padding:8px 13px;cursor:pointer;transition:.18s}
+.stab:hover{color:var(--ink);border-color:rgba(52,224,208,.45)}
+.stab.active{color:#06121a;background:linear-gradient(120deg,var(--amber),#ffce82);border-color:transparent;font-weight:700}
+.spacer{flex:1}
+.chips{display:flex;gap:6px;flex-wrap:wrap}
+.chip{font-family:"JetBrains Mono",monospace;font-size:10.5px;letter-spacing:.05em;color:var(--mut);background:rgba(255,255,255,.02);border:1px solid var(--line);border-radius:20px;padding:6px 12px;cursor:pointer;transition:.18s;user-select:none}
+.chip:hover{color:var(--ink);border-color:rgba(52,224,208,.4)}
+.chip.on{color:#06121a;font-weight:700;background:var(--cc,#cbd5e3);border-color:transparent}
+#clearSel{border-color:rgba(255,123,134,.5);color:var(--coral)}
+#search{font-family:"JetBrains Mono",monospace;font-size:12px;background:var(--panel2);border:1px solid var(--line);color:var(--ink);border-radius:9px;padding:9px 12px;width:190px;outline:none}
+#search:focus{border-color:rgba(52,224,208,.5)}
+.ctlhide{display:none!important}
+.legend{display:flex;gap:14px;flex-wrap:wrap;font-family:"JetBrains Mono",monospace;font-size:10px;color:var(--mut);margin:2px 2px 10px}
+.legend span{display:inline-flex;align-items:center;gap:6px}.swatch{width:20px;height:0;border-top:2.4px solid}
+.k-fk{border-color:var(--slate)}.k-flow{border-color:var(--cyan)}.k-reads{border-color:var(--amber)}.k-writes{border-color:var(--green)}.k-loads{border-color:var(--cyan)}
+.view{display:none;animation:fade .4s ease both}.view.show{display:block}
+@keyframes fade{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+.gwrap{display:grid;grid-template-columns:1fr 300px;gap:14px;align-items:start}
+@media(max-width:1100px){.gwrap{grid-template-columns:1fr}}
+.stagebox{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:16px;padding:14px;overflow:auto;max-height:80vh;position:relative}
+.stage{position:relative}.wires{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:1;overflow:visible}
+.cols{position:relative;z-index:2;display:flex;gap:78px;align-items:flex-start;min-width:560px}
+.col{display:flex;flex-direction:column;gap:18px;flex:0 0 auto;width:218px}
+.colh{font-family:"JetBrains Mono",monospace;font-size:10.5px;letter-spacing:.16em;text-transform:uppercase;font-weight:700;padding:2px 2px 6px;border-bottom:1px solid var(--line);margin-bottom:2px;position:sticky;top:0;background:linear-gradient(180deg,var(--panel) 70%,transparent);z-index:3}
+.tnode{background:rgba(13,20,34,.94);border:1px solid var(--line);border-radius:11px;overflow:hidden;transition:.25s;opacity:0;animation:nodein .5s ease forwards;animation-delay:var(--d,0s);border-left:3px solid var(--lc,#888)}
+@keyframes nodein{to{opacity:1}}
+.tnode .th{display:flex;align-items:center;gap:8px;padding:9px 11px;cursor:pointer;border-bottom:1px solid var(--line);font-weight:700;font-size:13px;user-select:none}
+.tnode .th .lz{width:8px;height:8px;border-radius:2px;flex:none}
+.tnode .th small{margin-left:auto;font-family:"JetBrains Mono",monospace;font-size:8.5px;color:var(--mut);letter-spacing:.06em;font-weight:400}
+.rows{display:flex;flex-direction:column}
+.row{display:flex;align-items:center;gap:7px;padding:5px 11px;font-family:"JetBrains Mono",monospace;font-size:10.5px;color:#c2cee0;border-top:1px solid rgba(120,160,210,.05);transition:.15s}
+.row:hover{background:rgba(52,224,208,.07)}.row .fn{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.badge{font-size:8px;font-weight:700;padding:1.5px 5px;border-radius:4px;flex:none}
+.b-pk{background:rgba(246,168,51,.18);color:var(--amber)}.b-fk{background:rgba(111,147,196,.2);color:#9fc0ee}.b-new{background:rgba(94,217,138,.18);color:var(--green)}
+.tnode.dimmed{opacity:.3!important;filter:saturate(.4) brightness(.86)!important}
+.tnode.searchdim{opacity:.18!important}
+.tnode.sel{box-shadow:0 0 0 1.6px var(--cyan),0 14px 40px -18px rgba(52,224,208,.6)}.tnode.sel .th{background:rgba(52,224,208,.08)}
+.tnode.neigh{box-shadow:0 0 0 1px rgba(246,168,51,.6)}.hide{display:none!important}
+path.wire{fill:none;stroke-width:.9;opacity:.13;stroke-linecap:round;transition:opacity .25s,stroke-width .25s}
+path.wire.k-fk{stroke:var(--slate)}path.wire.k-flow{stroke:var(--cyan)}path.wire.k-reads{stroke:var(--amber)}path.wire.k-writes{stroke:var(--green)}path.wire.k-loads{stroke:var(--cyan)}
+.stage.focus path.wire{opacity:.04}.stage.focus path.wire.on,path.wire.on{opacity:.92;stroke-width:1.5;stroke-dasharray:4 6;animation:dash 1.2s linear infinite}
+@keyframes dash{to{stroke-dashoffset:-20}}circle.blip{pointer-events:none}
+.ah-c{fill:var(--cyan)}.ah-s{fill:var(--slate)}.ah-a{fill:var(--amber)}.ah-g{fill:var(--green)}
+.detail{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:16px;padding:18px;position:sticky;top:14px;max-height:80vh;overflow:auto}
+.detail h3{font-size:15px;font-weight:800}.detail .selcount{font-family:"JetBrains Mono",monospace;font-size:10px;color:var(--cyan);margin-top:4px}
+.detail .dl{font-family:"JetBrains Mono",monospace;font-size:10px;color:var(--mut);text-transform:uppercase;letter-spacing:.16em;margin:15px 0 7px}
+.detail .empty{color:var(--mut);font-family:"JetBrains Mono",monospace;font-size:11.5px;line-height:1.8}
+.rel{font-family:"JetBrains Mono",monospace;font-size:10.5px;padding:7px 9px;border:1px solid var(--line);border-radius:8px;margin-bottom:6px;cursor:pointer;transition:.15s;line-height:1.45}
+.rel:hover{border-color:rgba(52,224,208,.5);background:rgba(52,224,208,.05)}.rel .ar{color:var(--cyan)}.rel .tgt{color:var(--amber)}.rel .kd{color:var(--mut)}
+.fl{font-family:"JetBrains Mono",monospace;font-size:10.5px;color:#c2cee0;padding:3px 0;display:flex;gap:6px;align-items:center}
+.endp{font-family:"JetBrains Mono",monospace;font-size:10.5px;color:var(--cyan);padding:6px 0 0;border-top:1px dashed var(--line);margin-top:8px;word-break:break-word}
+.dpanelnav{display:flex;gap:6px;margin-top:13px}.dpanelnav button{flex:1;font-family:"JetBrains Mono",monospace;font-size:10px;color:#dbe3ee;background:rgba(255,255,255,.02);border:1px solid var(--line);border-radius:7px;padding:8px;cursor:pointer;transition:.15s}
+.dpanelnav button:hover{color:var(--cyan);border-color:rgba(52,224,208,.5)}
+.pcard{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:16px;padding:18px;margin-top:12px}
+.branches{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:14px}
+.branch{border:1px solid var(--line);border-radius:13px;overflow:hidden;background:rgba(13,20,34,.6);display:flex;flex-direction:column}
+.branch .bh{padding:12px;font-weight:700;font-size:13px;border-bottom:1px solid var(--line);background:rgba(52,224,208,.08);color:var(--cyan)}
+.branch .cond{font-family:"JetBrains Mono",monospace;font-size:10px;color:var(--mut);padding:9px 12px;border-bottom:1px solid var(--line);line-height:1.6}
+.tchips{display:flex;flex-wrap:wrap;gap:5px;padding:9px 12px}
+.tchip{font-family:"JetBrains Mono",monospace;font-size:9px;color:#bcd;background:rgba(52,224,208,.08);border:1px solid rgba(52,224,208,.22);border-radius:6px;padding:3px 7px;cursor:pointer;transition:.15s;white-space:nowrap}
+.tchip:hover{background:rgba(52,224,208,.22);color:#eaffff;font-weight:700}
+.lep{font-family:"JetBrains Mono",monospace;font-size:9px;color:var(--cyan);padding:0 12px 8px;opacity:.9;word-break:break-word}
+.eff{padding:8px 12px;border-top:1px solid var(--line)}.eff .et{font-family:"JetBrains Mono",monospace;font-size:8.5px;letter-spacing:.12em;text-transform:uppercase;margin-bottom:5px}
+.eff.be .et{color:var(--cyan)}.eff.fe .et{color:var(--amber)}.eff ul{margin:0;padding:0}
+.eff li{list-style:none;font-family:"JetBrains Mono",monospace;font-size:9.5px;color:var(--mut);padding:2px 0 2px 12px;position:relative;line-height:1.5}
+.eff li::before{content:"›";position:absolute;left:0;color:var(--cyan)}.eff.fe li::before{color:var(--amber)}
+.cfoot{display:flex;gap:6px;padding:10px;border-top:1px solid var(--line);margin-top:auto}
+.cbtn{flex:1;font-family:"JetBrains Mono",monospace;font-size:9.5px;color:#dbe3ee;background:rgba(255,255,255,.02);border:1px solid var(--line);border-radius:8px;padding:8px 5px;cursor:pointer;transition:.18s}
+.cbtn:hover{color:#06121a;background:linear-gradient(120deg,var(--cyan),#7af0e4);border-color:transparent;font-weight:700}
+.fbanner{display:none;align-items:center;gap:10px;background:rgba(52,224,208,.08);border:1px solid rgba(52,224,208,.3);border-radius:10px;padding:9px 13px;margin-bottom:10px;font-family:"JetBrains Mono",monospace;font-size:11px;color:var(--cyan)}
+.fbanner.show{display:flex}.fbanner button{margin-left:auto;font-family:"JetBrains Mono",monospace;font-size:10px;color:var(--coral);background:transparent;border:1px solid rgba(255,123,134,.4);border-radius:6px;padding:5px 10px;cursor:pointer}
+table.rels{width:100%;border-collapse:collapse;font-size:12px;margin-top:6px}
+table.rels th{font-family:"JetBrains Mono",monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;text-align:left;color:var(--mut);padding:9px;border-bottom:1px solid rgba(120,160,210,.25);position:sticky;top:0;background:var(--panel2)}
+table.rels td{padding:8px 9px;border-bottom:1px solid var(--line);font-family:"JetBrains Mono",monospace;font-size:11px;vertical-align:top}
+#relsBody tr{cursor:pointer}#relsBody tr:hover td{background:rgba(52,224,208,.06)}
+#apiBody tr{cursor:pointer}#apiBody tr:hover td{background:rgba(52,224,208,.06)}
+.apibtn{font-family:"JetBrains Mono",monospace;font-size:9px;color:#cdd;background:rgba(255,255,255,.03);border:1px solid var(--line);border-radius:6px;padding:4px 7px;margin-right:5px;cursor:pointer;transition:.15s}
+.apibtn:hover{color:#06121a;background:var(--cyan);border-color:transparent;font-weight:700}
+.src-c{color:#c2cee0}.tgt-c{color:var(--amber)}.fld{color:var(--cyan)}
+.pill{font-size:8.5px;font-weight:700;padding:2px 6px;border-radius:5px}
+.p-fk{background:rgba(111,147,196,.18);color:#9fc0ee}.p-flow{background:rgba(52,224,208,.16);color:var(--cyan)}.p-reads{background:rgba(246,168,51,.16);color:var(--amber)}.p-writes{background:rgba(94,217,138,.16);color:var(--green)}.p-loads{background:rgba(52,224,208,.16);color:var(--cyan)}.p-get{background:rgba(246,168,51,.16);color:var(--amber)}.p-post{background:rgba(94,217,138,.16);color:var(--green)}.p-put{background:rgba(94,217,138,.16);color:var(--green)}.p-svc{background:rgba(111,147,196,.18);color:#9fc0ee}.p-delete{background:rgba(255,123,134,.16);color:var(--coral)}.p-patch{background:rgba(94,217,138,.16);color:var(--green)}
+.hint{font-family:"JetBrains Mono",monospace;font-size:10px;color:var(--mut);margin:0 2px 10px}
+a.mtab{text-decoration:none;display:inline-block}
+.crosslinks{font-family:"JetBrains Mono",monospace;font-size:10px;color:var(--mut);margin:2px 2px 8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.crosslinks a{color:var(--cyan);text-decoration:none;border:1px solid var(--line);border-radius:14px;padding:3px 10px;transition:.15s}
+.crosslinks a:hover{border-color:rgba(52,224,208,.55);background:rgba(52,224,208,.06)}
+footer{margin-top:24px;padding-top:14px;border-top:1px solid var(--line);font-family:"JetBrains Mono",monospace;font-size:10px;color:var(--mut)}
+</style></head><body><div class='wrap'><header><div><div class='kick'>Candor Foods · ERP</div><h1>NCR · Non-Conformance <span class='cy'>·</span> <span class='am'>wiring</span></h1></div><div class='meta'>reference only · no DB / app code touched<br>4 tables · 2 links · 15 endpoints · audited vs routers · 2026-06-14</div></header><div class='modtabs' id='modTabs'><a class='mtab' href='Candor_System_Wiring.html'>◆ System Map</a><a class='mtab' href='Candor_Module_production.html'>Jobcard · Production</a><a class='mtab' href='Candor_Module_purchase.html'>Purchase · PO</a><a class='mtab' href='Candor_Module_receipt.html'>Inward · Receipt</a><a class='mtab' href='Candor_Module_so.html'>Outward · Sales Order</a><a class='mtab' href='Candor_Module_transfer.html'>Transfers</a><a class='mtab' href='Candor_Module_qc.html'>Quality Control</a><button class='mtab active' data-k='ncr'>NCR · Non-Conformance</button><a class='mtab' href='Candor_Module_sample.html'>Sample · NPD</a><a class='mtab' href='Candor_Module_vendor.html'>Vendor Master</a><a class='mtab' href='Candor_Module_auth.html'>Auth · Access</a><a class='mtab' href='Candor_Module_shared.html'>Shared · Masters</a></div><div class='crosslinks'>Connects to: <a href='Candor_Module_qc.html' title='from inspection'>Quality Control →</a><a href='Candor_Module_purchase.html' title='txn → PO'>Purchase · PO →</a><a href='Candor_Module_vendor.html' title='supplier'>Vendor Master →</a></div><div class='bar'><div class='subtabs' id='subTabs'><button class='stab active' data-s='graph'>◇ Graph</button><button class='stab' data-s='flow'>⌥ Flow</button><button class='stab' data-s='rels'>▤ Relationships</button><button class='stab' data-s='api'>⇄ Endpoints</button></div><div class='spacer'></div><div class='chips' id='layerChips'></div><input id='search' placeholder='search…' autocomplete='off'><button class='stab' id='btnExport' title='Download the full table/column/FK/endpoint data as JSON (also cached to this browser localStorage for reference)'>⤓ Data</button></div><section class='view show' id='view-graph'><div class='legend'><span><i class='swatch k-flow'></i>flow / loads</span><span><i class='swatch k-fk'></i>foreign key</span><span><i class='swatch k-reads'></i>reads (→ frontend)</span><span><i class='swatch k-writes'></i>writes</span><span style='color:var(--cyan)'>hover trace · click multi-select</span></div><div class='gwrap'><div class='stagebox'><div class='stage' id='stage'><svg class='wires' id='wires'><defs><marker id='ac' viewBox='0 0 10 10' refX='8' refY='5' markerWidth='4.5' markerHeight='4.5' orient='auto'><path d='M0 0 L10 5 L0 10z' class='ah-c'/></marker><marker id='as' viewBox='0 0 10 10' refX='8' refY='5' markerWidth='4.5' markerHeight='4.5' orient='auto'><path d='M0 0 L10 5 L0 10z' class='ah-s'/></marker><marker id='aa' viewBox='0 0 10 10' refX='8' refY='5' markerWidth='4.5' markerHeight='4.5' orient='auto'><path d='M0 0 L10 5 L0 10z' class='ah-a'/></marker><marker id='ag' viewBox='0 0 10 10' refX='8' refY='5' markerWidth='4.5' markerHeight='4.5' orient='auto'><path d='M0 0 L10 5 L0 10z' class='ah-g'/></marker></defs></svg><div class='cols' id='cols'></div></div></div><aside class='detail' id='detail'></aside></div></section><section class='view' id='view-flow'><div class='hint'>Process flow — each step shows the tables it touches, its endpoint, and backend/frontend effect. Buttons jump to the Graph or Relationships filtered to that step.</div><div class='pcard'><div class='branches' id='branches'></div></div></section><section class='view' id='view-rels'><div class='hint'>Field-level links. Click a row to open it in the Graph; chips & search filter.</div><div class='fbanner' id='relsBanner'></div><div class='pcard' style='padding:8px 14px;max-height:74vh;overflow:auto'><table class='rels'><thead><tr><th>From</th><th>Field</th><th>Refers to</th><th>Target field</th><th>Kind</th><th>What</th></tr></thead><tbody id='relsBody'></tbody></table></div></section><section class='view' id='view-api'><div class='hint'>Endpoints (audited against the module router). Click a row or ◇ to open its tables in the Graph; ▤ for its links. Search filters.</div><div class='fbanner' id='apiBanner'></div><div class='pcard' style='padding:8px 14px;max-height:74vh;overflow:auto'><table class='rels'><thead><tr><th>Method</th><th>Endpoint</th><th>Service</th><th>Writes / reads</th><th>Note</th><th>Trace</th></tr></thead><tbody id='apiBody'></tbody></table></div></section><footer>CANDOR FOODS · NCR · Non-Conformance · reference only · part of the system wiring map.</footer></div><script>
+const SYS={"order": ["ncr"], "modules": {"ncr": {"key": "ncr", "label": "NCR · Non-Conformance", "prefix": "/api/v1/ncr", "nodes": [{"id": "ncr_record", "name": "ncr_record", "layer": "core", "sub": "64 cols", "fields": [{"n": "ncr_no", "k": "PK"}, {"n": "status", "k": ""}, {"n": "severity", "k": ""}, {"n": "raised_via", "k": ""}, {"n": "inspection_id", "k": ""}, {"n": "transaction_no", "k": ""}, {"n": "line_number", "k": ""}, {"n": "sku_id", "k": ""}, {"n": "sku_name", "k": ""}, {"n": "supplier_id", "k": ""}, {"n": "supplier_name", "k": ""}, {"n": "lot_number", "k": ""}, {"n": "rejected_qty", "k": ""}, {"n": "summary", "k": ""}, {"n": "documented_date", "k": ""}, {"n": "disposition", "k": ""}, {"n": "disposition_qty", "k": ""}, {"n": "financial_impact", "k": ""}, {"n": "rationale", "k": ""}, {"n": "rtv_vehicle_no", "k": ""}, {"n": "rtv_lr_no", "k": ""}, {"n": "concurrence_user_id", "k": ""}, {"n": "disposition_at", "k": ""}, {"n": "disposition_by", "k": ""}, {"n": "raised_at", "k": ""}, {"n": "raised_by", "k": ""}, {"n": "requires_dual_approval", "k": ""}, {"n": "dual_approval_by", "k": ""}, {"n": "dual_approval_at", "k": ""}, {"n": "cancel_reason", "k": ""}, {"n": "cancelled_at", "k": ""}, {"n": "cancelled_by", "k": ""}, {"n": "reopen_reason", "k": ""}, {"n": "reopened_at", "k": ""}, {"n": "reopened_by", "k": ""}, {"n": "closed_at", "k": ""}, {"n": "closure_tat_days", "k": ""}, {"n": "ncr_id", "k": "PK"}, {"n": "other_party", "k": ""}, {"n": "detected_by", "k": ""}, {"n": "invoice_challan_ref", "k": ""}, {"n": "batch_no", "k": ""}, {"n": "product_description", "k": ""}, {"n": "rc_no", "k": ""}, {"n": "quantity", "k": ""}, {"n": "reason_nonconformity", "k": ""}, {"n": "food_safety_flag", "k": ""}, {"n": "documented_by", "k": ""}, {"n": "financial_action", "k": ""}, {"n": "supplier_action_type", "k": ""}, {"n": "target_completion_date", "k": ""}, {"n": "authorized_person", "k": ""}, {"n": "authorized_date", "k": ""}, {"n": "received_by", "k": ""}, {"n": "received_date", "k": ""}, {"n": "created_by", "k": ""}, {"n": "approved_by", "k": ""}, {"n": "ncr_category", "k": ""}, {"n": "severity_rollup", "k": ""}, {"n": "financial_impact_inr", "k": ""}, {"n": "failed_parameters", "k": ""}, {"n": "supplier_actions", "k": ""}, {"n": "created_at", "k": ""}, {"n": "entity", "k": ""}], "sec": "NCR record"}, {"id": "ncr_event_log", "name": "ncr_event_log", "layer": "core", "sub": "7 cols", "fields": [{"n": "event_id", "k": "PK"}, {"n": "event_type", "k": ""}, {"n": "entity_type", "k": ""}, {"n": "entity_id", "k": ""}, {"n": "occurred_at", "k": ""}, {"n": "occurred_by", "k": ""}, {"n": "payload", "k": ""}], "sec": "CAPA / Details"}, {"id": "ncr_parameter_detail", "name": "ncr_parameter_detail", "layer": "core", "sub": "12 cols", "fields": [{"n": "detail_id", "k": "PK"}, {"n": "ncr_no", "k": "FK"}, {"n": "parameter_id", "k": ""}, {"n": "parameter_name", "k": ""}, {"n": "observed_value_text", "k": ""}, {"n": "observed_value_num", "k": ""}, {"n": "spec_min", "k": ""}, {"n": "spec_max", "k": ""}, {"n": "deviation_pct", "k": ""}, {"n": "severity", "k": ""}, {"n": "notes", "k": ""}, {"n": "created_at", "k": ""}], "sec": "CAPA / Details"}, {"id": "ncr_supplier_action", "name": "ncr_supplier_action", "layer": "core", "sub": "17 cols", "fields": [{"n": "action_id", "k": "PK"}, {"n": "ncr_no", "k": "FK"}, {"n": "round_no", "k": ""}, {"n": "root_cause", "k": ""}, {"n": "corrective_action", "k": ""}, {"n": "preventive_action", "k": ""}, {"n": "target_date", "k": ""}, {"n": "responsible_person", "k": ""}, {"n": "evidence_s3_keys", "k": ""}, {"n": "submitted_at", "k": ""}, {"n": "submitted_by", "k": ""}, {"n": "submitted_via", "k": ""}, {"n": "verified_at", "k": ""}, {"n": "verified_by", "k": ""}, {"n": "is_effective", "k": ""}, {"n": "verification_notes", "k": ""}, {"n": "verification_evidence_s3_keys", "k": ""}], "sec": "CAPA / Details"}], "edges": [{"f": ["ncr_parameter_detail", "ncr_no"], "t": ["ncr_record", "ncr_no"], "k": "fk", "d": "ncr_no → ncr_record"}, {"f": ["ncr_supplier_action", "ncr_no"], "t": ["ncr_record", "ncr_no"], "k": "fk", "d": "ncr_no → ncr_record"}], "endpoints": [["POST", "/api/v1/ncr/raise  (L84)", "raise_ncr", "", "", "ncr_event_log,ncr_parameter_detail,ncr_record"], ["GET", "/api/v1/ncr  (L111)", "list_ncrs", "", "", "ncr_event_log,ncr_parameter_detail,ncr_record"], ["GET", "/api/v1/ncr/  (L112)", "list_ncrs", "", "", "ncr_event_log,ncr_parameter_detail,ncr_record"], ["GET", "/api/v1/ncr/{ncr_no}  (L138)", "get_detail", "", "", "ncr_event_log,ncr_parameter_detail,ncr_record"], ["PUT", "/api/v1/ncr/{ncr_no}  (L152)", "update_header", "", "", "ncr_event_log,ncr_parameter_detail,ncr_record"], ["POST", "/api/v1/ncr/{ncr_no}/disposition  (L170)", "submit_disposition", "", "", "ncr_event_log,ncr_parameter_detail,ncr_record"], ["PUT", "/api/v1/ncr/{ncr_no}/disposition  (L186)", "edit_disposition", "", "", "ncr_event_log,ncr_parameter_detail,ncr_record"], ["POST", "/api/v1/ncr/{ncr_no}/dual-approve  (L203)", "dual_approve", "", "", "ncr_event_log,ncr_parameter_detail,ncr_record"], ["POST", "/api/v1/ncr/{ncr_no}/capa  (L225)", "submit_capa", "", "", "ncr_event_log,ncr_parameter_detail,ncr_record"], ["PUT", "/api/v1/ncr/{ncr_no}/capa/{action_id}  (L241)", "update_capa", "", "", "ncr_event_log,ncr_parameter_detail,ncr_record"], ["DELETE", "/api/v1/ncr/{ncr_no}/capa/{action_id}  (L258)", "delete_capa", "", "", "ncr_event_log,ncr_parameter_detail,ncr_record"], ["POST", "/api/v1/ncr/{ncr_no}/verify  (L274)", "verify_capa", "", "", "ncr_event_log,ncr_parameter_detail,ncr_record"], ["POST", "/api/v1/ncr/{ncr_no}/cancel  (L290)", "cancel_ncr", "", "", "ncr_event_log,ncr_parameter_detail,ncr_record"], ["POST", "/api/v1/ncr/{ncr_no}/reopen  (L307)", "reopen_ncr", "", "", "ncr_event_log,ncr_parameter_detail,ncr_record"], ["GET", "/api/v1/ncr/{ncr_no}/audit  (L325)", "audit", "", "", "ncr_event_log,ncr_parameter_detail,ncr_record"]], "flow": [{"n": "Raise NCR", "d": "Failed QC or manual.", "tables": ["ncr_record", "ncr_parameter_detail"], "ep": "POST /raise", "be": ["raise_ncr"], "fe": ["RaiseNcr"]}, {"n": "Disposition", "d": "Reject/return/accept.", "tables": ["ncr_record"], "ep": "POST /{ncr_no}/disposition", "be": ["disposition"], "fe": ["disposition"]}, {"n": "CAPA", "d": "Supplier corrective actions.", "tables": ["ncr_record"], "ep": "POST /{ncr_no}/capa", "be": ["submit_capa"], "fe": ["CAPA"]}, {"n": "Verify & close", "d": "Verify CAPA; close.", "tables": ["ncr_event_log"], "ep": "POST /{ncr_no}/verify", "be": ["verify_capa"], "fe": ["verify"]}], "crossModule": [{"to": "qc", "via": "from inspection"}, {"to": "purchase", "via": "txn → PO"}, {"to": "vendor", "via": "supplier"}], "secorder": ["NCR record", "CAPA / Details"]}}, "labels": {"production": "Jobcard · Production", "purchase": "Purchase · PO", "receipt": "Inward · Receipt", "so": "Outward · Sales Order", "transfer": "Transfers", "qc": "Quality Control", "ncr": "NCR · Non-Conformance", "sample": "Sample · NPD", "vendor": "Vendor Master", "auth": "Auth · Access", "shared": "Shared · Masters"}};
+
+const SVGNS='http://www.w3.org/2000/svg';
+const LAYERS=[{k:'source',l:'Source / Procure'},{k:'inward',l:'Inward'},{k:'make',l:'Make'},{k:'quality',l:'Quality'},{k:'outward',l:'Outward'},{k:'support',l:'Support'},{k:'plug',l:'Plug'},{k:'core',l:'Core / DB'},{k:'backend',l:'Backend'},{k:'satellite',l:'Satellite'},{k:'frontend',l:'Frontend'}];
+const LIDX={};LAYERS.forEach((x,i)=>LIDX[x.k]=i);
+const LCOL={source:'#a98bff',inward:'#5ed98a',make:'#34e0d0',quality:'#f6a833',outward:'#ff7b86',support:'#6f93c4',plug:'#5ed98a',core:'#34e0d0',backend:'#34e0d0',satellite:'#6f93c4',frontend:'#f6a833'};
+const KCOL={fk:'#6f93c4',flow:'#34e0d0',writes:'#5ed98a',reads:'#f6a833',loads:'#34e0d0'};
+const MARK={fk:'as',flow:'ac',writes:'ag',reads:'aa',loads:'ac'};
+let curModule='overview',curSub='graph',curLayer='all',hoverId=null,relsFocus=null,apiFocus=null;
+const selSet=new Set();
+let NODES=[],EDGES=[],ENDP=[],FLOW=[],NMAP={},elMap={},cardMap={},pathEls=[],colIndexOf={};
+const PAL=['#34e0d0','#5ed98a','#f6a833','#a98bff','#ff7b86','#6f93c4','#7ad0ff','#ffce82','#9be38a','#c4b0ff','#ff9bb0','#8fb3e6','#34e0d0','#5ed98a','#f6a833'];
+function M(){return curModule==='overview'?SYS.overview:SYS.modules[curModule];}
+function secList(){const m=M();let s=(m.secorder&&m.secorder.length)?m.secorder.slice():[];if(!s.length){m.nodes.forEach(n=>{const x=n.sec||n.layer;if(!s.includes(x))s.push(x);});}return s;}
+const stage=()=>document.getElementById('stage');const svg=()=>document.getElementById('wires');
+const SV=()=>document.getElementById('search');
+
+// ---- major tabs
+function buildModTabs(){
+ let h='<button class="mtab ov active" data-k="overview">◆ System Overview</button>';
+ SYS.order.forEach(k=>{h+=`<button class="mtab" data-k="${k}">${SYS.labels[k]}</button>`;});
+ const wrap=document.getElementById('modTabs'); wrap.innerHTML=h;
+ wrap.querySelectorAll('.mtab').forEach(b=>b.onclick=()=>{enterModule(b.dataset.k);});
+}
+function enterModule(key){
+ loadModule(key);
+ document.querySelectorAll('#modTabs .mtab').forEach(b=>b.classList.toggle('active',b.dataset.k===key));
+}
+// ---- load a module
+function loadModule(key){
+ curModule=key; const m=M();
+ NODES=m.nodes||[];EDGES=m.edges||[];ENDP=m.endpoints||[];FLOW=m.flow||[];
+ NMAP={};NODES.forEach(n=>NMAP[n.id]=n);
+ selSet.clear();hoverId=null;relsFocus=null;apiFocus=null;curLayer='all';
+ if(SV())SV().value='';
+ buildChips();buildCards();buildRels();buildApi();buildFlow();clearDetail();
+ const ov=key==='overview';
+ document.querySelectorAll('#subTabs .stab').forEach(b=>b.style.display=(ov&&b.dataset.s!=='graph')?'none':'');
+ if(ov)curSub='graph';
+ showSub(curSub);
+}
+// ---- dynamic layer chips
+function buildChips(){
+ const secs=secList();
+ let h='<span class="chip on" data-l="all" style="--cc:#cbd5e3">ALL</span>';
+ secs.forEach((s,i)=>{h+=`<span class="chip" data-l="${s}" style="--cc:${PAL[i%PAL.length]}">${s.toUpperCase()}</span>`;});
+ h+='<span class="chip" id="clearSel" style="display:none">✕ clear</span>';
+ const w=document.getElementById('layerChips');w.innerHTML=h;
+ w.querySelectorAll('.chip[data-l]').forEach(ch=>ch.onclick=()=>{w.querySelectorAll('.chip[data-l]').forEach(x=>x.classList.remove('on'));ch.classList.add('on');curLayer=ch.dataset.l;applyControls();});
+ document.getElementById('clearSel').onclick=()=>{selSet.clear();hoverId=null;applyHi();clearDetail();};
+}
+// ---- build cards
+function badge(k){return /PK/.test(k)?'b-pk':(/NEW/.test(k)?'b-new':'b-fk');}
+function buildCards(){
+ const cols=document.getElementById('cols');cols.innerHTML='';elMap={};cardMap={};colIndexOf={};
+ const secs=secList();
+ secs.forEach((sec,ci)=>{
+  const col=document.createElement('div');col.className='col';col.dataset.sec=sec;
+  col.innerHTML=`<div class="colh" style="color:${PAL[ci%PAL.length]}">${sec}</div>`;
+  M().nodes.filter(n=>(n.sec||n.layer)===sec).forEach((n,i)=>{
+   colIndexOf[n.id]=ci;
+   const card=document.createElement('div');card.className='tnode';card.dataset.id=n.id;card.style.setProperty('--d',(ci*0.04+i*0.03)+'s');card.style.setProperty('--lc',LCOL[n.layer]||'#888');
+   const rows=(n.fields||[]).map(f=>`<div class="row" data-n="${n.id}" data-f="${f.n}"><span class="fn">${f.n}</span>${f.k?`<span class="badge ${badge(f.k)}">${f.k}</span>`:''}</div>`).join('');
+   card.innerHTML=`<div class="th"><i class="lz" style="background:${LCOL[n.layer]}"></i>${n.name}<small>${n.sub||''}</small></div><div class="rows">${rows}</div>`;
+   col.appendChild(card);
+  });
+  cols.appendChild(col);
+ });
+ document.querySelectorAll('#cols .row').forEach(r=>elMap[r.dataset.n+'||'+r.dataset.f]=r);
+ document.querySelectorAll('#cols .tnode').forEach(c=>cardMap[c.dataset.id]=c);
+ document.querySelectorAll('#cols .tnode').forEach(card=>{
+  const th=card.querySelector('.th');const id=card.dataset.id;
+  if(curModule==='overview'){
+   th.onclick=()=>enterModule(id);
+   card.onmouseenter=()=>{hoverId=id;applyHi();ovDetail(id);};
+   card.onmouseleave=()=>{hoverId=null;applyHi();clearDetail();};
+  }else{
+   th.onclick=()=>toggleSelect(id,true);
+   card.onmouseenter=()=>{if(!selSet.size){hoverId=id;applyHi();detail(id);}};
+   card.onmouseleave=()=>{if(!selSet.size){hoverId=null;applyHi();clearDetail();}};
+  }
+ });
+}
+// ---- wires
+function anchor(id,field,side){let el=elMap[id+'||'+field]||cardMap[id];if(!el)return null;const r=el.getBoundingClientRect(),s=stage().getBoundingClientRect();return {x:(side==='r'?r.right:r.left)-s.left,y:r.top-s.top+r.height/2};}
+function removeBlips(){[...svg().querySelectorAll('circle.blip')].forEach(b=>b.remove());}
+function draw(){
+ const sg=svg();[...sg.querySelectorAll('path.wire')].forEach(p=>p.remove());removeBlips();pathEls=[];
+ sg.setAttribute('width',stage().scrollWidth);sg.setAttribute('height',stage().scrollHeight);sg.setAttribute('viewBox',`0 0 ${stage().scrollWidth} ${stage().scrollHeight}`);
+ const loop={};
+ EDGES.forEach((e,idx)=>{
+  const fn=NMAP[e.f[0]],tn=NMAP[e.t[0]];if(!fn||!tn)return;
+  if(curLayer!=='all'&&fn.layer!==curLayer&&tn.layer!==curLayer)return;
+  const fc=cardMap[e.f[0]],tc=cardMap[e.t[0]];if(!fc||!tc||fc.classList.contains('hide')||tc.classList.contains('hide'))return;
+  const cf=(colIndexOf[e.f[0]]!==undefined?colIndexOf[e.f[0]]:0),ct=(colIndexOf[e.t[0]]!==undefined?colIndexOf[e.t[0]]:0);
+  const fwd=ct>cf;
+  const p1=anchor(e.f[0],e.f[1],'r'),p2=anchor(e.t[0],e.t[1],fwd?'l':'r');if(!p1||!p2)return;
+  let d;if(fwd){const dx=Math.max(46,Math.abs(p2.x-p1.x)*0.4);d=`M${p1.x} ${p1.y} C ${p1.x+dx} ${p1.y}, ${p2.x-dx} ${p2.y}, ${p2.x} ${p2.y}`;}
+  else{loop[e.f[0]]=(loop[e.f[0]]||0)+1;const off=66+loop[e.f[0]]*20;d=`M${p1.x} ${p1.y} C ${p1.x+off} ${p1.y}, ${p2.x+off} ${p2.y}, ${p2.x} ${p2.y}`;}
+  const path=document.createElementNS(SVGNS,'path');path.setAttribute('d',d);path.setAttribute('class','wire k-'+e.k);path.id='wp'+idx;path._e=e;sg.appendChild(path);pathEls.push(path);
+ });
+ applyHi();
+}
+function activeIds(){if(selSet.size)return selSet;if(hoverId)return new Set([hoverId]);return null;}
+function makeBlips(){removeBlips();pathEls.forEach(p=>{if(!p.classList.contains('on'))return;const len=p.getTotalLength?p.getTotalLength():200;const b=document.createElementNS(SVGNS,'circle');b.setAttribute('r','2');b.setAttribute('class','blip');b.setAttribute('fill',KCOL[p._e.k]);b.setAttribute('filter','drop-shadow(0 0 2px '+KCOL[p._e.k]+')');const am=document.createElementNS(SVGNS,'animateMotion');am.setAttribute('dur',(Math.max(0.9,len/170)).toFixed(2)+'s');am.setAttribute('repeatCount','indefinite');am.setAttribute('rotate','auto');const mp=document.createElementNS(SVGNS,'mpath');mp.setAttributeNS('http://www.w3.org/1999/xlink','href','#'+p.id);mp.setAttribute('href','#'+p.id);am.appendChild(mp);b.appendChild(am);svg().appendChild(b);});}
+function applyHi(){
+ const act=activeIds();if(!act){clearHi();return;}
+ stage().classList.add('focus');const neigh=new Set(act);
+ pathEls.forEach(p=>{const e=p._e;const on=act.has(e.f[0])||act.has(e.t[0]);p.classList.toggle('on',on);if(on){p.setAttribute('marker-end','url(#'+MARK[e.k]+')');neigh.add(e.f[0]);neigh.add(e.t[0]);}else p.removeAttribute('marker-end');});
+ document.querySelectorAll('#cols .tnode').forEach(c=>{const id=c.dataset.id;c.classList.toggle('sel',selSet.has(id));c.classList.toggle('neigh',neigh.has(id)&&!selSet.has(id));c.classList.toggle('dimmed',!neigh.has(id));});
+ makeBlips();updateClear();
+}
+function clearHi(){stage().classList.remove('focus');pathEls.forEach(p=>{p.classList.remove('on');p.removeAttribute('marker-end');});removeBlips();document.querySelectorAll('#cols .tnode').forEach(c=>c.classList.remove('sel','neigh','dimmed'));updateClear();}
+function updateClear(){const cs=document.getElementById('clearSel');if(!cs)return;cs.style.display=selSet.size?'':'none';cs.textContent='✕ clear ('+selSet.size+')';}
+// ---- detail
+const EMPTY='<div class="empty">Hover a table to trace links · click to multi-select. In <b style="color:var(--violet)">System Overview</b>, click a module to open it.</div>';
+function clearDetail(){document.getElementById('detail').innerHTML=EMPTY;}
+function detail(id){
+ const n=NMAP[id];if(!n)return;const out=EDGES.filter(e=>e.f[0]===id),inc=EDGES.filter(e=>e.t[0]===id);
+ const rr=(e,dir)=>{const o=dir==='out'?e.t:e.f,fld=dir==='out'?e.f[1]:e.t[1],on=NMAP[o[0]];return `<div class="rel" data-go="${o[0]}"><span class="fld">${fld}</span> <span class="ar">${dir==='out'?'→':'←'}</span> <span class="tgt">${on?on.name:o[0]}</span>.<span class="fld">${o[1]}</span><br><span class="kd">${e.k.toUpperCase()} · ${e.d||''}</span></div>`;};
+ document.getElementById('detail').innerHTML=`<h3><i class="lz" style="display:inline-block;width:10px;height:10px;border-radius:2px;background:${LCOL[n.layer]}"></i> ${n.name}</h3>
+  <div style="font-family:'JetBrains Mono';font-size:10px;color:var(--mut);margin-top:3px">${(n.layer||'').toUpperCase()} · ${n.sub||''}</div>
+  ${selSet.size>1?`<div class="selcount">${selSet.size} tables selected — showing ${n.name}</div>`:''}
+  <div class="dl">Fields (${(n.fields||[]).length})</div>${(n.fields||[]).map(f=>`<div class="fl">${f.n}${f.k?` <span class="badge ${badge(f.k)}">${f.k}</span>`:''}</div>`).join('')}
+  <div class="dl">Refers to → (${out.length})</div>${out.length?out.map(e=>rr(e,'out')).join(''):'<div class="empty">—</div>'}
+  <div class="dl">← Referred by (${inc.length})</div>${inc.length?inc.map(e=>rr(e,'in')).join(''):'<div class="empty">—</div>'}
+  <div class="dpanelnav"><button data-dn="rels">▤ links in Relationships</button></div>`;
+ document.querySelectorAll('#detail .rel').forEach(r=>r.onclick=()=>toggleSelect(r.dataset.go,true));
+ const b=document.querySelector('#detail .dpanelnav button');if(b)b.onclick=()=>focusRels([id]);
+}
+function ovDetail(id){const mod=SYS.modules[id];if(!mod){clearDetail();return;}
+ document.getElementById('detail').innerHTML=`<h3>${mod.label}</h3><div class="endp">⇄ ${mod.prefix||''}</div>
+  <div class="dl">Contains</div><div class="fl">${mod.nodes.length} tables · ${mod.edges.length} links · ${mod.endpoints.length} endpoints</div>
+  <div class="dl">Connects to</div>${(mod.crossModule||[]).map(c=>`<div class="rel" data-go="${c.to}"><span class="tgt">${SYS.labels[c.to]||c.to}</span><br><span class="kd">${c.via||''}</span></div>`).join('')||'<div class="empty">—</div>'}
+  <div class="dpanelnav"><button data-go="${id}">◇ open ${mod.label} →</button></div>`;
+ document.querySelectorAll('#detail .rel').forEach(r=>r.onclick=()=>SYS.modules[r.dataset.go]&&enterModule(r.dataset.go));
+ const b=document.querySelector('#detail .dpanelnav button');if(b)b.onclick=()=>enterModule(id);
+}
+function toggleSelect(id,add){if(!add){selSet.clear();selSet.add(id);}else{if(selSet.has(id))selSet.delete(id);else selSet.add(id);}applyHi();const s=selSet.has(id)?id:[...selSet].pop();if(s)detail(s);else clearDetail();}
+// ---- sub views
+function showSub(sub){
+ curSub=sub;if(SV())SV().value='';relsFocus=null;apiFocus=null;fHide('relsBanner');fHide('apiBanner');
+ document.querySelectorAll('#subTabs .stab').forEach(b=>b.classList.toggle('active',b.dataset.s===sub));
+ document.querySelectorAll('.view').forEach(v=>v.classList.remove('show'));
+ document.getElementById('view-'+sub).classList.add('show');
+ setControlVis();applyControls();
+ if(sub==='graph')requestAnimationFrame(draw);
+}
+function setControlVis(){
+ const chips=document.getElementById('layerChips'),s=SV();
+ chips.classList.toggle('ctlhide',!(curSub==='graph'||curSub==='rels'));
+ s.classList.toggle('ctlhide',curSub==='flow');
+ s.placeholder=curSub==='api'?'search endpoints…':(curSub==='rels'?'search links…':'search table / field…');
+}
+function applyGraphFilters(){
+ const q=SV().value.toLowerCase().trim();
+ document.querySelectorAll('#cols .tnode').forEach(c=>{const n=NMAP[c.dataset.id];const lh=curLayer!=='all'&&(n.sec||n.layer)!==curLayer;const sh=q&&!(n.name.toLowerCase().includes(q)||(n.fields||[]).some(f=>f.n.toLowerCase().includes(q)));c.classList.toggle('hide',lh||sh);});
+ document.querySelectorAll('#cols .col').forEach(c=>{const any=[...c.querySelectorAll('.tnode')].some(t=>!t.classList.contains('hide'));c.style.display=any?'':'none';});
+ requestAnimationFrame(draw);
+}
+function filterRels(){const q=SV().value.toLowerCase().trim();document.querySelectorAll('#relsBody tr').forEach(r=>{const lo=curLayer==='all'||r.dataset.fl===curLayer||r.dataset.tl===curLayer;const to=!q||r.textContent.toLowerCase().includes(q);const fo=!relsFocus||relsFocus.has(r.dataset.go)||relsFocus.has(r.dataset.to);r.style.display=(lo&&to&&fo)?'':'none';});}
+function filterApi(){const q=SV().value.toLowerCase().trim();document.querySelectorAll('#apiBody tr').forEach(r=>{const t=r.textContent.toLowerCase();r.style.display=((!q||t.includes(q))&&(!apiFocus||apiFocus.some(k=>t.includes(k))))?'':'none';});}
+function applyControls(){if(curSub==='graph')applyGraphFilters();else if(curSub==='rels')filterRels();else if(curSub==='api')filterApi();}
+function fBanner(id,txt,onClear){const el=document.getElementById(id);el.innerHTML='◆ '+txt+' <button>✕ show all</button>';el.classList.add('show');el.querySelector('button').onclick=onClear;}
+function fHide(id){const el=document.getElementById(id);if(el)el.classList.remove('show');}
+function gotoSub(s){showSub(s);document.querySelectorAll('#subTabs .stab').forEach(b=>b.classList.toggle('active',b.dataset.s===s));}
+function focusGraph(ids){ids=ids.filter(i=>NMAP[i]);if(!ids.length)return;selSet.clear();ids.forEach(i=>selSet.add(i));curLayer='all';document.querySelectorAll('#layerChips .chip[data-l]').forEach(x=>x.classList.toggle('on',x.dataset.l==='all'));gotoSub('graph');setTimeout(()=>{applyHi();detail(ids[0]);const f=cardMap[ids[0]];if(f)f.scrollIntoView({block:'center',behavior:'smooth'});},150);}
+function focusRels(ids){ids=ids.filter(i=>NMAP[i]);gotoSub('rels');relsFocus=new Set(ids);filterRels();fBanner('relsBanner','links for this step ('+ids.length+' tables)',()=>{relsFocus=null;fHide('relsBanner');filterRels();});}
+function focusApi(keys){gotoSub('api');apiFocus=keys.map(k=>String(k).toLowerCase()).filter(Boolean);filterApi();fBanner('apiBanner','endpoints for this step',()=>{apiFocus=null;fHide('apiBanner');filterApi();});}
+// ---- rels table
+function buildRels(){
+ document.getElementById('relsBody').innerHTML=EDGES.map(e=>{const fn=NMAP[e.f[0]],tn=NMAP[e.t[0]];if(!fn||!tn)return '';return `<tr data-go="${e.f[0]}" data-to="${e.t[0]}" data-fl="${fn.sec||fn.layer}" data-tl="${tn.sec||tn.layer}"><td class="src-c">${fn.name}</td><td class="fld">${e.f[1]}</td><td class="tgt-c">${tn.name}</td><td class="fld">${e.t[1]}</td><td><span class="pill p-${e.k}">${e.k}</span></td><td style="color:var(--mut)">${e.d||''}</td></tr>`;}).join('');
+ document.querySelectorAll('#relsBody tr').forEach(tr=>tr.onclick=()=>{gotoSub('graph');toggleSelect(tr.dataset.go,false);const el=cardMap[tr.dataset.go];if(el)el.scrollIntoView({block:'center',behavior:'smooth'});});
+}
+// ---- api table
+function buildApi(){
+ document.getElementById('apiBody').innerHTML=ENDP.map(a=>{const m=(a[0]||'').toLowerCase();return `<tr data-tables="${a[5]||''}"><td><span class="pill p-${m}">${a[0]}</span></td><td class="fld">${a[1]}</td><td class="src-c">${a[2]||''}</td><td style="color:#cdd7e6">${a[3]||''}</td><td class="tgt-c">${a[4]||''}</td><td style="white-space:nowrap"><button class="apibtn" data-act="graph">◇</button><button class="apibtn" data-act="rels">▤</button></td></tr>`;}).join('');
+ document.querySelectorAll('#apiBody tr').forEach(tr=>{const ids=()=>(tr.dataset.tables||'').split(',').filter(Boolean);tr.querySelectorAll('.apibtn').forEach(b=>b.onclick=(e)=>{e.stopPropagation();if(b.dataset.act==='graph')focusGraph(ids());else focusRels(ids());});tr.onclick=()=>focusGraph(ids());});
+}
+// ---- flow
+function buildFlow(){
+ const wrap=document.getElementById('branches');
+ if(!FLOW.length){wrap.innerHTML='<div class="hint">No process flow for this view. Use the Overview graph or open a module.</div>';return;}
+ wrap.innerHTML=FLOW.map((s,i)=>`<div class="branch"><div class="bh">${i+1} · ${s.n}</div>
+  <div class="cond">${s.d||''}</div>
+  <div class="tchips">${(s.tables||[]).map(t=>`<span class="tchip" data-go="${t}">${NMAP[t]?NMAP[t].name:t}</span>`).join('')}</div>
+  ${s.ep?`<div class="lep">⇄ ${s.ep}</div>`:''}
+  ${(s.be&&s.be.length)?`<div class="eff be"><div class="et">Backend</div><ul>${s.be.map(x=>`<li>${x}</li>`).join('')}</ul></div>`:''}
+  ${(s.fe&&s.fe.length)?`<div class="eff fe"><div class="et">Frontend</div><ul>${s.fe.map(x=>`<li>${x}</li>`).join('')}</ul></div>`:''}
+  <div class="cfoot"><button class="cbtn" data-act="graph" data-set="${(s.tables||[]).join(',')}">◇ Graph</button><button class="cbtn" data-act="rels" data-set="${(s.tables||[]).join(',')}">▤ Links</button></div></div>`).join('');
+ wrap.querySelectorAll('.tchip').forEach(c=>c.onclick=()=>focusGraph([c.dataset.go]));
+ wrap.querySelectorAll('.cbtn').forEach(b=>b.onclick=()=>{const set=(b.dataset.set||'').split(',').filter(Boolean);if(b.dataset.act==='graph')focusGraph(set);else focusRels(set);});
+}
+// ---- sub tab buttons
+document.querySelectorAll('#subTabs .stab').forEach(b=>b.onclick=()=>showSub(b.dataset.s));
+SV().oninput=applyControls;
+window.addEventListener('resize',()=>{clearTimeout(window._rt);window._rt=setTimeout(()=>{if(curSub==='graph')draw();},150);});
+// ---- save full data to browser localStorage (for reference) + export button ----
+const LSKEY='candor_wiring_'+(SYS.overview?'system':SYS.order[0]);
+try{localStorage.setItem(LSKEY,JSON.stringify(SYS));}catch(e){}
+(function(){var b=document.getElementById('btnExport');if(b)b.onclick=function(){
+  var blob=new Blob([JSON.stringify(SYS,null,1)],{type:'application/json'});
+  var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=LSKEY+'.json';
+  document.body.appendChild(a);a.click();a.remove();};})();
+// init
+if(SYS.overview){buildModTabs();loadModule('overview');}else{loadModule(SYS.order[0]);}
+setTimeout(()=>{if(curSub==='graph')draw();},160);
+
+</script></body></html>

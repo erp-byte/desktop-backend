@@ -1,0 +1,397 @@
+/* Component: button — canonical selectors per 01-UI-SPEC.md §3.1.
+   Canonical `.btn` at 36px + flat accent fill for primary. Legacy aliases
+   at the bottom preserve today's 40px + gradient primary rendering until
+   each module migrates to `.btn.btn--primary` markup. */
+
+/* ── Base ── */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  height: 36px;
+  padding: 0 var(--space-4);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  font-family: var(--font-sans);
+  font-size: var(--font-body);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-primary);
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+  transition:
+    background var(--duration-fast) var(--easing-standard),
+    border-color var(--duration-fast) var(--easing-standard),
+    color var(--duration-fast) var(--easing-standard),
+    transform var(--duration-instant) var(--easing-standard);
+}
+
+/* ── Sizes ── */
+.btn--sm {
+  height: 32px;
+  padding: 0 var(--space-3);
+  font-size: var(--font-body-sm);
+}
+
+.btn--lg {
+  height: 42px;
+  padding: 0 var(--space-5);
+  font-size: var(--font-body);
+  font-weight: var(--font-weight-semibold);
+}
+
+/* ── Variants ── */
+.btn--primary {
+  background: var(--color-accent);
+  color: var(--color-text-inverse);
+  border-color: transparent;
+}
+.btn--primary:hover:not(:disabled) {
+  background: var(--color-accent-hover);
+}
+.btn--primary:active:not(:disabled) {
+  background: var(--color-accent-pressed);
+}
+
+.btn--secondary {
+  background: var(--color-surface-sunken);
+  color: var(--color-text-primary);
+  border-color: var(--color-border-subtle);
+}
+.btn--secondary:hover:not(:disabled) {
+  border-color: var(--color-border-strong);
+  background: var(--color-surface-hover);
+}
+
+.btn--tertiary {
+  background: var(--color-accent-glow);
+  color: var(--color-accent);
+  border-color: var(--color-accent-strong);
+}
+.btn--tertiary:hover:not(:disabled) {
+  background: var(--color-accent-strong);
+}
+
+.btn--ghost {
+  background: transparent;
+  color: var(--color-text-secondary);
+  border-color: transparent;
+}
+.btn--ghost:hover:not(:disabled) {
+  color: var(--color-text-primary);
+  background: var(--color-surface-hover);
+}
+
+.btn--destructive {
+  background: var(--color-danger-fg);
+  color: var(--color-text-inverse);
+  border-color: transparent;
+}
+.btn--destructive:hover:not(:disabled) {
+  background: #a93226; /* token-exempt: destructive hover — darker danger not covered by current semantic tokens */
+}
+
+/* ── Icon-only ── */
+.btn--icon-only {
+  width: 36px;
+  padding: 0;
+}
+.btn--icon-only.btn--sm {
+  width: 32px;
+}
+.btn--icon-only.btn--lg {
+  width: 42px;
+}
+
+/* ── Icon slot ── */
+.btn__icon {
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+  stroke: currentColor;
+  fill: none;
+}
+.btn--sm .btn__icon { width: 14px; height: 14px; }
+.btn--lg .btn__icon { width: 16px; height: 16px; }
+
+/* ── Spinner slot (loading state) ── */
+.btn__spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  flex-shrink: 0;
+}
+.btn--lg .btn__spinner { width: 16px; height: 16px; }
+
+/* ── States ── */
+.btn:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+.btn--destructive:focus-visible {
+  box-shadow: var(--focus-ring-danger);
+}
+
+.btn:active:not(:disabled) {
+  transform: scale(0.98);
+}
+
+.btn:disabled,
+.btn.is-disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
+.btn.is-loading {
+  pointer-events: none;
+}
+.btn.is-loading > :not(.btn__spinner) {
+  opacity: 0.7;
+}
+
+/* ── Back button — 30px outlined, used in-page under titlebar ── */
+.btn-back,
+.pb-back-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  height: 30px;
+  padding: 0 var(--space-3);
+  background: transparent;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-md);
+  font-family: var(--font-sans);
+  font-size: var(--font-body-sm);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  transition:
+    border-color var(--duration-fast) var(--easing-standard),
+    color var(--duration-fast) var(--easing-standard),
+    background var(--duration-fast) var(--easing-standard);
+}
+.btn-back:hover,
+.pb-back-btn:hover {
+  border-color: var(--color-border-strong);
+  color: var(--color-text-primary);
+}
+.btn-back:focus-visible,
+.pb-back-btn:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+/* ──────────────────────────────────────────────────────────────────────
+   LEGACY ALIASES — preserve today's 40px heights and gradient primaries
+   so unmigrated markup (.btn-primary / .create-btn / .modal-btn.primary /
+   .fd-btn--accent / etc.) renders identically until each consumer migrates
+   to canonical `.btn.btn--variant` markup. Plan 10 deletes these once all
+   modules migrate.
+   ────────────────────────────────────────────────────────────────────── */
+
+/* Legacy PRIMARY family — 40px + burgundy-accent gradient */
+.btn-primary,
+.create-btn,
+.toolbar-btn:not(.danger),
+.ful-create-plan-btn,
+.td-load-btn,
+.dc-btn-primary,
+.modal-btn.primary,
+.jcd-action-btn,
+.add-line-btn,
+.fd-btn--accent {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  height: 40px; /* legacy height — Plan 10 drops to 36px when each consumer migrates to .btn.btn--primary markup */
+  padding: 0 var(--space-4);
+  background: linear-gradient(135deg, var(--color-accent), var(--color-accent-hover));
+  color: var(--color-text-inverse);
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  font-family: var(--font-sans);
+  font-size: var(--font-body);
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+  white-space: nowrap;
+  user-select: none;
+  transition:
+    background var(--duration-fast) var(--easing-standard),
+    transform var(--duration-instant) var(--easing-standard),
+    box-shadow var(--duration-fast) var(--easing-standard);
+}
+.btn-primary:hover:not(:disabled),
+.create-btn:hover:not(:disabled),
+.toolbar-btn:not(.danger):hover:not(:disabled),
+.ful-create-plan-btn:hover:not(:disabled),
+.td-load-btn:hover:not(:disabled),
+.dc-btn-primary:hover:not(:disabled),
+.modal-btn.primary:hover:not(:disabled),
+.jcd-action-btn:hover:not(:disabled),
+.add-line-btn:hover:not(:disabled),
+.fd-btn--accent:hover:not(:disabled) {
+  background: linear-gradient(135deg, var(--color-accent-hover), var(--color-accent));
+  box-shadow: var(--shadow-sm);
+}
+
+/* Legacy SECONDARY family — 40px outlined */
+.btn-secondary,
+.ful-load-more-btn,
+.dc-btn-secondary,
+.modal-btn.secondary,
+.fd-btn--outline,
+.fd-btn--secondary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  height: 40px; /* legacy height */
+  padding: 0 var(--space-4);
+  background: var(--color-surface-sunken);
+  color: var(--color-text-primary);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-md);
+  font-family: var(--font-sans);
+  font-size: var(--font-body);
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    border-color var(--duration-fast) var(--easing-standard),
+    background var(--duration-fast) var(--easing-standard);
+}
+.btn-secondary:hover:not(:disabled),
+.ful-load-more-btn:hover:not(:disabled),
+.dc-btn-secondary:hover:not(:disabled),
+.modal-btn.secondary:hover:not(:disabled),
+.fd-btn--outline:hover:not(:disabled),
+.fd-btn--secondary:hover:not(:disabled) {
+  border-color: var(--color-border-strong);
+  background: var(--color-surface-hover);
+}
+
+/* Legacy DESTRUCTIVE — 40px */
+.toolbar-btn.danger {
+  height: 40px;
+  padding: 0 var(--space-4);
+  background: var(--color-danger-fg);
+  color: var(--color-text-inverse);
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  font-family: var(--font-sans);
+  font-size: var(--font-body);
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  transition: background var(--duration-fast) var(--easing-standard);
+}
+.toolbar-btn.danger:hover:not(:disabled) {
+  background: #a93226; /* token-exempt: destructive hover */
+}
+
+/* Legacy SUCCESS one-off (.dc-btn-success) — kept alive so discrepancy
+   module renders identically. UI-SPEC §3.1 standardizes on 5 variants
+   (no --success). Plan 10 audit will ask the user to add .btn--success
+   OR migrate discrepancy to .btn--primary. */
+.dc-btn-success {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  height: 40px;
+  padding: 0 var(--space-4);
+  background: var(--color-success-fg);
+  color: var(--color-text-inverse);
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  font-family: var(--font-sans);
+  font-size: var(--font-body);
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+  transition: background var(--duration-fast) var(--easing-standard);
+}
+.dc-btn-success:hover:not(:disabled) {
+  background: #267048; /* token-exempt: darker success hover not in semantic token set */
+}
+
+/* Legacy ghost-small family — secondary-action row buttons */
+.pb-sel-btn,
+.bom-pane-btn,
+.btn-send-claude,
+.bom-override-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  height: 32px;
+  padding: 0 var(--space-3);
+  background: transparent;
+  color: var(--color-text-secondary);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-md);
+  font-family: var(--font-sans);
+  font-size: var(--font-body-sm);
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+  transition:
+    border-color var(--duration-fast) var(--easing-standard),
+    color var(--duration-fast) var(--easing-standard),
+    background var(--duration-fast) var(--easing-standard);
+}
+.pb-sel-btn:hover:not(:disabled),
+.bom-pane-btn:hover:not(:disabled),
+.btn-send-claude:hover:not(:disabled),
+.bom-override-btn:hover:not(:disabled) {
+  border-color: var(--color-border-strong);
+  color: var(--color-text-primary);
+  background: var(--color-surface-hover);
+}
+
+/* Legacy fd-btn base (fulfillment module's base button class) */
+.fd-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  height: 40px;
+  padding: 0 var(--space-4);
+  border-radius: var(--radius-md);
+  font-family: var(--font-sans);
+  font-size: var(--font-body);
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition:
+    background var(--duration-fast) var(--easing-standard),
+    border-color var(--duration-fast) var(--easing-standard);
+}
+
+/* Legacy modal-btn base (shared dialog action button) — sizing + layout only;
+   primary/secondary color are owned by .modal-btn.primary/.secondary above
+   (which route through the legacy PRIMARY/SECONDARY family). */
+.modal-btn {
+  flex: 1;
+  min-height: 40px;
+  padding: 0 var(--space-4);
+  border-radius: var(--radius-md);
+  font-family: var(--font-sans);
+  font-size: var(--font-body-sm);
+  font-weight: var(--font-weight-medium);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  cursor: pointer;
+  border: 1px solid transparent;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition:
+    background var(--duration-fast) var(--easing-standard),
+    border-color var(--duration-fast) var(--easing-standard);
+}

@@ -1,0 +1,12 @@
+{
+  "include": ["app"],
+  "exclude": [
+    "**/__pycache__",
+    "**/.venv",
+    "**/node_modules",
+    ".worktrees"
+  ],
+  "extraPaths": ["."],
+  "pythonVersion": "3.14",
+  "reportMissingImports": "warning"
+}

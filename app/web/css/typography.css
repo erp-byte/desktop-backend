@@ -1,0 +1,146 @@
+/* Component: typography — canonical selectors per 01-UI-SPEC.md §2.2 and §3.3.
+   Default headings scoped to page body; utility classes for body/caption/eyebrow/mono. */
+
+/* ── Headings — defaults and utility classes ── */
+h1,
+.heading-h1,
+.page-title {
+  font-family: var(--font-display);
+  font-size: var(--font-h1);
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--line-height-tight);
+  letter-spacing: var(--tracking-tight);
+  color: var(--color-text-primary);
+  margin: 0;
+}
+
+h2,
+.heading-h2 {
+  font-family: var(--font-sans);
+  font-size: var(--font-h2);
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--line-height-tight);
+  letter-spacing: -0.2px; /* token-exempt: per UI-SPEC §2.2 table, h2 tracking is -0.2px (between --tracking-normal 0 and --tracking-tight -0.3px) */
+  color: var(--color-text-primary);
+  margin: 0;
+}
+
+h3,
+.heading-h3 {
+  font-family: var(--font-sans);
+  font-size: var(--font-h3);
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--line-height-snug);
+  color: var(--color-text-primary);
+  margin: 0;
+}
+
+h4,
+.heading-h4 {
+  font-family: var(--font-sans);
+  font-size: var(--font-h4);
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--line-height-snug);
+  color: var(--color-text-primary);
+  margin: 0;
+}
+
+.heading-display {
+  font-family: var(--font-display);
+  font-size: var(--font-display-size);
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--line-height-tight);
+  color: var(--color-text-primary);
+}
+
+/* ── Body / caption / overline utilities ── */
+.text-body-lg {
+  font-size: var(--font-body-lg);
+  font-weight: var(--font-weight-regular);
+  line-height: var(--line-height-normal);
+}
+
+.text-body {
+  font-size: var(--font-body);
+  font-weight: var(--font-weight-regular);
+  line-height: var(--line-height-normal);
+}
+
+.text-body-sm {
+  font-size: var(--font-body-sm);
+  font-weight: var(--font-weight-regular);
+  line-height: var(--line-height-normal);
+}
+
+.text-caption {
+  font-size: var(--font-caption);
+  font-weight: var(--font-weight-medium);
+  line-height: var(--line-height-snug);
+  letter-spacing: var(--tracking-wide);
+}
+
+.text-overline,
+.eyebrow {
+  font-size: var(--font-overline);
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--line-height-tight);
+  letter-spacing: var(--tracking-wider);
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+}
+
+/* ── Mono / tabular utilities ── */
+.mono {
+  font-family: var(--font-mono);
+}
+
+.numeric,
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Text color utilities ── */
+.text-muted {
+  color: var(--color-text-muted);
+}
+
+.text-secondary {
+  color: var(--color-text-secondary);
+}
+
+.text-primary {
+  color: var(--color-text-primary);
+}
+
+.text-accent {
+  color: var(--color-accent);
+}
+
+.text-danger {
+  color: var(--color-danger-fg);
+}
+
+.text-success {
+  color: var(--color-success-fg);
+}
+
+.text-warning {
+  color: var(--color-warning-fg);
+}
+
+/* ── Legacy: .modal-title — preserve reset.css-era sizing ── */
+.modal-title {
+  font-family: var(--font-display);
+  font-size: var(--font-h2);
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--line-height-tight);
+  color: var(--color-text-primary);
+  margin: 0 0 var(--space-2);
+}
+
+.modal-desc {
+  font-size: var(--font-body-sm);
+  color: var(--color-text-secondary);
+  line-height: var(--line-height-loose);
+  margin: 0 0 var(--space-4);
+}

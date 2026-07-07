@@ -1,0 +1,275 @@
+/* ── Candor IMS Frontend — Design Tokens ──
+   Generated from 01-UI-SPEC.md §2 on 2026-04-18.
+   Single source of truth for colors, typography, spacing, radius, shadow,
+   z-index, motion, and focus-ring tokens. Legacy aliases at the bottom
+   preserve today's rendering for ~30 module stylesheets that read
+   `var(--bg-*)` / `var(--accent)` / `var(--clr-*)` / `var(--mod-*)` /
+   `var(--text-*)` / `var(--border-*)` / `var(--radius-*)` / `var(--shadow-*)`
+   names. Plan 10 flips legacy values to canonical UI-SPEC values.
+
+   Cascade order (UI-SPEC D23 / §7.3): reset → tokens → components →
+   utilities → overrides. Declaring @layer up front means any future file
+   can opt into a layer without re-writing the cascade.
+*/
+
+@layer reset, tokens, components, utilities, overrides;
+
+:root {
+  /* ── Section A — Semantic tokens (canonical per UI-SPEC §2) ── */
+
+  /* §2.1 Color — Surfaces */
+  --color-surface-page:       #f5f4f2;
+  --color-surface-raised:     #ffffff;
+  --color-surface-alt:        #fafaf8;
+  --color-surface-sunken:     #f7f6f4;
+  --color-surface-sidebar:    #f0efed;
+  --color-surface-hover:      rgba(0,0,0,0.03);
+  --color-surface-overlay:    rgba(0,0,0,0.28);
+
+  /* §2.1 Color — Text
+     TODO: UI-SPEC §2.1 recommends 0.55→0.62 contrast bump on text-secondary
+     and 0.25→0.28 on text-placeholder; ship in Plan 10 cleanup after canary
+     validates the rest. Keeping today's values to avoid cascading visual
+     shift across 30 modules pre-migration. */
+  --color-text-primary:       #1a1a1f;
+  --color-text-secondary:     rgba(26,26,31,0.55);
+  --color-text-muted:         rgba(26,26,31,0.40);
+  --color-text-placeholder:   rgba(26,26,31,0.25);
+  --color-text-inverse:       #ffffff;
+  --color-text-link:          var(--color-accent);
+  --color-text-link-hover:    var(--color-accent-hover);
+
+  /* §2.1 Color — Borders */
+  --color-border-subtle:      rgba(0,0,0,0.08);
+  --color-border-strong:      rgba(0,0,0,0.14);
+  --color-border-card:        rgba(0,0,0,0.07);
+  --color-border-focus:       rgba(155,56,61,0.45);
+
+  /* §2.1 Color — Brand */
+  --color-accent:             #9b383d;
+  --color-accent-hover:       #b04449;
+  --color-accent-pressed:     #852f34;
+  --color-accent-glow:        rgba(155,56,61,0.08);
+  --color-accent-strong:      rgba(155,56,61,0.18);
+
+  /* §2.1 Color — Semantic status */
+  --color-success-fg:         #2e8b57;
+  --color-success-bg:         rgba(46,139,87,0.10);
+  --color-success-border:     rgba(46,139,87,0.22);
+
+  --color-warning-fg:         #d4850a;
+  --color-warning-bg:         rgba(212,133,10,0.10);
+  --color-warning-border:     rgba(212,133,10,0.22);
+
+  --color-danger-fg:          #c0392b;
+  --color-danger-bg:          rgba(192,57,43,0.10);
+  --color-danger-border:      rgba(192,57,43,0.22);
+
+  --color-info-fg:            #2b6cb0;
+  --color-info-bg:            rgba(43,108,176,0.10);
+  --color-info-border:        rgba(43,108,176,0.22);
+
+  --color-neutral-fg:         rgba(26,26,31,0.55);
+  --color-neutral-bg:         rgba(0,0,0,0.04);
+  --color-neutral-border:     rgba(0,0,0,0.10);
+
+  /* §2.1 Focus ring */
+  --focus-ring:               0 0 0 3px rgba(155,56,61,0.18);
+  --focus-ring-danger:        0 0 0 3px rgba(192,57,43,0.18);
+
+  /* §2.1 Color — Module accents */
+  --color-module-blue:        #2b6cb0;
+  --color-module-emerald:     #2e8b57;
+  --color-module-amber:       #d4850a;
+  --color-module-rose:        #c0392b;
+  --color-module-violet:      #7c3aed;
+  --color-module-cyan:        #0891b2;
+  --color-module-coral:       #c2553a;
+  --color-module-teal:        #0d9488;
+
+  /* Plan 02 in-canary addition — machine-status signal colors
+     Bright 6px dots on white where muted semantic hues would disappear.
+     Distinct from --color-success-fg / --color-danger-fg. */
+  --color-signal-free:        #22c55e;   /* machine available / resource free */
+  --color-signal-active:      #f97316;   /* machine in use / processing */
+  --color-signal-inplan:      #6366f1;   /* machine queued in current plan */
+
+  /* §2.2 Typography — Families */
+  --font-sans:    'DM Sans', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-display: 'Playfair Display', 'DM Sans', serif;
+  --font-mono:    'JetBrains Mono', 'Consolas', monospace;
+
+  /* §2.2 Typography — Weights */
+  --font-weight-regular:   400;
+  --font-weight-medium:    500;
+  --font-weight-semibold:  600;
+
+  /* §2.2 Typography — Scale
+     Note: `--font-display` is the family token (above); the display size
+     is `--font-display-size` to avoid a custom-property cycle. Modules
+     that want the hero size use `font-size: var(--font-display-size)`. */
+  --font-display-size:  28px;
+  --font-h1:            22px;
+  --font-h2:            18px;
+  --font-h3:            15px;
+  --font-h4:            13px;
+  --font-body-lg:       14px;
+  --font-body:          13px;
+  --font-body-sm:       12px;
+  --font-caption:       11px;
+  --font-overline:      10px;
+  --font-mono-body:     12px;
+  --font-mono-sm:       11px;
+  --font-mono-value:    22px;
+
+  /* §2.2 Typography — Line heights */
+  --line-height-tight:  1.2;
+  --line-height-snug:   1.35;
+  --line-height-normal: 1.5;
+  --line-height-loose:  1.65;
+
+  /* §2.2 Typography — Letter spacing */
+  --tracking-tight:   -0.3px;
+  --tracking-normal:  0;
+  --tracking-wide:    0.6px;
+  --tracking-wider:   1.2px;
+  --tracking-widest:  1.8px;
+
+  /* §2.3 Spacing — 4px-base scale */
+  --space-0:    0;
+  --space-0_5:  2px;
+  --space-1:    4px;
+  --space-2:    8px;
+  --space-3:    12px;
+  --space-4:    16px;
+  --space-5:    20px;
+  --space-6:    24px;
+  --space-7:    28px;
+  --space-8:    32px;
+  --space-10:   40px;
+  --space-12:   48px;
+  --space-16:   64px;
+  --space-20:   80px;
+  --space-24:   96px;
+
+  /* §2.3 Spacing — Component-padding tokens */
+  --space-input-x:   14px;
+  --space-input-y:   0;
+  --space-card-x:    20px;
+  --space-card-y:    18px;
+  --space-page-x:    32px;
+  --space-page-y:    24px;
+
+  /* §2.4 Radius — canonical values (LEGACY aliases below override these for
+     today's rendering; Plan 10 flips) */
+  --radius-none:   0;
+  --radius-pill:   999px;
+
+  /* §2.5 Shadow — canonical values (LEGACY aliases below override; Plan 10 flips) */
+  --shadow-none:   none;
+  --shadow-xs:     0 1px 2px rgba(0,0,0,0.05);
+
+  /* §2.6 Z-index */
+  --z-base:         0;
+  --z-raised:       1;
+  --z-sticky:       10;
+  --z-dropdown:     50;
+  --z-titlebar:     100;
+  --z-modal-backdrop: 200;
+  --z-modal:        210;
+  --z-toast:        300;
+  --z-tooltip:      400;
+
+  /* §2.7 Motion */
+  --duration-instant:  100ms;
+  --duration-fast:     150ms;
+  --duration-base:     200ms;
+  --duration-slow:     350ms;
+
+  --easing-standard:   cubic-bezier(0.2, 0, 0, 1);
+  --easing-emphasized: cubic-bezier(0.16, 1, 0.3, 1);
+  --easing-linear:     linear;
+
+  /* ── Section B — Legacy aliases (preserve today's rendering) ──
+     These DECLARATIONS come AFTER the canonical ones above.
+     Radius/shadow legacy values OVERRIDE canonical so today's modules keep
+     rendering at ~10/14/18px radii and today's shadow blur values.
+     Plan 10 flips these to canonical in one surgical commit once every
+     module has migrated.
+  */
+
+  /* Radius — LEGACY values (Plan 10 will flip to canonical 6/8/12/16) */
+  --radius-xs:  4px;
+  --radius-sm:  6px;
+  --radius-md:  10px;   /* canonical spec: 8px — legacy 10px preserved */
+  --radius-lg:  14px;   /* canonical spec: 12px — legacy 14px preserved */
+  --radius-xl:  18px;   /* canonical spec: 16px — legacy 18px preserved */
+
+  /* Shadow — LEGACY values (Plan 10 will flip to canonical blur values) */
+  --shadow-sm:  0 1px 2px rgba(0,0,0,0.04);
+  --shadow-md:  0 4px 6px rgba(0,0,0,0.05);
+  --shadow-lg:  0 10px 25px rgba(0,0,0,0.1);
+  --shadow-xl:  0 20px 40px rgba(0,0,0,0.12);
+
+  /* Backgrounds */
+  --bg-primary:      var(--color-surface-page);
+  --bg-main:         var(--color-surface-page);
+  --bg-card:         var(--color-surface-raised);
+  --bg-card-alt:     var(--color-surface-alt);
+  --bg-card-hover:   var(--color-surface-sidebar);
+  --bg-sidebar:      var(--color-surface-sidebar);
+  --bg-input:        var(--color-surface-sunken);
+  --bg-input-focus:  var(--color-surface-sunken);
+  --bg-hover:        rgba(0,0,0,0.02);   /* legacy 0.02 retained; canonical --color-surface-hover is 0.03 */
+
+  /* Borders */
+  --border:          var(--color-border-subtle);
+  --border-subtle:   var(--color-border-subtle);
+  --border-card:     var(--color-border-card);
+  --border-focus:    var(--color-border-focus);
+
+  /* Text */
+  --text-primary:      var(--color-text-primary);
+  --text-secondary:    var(--color-text-secondary);
+  --text-muted:        var(--color-text-muted);
+  --text-placeholder:  var(--color-text-placeholder);
+
+  /* Brand */
+  --accent:         var(--color-accent);
+  --accent-hover:   var(--color-accent-hover);
+  --accent-glow:    var(--color-accent-glow);
+  --accent-strong:  var(--color-accent-strong);
+
+  /* Status (single-purpose rgba + fg family for dashboards) */
+  --clr-ok:              var(--color-success-fg);
+  --clr-ok-bg:           var(--color-success-bg);
+  --clr-mismatch:        var(--color-danger-fg);
+  --clr-mismatch-bg:     var(--color-danger-bg);
+  --clr-warning:         var(--color-warning-fg);
+  --clr-warning-bg:      var(--color-warning-bg);
+  --clr-info:            var(--color-info-fg);
+  --clr-info-bg:         var(--color-info-bg);
+  --clr-received:        var(--color-success-fg);
+  --clr-received-bg:     var(--color-success-bg);
+  --clr-unmatched:       var(--color-warning-fg);
+  --clr-unmatched-bg:    var(--color-warning-bg);
+
+  /* Module accents */
+  --mod-blue:     var(--color-module-blue);
+  --mod-emerald:  var(--color-module-emerald);
+  --mod-amber:    var(--color-module-amber);
+  --mod-rose:     var(--color-module-rose);
+  --mod-violet:   var(--color-module-violet);
+  --mod-cyan:     var(--color-module-cyan);
+  --mod-coral:    var(--color-module-coral);
+  --mod-teal:     var(--color-module-teal);
+
+  /* Other legacy single-tokens referenced by existing modules */
+  --red: var(--color-danger-fg);
+  --surface-2: var(--color-surface-alt);
+  --card-stripe: var(--color-border-subtle);
+  --card-accent: var(--color-accent);
+  --card-accent-bg: var(--color-accent-glow);
+}
+
+/* Last updated: 2026-04-18 */

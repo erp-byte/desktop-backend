@@ -1,0 +1,137 @@
+/* Component: state — canonical selectors per 01-UI-SPEC.md §3.11.
+   Empty / loading / error states + progress spinner. Three-state family
+   shares the same centered-column layout; only icon/title color diverge. */
+
+/* ── Empty state ── */
+.empty-state,
+.empty-lines,
+.no-results,
+.jc-empty,
+.td-empty-state,
+.lp-empty {
+  display: none;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-12) var(--space-5);
+  gap: var(--space-2);
+  text-align: center;
+  color: var(--color-text-muted);
+}
+
+.empty-state.show,
+.empty-lines.show,
+.no-results.show,
+.jc-empty.show,
+.td-empty-state.show,
+.lp-empty.show {
+  display: flex;
+}
+
+.empty-state__icon,
+.empty-state > svg:first-child {
+  width: 48px; /* token-exempt: canonical empty-state icon size per UI-SPEC §3.11 */
+  height: 48px;
+  opacity: 0.35;
+  margin-bottom: var(--space-2);
+  color: var(--color-text-muted);
+  stroke: currentColor;
+  fill: none;
+}
+
+.empty-state__title {
+  font-family: var(--font-sans);
+  font-size: var(--font-h3);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-primary);
+  margin: 0;
+}
+
+.empty-state__message,
+.empty-state > p {
+  font-size: var(--font-body-sm);
+  color: var(--color-text-muted);
+  max-width: 380px; /* token-exempt: reading-width cap for empty-state prose per UI-SPEC §3.11 */
+  line-height: var(--line-height-normal);
+  margin: 0;
+}
+
+/* ── Loading state ── */
+.loading-state {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(245,244,242,0.72); /* token-exempt: loading veil alpha — will become --color-surface-loading-veil in Plan 10 */
+  pointer-events: none;
+  z-index: var(--z-raised);
+}
+
+.loading-state--inline {
+  position: static;
+  inset: auto;
+  display: inline-flex;
+  gap: var(--space-2);
+  background: transparent;
+  padding: var(--space-2);
+}
+
+/* ── Error state — same layout as empty-state but danger color ── */
+.error-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-12) var(--space-5);
+  gap: var(--space-2);
+  text-align: center;
+  color: var(--color-danger-fg);
+}
+
+.error-state__icon {
+  width: 48px;
+  height: 48px;
+  opacity: 0.55;
+  color: var(--color-danger-fg);
+  margin-bottom: var(--space-2);
+}
+
+.error-state__title {
+  font-family: var(--font-sans);
+  font-size: var(--font-h3);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-danger-fg);
+  margin: 0;
+}
+
+.error-state__message {
+  font-size: var(--font-body-sm);
+  color: var(--color-text-muted);
+  max-width: 380px;
+  line-height: var(--line-height-normal);
+  margin: 0;
+}
+
+/* ── Progress spinner — shared keyframe lives in animations.css ── */
+.progress-spinner {
+  width: 20px;
+  height: 20px;
+  border: 2px solid var(--color-border-subtle);
+  border-top-color: var(--color-accent);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  flex-shrink: 0;
+}
+
+.progress-spinner--sm {
+  width: 14px;
+  height: 14px;
+  border-width: 1.5px;
+}
+
+.progress-spinner--lg {
+  width: 28px;
+  height: 28px;
+  border-width: 2.5px;
+}

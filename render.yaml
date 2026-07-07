@@ -1,0 +1,51 @@
+services:
+  # 1. FastAPI REST backend
+  - type: web
+    name: desktop-backend
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: consumption-db
+          property: connectionString
+      - key: PYTHON_VERSION
+        value: "3.12"
+      - key: RENDER_BACKEND_URL
+        value: "https://desktop-backend-vhf0.onrender.com"
+      - key: AUTH_ENCRYPTION_KEY
+        sync: false
+
+  # 2. MCP Planner (18 tools — plan generation + indents)
+  - type: web
+    name: candor-planner-mcp
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python mcp_planner.py
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: consumption-db
+          property: connectionString
+      - key: PYTHON_VERSION
+        value: "3.12"
+
+  # 3. MCP Tracker (28 tools — view only)
+  - type: web
+    name: candor-tracker-mcp
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python mcp_tracker.py
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: consumption-db
+          property: connectionString
+      - key: PYTHON_VERSION
+        value: "3.12"
+
+databases:
+  - name: consumption-db
+    plan: free
+    databaseName: consumption
