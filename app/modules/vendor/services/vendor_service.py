@@ -35,7 +35,9 @@ _VENDOR_COLUMNS = """
     pin_code, fssai_no, brc_other, cin_no, pan_no, gstn, iec_no,
     pollution_epr, tin_tan, is_msme, msme_registration_date, msme_type_id,
     uam_udyam_no, business_turnover_3y, capabilities, remarks, reference,
-    scoc_status_id, kyc_status_id, doc_status_id, approved_by, approved_at,
+    scoc_status_id, kyc_status_id, doc_status_id,
+    supplier_type_other, firm_status_other, business_type_other,
+    approved_by, approved_at,
     created_at, created_by, updated_at, updated_by, is_deleted
 """
 
@@ -141,8 +143,9 @@ async def _insert_vendor(
         "iec_no", "pollution_epr", "tin_tan", "is_msme",
         "msme_registration_date", "msme_type_id", "uam_udyam_no",
         "business_turnover_3y", "capabilities", "remarks", "reference",
-        "scoc_status_id", "kyc_status_id", "doc_status_id", "approved_by",
-        "approved_at", "created_by", "updated_by",
+        "scoc_status_id", "kyc_status_id", "doc_status_id",
+        "supplier_type_other", "firm_status_other", "business_type_other",
+        "approved_by", "approved_at", "created_by", "updated_by",
     ]
     placeholders = ", ".join(f"${i + 1}" for i in range(len(cols)))
     values = [data.get(c) for c in cols]

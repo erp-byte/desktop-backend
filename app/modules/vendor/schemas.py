@@ -100,6 +100,12 @@ class VendorBase(BaseModel):
     kyc_status_id: str | None = None
     doc_status_id: str | None = None
 
+    # Free-text "Others" companion values. Populated only when the matching
+    # *_id lookup resolves to the "Others" option on the form; NULL otherwise.
+    supplier_type_other: str | None = Field(default=None, max_length=200)
+    firm_status_other: str | None = Field(default=None, max_length=200)
+    business_type_other: str | None = Field(default=None, max_length=200)
+
     core_business: str | None = None
     contact_person: str | None = None
     designation: str | None = None
@@ -188,6 +194,10 @@ class VendorUpdateRequest(BaseModel):
     scoc_status_id: str | None = None
     kyc_status_id: str | None = None
     doc_status_id: str | None = None
+
+    supplier_type_other: str | None = None
+    firm_status_other: str | None = None
+    business_type_other: str | None = None
 
     core_business: str | None = None
     contact_person: str | None = None
