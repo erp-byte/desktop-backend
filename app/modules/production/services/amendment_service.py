@@ -48,3 +48,41 @@ async def log_amendment(conn, *, record_id, record_type, field_name,
          str(previous_value) if previous_value is not None else None,
          str(new_value) if new_value is not None else None,
          changed_by, reason)
+
+
+# ── Job-card edit log (whole-JC audit: header/tabs + box data) ──────────────
+# The whole job card's change history lives in amendment_log keyed by
+# record_id = str(job_card_id): record_type 'job_card' for JC/tab fields,
+# 'job_card_box' for per-box edits (field_name = "box:<box_id>.<field>"). The
+# frontend reads this to paint every ever-edited value light red.
+_JC_LOG_RECORD_TYPES = ("job_card", "job_card_box")
+
+
+async def log_jc_field_changes(conn, *, job_card_id, record_type, field_prefix,
+                               before, after, changed_by, reason=None):
+    """Diff two field dicts (same keys) and log one amendment row per CHANGED
+    field. field_name = f"{field_prefix}{key}". No-ops are skipped by
+    log_amendment. Runs in the caller's txn."""
+    for key, new_val in after.items():
+        await log_amendment(
+            conn, record_id=str(job_card_id), record_type=record_type,
+            field_name=f"{field_prefix}{key}", previous_value=before.get(key),
+            new_value=new_val, changed_by=changed_by, reason=reason,
+        )
+
+
+async def list_jc_edit_log(conn, job_card_id):
+    """Every recorded change for one job card (header/tabs + box data), newest
+    first. Drives the frontend's light-red 'this was edited' markers."""
+    rows = await conn.fetch(
+        """
+        SELECT record_type, field_name, previous_value, new_value,
+               changed_by, changed_at, reason
+          FROM amendment_log
+         WHERE record_id = $1 AND record_type = ANY($2::text[])
+         ORDER BY changed_at DESC
+         LIMIT 5000
+        """,
+        str(job_card_id), list(_JC_LOG_RECORD_TYPES),
+    )
+    return [dict(r) for r in rows]

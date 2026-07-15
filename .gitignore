@@ -27,3 +27,6 @@ gen_pdf.py
 # Local business data + scratch (never publish to shared remote)
 scratch/
 data/
+
+# build artifacts (embed .env) — never commit
+*.zip

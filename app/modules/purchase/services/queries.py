@@ -117,8 +117,14 @@ def _str_or_none(val) -> str | None:
     return str(val)
 
 
-def build_po_detail(header, lines, sections_by_line, boxes_by_line_section) -> dict:
-    """Build a single POHeaderOut-compatible dict."""
+def build_po_detail(header, lines, sections_by_line, boxes_by_line_section, section_box_counts=None) -> dict:
+    """Build a single POHeaderOut-compatible dict.
+
+    When boxes are lazily loaded (include_boxes=False in fetch_po_details),
+    ``boxes_by_line_section`` is empty and ``section_box_counts`` maps
+    (line_number, section_number) -> box count so the totals stay accurate
+    without transferring the box rows.
+    """
     h = header
     txn_no = h["transaction_no"]
 
@@ -134,7 +140,12 @@ def build_po_detail(header, lines, sections_by_line, boxes_by_line_section) -> d
         for s in line_sections:
             sn = s["section_number"]
             section_boxes = boxes_by_line_section.get((ln, sn), [])
-            line_box_count += len(section_boxes)
+            sec_total = (
+                section_box_counts.get((ln, sn), 0)
+                if section_box_counts is not None
+                else len(section_boxes)
+            )
+            line_box_count += sec_total
 
             section_dicts.append({
                 "transaction_no": txn_no,
@@ -144,7 +155,7 @@ def build_po_detail(header, lines, sections_by_line, boxes_by_line_section) -> d
                 "box_count": int(s["box_count"]) if s.get("box_count") is not None else None,
                 "manufacturing_date": s.get("manufacturing_date"),
                 "expiry_date": s.get("expiry_date"),
-                "total_boxes": len(section_boxes),
+                "total_boxes": sec_total,
                 "boxes": [
                     {
                         "box_id": b["box_id"],
@@ -230,9 +241,15 @@ def build_po_detail(header, lines, sections_by_line, boxes_by_line_section) -> d
 
 
 async def fetch_po_details(
-    pool, transaction_nos: list[str], headers: list
+    pool, transaction_nos: list[str], headers: list, include_boxes: bool = True
 ) -> list[dict]:
-    """Fetch lines + sections + boxes for a batch of transactions and build detail dicts."""
+    """Fetch lines + sections (+ boxes) for a batch of transactions and build detail dicts.
+
+    When ``include_boxes`` is False the per-box rows are NOT loaded — only a cheap
+    per-section COUNT aggregate — so each section comes back with an empty
+    ``boxes`` list and an accurate ``total_boxes``. The box rows are then fetched
+    lazily per expanded section via GET /{txn}/boxes.
+    """
     if not transaction_nos:
         return []
 
@@ -244,10 +261,31 @@ async def fetch_po_details(
         "SELECT * FROM po_section WHERE transaction_no = ANY($1) ORDER BY transaction_no, line_number, section_number",
         transaction_nos,
     )
-    boxes = await pool.fetch(
-        "SELECT * FROM po_box WHERE transaction_no = ANY($1) ORDER BY transaction_no, line_number, section_number, box_number",
-        transaction_nos,
-    )
+
+    boxes_by_txn_line_section: dict[str, dict[tuple[int, int], list]] = {}
+    counts_by_txn: dict[str, dict[tuple[int, int], int]] | None = None
+    if include_boxes:
+        boxes = await pool.fetch(
+            "SELECT * FROM po_box WHERE transaction_no = ANY($1) "
+            "ORDER BY transaction_no, line_number, section_number, box_number",
+            transaction_nos,
+        )
+        for b in boxes:
+            txn = b["transaction_no"]
+            key = (b["line_number"], b["section_number"])
+            boxes_by_txn_line_section.setdefault(txn, {}).setdefault(key, []).append(b)
+    else:
+        counts_by_txn = {}
+        count_rows = await pool.fetch(
+            "SELECT transaction_no, line_number, section_number, COUNT(*) AS c "
+            "FROM po_box WHERE transaction_no = ANY($1) "
+            "GROUP BY transaction_no, line_number, section_number",
+            transaction_nos,
+        )
+        for r in count_rows:
+            counts_by_txn.setdefault(r["transaction_no"], {})[
+                (r["line_number"], r["section_number"])
+            ] = r["c"]
 
     lines_by_txn: dict[str, list] = {}
     for l in lines:
@@ -259,18 +297,15 @@ async def fetch_po_details(
         ln = s["line_number"]
         sections_by_txn_line.setdefault(txn, {}).setdefault(ln, []).append(s)
 
-    boxes_by_txn_line_section: dict[str, dict[tuple[int, int], list]] = {}
-    for b in boxes:
-        txn = b["transaction_no"]
-        key = (b["line_number"], b["section_number"])
-        boxes_by_txn_line_section.setdefault(txn, {}).setdefault(key, []).append(b)
-
     results = []
     for h in headers:
         txn_no = h["transaction_no"]
         txn_lines = lines_by_txn.get(txn_no, [])
         txn_sections = sections_by_txn_line.get(txn_no, {})
         txn_boxes = boxes_by_txn_line_section.get(txn_no, {})
-        results.append(build_po_detail(h, txn_lines, txn_sections, txn_boxes))
+        txn_counts = counts_by_txn.get(txn_no, {}) if counts_by_txn is not None else None
+        results.append(
+            build_po_detail(h, txn_lines, txn_sections, txn_boxes, section_box_counts=txn_counts)
+        )
 
     return results

@@ -14,6 +14,7 @@ from app.modules.purchase.schemas import (
     POExportResponse,
     POUploadResponse,
 )
+from app.modules.purchase.schemas.box import BoxOut
 from app.modules.purchase.services.ingest import ingest_po_book
 from app.modules.purchase.services.queries import (
     build_where_clause,
@@ -348,7 +349,14 @@ async def get_summary(
 
 
 @router.get("/{transaction_no}", response_model=POHeaderOut)
-async def get_po(request: Request, transaction_no: str):
+async def get_po(
+    request: Request,
+    transaction_no: str,
+    include_boxes: bool = Query(
+        True,
+        description="When false, sections omit box rows (counts only); boxes load lazily via GET /{txn}/boxes.",
+    ),
+):
     pool = request.app.state.db_pool
     header = await pool.fetchrow(
         "SELECT * FROM po_header WHERE transaction_no = $1", transaction_no
@@ -356,8 +364,98 @@ async def get_po(request: Request, transaction_no: str):
     if not header:
         raise HTTPException(404, detail="Transaction not found.")
 
-    details = await fetch_po_details(pool, [transaction_no], [header])
+    details = await fetch_po_details(pool, [transaction_no], [header], include_boxes=include_boxes)
     return POHeaderOut(**details[0])
+
+
+# ---------------------------------------------------------------------------
+# Stores Team: Section boxes — lazy paginated load + print (all / range)
+# ---------------------------------------------------------------------------
+
+
+class BoxListResponse(BaseModel):
+    boxes: list[BoxOut]
+    total: int
+    page: int
+    page_size: int
+
+
+class BoxPrintResponse(BaseModel):
+    boxes: list[BoxOut]
+    total: int
+
+
+def _box_row_to_out(b) -> dict:
+    return {
+        "box_id": b["box_id"],
+        "transaction_no": b["transaction_no"],
+        "line_number": b["line_number"],
+        "section_number": b["section_number"],
+        "box_number": b["box_number"],
+        "net_weight": float(b["net_weight"]) if b["net_weight"] is not None else None,
+        "gross_weight": float(b["gross_weight"]) if b["gross_weight"] is not None else None,
+        "lot_number": b["lot_number"],
+        "count": int(b["count"]) if b["count"] is not None else None,
+    }
+
+
+@router.get("/{transaction_no}/boxes", response_model=BoxListResponse)
+async def list_section_boxes(
+    request: Request,
+    transaction_no: str,
+    line_number: int = Query(..., description="PO line the section belongs to"),
+    section_number: int = Query(..., description="Section within the line"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(200, ge=1, le=1000),
+):
+    """Paginated boxes for ONE section — loaded lazily when a section is expanded."""
+    pool = request.app.state.db_pool
+    total = await pool.fetchval(
+        "SELECT COUNT(*) FROM po_box "
+        "WHERE transaction_no = $1 AND line_number = $2 AND section_number = $3",
+        transaction_no, line_number, section_number,
+    )
+    offset = (page - 1) * page_size
+    rows = await pool.fetch(
+        "SELECT * FROM po_box "
+        "WHERE transaction_no = $1 AND line_number = $2 AND section_number = $3 "
+        "ORDER BY box_number LIMIT $4 OFFSET $5",
+        transaction_no, line_number, section_number, page_size, offset,
+    )
+    return BoxListResponse(
+        boxes=[_box_row_to_out(b) for b in rows],
+        total=total or 0,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@router.get("/{transaction_no}/boxes/print", response_model=BoxPrintResponse)
+async def list_section_boxes_for_print(
+    request: Request,
+    transaction_no: str,
+    line_number: int = Query(...),
+    section_number: int = Query(...),
+    from_box: int | None = Query(None, description="Lowest box_number to include (inclusive)"),
+    to_box: int | None = Query(None, description="Highest box_number to include (inclusive)"),
+    limit: int = Query(20000, ge=1, le=50000),
+):
+    """All boxes for a section, or a box_number range — for label printing (no pagination)."""
+    pool = request.app.state.db_pool
+    clauses = ["transaction_no = $1", "line_number = $2", "section_number = $3"]
+    params: list = [transaction_no, line_number, section_number]
+    if from_box is not None:
+        params.append(from_box)
+        clauses.append(f"box_number >= ${len(params)}")
+    if to_box is not None:
+        params.append(to_box)
+        clauses.append(f"box_number <= ${len(params)}")
+    params.append(limit)
+    rows = await pool.fetch(
+        f"SELECT * FROM po_box WHERE {' AND '.join(clauses)} ORDER BY box_number LIMIT ${len(params)}",
+        *params,
+    )
+    return BoxPrintResponse(boxes=[_box_row_to_out(b) for b in rows], total=len(rows))
 
 
 # ---------------------------------------------------------------------------
@@ -533,9 +631,9 @@ async def stores_update_boxes(request: Request, transaction_no: str, body: Updat
                     section.expiry_date,
                 )
 
-                # Update boxes within this section
-                for b in section.boxes:
-                    await conn.execute(
+                # Update boxes within this section — one batched round-trip.
+                if section.boxes:
+                    await conn.executemany(
                         """
                         UPDATE po_box SET
                             box_number = COALESCE($2, box_number),
@@ -545,12 +643,10 @@ async def stores_update_boxes(request: Request, transaction_no: str, body: Updat
                             count = COALESCE($6, count)
                         WHERE box_id = $1
                         """,
-                        b.box_id,
-                        b.box_number,
-                        b.net_weight,
-                        b.gross_weight,
-                        b.lot_number,
-                        b.count,
+                        [
+                            (b.box_id, b.box_number, b.net_weight, b.gross_weight, b.lot_number, b.count)
+                            for b in section.boxes
+                        ],
                     )
 
     updated = await pool.fetchrow(
@@ -576,6 +672,9 @@ class BoxInput(BaseModel):
 
 class SectionInput(BaseModel):
     line_number: int
+    # When provided, boxes are APPENDED to this existing section (the per-section
+    # "+ Add Boxes" panel). When omitted, a new section is created (max+1).
+    section_number: int | None = None
     box_count: int | None = None
     lot_number: str | None = None
     manufacturing_date: str | None = None
@@ -607,36 +706,111 @@ async def stores_add_boxes(request: Request, transaction_no: str, body: AddSecti
 
     async with pool.acquire() as conn:
         async with conn.transaction():
-            for section in body.sections:
-                # Determine next section_number for this line
-                max_sn = await conn.fetchval(
-                    """
-                    SELECT COALESCE(MAX(section_number), 0)
-                    FROM po_section
-                    WHERE transaction_no = $1 AND line_number = $2
-                    """,
-                    transaction_no,
-                    section.line_number,
-                )
-                section_number = max_sn + 1
+            # ── Server-side box_id generation ─────────────────────────────────
+            # box_id is a global TEXT PRIMARY KEY. Minting it on the client as
+            # {Date.now()-last8}-{per-batch counter} restarts the counter every
+            # batch (so appended boxes aren't sequential) and can collide on the
+            # PK. Generate it here instead: reuse the transaction's existing
+            # 8-digit base and take the next counter GLOBALLY for that base — so
+            # boxes continue the sequence (…-2, …-3) and never hit the PK.
+            def _base_of(bid):
+                return bid.rsplit("-", 1)[0] if bid and "-" in bid else (bid or None)
 
-                # Insert section
-                await conn.execute(
-                    """
-                    INSERT INTO po_section (
-                        transaction_no, line_number, section_number,
-                        lot_number, box_count, manufacturing_date, expiry_date
+            _existing_bid = await conn.fetchval(
+                """
+                SELECT box_id FROM po_box WHERE transaction_no = $1
+                ORDER BY created_at DESC, box_id DESC LIMIT 1
+                """,
+                transaction_no,
+            )
+            box_base = _base_of(_existing_bid)
+            if not box_base:
+                # First boxes for this transaction — seed the base from the
+                # client's proposed id ({last8}-{n}); constant fallback otherwise.
+                for _s in body.sections:
+                    if _s.boxes:
+                        box_base = _base_of(_s.boxes[0].box_id)
+                        if box_base:
+                            break
+            if not box_base:
+                box_base = "10000000"
+            _max_seq = await conn.fetchval(
+                """
+                SELECT COALESCE(MAX(CAST(split_part(box_id, '-', 2) AS INTEGER)), 0)
+                FROM po_box
+                WHERE box_id LIKE $1 || '-%' AND split_part(box_id, '-', 2) ~ '^[0-9]+$'
+                """,
+                box_base,
+            )
+            next_box_seq = (_max_seq or 0) + 1
+
+            for section in body.sections:
+                if section.section_number is not None:
+                    # Append boxes to an EXISTING section (the per-section
+                    # "+ Add Boxes" panel). Verify it exists, then grow its
+                    # box_count by the number of appended boxes.
+                    sec_exists = await conn.fetchval(
+                        """
+                        SELECT 1 FROM po_section
+                        WHERE transaction_no = $1 AND line_number = $2 AND section_number = $3
+                        """,
+                        transaction_no,
+                        section.line_number,
+                        section.section_number,
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7)
-                    """,
-                    transaction_no,
-                    section.line_number,
-                    section_number,
-                    section.lot_number,
-                    section.box_count,
-                    section.manufacturing_date,
-                    section.expiry_date,
-                )
+                    if not sec_exists:
+                        raise HTTPException(
+                            404,
+                            detail=f"Section {section.section_number} not found for line {section.line_number}.",
+                        )
+                    section_number = section.section_number
+                    await conn.execute(
+                        """
+                        UPDATE po_section SET
+                            box_count = COALESCE(box_count, 0) + $4,
+                            lot_number = COALESCE($5, lot_number),
+                            manufacturing_date = COALESCE($6, manufacturing_date),
+                            expiry_date = COALESCE($7, expiry_date)
+                        WHERE transaction_no = $1 AND line_number = $2 AND section_number = $3
+                        """,
+                        transaction_no,
+                        section.line_number,
+                        section_number,
+                        len(section.boxes),
+                        section.lot_number,
+                        section.manufacturing_date,
+                        section.expiry_date,
+                    )
+                else:
+                    # Determine next section_number for this line (new section)
+                    max_sn = await conn.fetchval(
+                        """
+                        SELECT COALESCE(MAX(section_number), 0)
+                        FROM po_section
+                        WHERE transaction_no = $1 AND line_number = $2
+                        """,
+                        transaction_no,
+                        section.line_number,
+                    )
+                    section_number = max_sn + 1
+
+                    # Insert section
+                    await conn.execute(
+                        """
+                        INSERT INTO po_section (
+                            transaction_no, line_number, section_number,
+                            lot_number, box_count, manufacturing_date, expiry_date
+                        )
+                        VALUES ($1, $2, $3, $4, $5, $6, $7)
+                        """,
+                        transaction_no,
+                        section.line_number,
+                        section_number,
+                        section.lot_number,
+                        section.box_count,
+                        section.manufacturing_date,
+                        section.expiry_date,
+                    )
 
                 # Insert boxes for this section
                 # Get SKU name and warehouse for inventory batch creation
@@ -648,8 +822,41 @@ async def stores_add_boxes(request: Request, transaction_no: str, body: AddSecti
                 entity_for_batch = existing.get('entity', 'cfpl')
                 po_date_for_batch = existing.get('po_date', None)
 
+                # box_number continues from the section's actual last box, not the
+                # client's guess (which is stale in lazy/paginated mode). New
+                # section → 0 → boxes start at 1.
+                next_box_number = (await conn.fetchval(
+                    "SELECT COALESCE(MAX(box_number), 0) FROM po_box "
+                    "WHERE transaction_no = $1 AND line_number = $2 AND section_number = $3",
+                    transaction_no, section.line_number, section_number,
+                )) + 1
+
+                # Build all rows first, then insert in two batched round-trips
+                # (executemany) instead of 2 per box — the big speedup for large
+                # sections.
+                inward_date = _coerce_date(po_date_for_batch)
+                mfg_date = _coerce_date(section.manufacturing_date)
+                exp_date = _coerce_date(section.expiry_date)
+                po_box_rows = []
+                batch_rows = []
                 for b in section.boxes:
-                    await conn.execute(
+                    # Server-generated, globally-unique, sequential box_id.
+                    b_box_id = f"{box_base}-{next_box_seq}"
+                    next_box_seq += 1
+                    this_box_number = next_box_number
+                    next_box_number += 1
+                    po_box_rows.append((
+                        b_box_id, transaction_no, section.line_number, section_number,
+                        this_box_number, b.net_weight, b.gross_weight, b.lot_number, b.count,
+                    ))
+                    batch_rows.append((
+                        b_box_id, sku_for_batch, transaction_no, b.lot_number,
+                        inward_date, mfg_date, exp_date,
+                        b.net_weight, warehouse_for_batch, entity_for_batch,
+                    ))
+
+                if po_box_rows:
+                    await conn.executemany(
                         """
                         INSERT INTO po_box (
                             box_id, transaction_no, line_number, section_number,
@@ -657,19 +864,10 @@ async def stores_add_boxes(request: Request, transaction_no: str, body: AddSecti
                         )
                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                         """,
-                        b.box_id,
-                        transaction_no,
-                        section.line_number,
-                        section_number,
-                        b.box_number,
-                        b.net_weight,
-                        b.gross_weight,
-                        b.lot_number,
-                        b.count,
+                        po_box_rows,
                     )
-
-                    # Auto-create inventory batch per box
-                    await conn.execute("""
+                    # Auto-create one inventory batch per box.
+                    await conn.executemany("""
                         INSERT INTO inventory_batch
                             (batch_id, sku_name, item_type, transaction_no, lot_number, source,
                              inward_date, manufacturing_date, expiry_date,
@@ -678,11 +876,7 @@ async def stores_add_boxes(request: Request, transaction_no: str, body: AddSecti
                                 COALESCE($5, CURRENT_DATE), $6, $7,
                                 $8, $8, $9, 'rm_store', $10)
                         ON CONFLICT (batch_id) DO NOTHING
-                    """, b.box_id, sku_for_batch, transaction_no, b.lot_number,
-                        _coerce_date(po_date_for_batch),
-                        _coerce_date(section.manufacturing_date),
-                        _coerce_date(section.expiry_date),
-                        b.net_weight, warehouse_for_batch, entity_for_batch)
+                    """, batch_rows)
 
     updated = await pool.fetchrow(
         "SELECT * FROM po_header WHERE transaction_no = $1", transaction_no

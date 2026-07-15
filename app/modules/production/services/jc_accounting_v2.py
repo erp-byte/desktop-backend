@@ -580,6 +580,17 @@ async def save_consumption(conn, *, job_card_id: int,
         ret      = _f(r.get("return_qty"))
         variance = round(actual - issued, 3)
 
+        # Snapshot the prior consumed qty so the JC edit log records a real edit
+        # (drives the FE red marker on the consumption input). Keyed on the same
+        # (JC, batch, material) as the upsert. None → new row (first entry, not an
+        # edit); only a change to an existing value is logged below.
+        old_actual = await conn.fetchval(
+            "SELECT actual_consumed_qty FROM job_card_material_consumption_v2 "
+            "WHERE job_card_id = $1 AND COALESCE(batch_id, 0) = COALESCE($2::bigint, 0) "
+            "AND material_sku_name = $3",
+            job_card_id, batch_id, material,
+        )
+
         # consumption_id is app-supplied (migration 019). On the common
         # path the (job_card_id, material_sku_name) UNIQUE triggers an
         # UPDATE which preserves the existing PK — our candidate is just
@@ -624,6 +635,18 @@ async def save_consumption(conn, *, job_card_id: int,
             )
         row = await insert_with_pk_retry(conn, _insert)
         saved.append(_serialize(row))
+        # Audit a genuine change to an existing material's consumed qty (no-ops
+        # skipped by the logger). field_name = 'consumption:<batch>:<material>.<col>'
+        # (or 'consumption:<material>.<col>' for the legacy no-batch bucket).
+        if recorded_by and old_actual is not None:
+            from app.modules.production.services.amendment_service import log_jc_field_changes
+            prefix = f"consumption:{batch_id}:{material}." if batch_id else f"consumption:{material}."
+            await log_jc_field_changes(
+                conn, job_card_id=job_card_id, record_type="job_card",
+                field_prefix=prefix, changed_by=recorded_by, reason="consumption edit",
+                before={"actual_consumed_qty": old_actual},
+                after={"actual_consumed_qty": row["actual_consumed_qty"]},
+            )
 
     # B12: silent variance capture after the consumption upsert.
     try:
@@ -980,6 +1003,27 @@ async def save_accounting(conn, *, job_card_id: int,
         """
     )
 
+    # Snapshot the operator-entered figures BEFORE the upsert so the JC edit log
+    # can record the real before→after per field (drives the Accounting-tab red
+    # markers). Only a genuine edit of an existing row is logged (see below) —
+    # first save is creation, not a change.
+    _AUDIT_COLS = ("total_input_qty", "output_qty", "output_qty_units",
+                   "process_loss_qty", "extra_give_away_qty", "balance_material_qty",
+                   "offgrade_total_qty", "rejection_qty", "wastage_qty",
+                   "control_sample_qty")
+    if has_batch_col:
+        old_acct = await conn.fetchrow(
+            f"SELECT {', '.join(_AUDIT_COLS)} FROM job_card_accounting_v2 "
+            "WHERE job_card_id=$1 AND COALESCE(batch_id,0)=COALESCE($2::bigint,0)",
+            job_card_id, batch_id,
+        )
+    else:
+        old_acct = await conn.fetchrow(
+            f"SELECT {', '.join(_AUDIT_COLS)} FROM job_card_accounting_v2 "
+            "WHERE job_card_id=$1",
+            job_card_id,
+        )
+
     if has_batch_col:
         async def _insert():
             return await conn.fetchrow(
@@ -1134,6 +1178,18 @@ async def save_accounting(conn, *, job_card_id: int,
                 saved_by,
             )
     row = await insert_with_pk_retry(conn, _insert)
+    # Audit each figure the operator actually changed (no-ops skipped by the
+    # logger). Only when a prior row existed — a first save is creation, not an
+    # edit, so it must not paint every field red on the Accounting tab.
+    if saved_by and old_acct is not None:
+        from app.modules.production.services.amendment_service import log_jc_field_changes
+        prefix = f"accounting:{batch_id}." if batch_id else "accounting."
+        await log_jc_field_changes(
+            conn, job_card_id=job_card_id, record_type="job_card",
+            field_prefix=prefix, changed_by=saved_by, reason="accounting edit",
+            before={c: old_acct[c] for c in _AUDIT_COLS},
+            after={c: row[c] for c in _AUDIT_COLS},
+        )
     # B12: silent variance capture after summary save. Variance values
     # may have shifted if the operator adjusted consumption rows since
     # the previous capture.

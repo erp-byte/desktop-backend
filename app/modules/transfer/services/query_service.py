@@ -492,15 +492,33 @@ async def get_transfer(conn, transfer_id: int) -> dict:
 
     result = _map_transfer_header(dict(row))
 
+    # Enrich blank category/sub_category/uom from the all_sku master (matched on
+    # description, preferring the row whose item_type matches the line). COALESCE
+    # so any value already stored on the line wins; only blanks get filled.
+    # ponytail: UPPER(TRIM()) skips idx_all_sku_particulars, but lines/transfer is
+    # tiny and all_sku is a bounded master — add a functional index if it ever bites.
     line_rows = await conn.fetch(
         """
-        SELECT id, header_id, rm_pm_fg_type, item_category, sub_category,
-               item_desc_raw, pack_size, qty, uom, unit_pack_size,
-               net_weight, total_weight, batch_number, lot_number,
-               created_at, updated_at
-        FROM interunit_transfers_lines
-        WHERE header_id = $1
-        ORDER BY id
+        SELECT l.id, l.header_id, l.rm_pm_fg_type,
+               COALESCE(NULLIF(l.item_category, ''), sk.item_group) AS item_category,
+               COALESCE(NULLIF(l.sub_category, ''), sk.sub_group)   AS sub_category,
+               l.item_desc_raw, l.pack_size, l.qty,
+               COALESCE(NULLIF(l.uom, ''), sk.uom::text)            AS uom,
+               l.unit_pack_size, l.net_weight, l.total_weight,
+               l.batch_number, l.lot_number, l.created_at, l.updated_at
+        FROM interunit_transfers_lines l
+        LEFT JOIN LATERAL (
+            SELECT item_group, sub_group, uom
+            FROM public.all_sku
+            WHERE UPPER(TRIM(particulars)) = UPPER(TRIM(l.item_desc_raw))
+              AND (COALESCE(l.rm_pm_fg_type, '') = ''
+                   OR UPPER(item_type) = UPPER(l.rm_pm_fg_type))
+            ORDER BY (UPPER(COALESCE(item_type, '')) = UPPER(COALESCE(l.rm_pm_fg_type, ''))) DESC,
+                     sku_id
+            LIMIT 1
+        ) sk ON TRUE
+        WHERE l.header_id = $1
+        ORDER BY l.id
         """,
         transfer_id,
     )

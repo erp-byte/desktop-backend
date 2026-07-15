@@ -202,6 +202,9 @@ async def list_pos(
     loading_unloading_charges_max: float | None = Query(None),
     other_charges_non_gst_min: float | None = Query(None),
     other_charges_non_gst_max: float | None = Query(None),
+    # Material In dashboard section partition
+    section: str | None = Query(None, pattern="^(today|pending|completed)$"),
+    today_date: str | None = Query(None),
     # visibility / pagination
     include_deleted: bool = Query(False),
     page: int = Query(1, ge=1),
@@ -242,6 +245,7 @@ async def list_pos(
         loading_unloading_charges_max=loading_unloading_charges_max,
         other_charges_non_gst_min=other_charges_non_gst_min,
         other_charges_non_gst_max=other_charges_non_gst_max,
+        section=section, today_date=today_date,
     )
 
     where_sql, params = po_query.build_where(
@@ -344,6 +348,92 @@ async def get_po_lines(
     lines = [po_query.line_row_to_dict(r) for r in line_rows]
     return {
         "header": header,
+        "total_lines": len(lines),
+        "lines": lines,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 5b. GET /api/v1/po/{transaction_no}/receipt-summary
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@router.get("/{transaction_no}/receipt-summary")
+async def get_receipt_summary(
+    request: Request,
+    transaction_no: str,
+    include_deleted: bool = Query(False),
+    user: AuthUser = Depends(require_permission("purchase", "po", action="read")),
+):
+    """Per-line ordered-vs-received rollup for the Material In 'Completed' view.
+
+    Received weight = SUM(po_box.net_weight); received count = SUM(po_box.count)
+    or, when box counts are absent, the number of boxes. A line is "matched" when
+    it is short on neither dimension; the PO is "completed" when it has ≥1 box and
+    every line matches. Uses the SAME rule as po_query._FULLY_RECEIVED_PREDICATE
+    (the section filter), so a PO in the Completed section reports completed=true.
+    """
+    header = await _fetch_header(request, transaction_no, include_deleted, user)
+
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT l.line_number, l.sku_name, l.particulars,
+                   l.pack_count, l.po_weight,
+                   COALESCE(r.rec_wt, 0)  AS received_weight,
+                   COALESCE(r.rec_cnt, 0) AS received_count,
+                   COALESCE(r.n_boxes, 0) AS received_boxes
+              FROM po_line l
+              LEFT JOIN LATERAL (
+                  SELECT COALESCE(SUM(b.net_weight), 0)          AS rec_wt,
+                         COALESCE(SUM(b.count), COUNT(b.box_id)) AS rec_cnt,
+                         COUNT(b.box_id)                          AS n_boxes
+                    FROM po_box b
+                   WHERE b.transaction_no = l.transaction_no
+                     AND b.line_number    = l.line_number
+              ) r ON TRUE
+             WHERE l.transaction_no = $1
+             ORDER BY l.line_number
+            """,
+            transaction_no,
+        )
+
+    factor = po_query._WEIGHT_MATCH_FACTOR
+    lines: list[dict] = []
+    any_box = False
+    all_matched = True
+    for row in rows:
+        ordered_weight = float(row["po_weight"]) if row["po_weight"] is not None else None
+        received_weight = float(row["received_weight"] or 0)
+        ordered_count = int(row["pack_count"]) if row["pack_count"] is not None else None
+        received_count = int(row["received_count"] or 0)
+        n_boxes = int(row["received_boxes"] or 0)
+        if n_boxes > 0:
+            any_box = True
+        weight_matched = ordered_weight is None or received_weight >= ordered_weight * factor
+        count_matched = ordered_count is None or received_count >= ordered_count
+        matched = weight_matched and count_matched
+        if not matched:
+            all_matched = False
+        lines.append({
+            "line_number": row["line_number"],
+            "sku_name": row["sku_name"],
+            "particulars": row["particulars"],
+            "ordered_weight": ordered_weight,
+            "received_weight": received_weight,
+            "ordered_count": ordered_count,
+            "received_count": received_count,
+            "received_boxes": n_boxes,
+            "weight_matched": weight_matched,
+            "count_matched": count_matched,
+            "matched": matched,
+        })
+
+    return {
+        "transaction_no": transaction_no,
+        "entity": header.get("entity"),
+        "completed": any_box and all_matched,
         "total_lines": len(lines),
         "lines": lines,
     }

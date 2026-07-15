@@ -27,7 +27,10 @@ WEIGHT_TOLERANCE_KG = 0.5
 
 _WIP_OUTPUT_KINDS = ("SFG", "WIP")
 _SFG_INPUT_KINDS = ("SFG", "WIP")
-_BOX_OPEN_STATUS = "PRINTED"
+# Boxes are minted PENDING (weighed but label not yet printed). The per-box print
+# action (update_wip_boxes with mark_printed) flips them to PRINTED. Both states
+# are pre-receive and editable; a box can only be scanned downstream once PRINTED.
+_BOX_PENDING_STATUS = "PENDING"
 # A box can be received while it is still PRINTED or (once a dispatch step is
 # wired) DISPATCHED — both are valid pre-receive states.
 _BOX_RECEIVABLE_STATUSES = ("PRINTED", "DISPATCHED")
@@ -37,6 +40,24 @@ _NOT_PRODUCING_STATUSES = (
 )
 
 
+async def _batch_cap_kg(conn, batch_id: int) -> float | None:
+    """The accounting weight (kg) a batch's boxes must not exceed: the batch's
+    produced → input → planned quantity, first one that is set and > 0. Returns
+    None when the batch has no accounting weight yet (→ no cap enforced)."""
+    batch = await conn.fetchrow(
+        "SELECT produced_qty_kg, input_qty_kg, planned_qty_kg "
+        "FROM job_card_batch_v2 WHERE batch_id = $1",
+        batch_id,
+    )
+    if not batch:
+        return None
+    for f in ("produced_qty_kg", "input_qty_kg", "planned_qty_kg"):
+        v = batch[f]
+        if v is not None and float(v) > 0:
+            return float(v)
+    return None
+
+
 async def create_wip_boxes(
     conn,
     job_card_id: int,
@@ -44,18 +65,19 @@ async def create_wip_boxes(
     *,
     expected_net_kg: float | None = None,
     source_inventory_batch_id: str | None = None,
-    parent_box_ids: list[int] | None = None,
+    parent_box_ids: list[str] | None = None,
 ) -> dict:
     """Mint ``sfg_box`` rows for a WIP-stage JC's physical box split.
 
-    ``boxes``: list of ``{"net_weight": float, "gross_weight": float | None}``,
-    one per physical box/bag. Each row gets an 8-digit app-supplied ``box_id``.
+    ``boxes``: list of ``{"net_weight": float, "gross_weight": float | None,
+    "batch_code"|"lot"|"batch": str | None, "units"|"count": int | None}``, one
+    per physical box/bag. Each row gets a TEXT ``box_id`` of the form
+    ``"<8-digit-time-base>-<per-JC counter>"`` (e.g. ``"48213307-1"``), matching
+    the po_box / RM box format. The counter CONTINUES from the last box created
+    for this job card, so a second create call appends ``-N+1, -N+2, …`` rather
+    than resetting — a JC can be split across multiple calls.
 
     Phase 7 genealogy wiring (FULLY active, no longer deferred):
-      * ``lot_number`` is stamped on every new box from the source WIP
-        ``inventory_batch.lot_number`` (looked up via ``source_inventory_batch_id``).
-        If no source batch is given, or its lot is NULL, the box's lot_number is
-        left NULL — never fabricated.
       * ``parent_box_id`` (box→box link): when ``parent_box_ids`` is given (a
         downstream WIP stage re-boxing the SFG it consumed), each new box is
         linked to a source box. The mapping is ROUND-ROBIN by index
@@ -68,10 +90,10 @@ async def create_wip_boxes(
     inside an outer transaction (``insert_with_pk_retry`` uses savepoints).
     """
     # Serialise concurrent splits of the SAME job card (double-click / retry /
-    # two operators) so the count-then-insert guard below can't be raced into a
-    # double box set. Transaction-scoped advisory lock keyed on the JC id (an
-    # 8-digit id never collides with helpers.SFG_CODE_LOCK). Backed by the
-    # UNIQUE(job_card_id, box_number) constraint in 053 as a hard schema backstop.
+    # two operators) so the per-JC counter read below stays monotonic and two
+    # calls can't mint the same "<base>-<counter>". Transaction-scoped advisory
+    # lock keyed on the JC id (an 8-digit id never collides with
+    # helpers.SFG_CODE_LOCK). carton_id (TEXT PK) is the hard schema backstop.
     await conn.execute("SELECT pg_advisory_xact_lock($1)", job_card_id)
 
     jc = await conn.fetchrow(
@@ -105,8 +127,8 @@ async def create_wip_boxes(
                        "routing first).",
         }
 
-    # Validate per-box weights.
-    clean: list[tuple[float, float | None]] = []
+    # Validate per-box weights + optional batch code / unit count / batch link.
+    clean: list[tuple[float, float | None, str | None, int | None, int | None]] = []
     for i, b in enumerate(boxes or [], 1):
         try:
             nw = round(float(b.get("net_weight")), 3)
@@ -123,11 +145,75 @@ async def create_wip_boxes(
                 return {"error": "bad_weight", "message": f"Box {i}: gross_weight is not a number"}
             if gw < nw:
                 return {"error": "bad_weight", "message": f"Box {i}: gross_weight < net_weight"}
-        clean.append((nw, gw))
+        # "Batch" (FE) maps to sfg_box.batch_code (lot_number was dropped in 067).
+        bc_raw = b.get("batch_code") or b.get("lot") or b.get("batch")
+        batch_code = str(bc_raw).strip() or None if bc_raw not in (None, "") else None
+        u_raw = b.get("units") if b.get("units") is not None else b.get("count")
+        units = None
+        if u_raw not in (None, ""):
+            try:
+                units = int(u_raw)
+            except (TypeError, ValueError):
+                return {"error": "bad_units", "message": f"Box {i}: count is not an integer"}
+            if units < 0:
+                return {"error": "bad_units", "message": f"Box {i}: count must be >= 0"}
+        # MANDATORY link to a job-card accounting batch (job_card_batch_v2.batch_id,
+        # an 8-digit BIGINT). Every box must belong to a batch so the box→batch
+        # capacity/grouping invariants hold; batch_code carries that batch's display
+        # name. Validated against this JC's batches below.
+        bid_raw = b.get("batch_id")
+        if bid_raw in (None, ""):
+            return {"error": "batch_required",
+                    "message": f"Box {i}: select a batch — every box must be linked to an accounting batch"}
+        try:
+            batch_id = int(bid_raw)
+        except (TypeError, ValueError):
+            return {"error": "bad_batch", "message": f"Box {i}: batch_id is not an integer"}
+        clean.append((nw, gw, batch_code, units, batch_id))
     if not clean:
         return {"error": "no_boxes", "message": "No boxes supplied"}
 
-    total_net = round(sum(nw for nw, _ in clean), 3)
+    # Verify every linked batch_id actually belongs to THIS job card (the FE only
+    # offers this JC's batches; this guards a hand-crafted / stale payload from
+    # tying a box to another JC's — or a non-existent — batch).
+    linked_ids = {row[4] for row in clean if row[4] is not None}
+    if linked_ids:
+        rows = await conn.fetch(
+            "SELECT batch_id FROM job_card_batch_v2 "
+            "WHERE job_card_id = $1 AND batch_id = ANY($2::bigint[])",
+            job_card_id, list(linked_ids),
+        )
+        missing = linked_ids - {r["batch_id"] for r in rows}
+        if missing:
+            return {
+                "error": "bad_batch",
+                "message": f"Batch id(s) {sorted(missing)} are not batches of this job card",
+            }
+
+    # Cap: a batch's total box net weight must not exceed its accounting weight.
+    # Sum the new boxes per batch, add the batch's existing box net, reject the
+    # whole call if any batch would overflow (WEIGHT_TOLERANCE_KG covers rounding).
+    add_by_batch: dict[int, float] = {}
+    for row in clean:
+        if row[4] is not None:
+            add_by_batch[row[4]] = add_by_batch.get(row[4], 0.0) + row[0]
+    for bid, add_net in add_by_batch.items():
+        cap = await _batch_cap_kg(conn, bid)
+        if cap is None:
+            continue
+        existing = await conn.fetchval(
+            "SELECT COALESCE(SUM(net_weight), 0) FROM sfg_box "
+            "WHERE batch_id = $1 AND item_type = 'sfg'", bid,
+        ) or 0
+        total = round(float(existing) + add_net, 3)
+        if total > cap + WEIGHT_TOLERANCE_KG:
+            return {
+                "error": "batch_over_capacity",
+                "message": f"Boxes for this batch would total {total} kg, over the "
+                           f"batch's accounting {cap} kg.",
+            }
+
+    total_net = round(sum(row[0] for row in clean), 3)
     if expected_net_kg is not None:
         try:
             exp = round(float(expected_net_kg), 3)
@@ -140,52 +226,61 @@ async def create_wip_boxes(
                            f"{exp} kg by more than {WEIGHT_TOLERANCE_KG} kg",
             }
 
-    # Don't double-split a JC (no phantom weight). Caller can GET existing first.
-    already = await conn.fetchval(
-        "SELECT count(*) FROM sfg_box WHERE job_card_id = $1", job_card_id
+    # Per-JC continuing counter: box ids are "<base>-<counter>" and the counter
+    # continues from the last box created for this JC (a second create call
+    # appends -N+1, -N+2 … rather than resetting). Bare-numeric legacy ids (no
+    # '-suffix') are excluded, so the first new box on a legacy JC starts at 1.
+    last_counter = await conn.fetchval(
+        """
+        SELECT COALESCE(MAX(CAST(split_part(carton_id, '-', 2) AS INTEGER)), 0)
+          FROM sfg_box
+         WHERE job_card_id = $1
+           AND split_part(carton_id, '-', 2) ~ '^[0-9]+$'
+        """,
+        job_card_id,
     )
-    if already and already > 0:
-        return {
-            "error": "already_boxed",
-            "message": f"Job card {job_card_id} already has {already} box(es)",
-        }
 
     # Phase 7 (PARENT LINKAGE): normalise the optional box→box parents. Round-robin
     # by index so any N-new → M-parent re-box is covered (1:1 when counts match).
-    parents: list[int] | None = None
+    parents: list[str] | None = None
     if parent_box_ids:
         parents = []
         for raw in parent_box_ids:
-            try:
-                parents.append(int(raw))
-            except (TypeError, ValueError):
-                return {"error": "bad_parent", "message": f"parent_box_id {raw!r} is not an int"}
+            pid = str(raw).strip()
+            if not pid:
+                return {"error": "bad_parent", "message": f"parent_box_id {raw!r} is not a valid box id"}
+            parents.append(pid)
         if not parents:
             parents = None
 
     stage_bucket = jc["stage"] or "Create WIP"
     created: list[dict] = []
-    for n, (nw, gw) in enumerate(clean, 1):
+    for n, (nw, gw, batch_code, units, batch_id) in enumerate(clean, 1):
+        counter = last_counter + n
         parent_box_id = parents[(n - 1) % len(parents)] if parents else None
-        # new_short_time_id() re-evaluated each retry so a same-ms PK collision
-        # resolves with a fresh id; carton_id is the PK so a true collision
-        # raises *_pkey and insert_with_pk_retry retries.
-        async def _insert(_nw=nw, _gw=gw, _parent=parent_box_id):
+        # box_id = "<8-digit-time-base>-<per-JC counter>". new_short_time_id() is
+        # re-rolled INSIDE the retry so a same-ms cross-JC PK collision on
+        # "<base>-1" resolves with a fresh base; the per-JC counter stays fixed.
+        async def _insert(_nw=nw, _gw=gw, _parent=parent_box_id, _counter=counter,
+                          _bc=batch_code, _u=units, _bid=batch_id):
+            box_id = f"{new_short_time_id()}-{_counter}"
             return await conn.fetchrow(
                 """
                 INSERT INTO sfg_box (
                     carton_id, item_type, job_card_id, job_card_number, sfg_code,
                     entity, floor, stage_bucket, net_weight, gross_weight,
-                    status, source_inventory_batch_id, parent_box_id
-                ) VALUES ($1,'sfg',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-                RETURNING carton_id AS box_id, net_weight, gross_weight,
-                          sfg_code, job_card_id, job_card_number, entity, floor,
-                          stage_bucket, status, parent_box_id,
-                          source_inventory_batch_id
+                    batch_code, units, status, source_inventory_batch_id, parent_box_id,
+                    fg_sku_name, batch_id
+                ) VALUES ($1,'sfg',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+                RETURNING carton_id AS box_id, net_weight, gross_weight, batch_code,
+                          units, sfg_code, fg_sku_name, batch_id, job_card_id,
+                          job_card_number, entity, floor, stage_bucket, status,
+                          parent_box_id, source_inventory_batch_id
                 """,
-                new_short_time_id(), job_card_id, jc["job_card_number"], sfg_code,
+                box_id, job_card_id, jc["job_card_number"], sfg_code,
                 jc["entity"], jc["floor"], stage_bucket, _nw, _gw,
-                _BOX_OPEN_STATUS, source_inventory_batch_id, _parent,
+                _bc, _u, _BOX_PENDING_STATUS, source_inventory_batch_id, _parent,
+                jc["fg_sku_name"], _bid,
             )
 
         row = await insert_with_pk_retry(conn, _insert, max_retries=5)
@@ -205,7 +300,7 @@ async def create_wip_boxes(
 
 
 async def scan_receive_sfg_box(
-    conn, downstream_job_card_id: int, box_ids: list[int], *, scanned_by: str | None = None
+    conn, downstream_job_card_id: int, box_ids: list[str], *, scanned_by: str | None = None
 ) -> dict:
     """Scan SFG box QR ids into a downstream (consuming) job card.
 
@@ -251,12 +346,11 @@ async def scan_receive_sfg_box(
 
     accepted: list[dict] = []
     rejected: list[dict] = []
-    seen: set[int] = set()
+    seen: set[str] = set()
 
     for raw in box_ids or []:
-        try:
-            bid = int(raw)
-        except (TypeError, ValueError):
+        bid = str(raw).strip()
+        if not bid:
             rejected.append({"box_id": raw, "reason": "Not a valid box id"})
             continue
         if bid in seen:  # same id twice in one scan batch
@@ -419,7 +513,7 @@ async def get_boxes_for_jc(conn, job_card_id: int) -> dict:
                parent_box_id, so_number, created_by, created_at
           FROM sfg_box
          WHERE job_card_id = $1 AND item_type = 'sfg'
-         ORDER BY carton_id
+         ORDER BY created_at, carton_id
         """,
         job_card_id,
     )
@@ -432,12 +526,187 @@ async def get_boxes_for_jc(conn, job_card_id: int) -> dict:
     }
 
 
-async def get_box(conn, box_id: int) -> dict | None:
+async def get_box(conn, box_id: str) -> dict | None:
     """Single box/carton lookup (mirror of GET /boxes/{box_id} for po_box)."""
     row = await conn.fetchrow(
         "SELECT *, carton_id AS box_id FROM sfg_box WHERE carton_id = $1", box_id
     )
     return dict(row) if row else None
+
+
+async def update_wip_boxes(conn, job_card_id: int, updates: list[dict],
+                           *, changed_by: str | None = None) -> dict:
+    """Edit mutable fields (net/gross weight, batch link, unit count) of existing
+    SFG boxes — the Material-In "Update saved boxes" analogue.
+
+    ``updates``: list of ``{"box_id": str, "net_weight": float, "gross_weight":
+    float | None, "batch_code": str | None, "batch_id": int | None, "units":
+    int | None, "mark_printed": bool}``. PENDING or PRINTED boxes of THIS job card
+    (item_type='sfg') are editable — a box already scanned into a downstream stage
+    (RECEIVED/CONSUMED) is weight-locked and lands in ``skipped`` instead. When
+    ``mark_printed`` is true (the per-box print action), the box also transitions
+    PENDING → PRINTED as its data is saved. MUST run in an outer txn.
+
+    Returns ``{"updated": [...], "skipped": [{"box_id","reason"}]}`` or an
+    ``{"error","message"}`` dict (mapped to HTTP 400 by the caller).
+    """
+    if not updates:
+        return {"error": "no_boxes", "message": "No boxes to update"}
+
+    # Validate every row up front (same rules as create) so a bad payload fails
+    # before any row is written. clean = (carton_id, nw, gw, batch_code, units, batch_id, mark_printed).
+    clean: list[tuple[str, float, float | None, str | None, int | None, int | None, bool]] = []
+    for i, u in enumerate(updates, 1):
+        cid = str(u.get("box_id") or u.get("carton_id") or "").strip()
+        if not cid:
+            return {"error": "bad_box", "message": f"Update {i}: missing box_id"}
+        try:
+            nw = round(float(u.get("net_weight")), 3)
+        except (TypeError, ValueError):
+            return {"error": "bad_weight", "message": f"Box {cid}: net_weight is not a number"}
+        if nw <= 0:
+            return {"error": "bad_weight", "message": f"Box {cid}: net_weight must be > 0"}
+        gw_raw = u.get("gross_weight")
+        gw = None
+        if gw_raw not in (None, ""):
+            try:
+                gw = round(float(gw_raw), 3)
+            except (TypeError, ValueError):
+                return {"error": "bad_weight", "message": f"Box {cid}: gross_weight is not a number"}
+            if gw < nw:
+                return {"error": "bad_weight", "message": f"Box {cid}: gross_weight < net_weight"}
+        bc_raw = u.get("batch_code")
+        batch_code = str(bc_raw).strip() or None if bc_raw not in (None, "") else None
+        u_raw = u.get("units")
+        units = None
+        if u_raw not in (None, ""):
+            try:
+                units = int(u_raw)
+            except (TypeError, ValueError):
+                return {"error": "bad_units", "message": f"Box {cid}: count is not an integer"}
+            if units < 0:
+                return {"error": "bad_units", "message": f"Box {cid}: count must be >= 0"}
+        # Batch is mandatory — an edit may not clear a box's batch link (mirror of
+        # create_wip_boxes). Assigning a batch to a previously-unlinked box is fine
+        # (that's a non-null target); only a null/blank target is rejected.
+        bid_raw = u.get("batch_id")
+        if bid_raw in (None, ""):
+            return {"error": "batch_required",
+                    "message": f"Box {cid}: select a batch — every box must be linked to an accounting batch"}
+        try:
+            batch_id = int(bid_raw)
+        except (TypeError, ValueError):
+            return {"error": "bad_batch", "message": f"Box {cid}: batch_id is not an integer"}
+        mark_printed = bool(u.get("mark_printed"))
+        clean.append((cid, nw, gw, batch_code, units, batch_id, mark_printed))
+
+    # Every linked batch must belong to THIS job card (mirror of create_wip_boxes).
+    linked_ids = {row[5] for row in clean if row[5] is not None}
+    if linked_ids:
+        rows = await conn.fetch(
+            "SELECT batch_id FROM job_card_batch_v2 "
+            "WHERE job_card_id = $1 AND batch_id = ANY($2::bigint[])",
+            job_card_id, list(linked_ids),
+        )
+        missing = linked_ids - {r["batch_id"] for r in rows}
+        if missing:
+            return {
+                "error": "bad_batch",
+                "message": f"Batch id(s) {sorted(missing)} are not batches of this job card",
+            }
+
+    # Only boxes the UPDATE below will actually touch (right JC, SFG, still
+    # PENDING/PRINTED) leave their current batch; a skipped box keeps its batch_id
+    # and must stay counted in `base`. Lock that exact set FOR UPDATE so a
+    # concurrent status flip can't desync this check from the UPDATE (one txn).
+    payload_ids = [row[0] for row in clean]
+    upd_rows = await conn.fetch(
+        "SELECT carton_id FROM sfg_box "
+        "WHERE job_card_id = $1 AND item_type = 'sfg' "
+        "AND status IN ('PENDING', 'PRINTED') AND carton_id = ANY($2::text[]) "
+        "FOR UPDATE",
+        job_card_id, payload_ids,
+    )
+    updatable = {r["carton_id"] for r in upd_rows}
+
+    # Cap: after these edits, each batch a box will land in must stay within its
+    # accounting weight. base = net of that batch's boxes NOT being moved by this
+    # update; add = Σ new net of updatable boxes targeting it. (Boxes moving OUT
+    # only reduce a batch, so checking target batches bounds the maximum.)
+    target_add: dict[int, float] = {}
+    for row in clean:
+        if row[5] is not None and row[0] in updatable:
+            target_add[row[5]] = target_add.get(row[5], 0.0) + row[1]
+    for bid, add_net in target_add.items():
+        cap = await _batch_cap_kg(conn, bid)
+        if cap is None:
+            continue
+        base = await conn.fetchval(
+            "SELECT COALESCE(SUM(net_weight), 0) FROM sfg_box "
+            "WHERE batch_id = $1 AND item_type = 'sfg' AND carton_id != ALL($2::text[])",
+            bid, list(updatable),
+        ) or 0
+        total = round(float(base) + add_net, 3)
+        if total > cap + WEIGHT_TOLERANCE_KG:
+            return {
+                "error": "batch_over_capacity",
+                "message": f"Boxes for this batch would total {total} kg, over the "
+                           f"batch's accounting {cap} kg.",
+            }
+
+    from app.modules.production.services.amendment_service import log_jc_field_changes
+
+    updated: list[dict] = []
+    skipped: list[dict] = []
+    for cid, nw, gw, batch_code, units, batch_id, mark_printed in clean:
+        # Snapshot pre-edit values so the edit log records the real before→after
+        # per changed field (the box-data audit that drives the FE red markers).
+        old = await conn.fetchrow(
+            "SELECT net_weight, gross_weight, batch_code, units FROM sfg_box "
+            "WHERE carton_id = $1 AND job_card_id = $2 AND item_type = 'sfg'",
+            cid, job_card_id,
+        )
+        # The status IN (PENDING,PRINTED) + jc + item_type guard means a wrong-JC,
+        # non-SFG, or already-received box updates 0 rows → reported as skipped,
+        # never a silent cross-tenant write. mark_printed ($8) flips PENDING →
+        # PRINTED as the box's data is saved (the per-box print action); a plain
+        # edit leaves the status untouched.
+        row = await conn.fetchrow(
+            """
+            UPDATE sfg_box
+               SET net_weight = $3, gross_weight = $4, batch_code = $5,
+                   units = $6, batch_id = $7,
+                   status = CASE WHEN $8 THEN 'PRINTED' ELSE status END
+             WHERE carton_id = $1 AND job_card_id = $2
+               AND item_type = 'sfg' AND status IN ('PENDING', 'PRINTED')
+            RETURNING carton_id AS box_id, net_weight, gross_weight, batch_code,
+                      units, batch_id, sfg_code, fg_sku_name, status
+            """,
+            cid, job_card_id, nw, gw, batch_code, units, batch_id, mark_printed,
+        )
+        if row is None:
+            skipped.append({
+                "box_id": cid,
+                "reason": "Not found, not this job card's SFG box, or already received (not editable)",
+            })
+        else:
+            updated.append(dict(row))
+            # Audit each field that actually changed (no-ops skipped by the logger).
+            if old is not None and changed_by:
+                await log_jc_field_changes(
+                    conn, job_card_id=job_card_id, record_type="job_card_box",
+                    field_prefix=f"box:{cid}.", changed_by=changed_by, reason="box edit",
+                    before={"net_weight": old["net_weight"], "gross_weight": old["gross_weight"],
+                            "batch_code": old["batch_code"], "units": old["units"]},
+                    after={"net_weight": row["net_weight"], "gross_weight": row["gross_weight"],
+                           "batch_code": row["batch_code"], "units": row["units"]},
+                )
+
+    logger.info(
+        "SFG boxes: JC %s updated %d box(es), skipped %d",
+        job_card_id, len(updated), len(skipped),
+    )
+    return {"job_card_id": job_card_id, "updated": updated, "skipped": skipped}
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -481,12 +750,12 @@ async def get_jc_genealogy(conn, job_card_id: int,
     scope = set(allowed_entities) if allowed_entities else None
     produced_rows = await conn.fetch(
         f"SELECT {_BOX_GENEALOGY_COLS} FROM sfg_box "
-        f"WHERE job_card_id = $1 ORDER BY carton_id",
+        f"WHERE job_card_id = $1 ORDER BY created_at, carton_id",
         job_card_id,
     )
     consumed_rows = await conn.fetch(
         f"SELECT {_BOX_GENEALOGY_COLS} FROM sfg_box "
-        f"WHERE received_into_job_card_id = $1 ORDER BY job_card_id, carton_id",
+        f"WHERE received_into_job_card_id = $1 ORDER BY job_card_id, created_at, carton_id",
         job_card_id,
     )
     produced = [_box_dict(r) for r in produced_rows
@@ -502,7 +771,7 @@ async def get_jc_genealogy(conn, job_card_id: int,
     return {"job_card_id": job_card_id, "produced": produced, "consumed": consumed}
 
 
-async def get_box_genealogy(conn, box_id: int,
+async def get_box_genealogy(conn, box_id: str,
                             allowed_entities: list[str] | None = None) -> dict | None:
     """Walk UPSTREAM from a box, building an ordered ancestry ``chain``.
 
@@ -539,7 +808,7 @@ async def get_box_genealogy(conn, box_id: int,
         return None
 
     chain: list[dict] = []
-    visited: set[int] = set()
+    visited: set[str] = set()
     truncated = False
     # BFS over upstream ancestors; `frontier` holds (box_row, level).
     frontier: list[tuple[object, int]] = [(start, 0)]
@@ -584,7 +853,7 @@ async def get_box_genealogy(conn, box_id: int,
             producer_jc = await conn.fetchval(
                 "SELECT job_card_id FROM sfg_box "
                 "WHERE source_inventory_batch_id = $1 "
-                "ORDER BY job_card_id, carton_id LIMIT 1",
+                "ORDER BY job_card_id, created_at, carton_id LIMIT 1",
                 src_batch,
             )
             # Fall back to THIS box's own producing JC (boxes from the same batch
@@ -594,7 +863,7 @@ async def get_box_genealogy(conn, box_id: int,
             if producer_jc is not None:
                 upstream_rows = await conn.fetch(
                     f"SELECT {_BOX_GENEALOGY_COLS} FROM sfg_box "
-                    f"WHERE received_into_job_card_id = $1 ORDER BY job_card_id, carton_id",
+                    f"WHERE received_into_job_card_id = $1 ORDER BY job_card_id, created_at, carton_id",
                     producer_jc,
                 )
                 for urow in upstream_rows:
@@ -619,8 +888,9 @@ async def create_fg_cartons(
     """Mint ``sfg_box`` rows (item_type='fg') for a packing-stage JC's carton split.
 
     ``cartons``: list of ``{"net_weight": float, "units": int | None,
-    "gross_weight": float | None}``. Each row gets an 8-digit ``carton_id`` (the
-    QR payload). Mirrors ``create_wip_boxes`` but for the terminal FG/packing
+    "gross_weight": float | None}``. Each row gets a TEXT ``carton_id`` of the
+    form ``"<8-digit-time-base>-<per-JC counter>"`` (the QR payload), the same
+    scheme as ``create_wip_boxes``. Mirrors ``create_wip_boxes`` but for the terminal FG/packing
     stage (output_kind FG); stamps ``units``/``batch_id``/``batch_code``/
     ``fg_sku_name``/``created_by``. MUST run inside an outer transaction.
     """
@@ -695,10 +965,26 @@ async def create_fg_cartons(
                            f"{exp} kg by more than {WEIGHT_TOLERANCE_KG} kg",
             }
 
+    # Per-JC continuing counter (same scheme as create_wip_boxes) so a packing
+    # JC's carton ids are "<8-digit-time-base>-<counter>" and continue across calls.
+    last_counter = await conn.fetchval(
+        """
+        SELECT COALESCE(MAX(CAST(split_part(carton_id, '-', 2) AS INTEGER)), 0)
+          FROM sfg_box
+         WHERE job_card_id = $1
+           AND split_part(carton_id, '-', 2) ~ '^[0-9]+$'
+        """,
+        job_card_id,
+    )
+
     stage_bucket = jc["stage"] or "Packing"
     created: list[dict] = []
-    for (nw, gw, u) in clean:
-        async def _insert(_nw=nw, _gw=gw, _u=u):
+    for n, (nw, gw, u) in enumerate(clean, 1):
+        counter = last_counter + n
+        # carton_id = "<8-digit-time-base>-<per-JC counter>"; base re-rolled inside
+        # the retry so a same-ms cross-JC collision resolves with a fresh base.
+        async def _insert(_nw=nw, _gw=gw, _u=u, _counter=counter):
+            carton_id = f"{new_short_time_id()}-{_counter}"
             return await conn.fetchrow(
                 """
                 INSERT INTO sfg_box (
@@ -710,7 +996,7 @@ async def create_fg_cartons(
                           fg_sku_name, job_card_id, job_card_number, entity, floor,
                           stage_bucket, batch_id, batch_code, status, created_at
                 """,
-                new_short_time_id(), job_card_id, jc["job_card_number"], fg_code,
+                carton_id, job_card_id, jc["job_card_number"], fg_code,
                 jc["fg_sku_name"], jc["entity"], jc["floor"], stage_bucket,
                 batch_id, batch_code, _nw, _gw, _u, created_by,
             )
@@ -742,7 +1028,7 @@ async def get_cartons_for_jc(conn, job_card_id: int) -> dict:
                status, so_number, created_by, created_at
           FROM sfg_box
          WHERE job_card_id = $1 AND item_type = 'fg'
-         ORDER BY carton_id
+         ORDER BY created_at, carton_id
         """,
         job_card_id,
     )
@@ -760,7 +1046,7 @@ async def get_cartons_for_jc(conn, job_card_id: int) -> dict:
     }
 
 
-async def get_carton_genealogy(conn, carton_id: int,
+async def get_carton_genealogy(conn, carton_id: str,
                                allowed_entities: list[str] | None = None) -> dict | None:
     """Upstream trace for an FG carton: carton → the SFG boxes consumed into its
     packing JC → each box's own box→lot lineage (reuses ``get_box_genealogy``).
@@ -794,10 +1080,10 @@ async def get_carton_genealogy(conn, carton_id: int,
     consumed = await conn.fetch(
         f"SELECT {_BOX_GENEALOGY_COLS} FROM sfg_box "
         f"WHERE received_into_job_card_id = $1 AND item_type = 'sfg' "
-        f"ORDER BY job_card_id, carton_id",
+        f"ORDER BY job_card_id, created_at, carton_id",
         start["job_card_id"],
     )
-    seen: set[int] = set()
+    seen: set[str] = set()
     for box in consumed:
         if scope is not None and box["entity"] not in scope:
             continue

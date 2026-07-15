@@ -32,19 +32,22 @@ async def _insert_line(conn, tables: dict, cr_id: str, line: schemas.CRLineCreat
     await conn.execute(
         f"""
         INSERT INTO {tables['lines']}
-            (rtv_id, item_description, material_type, item_category, sub_category, uom,
-             qty, rate, value, net_weight, carton_weight, lot_number, item_mark, spl_remarks, vakkal)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+            (rtv_id, item_description, material_type, item_category, sub_category, sale_group,
+             uom, qty, rate, value, conversion, net_weight, carton_weight,
+             lot_number, item_mark, spl_remarks, vakkal)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
         ON CONFLICT (rtv_id, item_description) DO UPDATE SET
             material_type=EXCLUDED.material_type, item_category=EXCLUDED.item_category,
-            sub_category=EXCLUDED.sub_category, uom=EXCLUDED.uom, qty=EXCLUDED.qty,
-            rate=EXCLUDED.rate, value=EXCLUDED.value, net_weight=EXCLUDED.net_weight,
+            sub_category=EXCLUDED.sub_category, sale_group=EXCLUDED.sale_group,
+            uom=EXCLUDED.uom, qty=EXCLUDED.qty, rate=EXCLUDED.rate, value=EXCLUDED.value,
+            conversion=EXCLUDED.conversion, net_weight=EXCLUDED.net_weight,
             carton_weight=EXCLUDED.carton_weight, lot_number=EXCLUDED.lot_number,
             item_mark=EXCLUDED.item_mark, spl_remarks=EXCLUDED.spl_remarks,
             vakkal=EXCLUDED.vakkal, updated_at=NOW()
         """,
         cr_id, line.item_description, line.material_type, line.item_category,
-        line.sub_category, line.uom, qty, rate, value, net_weight, carton_weight,
+        line.sub_category, line.sale_group, line.uom, qty, rate, value, line.conversion,
+        net_weight, carton_weight,
         line.lot_number, line.item_mark, line.spl_remarks, line.vakkal,
     )
 

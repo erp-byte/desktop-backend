@@ -494,6 +494,15 @@ async def upsert_consumption_lines(
         uom         = e.get("uom") or "KGS"
         remarks     = e.get("remarks")
         src_dispatch = e.get("source_dispatch_id")
+        # Snapshot the prior consumed qty so a genuine edit is recorded in the JC
+        # edit log (drives the FE red marker). None → new row (first entry, not an
+        # edit). Keyed on the same (JC, batch, material) as the upsert.
+        old_actual = await conn.fetchval(
+            "SELECT actual_consumed_qty FROM job_card_material_consumption_v2 "
+            "WHERE job_card_id = $1 AND COALESCE(batch_id, 0) = COALESCE($2::bigint, 0) "
+            "AND material_sku_name = $3",
+            job_card_id, batch_id, sku,
+        )
         async def _upsert(_sku=sku, _kind=row_kind, _uom=uom,
                           _qty=qty, _bom_id=bom_line_id, _rem=remarks,
                           _rec_by=recorded_by, _batch=batch_id,
@@ -541,6 +550,19 @@ async def upsert_consumption_lines(
             )
         await insert_with_pk_retry(conn, _upsert)
         written += 1
+        # Audit a real change to an existing material's consumed qty. Compare at the
+        # column's 3-dp precision (NUMERIC) via rounded floats so a re-save of the
+        # same value isn't logged as a change. field_name =
+        # 'consumption:<batch>:<material>.actual_consumed_qty' (or no-batch form).
+        if recorded_by and old_actual is not None:
+            from app.modules.production.services.amendment_service import log_jc_field_changes
+            prefix = f"consumption:{batch_id}:{sku}." if batch_id else f"consumption:{sku}."
+            await log_jc_field_changes(
+                conn, job_card_id=job_card_id, record_type="job_card",
+                field_prefix=prefix, changed_by=recorded_by, reason="consumption edit",
+                before={"actual_consumed_qty": round(float(old_actual), 3)},
+                after={"actual_consumed_qty": round(float(qty), 3)},
+            )
     return written
 
 
@@ -3647,15 +3669,24 @@ async def patch_job_card(conn, *, job_card_id: int,
 
     sets: list[str] = []
     params: list = []
+    changed_keys: list[str] = []
     idx = 1
     for k, v in (fields or {}).items():
         if k not in _PATCH_ALLOWED_COLUMNS:
             continue
         sets.append(f'"{k}" = ${idx}')
         params.append(v); idx += 1
+        changed_keys.append(k)
     if not sets:
         return {"error": "no_change",
                 "message": "No editable fields supplied"}
+    # Snapshot pre-edit values of exactly the columns being patched (keys are from
+    # the allow-list, never user-controlled → safe to interpolate) so the edit log
+    # records real before→after per header field. Drives the FE red markers.
+    cols = ", ".join(f'"{k}"' for k in changed_keys)
+    old = await conn.fetchrow(
+        f"SELECT {cols} FROM job_card_v2 WHERE job_card_id=$1", job_card_id,
+    )
     # Stamp the audit trail too.
     sets.append(f'"updated_by" = ${idx}'); params.append(updated_by); idx += 1
     sets.append('"updated_at" = NOW()')
@@ -3668,6 +3699,14 @@ async def patch_job_card(conn, *, job_card_id: int,
     )
     if not row:
         return {"error": "job_card_not_found"}
+    if updated_by and old is not None:
+        from app.modules.production.services.amendment_service import log_jc_field_changes
+        await log_jc_field_changes(
+            conn, job_card_id=job_card_id, record_type="job_card", field_prefix="",
+            changed_by=updated_by, reason="header edit",
+            before={k: old[k] for k in changed_keys},
+            after={k: row[k] for k in changed_keys},
+        )
     return {"updated": True, "job_card": _serialize(row)}
 
 

@@ -330,6 +330,22 @@ SQL_FILES = [
     # cfpl_/cdpl_customer_return_header/_lines/_boxes (natural keys, rtv_id PK)
     # plus the global box_edit_logs audit table. Idempotent CREATE IF NOT EXISTS.
     DB_DIR / "070_customer_returns.sql",
+    # 071 sfg_box_string_id — carton_id (PK) + parent_box_id: BIGINT -> TEXT so a
+    # box id becomes "<8-digit-time-base>-<per-JC counter>" (matches po_box / RM).
+    # Drops + recreates the sfg_genealogy view (the only ALTER blocker); idempotent
+    # via a bigint-guard. Assumes 067's carton_id rename (applied out-of-band).
+    DB_DIR / "071_sfg_box_string_id.sql",
+    # 072 batch_label — operator-typed free-text batch name on the accounting
+    # "Open Batch" flow. Adds job_card_phase_v2.batch_label TEXT and recreates
+    # the job_card_batch_v2 view to expose it; batch_number stays the internal key.
+    DB_DIR / "072_batch_label.sql",
+    # 073 sfg_box_pending_status — SFG boxes start PENDING; the per-box print
+    # action flips them to PRINTED. Extends the sfg_box status CHECK to allow it.
+    DB_DIR / "073_sfg_box_pending_status.sql",
+    # 074 cr_line_sale_group_conversion — Customer-Returns line parity with the
+    # legacy RTV line model: adds sale_group + conversion TEXT to cfpl/cdpl
+    # customer_return_lines (dropped by the initial 070 port). Additive/idempotent.
+    DB_DIR / "074_cr_line_sale_group_conversion.sql",
 ]
 
 # ── Optional: drop the v1 legacy job-card stack (TEST / Supabase DB ONLY) ──────

@@ -37,10 +37,12 @@ class CRLineCreate(BaseModel):
     item_category: str
     sub_category: str
     item_description: str
+    sale_group: Optional[str] = None      # auto-filled from all_sku on item pick (legacy parity)
     uom: str
     qty: str = "0"
     rate: str = "0"
     value: str = "0"
+    conversion: Optional[str] = None      # line-level conversion (legacy sends = uom)
     net_weight: Optional[str] = "0"
     carton_weight: Optional[str] = "0"
     lot_number: Optional[str] = None
@@ -89,10 +91,12 @@ class CRLineResponse(BaseModel):
     material_type: str
     item_category: str
     sub_category: str
+    sale_group: Optional[str] = None
     uom: str
     qty: str
     rate: str
     value: str
+    conversion: Optional[str] = None
     net_weight: str
     carton_weight: str
     lot_number: Optional[str] = None

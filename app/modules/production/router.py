@@ -151,6 +151,24 @@ class PlanV2Delete(BaseModel):
     deleted_by: str = ""
 
 
+class BomLineV2Create(BaseModel):
+    material_sku_name: str = Field(..., min_length=1)
+    item_type: Literal["rm", "pm"]
+    quantity_per_unit: float = Field(..., gt=0)
+    uom: str | None = None
+    loss_pct: float | None = 0
+
+
+class BomCreateV2Request(BaseModel):
+    # Inline "Add BOM" from the plan-builder card: create/supersede the master
+    # BOM for one FG SKU so plan creation (POST /plans-v2) resolves it.
+    fg_sku_name: str = Field(..., min_length=1)
+    entity: Literal["cfpl", "cdpl"]
+    pack_size_kg: float | None = None
+    customer_name: str | None = None
+    lines: list[BomLineV2Create] = Field(..., min_length=1)
+
+
 class PlanLineV2Patch(BaseModel):
     # All optional — caller sends ONLY the fields they want to update.
     # planned_qty_* are NUMERIC(12,3) NOT NULL CHECK (> 0) on the column,
@@ -3732,6 +3750,19 @@ async def get_box(request: Request, box_id: str):
         return result
 
 
+class ScanIdentifyBody(BaseModel):
+    value: str  # raw QR contents: JSON {"tx","bi"} or a bare box id
+
+
+@router.post("/scan-identify")
+async def scan_identify(request: Request, body: ScanIdentifyBody):
+    """Universal box identify: which table does this scanned box belong to."""
+    from app.modules.production.services.box_identify_service import identify_box
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await identify_box(conn, body.value)
+
+
 class IssueNoteLine(BaseModel):
     bom_line_id: str | None = None
     sku: str | None = None
@@ -5156,6 +5187,24 @@ async def get_bom_summary_v2(request: Request, bom_id: int, full: bool = False):
     }
 
 
+@router.post("/plans-v2/bom")
+async def create_bom_master_v2(
+    request: Request,
+    body: BomCreateV2Request,
+    user=Depends(get_current_user),
+):
+    """Create/supersede the master BOM for one FG SKU so plan creation
+    (POST /plans-v2) resolves it via bom_header ILIKE + is_active."""
+    from app.modules.production.services.plan_v2 import create_bom
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await create_bom(conn, body.model_dump())
+    if result.get("error"):
+        raise HTTPException(status_code=400, detail=result)
+    return result
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  JOB CARD V2 — list/detail + multi-shift time capture
 # ═══════════════════════════════════════════════════════════════════════════
@@ -6473,6 +6522,9 @@ class BatchOpenRequest(BaseModel):
     planned_qty_kg: float | None = Field(default=None, ge=0)
     batch_date:     date  | None = None
     notes:          str   | None = None
+    # Operator-typed free-text batch name (072). Blank → server keeps NULL and
+    # the UI falls back to "Batch <number>". batch_number stays the internal key.
+    batch_label:    str   | None = Field(default=None, max_length=120)
     # Stage 2: how much of the JC pool this batch claims to consume.
     # Optional — no server-side gate; informational only.
     input_qty_kg:   float | None = Field(default=None, ge=0)
@@ -6511,6 +6563,12 @@ class BatchCancelRequest(BaseModel):
     reason: str | None = Field(default=None, max_length=500)
 
 
+class BatchRenameRequest(BaseModel):
+    """POST /job-cards-v2/{id}/batches/{batch_id}/rename (072) — set/clear the
+    operator-typed batch name. Blank clears back to the "Batch <number>" fallback."""
+    batch_label: str | None = Field(default=None, max_length=120)
+
+
 @router.post("/job-cards-v2/{job_card_id}/batches/open")
 async def batch_open_v2(
     request: Request,
@@ -6531,6 +6589,7 @@ async def batch_open_v2(
                 planned_qty_kg=body.planned_qty_kg,
                 batch_date=body.batch_date,
                 input_qty_kg=body.input_qty_kg,
+                batch_label=body.batch_label,
                 notes=body.notes,
             )
     _raise_if_locked(result)
@@ -6633,6 +6692,35 @@ async def batch_cancel_v2(
         raise HTTPException(status_code=404, detail=result)
     if result.get("error") in ("batch_not_open", "batch_has_attached_rows"):
         raise HTTPException(status_code=409, detail=result)
+    return result
+
+
+@router.post("/job-cards-v2/{job_card_id}/batches/{batch_id}/rename")
+async def batch_rename_v2(
+    request: Request,
+    job_card_id: int,
+    batch_id: int,
+    body: BatchRenameRequest | None = None,
+    user=Depends(get_current_user),
+):
+    """072: set/clear a batch's free-text name (shown instead of "Batch N")."""
+    from app.modules.production.services import job_card_batch_v2 as svc
+    pool = request.app.state.db_pool
+    body = body or BatchRenameRequest()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await svc.rename_batch(
+                conn,
+                batch_id=batch_id,
+                job_card_id=job_card_id,
+                batch_label=body.batch_label,
+                changed_by=(user.full_name or user.phone),
+            )
+    _raise_if_locked(result)
+    if result.get("error") == "batch_not_found":
+        raise HTTPException(status_code=404, detail="Batch not found")
+    if result.get("error") == "batch_jc_mismatch":
+        raise HTTPException(status_code=404, detail=result)
     return result
 
 
@@ -7765,6 +7853,9 @@ async def job_card_pdf_v1(
 class WipBoxItem(BaseModel):
     net_weight: float
     gross_weight: float | None = None
+    batch_code: str | None = None   # FE "Batch" → sfg_box.batch_code (the batch's display name)
+    batch_id: int | None = None     # FE batch dropdown → sfg_box.batch_id (job_card_batch_v2, 8-digit bigint)
+    units: int | None = None        # FE "Count"
 
 
 class CreateWipBoxesRequest(BaseModel):
@@ -7772,8 +7863,22 @@ class CreateWipBoxesRequest(BaseModel):
     expected_net_kg: float | None = None
 
 
+class UpdateWipBoxItem(BaseModel):
+    box_id: str                     # carton_id of the existing box to edit
+    net_weight: float
+    gross_weight: float | None = None
+    batch_code: str | None = None
+    batch_id: int | None = None
+    units: int | None = None
+    mark_printed: bool = False      # per-box print action: also flip PENDING → PRINTED
+
+
+class UpdateWipBoxesRequest(BaseModel):
+    boxes: list[UpdateWipBoxItem]
+
+
 class ScanSfgBoxesRequest(BaseModel):
-    box_ids: list[int]
+    box_ids: list[str]              # box QR payloads are now "<8-digit>-<counter>" TEXT
 
 
 class FgCartonItem(BaseModel):
@@ -7794,8 +7899,9 @@ async def create_wip_boxes_endpoint(
     request: Request, job_card_id: int, body: CreateWipBoxesRequest,
     user=Depends(get_current_user),
 ):
-    """Split a WIP-stage JC's net SFG into weighed boxes; mint an 8-digit
-    box_id (the QR payload) per box. Print labels via …/wip-boxes/labels.pdf."""
+    """Split a WIP-stage JC's net SFG into weighed boxes; mint a
+    "<8-digit-time-base>-<per-JC counter>" box_id (the QR payload) per box, the
+    counter continuing from the JC's last box. Print labels via …/wip-boxes/labels.pdf."""
     from app.modules.production.services.sfg_box_service import create_wip_boxes
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -7807,6 +7913,29 @@ async def create_wip_boxes_endpoint(
     if "error" in result:
         code = 404 if result["error"] == "not_found" else 400
         raise HTTPException(status_code=code, detail=result.get("message", result["error"]))
+    return strip_cost_fields(
+        result, getattr(user, "role_name", None),
+        is_admin=getattr(user, "is_admin", False),
+    )
+
+
+@router.put("/job-cards-v2/{job_card_id}/wip-boxes")
+async def update_wip_boxes_endpoint(
+    request: Request, job_card_id: int, body: UpdateWipBoxesRequest,
+    user=Depends(get_current_user),
+):
+    """Edit mutable fields (net/gross weight, batch link, count) of already-saved
+    SFG boxes. Only PRINTED boxes are editable; received/consumed ones are skipped."""
+    from app.modules.production.services.sfg_box_service import update_wip_boxes
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await update_wip_boxes(
+                conn, job_card_id, [b.model_dump() for b in body.boxes],
+                changed_by=(user.full_name or user.phone),
+            )
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result.get("message", result["error"]))
     return strip_cost_fields(
         result, getattr(user, "role_name", None),
         is_admin=getattr(user, "is_admin", False),
@@ -7826,6 +7955,19 @@ async def list_wip_boxes_endpoint(
         result, getattr(user, "role_name", None),
         is_admin=getattr(user, "is_admin", False),
     )
+
+
+@router.get("/job-cards-v2/{job_card_id}/edit-log")
+async def job_card_edit_log_endpoint(
+    request: Request, job_card_id: int, user=Depends(get_current_user),
+):
+    """Whole-job-card change history (header/tabs + box data) from amendment_log.
+    The frontend uses each row's field_name to paint the ever-edited value red."""
+    from app.modules.production.services.amendment_service import list_jc_edit_log
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        rows = await list_jc_edit_log(conn, job_card_id)
+    return {"job_card_id": job_card_id, "changes": rows}
 
 
 @router.get("/job-cards-v2/{job_card_id}/wip-boxes/labels.pdf")
@@ -7873,7 +8015,7 @@ async def scan_sfg_boxes_endpoint(
 
 @router.get("/sfg-boxes/{box_id}")
 async def get_sfg_box_endpoint(
-    request: Request, box_id: int, user=Depends(get_current_user),
+    request: Request, box_id: str, user=Depends(get_current_user),
 ):
     """Single SFG box lookup (mirror of GET /boxes/{box_id} for po_box)."""
     from app.modules.production.services.sfg_box_service import get_box
@@ -7931,7 +8073,7 @@ async def jc_sfg_genealogy_endpoint(
 
 @router.get("/sfg-boxes/{box_id}/genealogy")
 async def sfg_box_genealogy_endpoint(
-    request: Request, box_id: int, user=Depends(get_current_user),
+    request: Request, box_id: str, user=Depends(get_current_user),
 ):
     """Phase 7 — single-box upstream ancestry chain.
 
@@ -8047,7 +8189,7 @@ async def fg_carton_labels_endpoint(
 
 @router.get("/fg-cartons/{carton_id}/label.pdf")
 async def fg_carton_single_label_endpoint(
-    request: Request, carton_id: int, user=Depends(get_current_user),
+    request: Request, carton_id: str, user=Depends(get_current_user),
 ):
     """Single carton sticker. Entity-scoped for non-admins (mirror of the box reads)."""
     from app.modules.production.services.sfg_box_service import get_box
@@ -8071,7 +8213,7 @@ async def fg_carton_single_label_endpoint(
 
 @router.get("/fg-cartons/{carton_id}/genealogy")
 async def fg_carton_genealogy_endpoint(
-    request: Request, carton_id: int, user=Depends(get_current_user),
+    request: Request, carton_id: str, user=Depends(get_current_user),
 ):
     """Carton upstream trace: carton → SFG boxes consumed into the packing JC →
     each box's box→lot lineage. ``level`` 0 = the carton; increases upstream."""

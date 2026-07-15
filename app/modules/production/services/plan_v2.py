@@ -314,6 +314,70 @@ async def create_plan(conn, payload: dict) -> dict:
     return {"plan_id": plan_id, "plan_line_ids": line_ids}
 
 
+async def create_bom(conn, payload: dict) -> dict:
+    """Create a master BOM for one FG SKU, superseding any active one.
+
+    Powers the plan-builder card's inline "Add BOM" so plan creation can then
+    resolve the SKU (bom_header WHERE fg_sku_name ILIKE + is_active). Returns
+    ``{bom_id, fg_sku_name, lines_count}`` or an ``{error, message}`` envelope
+    (the caller maps that to HTTP 400). MUST run inside an outer transaction.
+    """
+    fg_sku_name = (payload.get("fg_sku_name") or "").strip()
+    entity = payload.get("entity")
+    lines = payload.get("lines") or []
+    if not fg_sku_name:
+        return {"error": "no_sku", "message": "fg_sku_name is required"}
+    if not lines:
+        return {"error": "no_lines", "message": "At least one BOM line is required"}
+    for i, ln in enumerate(lines, start=1):
+        if ln.get("item_type") not in ("rm", "pm"):
+            return {"error": "bad_item_type", "message": f"Line {i}: item_type must be 'rm' or 'pm'"}
+        if not (float(ln.get("quantity_per_unit") or 0) > 0):
+            return {"error": "bad_qty", "message": f"Line {i}: quantity_per_unit must be > 0"}
+
+    # 1. Supersede any currently-active master for this SKU. Deactivate BY NAME
+    #    (not name+entity) because create_plan's lookup and the detail path both
+    #    key on `fg_sku_name ILIKE $1 AND is_active=TRUE ORDER BY version DESC` with
+    #    NO entity filter — so exactly one active header per name must remain.
+    await conn.execute(
+        "UPDATE bom_header SET is_active = FALSE "
+        "WHERE fg_sku_name ILIKE $1 AND is_active = TRUE",
+        fg_sku_name,
+    )
+    # 2. Next version in this SKU lineage (global max + 1).
+    next_version = await conn.fetchval(
+        "SELECT COALESCE(MAX(version), 0) + 1 FROM bom_header WHERE fg_sku_name ILIKE $1",
+        fg_sku_name,
+    )
+    # 3. Insert the new active header (bom_id SERIAL — the DB assigns it).
+    bom_id = await conn.fetchval(
+        """
+        INSERT INTO bom_header
+            (fg_sku_name, customer_name, pack_size_kg, version, is_active, entity, effective_from)
+        VALUES ($1, $2, $3, $4, TRUE, $5, CURRENT_DATE)
+        RETURNING bom_id
+        """,
+        fg_sku_name, payload.get("customer_name"), payload.get("pack_size_kg"),
+        next_version, entity,
+    )
+    # 4. Insert lines 1..N (UNIQUE(bom_id, line_number)).
+    for i, ln in enumerate(lines, start=1):
+        await conn.execute(
+            """
+            INSERT INTO bom_line
+                (bom_id, line_number, material_sku_name, item_type, quantity_per_unit, uom, loss_pct)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            """,
+            bom_id, i, ln["material_sku_name"], ln["item_type"],
+            ln["quantity_per_unit"], ln.get("uom"), ln.get("loss_pct") or 0,
+        )
+    logger.info(
+        "BOM master created: bom_id=%s sku=%r entity=%s version=%s lines=%d",
+        bom_id, fg_sku_name, entity, next_version, len(lines),
+    )
+    return {"bom_id": bom_id, "fg_sku_name": fg_sku_name, "lines_count": len(lines)}
+
+
 async def get_plan(conn, plan_id: int) -> dict | None:
     """Full nested plan: header + lines + ordered steps."""
     header = await conn.fetchrow(

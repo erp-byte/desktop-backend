@@ -80,6 +80,7 @@ async def open_batch(conn, *, job_card_id: int,
                      planned_qty_kg: float | None = None,
                      batch_date: date | None = None,
                      input_qty_kg: float | None = None,
+                     batch_label: str | None = None,
                      notes: str | None = None) -> dict:
     """Allocate a new batch row. batch_number = max + 1; batch_date defaults
     to today. Returns {"opened": True, "batch": <row>} or an error dict.
@@ -120,19 +121,21 @@ async def open_batch(conn, *, job_card_id: int,
         batch_date = await conn.fetchval("SELECT CURRENT_DATE")
 
     opened_at_ist = ist_now_text()
+    # Operator-typed free-text name; blank → NULL (UI falls back to "Batch N").
+    label = (batch_label or "").strip() or None
 
     async def _insert():
         return await conn.fetchrow(
             """
             INSERT INTO job_card_batch_v2 (
-                batch_id, job_card_id, batch_number, batch_date,
+                batch_id, job_card_id, batch_number, batch_label, batch_date,
                 planned_qty_kg, input_qty_kg, status, notes,
                 opened_at_ist
-            ) VALUES ($1, $2, $3, $4, $5, $6, 'open', $7, $8)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'open', $8, $9)
             RETURNING *
             """,
             new_short_time_id(),
-            job_card_id, next_number, batch_date,
+            job_card_id, next_number, label, batch_date,
             planned_qty_kg, input_qty_kg, notes,
             opened_at_ist,
         )
@@ -524,6 +527,52 @@ async def list_batches(conn, job_card_id: int) -> list[dict]:
         job_card_id,
     )
     return [_serialize(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Rename batch (072 — set the operator-typed free-text batch label)
+# ---------------------------------------------------------------------------
+
+async def rename_batch(conn, *, batch_id: int,
+                       job_card_id: int | None = None,
+                       batch_label: str | None = None,
+                       changed_by: str | None = None) -> dict:
+    """Set/clear a batch's free-text label (the name shown instead of
+    "Batch <number>"). Cosmetic only — batch_number stays the internal key —
+    so any status is renamable; blank clears it back to the numbered fallback.
+    """
+    lock_err_jc = await _lock_check_via_batch(conn, batch_id)
+    if isinstance(lock_err_jc, dict):
+        return lock_err_jc
+    resolved_jc_id = lock_err_jc
+    if job_card_id is not None and job_card_id != resolved_jc_id:
+        return {
+            "error": "batch_jc_mismatch",
+            "path_job_card_id": job_card_id,
+            "batch_job_card_id": resolved_jc_id,
+            "message": "The batch belongs to a different job card than the URL path.",
+        }
+
+    label = (batch_label or "").strip() or None
+    old_label = await conn.fetchval(
+        "SELECT batch_label FROM job_card_batch_v2 WHERE batch_id=$1", batch_id,
+    )
+    row = await conn.fetchrow(
+        "UPDATE job_card_batch_v2 SET batch_label=$2 WHERE batch_id=$1 RETURNING *",
+        batch_id, label,
+    )
+    if row is None:
+        return {"error": "batch_not_found"}
+    # Audit the batch-name change against the parent JC (drives the FE red marker).
+    if changed_by:
+        from app.modules.production.services.amendment_service import log_amendment
+        await log_amendment(
+            conn, record_id=str(resolved_jc_id), record_type="job_card",
+            field_name=f"batch:{batch_id}.batch_label",
+            previous_value=old_label, new_value=label,
+            changed_by=changed_by, reason="batch rename",
+        )
+    return {"renamed": True, "batch": _serialize(row)}
 
 
 # ---------------------------------------------------------------------------

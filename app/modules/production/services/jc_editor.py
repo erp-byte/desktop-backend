@@ -57,6 +57,19 @@ async def _apply_partial_update(
     if not fields:
         raise HTTPException(status_code=422, detail="No editable fields supplied")
 
+    # Snapshot the to-be-edited columns first so the JC edit log records the real
+    # before→after per field (drives the FE red markers). Annexure rows only
+    # (parent_jc_id present); the main job_card header is logged on its own v2 path.
+    # `fields` keys come from the per-table allow-list above, so they're safe to
+    # interpolate; table / pk_col are internal constants.
+    old = None
+    if parent_jc_id is not None:
+        old = await conn.fetchrow(
+            f"SELECT {', '.join(fields.keys())} FROM {table} "
+            f"WHERE {pk_col} = $1 AND job_card_id = $2",
+            pk_val, parent_jc_id,
+        )
+
     set_parts: list[str] = []
     params: list = []
     for col, val in fields.items():
@@ -81,6 +94,18 @@ async def _apply_partial_update(
     row = await conn.fetchrow(sql, *params)
     if row is None:
         raise HTTPException(status_code=404, detail=f"{table} row not found or already deleted")
+
+    # Audit each annexure field that actually changed (no-ops skipped by the
+    # logger). record_type='job_card' + record_id=job_card_id so it surfaces in the
+    # JC edit log; field_name = '<annexure>:<row-id>.<col>' for the FE red markers.
+    if parent_jc_id is not None and old is not None:
+        from app.modules.production.services.amendment_service import log_jc_field_changes
+        short = table[len("job_card_"):] if table.startswith("job_card_") else table
+        await log_jc_field_changes(
+            conn, job_card_id=parent_jc_id, record_type="job_card",
+            field_prefix=f"{short}:{pk_val}.", changed_by=updated_by, reason="annexure edit",
+            before={c: old[c] for c in fields}, after={c: row[c] for c in fields},
+        )
     return dict(row), list(fields.keys())
 
 

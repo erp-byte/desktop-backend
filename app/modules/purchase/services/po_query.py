@@ -58,7 +58,47 @@ _ILIKE_FIELDS: dict[str, str] = {
 _SORTABLE_COLUMNS: frozenset[str] = frozenset({
     "po_date", "po_number", "vendor_supplier_name", "supplier_id",
     "gross_total", "total_amount", "transaction_no", "created_at",
+    # Also-projected columns the PO list UI now offers as sort keys.
+    "voucher_type", "order_reference_no", "entity",
 })
+
+# "Fully received" tolerance — received net weight must reach at least this
+# fraction of the ordered po_weight to count as matched (1% shortfall allowed for
+# weighing/moisture drift). Kept in one place so the section filter and the
+# receipt-summary endpoint apply the exact same rule.
+_WEIGHT_MATCH_FACTOR = 0.99
+
+# A transaction is "completed" for the Material In dashboard when the Stores team
+# has received material that fully matches the ordered PO quantity on BOTH weight
+# AND count: it has ≥1 weighed box AND no line is short. A line is "short" when
+#   • its ordered po_weight is present and SUM(received net_weight) < po_weight*factor, OR
+#   • its ordered pack_count is present and received count < pack_count.
+# Received count = SUM(po_box.count), or the number of boxes when box counts are
+# absent. A line with no ordered value on a dimension doesn't constrain that
+# dimension (unknown, not short). Subqueries correlate on po_header.transaction_no.
+_FULLY_RECEIVED_PREDICATE = f"""
+    EXISTS (
+        SELECT 1 FROM po_box b
+         WHERE b.transaction_no = po_header.transaction_no
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM po_line l
+        LEFT JOIN LATERAL (
+            SELECT COALESCE(SUM(b.net_weight), 0)           AS rec_wt,
+                   COALESCE(SUM(b.count), COUNT(b.box_id))  AS rec_cnt
+              FROM po_box b
+             WHERE b.transaction_no = l.transaction_no
+               AND b.line_number    = l.line_number
+        ) r ON TRUE
+         WHERE l.transaction_no = po_header.transaction_no
+           AND (
+                (l.po_weight  IS NOT NULL AND r.rec_wt  < l.po_weight * {_WEIGHT_MATCH_FACTOR})
+             OR (l.pack_count IS NOT NULL AND r.rec_cnt < l.pack_count)
+           )
+    )
+""".strip()
+
+_VALID_SECTIONS: frozenset[str] = frozenset({"today", "pending", "completed"})
 
 
 def _parse_date(s: str | None, label: str) -> date_type | None:
@@ -163,6 +203,38 @@ def build_where(
             _add(f"{f} >= ${{i}}", lo)
         if hi is not None:
             _add(f"{f} <= ${{i}}", hi)
+
+    # Material In dashboard section partition (today / pending / completed).
+    #   today     — po_date is the client's local today, whatever the receipt state
+    #   completed — NOT today AND received material fully matches ordered qty (wt+count)
+    #   pending   — NOT today AND NOT fully received
+    # The three are mutually exclusive (Today takes priority), matching the
+    # client's partition, so each section paginates independently server side.
+    section = filters.get("section")
+    if section:
+        section = str(section).lower()
+        if section not in _VALID_SECTIONS:
+            raise AuthError(
+                "validation_error",
+                f"Invalid section {section!r}; expected today|pending|completed",
+                400,
+            )
+        today = _parse_date(filters.get("today_date"), "today_date")
+        if section == "today":
+            if today is not None:
+                _add("po_date = ${i}", today)
+            else:
+                conditions.append("po_date = CURRENT_DATE")
+        else:
+            if today is not None:
+                _add("po_date IS DISTINCT FROM ${i}", today)
+            else:
+                conditions.append("po_date IS DISTINCT FROM CURRENT_DATE")
+            conditions.append(
+                f"({_FULLY_RECEIVED_PREDICATE})"
+                if section == "completed"
+                else f"NOT ({_FULLY_RECEIVED_PREDICATE})"
+            )
 
     # Visibility
     if not include_deleted:

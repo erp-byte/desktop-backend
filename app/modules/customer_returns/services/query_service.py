@@ -17,8 +17,8 @@ HEADER_COLS = (
     "transporter_name, driver_name, inward_manager, status, created_by, created_ts, updated_at"
 )
 LINE_COLS = (
-    "rtv_id, item_description, material_type, item_category, sub_category, uom, qty, rate, "
-    "value, net_weight, carton_weight, lot_number, item_mark, spl_remarks, vakkal, created_at, updated_at"
+    "rtv_id, item_description, material_type, item_category, sub_category, sale_group, uom, qty, rate, "
+    "value, conversion, net_weight, carton_weight, lot_number, item_mark, spl_remarks, vakkal, created_at, updated_at"
 )
 BOX_COLS = (
     "rtv_id, article_description, box_number, box_id, uom, conversion, lot_number, item_mark, "
@@ -114,10 +114,12 @@ def _map_line_row(r: dict) -> dict:
         "material_type": r.get("material_type") or "",
         "item_category": r.get("item_category") or "",
         "sub_category": r.get("sub_category") or "",
+        "sale_group": r.get("sale_group"),
         "uom": r.get("uom") or "",
         "qty": _num_str(r.get("qty")),
         "rate": _num_str(r.get("rate")),
         "value": _num_str(r.get("value")),
+        "conversion": None if r.get("conversion") is None else str(r.get("conversion")),
         "net_weight": _num_str(r.get("net_weight")),
         "carton_weight": _num_str(r.get("carton_weight")),
         "lot_number": r.get("lot_number"),
