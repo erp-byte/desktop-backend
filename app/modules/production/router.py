@@ -4836,7 +4836,9 @@ async def create_line_job_cards_v2(
                 detail=f"User is not assigned to floor(s): {', '.join(bad)}",
             )
 
-    from app.modules.production.services.job_card_v2 import create_job_cards_for_line
+    from app.modules.production.services.job_card_v2 import (
+        create_job_cards_for_line, maybe_release_plan_from_jcs,
+    )
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -4848,6 +4850,15 @@ async def create_line_job_cards_v2(
                 wip_steps=[s.model_dump() for s in body.wip_steps],
                 pkg_floor=body.pkg_floor,
             )
+            # If this per-line create means EVERY article on the plan now has
+            # job cards, release the plan (draft -> approved) so its status
+            # reflects that all articles are planned via the wizard. No-op on
+            # error, partial plans, or an already-approved plan.
+            if "error" not in result and result.get("plan_id"):
+                await maybe_release_plan_from_jcs(
+                    conn, result["plan_id"],
+                    approved_by=(getattr(user, "full_name", None) or None),
+                )
     err = result.get("error")
     if err == "line_not_found":
         raise HTTPException(status_code=404, detail="Plan line not found")

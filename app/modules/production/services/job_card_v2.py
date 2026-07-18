@@ -1293,7 +1293,33 @@ async def get_line_job_card_config(conn, plan_line_id: int) -> dict:
         plan_line_id,
     )
     if not rows:
-        return {"exists": False, "canonical_sfg": canonical_sfg}
+        # No job cards yet → prefill the Create-Job-Card wizard from the plan's
+        # snapshot route (production_plan_step_v2) so the operator can Create in
+        # ONE click instead of re-typing the process/floor chain the plan already
+        # knows. Last step = Packaging (Final FG); the rest are the WIP processes.
+        # sfg_output is left NULL — the frontend seeds the canonical SFG.
+        steps = await conn.fetch(
+            """
+            SELECT step_order, process_name, floor
+            FROM production_plan_step_v2
+            WHERE plan_line_id = $1
+            ORDER BY step_order
+            """,
+            plan_line_id,
+        )
+        out = {"exists": False, "canonical_sfg": canonical_sfg}
+        if steps:
+            if len(steps) >= 2:
+                wip_src, pkg_floor = steps[:-1], steps[-1]["floor"]
+            else:  # single-step route: use it as the lone WIP, reuse its floor for packaging
+                wip_src, pkg_floor = steps, steps[0]["floor"]
+            out["wip_steps"] = [
+                {"process": s["process_name"], "floor": s["floor"],
+                 "sfg_output": None, "job_card_id": None, "started": False}
+                for s in wip_src
+            ]
+            out["pkg_floor"] = pkg_floor
+        return out
 
     started = any(r["status"] not in _JC_EDITABLE_STATUSES for r in rows)
     wip_rows = rows[:-1]          # every stage except the terminating Packaging
@@ -1917,6 +1943,52 @@ async def maybe_close_plan_from_jcs(conn, plan_id: int) -> bool:
         plan_id,
     )
     logger.info("plan_id=%d auto-transitioned to 'executed' (all v2 JCs closed)", plan_id)
+    return True
+
+
+async def maybe_release_plan_from_jcs(conn, plan_id: int,
+                                      approved_by: str | None = None) -> bool:
+    """If EVERY line on this plan now has (non-deleted) job cards, flip a draft
+    plan to 'approved'. The per-line Create-Job-Card wizard is the modern
+    equivalent of the bulk Approve, so once all articles are carded via the
+    wizard the plan should read as approved (released to the floor), not draft.
+
+    Idempotent — only acts on a plan still in 'draft'; stamps approved_by /
+    approved_at like the Approve button does (COALESCE so a real approval is
+    never overwritten). Returns True when a transition happened.
+    """
+    plan = await conn.fetchrow(
+        "SELECT status FROM production_plan_v2 WHERE plan_id=$1", plan_id,
+    )
+    if not plan or plan["status"] != 'draft':
+        return False
+
+    counts = await conn.fetchrow(
+        """
+        SELECT
+            (SELECT COUNT(*) FROM production_plan_line_v2 WHERE plan_id=$1) AS lines,
+            (SELECT COUNT(*) FROM production_plan_line_v2 l
+              WHERE l.plan_id=$1
+                AND EXISTS (SELECT 1 FROM job_card_v2 j
+                            WHERE j.plan_line_id=l.plan_line_id
+                              AND j.deleted_at IS NULL)) AS carded
+        """,
+        plan_id,
+    )
+    if not counts or counts["lines"] == 0 or counts["carded"] != counts["lines"]:
+        return False
+
+    await conn.execute(
+        """
+        UPDATE production_plan_v2
+        SET status='approved',
+            approved_by=COALESCE(approved_by, $2),
+            approved_at=COALESCE(approved_at, NOW())
+        WHERE plan_id=$1 AND status='draft'
+        """,
+        plan_id, approved_by,
+    )
+    logger.info("plan_id=%d auto-transitioned 'draft'->'approved' (all lines carded via wizard)", plan_id)
     return True
 
 
