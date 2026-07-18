@@ -4810,6 +4810,10 @@ class JobCardLineCreate(BaseModel):
     qty_units: float | None = None
     wip_steps: list[JobCardLineCreateStep]
     pkg_floor: str
+    # Same-article merge: other plan lines (same SKU + BOM, same plan) to fold
+    # INTO this primary line before building ONE chain — qty_kg/qty_units above
+    # must already be the COMBINED total. Empty => plain single-line create.
+    merge_plan_line_ids: list[int] = []
 
 
 @router.post("/plans-v2/lines/{plan_line_id}/job-cards")
@@ -4838,27 +4842,35 @@ async def create_line_job_cards_v2(
 
     from app.modules.production.services.job_card_v2 import (
         create_job_cards_for_line, maybe_release_plan_from_jcs,
+        consolidate_plan_lines_for_merge,
     )
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
         async with conn.transaction():
-            result = await create_job_cards_for_line(
-                conn,
-                plan_line_id,
-                qty_kg=body.qty_kg,
-                qty_units=body.qty_units,
-                wip_steps=[s.model_dump() for s in body.wip_steps],
-                pkg_floor=body.pkg_floor,
+            # Same-article merge: fold sibling same-SKU lines into this primary
+            # line first (union SO refs + sum qty + delete siblings), so the chain
+            # below is ONE set of job cards for the combined article referencing
+            # every merged SO. No-op when merge_plan_line_ids is empty.
+            result = await consolidate_plan_lines_for_merge(
+                conn, plan_line_id, body.merge_plan_line_ids,
             )
-            # If this per-line create means EVERY article on the plan now has
-            # job cards, release the plan (draft -> approved) so its status
-            # reflects that all articles are planned via the wizard. No-op on
-            # error, partial plans, or an already-approved plan.
-            if "error" not in result and result.get("plan_id"):
-                await maybe_release_plan_from_jcs(
-                    conn, result["plan_id"],
-                    approved_by=(getattr(user, "full_name", None) or None),
+            if result is None:  # no merge requested, or merge succeeded
+                result = await create_job_cards_for_line(
+                    conn,
+                    plan_line_id,
+                    qty_kg=body.qty_kg,
+                    qty_units=body.qty_units,
+                    wip_steps=[s.model_dump() for s in body.wip_steps],
+                    pkg_floor=body.pkg_floor,
                 )
+                # If this create means EVERY article on the plan now has job
+                # cards, release the plan (draft -> approved). No-op on error /
+                # partial / already-approved plans.
+                if "error" not in result and result.get("plan_id"):
+                    await maybe_release_plan_from_jcs(
+                        conn, result["plan_id"],
+                        approved_by=(getattr(user, "full_name", None) or None),
+                    )
     err = result.get("error")
     if err == "line_not_found":
         raise HTTPException(status_code=404, detail="Plan line not found")
@@ -4868,6 +4880,8 @@ async def create_line_job_cards_v2(
             detail=(f"This article already has {result.get('count')} job card(s). "
                     "Cancel them before recreating."),
         )
+    if err in ("already_carded", "merge_conflict"):
+        raise HTTPException(status_code=409, detail=result.get("message"))
     if err in ("invalid_qty", "no_wip_steps", "missing_pkg_floor"):
         raise HTTPException(status_code=400, detail=result.get("message"))
     return result

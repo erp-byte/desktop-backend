@@ -1992,6 +1992,108 @@ async def maybe_release_plan_from_jcs(conn, plan_id: int,
     return True
 
 
+async def consolidate_plan_lines_for_merge(conn, primary_line_id: int,
+                                           merge_line_ids: list[int]) -> dict | None:
+    """Fold same-article sibling plan lines INTO the primary line so the wizard
+    can build ONE job-card chain for the combined article (rule: same SKU in the
+    same plan => one merged chain, both SO numbers on it).
+
+    Sums planned_qty, UNIONs linked_so_fulfillment_ids (so every merged SO number
+    surfaces on the chain via the existing get_job_card aggregation — no display
+    change), UNIONs distinct customer_name, then DELETEs the siblings (their
+    production_plan_step_v2 rows CASCADE away).
+
+    Guards: every sibling must be on the SAME plan, SAME fg_sku_name AND SAME
+    bom_id as the primary, and NONE of the lines (primary or siblings) may already
+    have job cards (else the merge would double-produce and the delete would be
+    blocked by the job_card_v2 -> line RESTRICT FK).
+
+    Reservations are deliberately NOT touched — they were made per-fulfillment at
+    plan-create and stay correct at rest.
+    # ponytail: cancel_plan/delete_plan/sync_so_from_qty_delta still subtract a
+    # line's FULL qty from every linked fulfillment (WHERE so_fulfillment_id =
+    # ANY(fids)), so a merged (multi-fid) line over-releases a fulfillment that is
+    # ALSO reserved by another plan. Pre-existing multi-fid ledger gap; fix by
+    # teaching those three loops to apportion per fulfillment.
+
+    Returns None on success (or when merge_line_ids is empty), else {"error", ...}.
+    MUST run inside an outer transaction.
+    """
+    merge_line_ids = [m for m in (merge_line_ids or []) if m != primary_line_id]
+    if not merge_line_ids:
+        return None
+
+    ids = [primary_line_id, *merge_line_ids]
+    rows = await conn.fetch(
+        """
+        SELECT plan_line_id, plan_id, fg_sku_name, bom_id, customer_name,
+               planned_qty_kg, planned_qty_units, linked_so_fulfillment_ids
+        FROM production_plan_line_v2
+        WHERE plan_line_id = ANY($1)
+        """,
+        ids,
+    )
+    by_id = {r["plan_line_id"]: r for r in rows}
+    primary = by_id.get(primary_line_id)
+    if primary is None or any(m not in by_id for m in merge_line_ids):
+        return {"error": "line_not_found", "message": "A plan line to merge was not found"}
+
+    pname = (primary["fg_sku_name"] or "").strip().lower()
+    for m in merge_line_ids:
+        s = by_id[m]
+        if s["plan_id"] != primary["plan_id"]:
+            return {"error": "merge_conflict", "message": "Cannot merge lines from different plans"}
+        if (s["fg_sku_name"] or "").strip().lower() != pname:
+            return {"error": "merge_conflict", "message": "Only lines with the same article can be merged"}
+        if s["bom_id"] != primary["bom_id"]:
+            return {"error": "merge_conflict", "message": "Lines have different BOMs — cannot merge"}
+
+    carded = await conn.fetchval(
+        "SELECT COUNT(*) FROM job_card_v2 WHERE plan_line_id = ANY($1) AND deleted_at IS NULL",
+        ids,
+    )
+    if carded and carded > 0:
+        return {"error": "already_carded",
+                "message": "One of the articles already has job cards — cancel them before merging"}
+
+    # union fids (dedup, order-stable), sum qty, union distinct customers
+    fids: list[int] = []
+    seen_f: set[int] = set()
+    custs: list[str] = []
+    seen_c: set[str] = set()
+    sum_kg = 0.0
+    sum_units = 0.0
+    for r in rows:
+        for f in (r["linked_so_fulfillment_ids"] or []):
+            if f not in seen_f:
+                seen_f.add(f); fids.append(f)
+        c = (r["customer_name"] or "").strip()
+        if c and c.lower() not in seen_c:
+            seen_c.add(c.lower()); custs.append(c)
+        sum_kg += float(r["planned_qty_kg"] or 0)
+        sum_units += float(r["planned_qty_units"] or 0)
+
+    await conn.execute(
+        """
+        UPDATE production_plan_line_v2
+        SET linked_so_fulfillment_ids = $2,
+            planned_qty_kg            = $3,
+            planned_qty_units         = $4,
+            customer_name             = $5
+        WHERE plan_line_id = $1
+        """,
+        primary_line_id, fids, round(sum_kg, 3), round(sum_units, 3),
+        (", ".join(custs) if custs else None),
+    )
+    await conn.execute(
+        "DELETE FROM production_plan_line_v2 WHERE plan_line_id = ANY($1)",
+        merge_line_ids,
+    )
+    logger.info("merged plan lines %s into primary line %d (%d fulfillments, %.3f kg)",
+                merge_line_ids, primary_line_id, len(fids), sum_kg)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Shift-log service (v2)
 # ---------------------------------------------------------------------------
