@@ -526,6 +526,17 @@ async def list_plans(conn, *, entity=None, warehouse=None, plan_type=None,
                                SELECT COUNT(*) FROM job_card_v2 j
                                WHERE j.plan_line_id = production_plan_line_v2.plan_line_id
                                  AND j.deleted_at IS NULL
+                           ),
+                           -- Already-carded qty = Σ of each chain's HEAD card
+                           -- (prev_job_card_id IS NULL → one head per partial
+                           -- chain). remaining = planned_qty_kg − this; drives
+                           -- the split "X kg left" / Create-another affordance.
+                           'carded_qty_kg',     (
+                               SELECT COALESCE(SUM(j.planned_qty_kg), 0)
+                               FROM job_card_v2 j
+                               WHERE j.plan_line_id = production_plan_line_v2.plan_line_id
+                                 AND j.prev_job_card_id IS NULL
+                                 AND j.deleted_at IS NULL
                            )
                        )
                        ORDER BY plan_line_id

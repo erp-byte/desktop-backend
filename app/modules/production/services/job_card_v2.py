@@ -1064,23 +1064,55 @@ async def create_job_cards_for_line(
     line = await conn.fetchrow(
         """
         SELECT l.plan_line_id, l.plan_id, l.bom_id, l.fg_sku_name, l.customer_name,
-               p.entity, p.warehouse
+               l.planned_qty_kg, p.entity, p.warehouse
         FROM   production_plan_line_v2 l
         JOIN   production_plan_v2 p ON p.plan_id = l.plan_id
         WHERE  l.plan_line_id = $1
+        FOR    UPDATE OF l
         """,
         plan_line_id,
     )
     if not line:
         return {"error": "line_not_found"}
+    # The FOR UPDATE above serializes concurrent partial-chain creates on the
+    # SAME line: a second create blocks until the first commits, then reads the
+    # updated carded total below — so two racing splits can't both pass the
+    # balance guard and over-card the line.
 
-    # ---- per-line idempotency guard -------------------------------------
-    existing = await conn.fetchval(
-        "SELECT COUNT(*) FROM job_card_v2 WHERE plan_line_id=$1 AND deleted_at IS NULL",
+    # ---- balance guard: split a line into multiple partial chains --------
+    # A plan line may be carded in several partial chains over time (e.g. a
+    # 450 kg line as 225 kg now + 225 kg later). The already-carded qty is the
+    # Σ of each chain's HEAD card planned_qty_kg — exactly one head per chain
+    # (prev_job_card_id IS NULL). We cap the total at the line's planned qty
+    # (decision: cap-at-remaining) so splitting can't over-card the line.
+    existing_heads = int(await conn.fetchval(
+        "SELECT COUNT(*) FROM job_card_v2 "
+        "WHERE plan_line_id=$1 AND prev_job_card_id IS NULL AND deleted_at IS NULL",
         plan_line_id,
-    )
-    if existing and existing > 0:
-        return {"error": "job_cards_already_exist", "count": existing}
+    ) or 0)
+    carded_kg = float(await conn.fetchval(
+        "SELECT COALESCE(SUM(planned_qty_kg), 0) FROM job_card_v2 "
+        "WHERE plan_line_id=$1 AND prev_job_card_id IS NULL AND deleted_at IS NULL",
+        plan_line_id,
+    ) or 0)
+    planned_kg = float(line["planned_qty_kg"] or 0)
+    _TOL = 0.001
+    if planned_kg <= 0:
+        # No planned qty to split against (e.g. RM SO) — keep the original
+        # single-chain rule so behaviour is unchanged for these lines.
+        if existing_heads > 0:
+            return {"error": "job_cards_already_exist", "count": existing_heads}
+    else:
+        remaining_kg = round(planned_kg - carded_kg, 3)
+        if remaining_kg <= _TOL:
+            return {"error": "line_fully_carded",
+                    "planned_qty_kg": planned_kg, "carded_qty_kg": round(carded_kg, 3),
+                    "message": "This line is already fully carded."}
+        if qk > remaining_kg + _TOL:
+            return {"error": "exceeds_balance",
+                    "remaining_qty_kg": remaining_kg, "requested_qty_kg": qk,
+                    "message": (f"Quantity {qk} kg exceeds the remaining "
+                                f"{remaining_kg} kg balance for this line.")}
 
     plan_id       = line["plan_id"]
     bom_id        = line["bom_id"]
@@ -1113,15 +1145,26 @@ async def create_job_cards_for_line(
     })
     n = len(steps_spec)
 
-    # ---- mutable-step reconciliation: REPLACE the line's snapshot steps --
-    # Safe: the per-line guard above guarantees no job_card_v2 references these
-    # (plan_step_id is ON DELETE RESTRICT), so the DELETE cannot orphan a JC.
-    await conn.execute(
-        "DELETE FROM production_plan_step_v2 WHERE plan_line_id=$1", plan_line_id,
-    )
+    # ---- step reconciliation: replace on the FIRST chain, append after ---
+    # The FIRST chain replaces the line's snapshot steps with the wizard's
+    # (safe: no JC references them yet). A SUBSEQUENT partial chain must NOT
+    # delete the existing steps — they're RESTRICT-referenced by the earlier
+    # chain's cards — so it appends its own step rows with CONTINUED step_order
+    # (uq_pps_v2_line_order is UNIQUE on (plan_line_id, step_order)).
+    chain_no = existing_heads + 1
+    if existing_heads == 0:
+        await conn.execute(
+            "DELETE FROM production_plan_step_v2 WHERE plan_line_id=$1", plan_line_id,
+        )
+        step_order_base = 0
+    else:
+        step_order_base = int(await conn.fetchval(
+            "SELECT COALESCE(MAX(step_order), 0) FROM production_plan_step_v2 "
+            "WHERE plan_line_id=$1", plan_line_id,
+        ) or 0)
     step_ids: list[int] = []
     for i, sp in enumerate(steps_spec):
-        async def _insert_step(_order=i + 1, _sp=sp):
+        async def _insert_step(_order=step_order_base + i + 1, _sp=sp):
             return await conn.fetchval(
                 """
                 INSERT INTO production_plan_step_v2 (
@@ -1158,8 +1201,12 @@ async def create_job_cards_for_line(
         status        = 'unlocked' if is_first else 'locked'
         locked_reason = None if is_first else 'awaiting_previous_stage'
 
-        jc_number = f"PLAN-{plan_id}-L{plan_line_id}-S{idx + 1}"
-        batch_no  = _batch_number(plan_id, plan_line_id, idx + 1)
+        # Chain suffix keeps job_card_number UNIQUE across partial chains on the
+        # same line (job_card_v2_job_card_number_key). First chain keeps the
+        # original format for backward-compat; 2nd+ chains get -B{chain_no}.
+        chain_suffix = "" if chain_no == 1 else f"-B{chain_no}"
+        jc_number = f"PLAN-{plan_id}-L{plan_line_id}-S{idx + 1}{chain_suffix}"
+        batch_no  = _batch_number(plan_id, plan_line_id, idx + 1) + chain_suffix
         step_id   = step_ids[idx]
 
         # NOTE: column/value order kept identical to
@@ -1963,6 +2010,10 @@ async def maybe_release_plan_from_jcs(conn, plan_id: int,
     if not plan or plan["status"] != 'draft':
         return False
 
+    # A line is "carded" for auto-approval only when it is FULLY carded — the
+    # Σ of its chains' head-card qty (prev_job_card_id IS NULL) reaches its
+    # planned qty. A partially-carded line (e.g. 225 of 450 kg) must NOT flip
+    # the plan to approved; the operator still owes the balance chain.
     counts = await conn.fetchrow(
         """
         SELECT
@@ -1971,7 +2022,12 @@ async def maybe_release_plan_from_jcs(conn, plan_id: int,
               WHERE l.plan_id=$1
                 AND EXISTS (SELECT 1 FROM job_card_v2 j
                             WHERE j.plan_line_id=l.plan_line_id
-                              AND j.deleted_at IS NULL)) AS carded
+                              AND j.deleted_at IS NULL)
+                AND COALESCE((SELECT SUM(j.planned_qty_kg) FROM job_card_v2 j
+                              WHERE j.plan_line_id=l.plan_line_id
+                                AND j.prev_job_card_id IS NULL
+                                AND j.deleted_at IS NULL), 0)
+                    >= COALESCE(l.planned_qty_kg, 0) - 0.001) AS carded
         """,
         plan_id,
     )
@@ -3324,6 +3380,19 @@ async def start_job_card(conn, *, job_card_id: int) -> dict:
         """,
         job_card_id,
     )
+
+    # Auto-open a batch so the Output & Accounting form is writable the moment
+    # START lands (status is now 'in_progress', which clears the FE's lifecycle
+    # gate). reuse_if_open=True makes it a no-op when an open batch already
+    # exists (out-of-band open / re-entry) so we never stack phantom opens. This
+    # runs in the /start endpoint's existing transaction, so a JC can never
+    # commit 'in_progress' with no batch — an open failure rolls back the status
+    # flip too. Local import avoids a job_card_v2 <-> job_card_batch_v2 cycle.
+    from app.modules.production.services.job_card_batch_v2 import open_batch
+    batch_res = await open_batch(conn, job_card_id=job_card_id, reuse_if_open=True)
+    if batch_res.get("error"):
+        return batch_res
+
     return {
         "started":     True,
         "job_card_id": job_card_id,
@@ -4593,15 +4662,34 @@ async def get_job_card(conn, job_card_id: int) -> dict | None:
         "end_time":       h.get("end_time"),
         "total_time_min": h.get("total_time_min"),
     }
-    # Latest output row collapses to the legacy single-output section.
+    # section_5_output is the batch-UNAWARE roll-up legacy/v1 clients read
+    # (and the web form's no-batch fallback). It used to be outputs[-1] — the
+    # single most-recently-saved row — so on a multi-batch JC it showed only
+    # the LAST batch's numbers instead of the JC total. Aggregate the LATEST
+    # output per batch (outputs is ordered recorded_at ASC, so the last row
+    # seen per batch_id is that batch's newest save), then SUM across batches.
+    # We take latest-per-batch rather than summing raw rows because output
+    # writes are append-only — summing every row would double-count re-saves.
     last_output = _serialize(outputs[-1]) if outputs else None
+    if outputs:
+        latest_by_batch: dict = {}
+        for _o in outputs:
+            _row = _serialize(_o)
+            latest_by_batch[_row.get("batch_id")] = _row
+        _latest = list(latest_by_batch.values())
+        agg_fg_kg    = sum(_accf(r.get("output_qty_kg"))   for r in _latest)
+        agg_rm       = sum(_accf(r.get("rm_consumed_kg"))  for r in _latest)
+        agg_loss     = sum(_accf(r.get("process_loss_kg")) for r in _latest)
+        _any_units   = any(r.get("output_qty_units") is not None for r in _latest)
+        agg_fg_units = sum(_accf(r.get("output_qty_units")) for r in _latest) if _any_units else None
+        agg_yield    = round((agg_fg_kg / agg_rm) * 100, 3) if agg_rm > 0 else None
     section_5_output = {
         "output_id":       last_output.get("output_id")  if last_output else None,
-        "fg_actual_kg":    last_output.get("output_qty_kg") if last_output else None,
-        "fg_actual_units": int(last_output["output_qty_units"]) if (last_output and last_output.get("output_qty_units") is not None) else None,
-        "rm_consumed_kg":  last_output.get("rm_consumed_kg") if last_output else None,
-        "process_loss_kg": last_output.get("process_loss_kg") if last_output else None,
-        "yield_pct":       last_output.get("yield_pct")  if last_output else None,
+        "fg_actual_kg":    agg_fg_kg    if outputs else None,
+        "fg_actual_units": int(round(agg_fg_units)) if (outputs and agg_fg_units is not None) else None,
+        "rm_consumed_kg":  agg_rm       if outputs else None,
+        "process_loss_kg": agg_loss     if outputs else None,
+        "yield_pct":       agg_yield    if outputs else None,
         "created_at":      last_output.get("recorded_at") if last_output else None,
     }
     # Sign-offs in the legacy list shape (one entry per role).

@@ -81,9 +81,16 @@ async def open_batch(conn, *, job_card_id: int,
                      batch_date: date | None = None,
                      input_qty_kg: float | None = None,
                      batch_label: str | None = None,
-                     notes: str | None = None) -> dict:
+                     notes: str | None = None,
+                     reuse_if_open: bool = False) -> dict:
     """Allocate a new batch row. batch_number = max + 1; batch_date defaults
     to today. Returns {"opened": True, "batch": <row>} or an error dict.
+
+    `reuse_if_open` (opt-in): when the JC already has an open batch, return
+    it instead of stacking another (returns {"opened": False, "reused": True,
+    "batch": <row>}). Used by the START auto-open so a re-entry / refetch can't
+    pile up phantom open batches. The manual /batches/open path leaves this
+    False, preserving the Stage-2 intentional multi-open behaviour below.
 
     Stage 2: multi-open allowed (migration 038 dropped the partial
     UNIQUE).  Concurrent /batches/open calls on the same JC now race
@@ -111,6 +118,20 @@ async def open_batch(conn, *, job_card_id: int,
     )
     if jc is None:
         return {"error": "job_card_not_found"}
+
+    # Idempotent auto-open (opt-in). Runs under the FOR UPDATE above, so
+    # concurrent STARTs serialize on the JC row: the second sees the first's
+    # committed open batch and reuses it instead of inserting another. This is
+    # what stops start_job_card from recreating the phantom-open pile.
+    if reuse_if_open:
+        existing = await conn.fetchrow(
+            "SELECT * FROM job_card_batch_v2 "
+            "WHERE  job_card_id=$1 AND status='open' "
+            "ORDER  BY batch_number DESC LIMIT 1",
+            job_card_id,
+        )
+        if existing is not None:
+            return {"opened": False, "reused": True, "batch": _serialize(existing)}
 
     next_number = await conn.fetchval(
         "SELECT COALESCE(MAX(batch_number), 0) + 1 FROM job_card_batch_v2 "
