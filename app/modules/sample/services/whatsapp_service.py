@@ -102,9 +102,11 @@ are sent as plain session text (no template — the reviewer just messaged us, s
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -470,6 +472,28 @@ async def _store_promote_message(conn, wamid: str, dev_jc_id: int, approver_kind
         logger.exception("Failed to store wa_promote_message for wamid %s", wamid)
 
 
+async def _upsert_promote_reminder(conn, dev_jc_id, approver_kind: str, *, reset: bool) -> None:
+    """Track resend pacing for one promote gate (079). reset=True on the initial send
+    (resend_count → 0, last_sent_at → now); reset=False after a reminder resend (bump
+    the count, restamp). Best-effort — a missing table (079 not applied) or any error
+    must never break the send/loop."""
+    try:
+        if reset:
+            await conn.execute(
+                """INSERT INTO wa_promote_reminder (dev_jc_id, approver_kind, last_sent_at, resend_count)
+                   VALUES ($1, $2, NOW(), 0)
+                   ON CONFLICT (dev_jc_id, approver_kind)
+                     DO UPDATE SET last_sent_at = NOW(), resend_count = 0""",
+                dev_jc_id, approver_kind)
+        else:
+            await conn.execute(
+                """UPDATE wa_promote_reminder SET last_sent_at = NOW(), resend_count = resend_count + 1
+                    WHERE dev_jc_id = $1 AND approver_kind = $2""",
+                dev_jc_id, approver_kind)
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to upsert wa_promote_reminder for %s/%s", dev_jc_id, approver_kind)
+
+
 async def notify_promote_review(conn, *, dev_jc_id, requestor_uid=None) -> None:
     """Message the promote approvers with Approve / Reject buttons: every
     inventory_manager (INV_MGR gate) + the source requisition's requestor BH
@@ -483,6 +507,16 @@ async def notify_promote_review(conn, *, dev_jc_id, requestor_uid=None) -> None:
         bh = await _phone_for_user(conn, requestor_uid)
         if bh:
             targets.append((bh, "REQUESTOR_BH"))
+    # Arm the resend tracker for every PENDING gate on THIS request — independent of
+    # whether a phone resolved right now. A fresh request resets the counter, and the
+    # reminder loop then recovers (starts delivering) once a phone is added to a gate.
+    for g in await conn.fetch(
+            """SELECT DISTINCT a.approver_kind FROM npd_dev_promote_approval a
+                 JOIN npd_dev_promote_request pr ON a.promote_request_id = pr.id
+                WHERE pr.dev_jc_id = $1 AND pr.status = 'PENDING' AND a.status = 'PENDING'""",
+            dev_jc_id):
+        await _upsert_promote_reminder(conn, dev_jc_id, g["approver_kind"], reset=True)
+
     if not targets:
         logger.warning("No promote approvers with a phone for dev JC %s — skipping WhatsApp "
                        "(assign a phone to the inventory_manager / requestor on auth_user)", dev_jc_id)
@@ -500,6 +534,87 @@ async def notify_promote_review(conn, *, dev_jc_id, requestor_uid=None) -> None:
         elif isinstance(resp, dict) and resp.get("error"):
             logger.warning("Promote notify to %s failed: %s (template %s — Approved in "
                            "WhatsApp Manager?)", phone, resp.get("error"), TPL_PROMOTE)
+
+
+async def resend_due_promotes(conn, *, ttl_hours: float, max_resends: int) -> int:
+    """Re-send promote-approval templates for gates still PENDING past the timeout.
+    Driven by promote_reminder_loop. Recipients are re-resolved at send time
+    (INV_MGR → every inventory_manager phone; REQUESTOR_BH → the bound requestor),
+    so a phone added/changed since the first send is picked up. Returns gates re-sent."""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=ttl_hours)
+    due = await conn.fetch(
+        """SELECT r.dev_jc_id, r.approver_kind, a.approver_user_id
+             FROM wa_promote_reminder r
+             JOIN npd_dev_promote_request pr
+               ON pr.dev_jc_id = r.dev_jc_id AND pr.status = 'PENDING'
+             JOIN npd_dev_promote_approval a
+               ON a.promote_request_id = pr.id
+              AND a.approver_kind = r.approver_kind
+              AND a.status = 'PENDING'
+            WHERE r.resend_count < $1 AND r.last_sent_at < $2""",
+        max_resends, cutoff)
+    sent = 0
+    for row in due:
+        dev_jc_id, kind, approver_uid = row["dev_jc_id"], row["approver_kind"], row["approver_user_id"]
+        jc = await conn.fetchrow("SELECT * FROM npd_dev_job_cards WHERE id = $1", dev_jc_id)
+        if jc is None:
+            continue
+        jc = dict(jc)
+        if kind == "INV_MGR":
+            phones = await _phones_for_role(conn, "inventory_manager")
+        else:  # REQUESTOR_BH
+            p = await _phone_for_user(conn, approver_uid)
+            phones = [p] if p else []
+        any_ok = False
+        for phone in phones:
+            try:
+                header, body = _promote_params(jc, _PROMOTE_GATE_LABEL[kind])
+                resp = await _send_template(phone, TPL_PROMOTE, body, header_params=header)
+            except Exception:  # noqa: BLE001 — one bad recipient must not abort the rest
+                logger.exception("Promote resend build/send failed for %s (dev JC %s)", phone, dev_jc_id)
+                continue
+            if _wamid(resp):
+                await _store_promote_message(conn, _wamid(resp), dev_jc_id, kind, phone)
+                any_ok = True
+        if any_ok:
+            await _upsert_promote_reminder(conn, dev_jc_id, kind, reset=False)  # bump count + restamp
+            sent += 1
+        else:
+            # Nothing sent (no phone / all failed) — restamp so we don't re-select every
+            # tick, but don't burn a resend on a non-send (lets it recover once a phone exists).
+            await conn.execute(
+                "UPDATE wa_promote_reminder SET last_sent_at = NOW() "
+                "WHERE dev_jc_id = $1 AND approver_kind = $2", dev_jc_id, kind)
+    return sent
+
+
+async def promote_reminder_loop(pool) -> None:
+    """In-process background loop: periodically re-send promote-approval templates for
+    gates still PENDING past WHATSAPP_PROMOTE_RESEND_HOURS (default 4), up to
+    WHATSAPP_PROMOTE_RESEND_MAX times (default 2). Mirrors the webhook dispatcher_loop.
+    NOTE: only ticks when the app runs as a persistent server (uvicorn/ECS) — on the
+    Lambda/Mangum path it does not run, exactly like dispatcher_loop. Assumes a SINGLE
+    persistent instance (like dispatcher_loop); running several would double-send, since
+    the due-gate SELECT takes no row lock — add FOR UPDATE SKIP LOCKED if that changes."""
+    tick_s = max(60, int(os.environ.get("WHATSAPP_PROMOTE_RESEND_TICK_MIN", "15")) * 60)
+    ttl_h = float(os.environ.get("WHATSAPP_PROMOTE_RESEND_HOURS", "4"))
+    max_n = int(os.environ.get("WHATSAPP_PROMOTE_RESEND_MAX", "2"))
+    logger.info("Promote reminder loop started (tick=%ds, ttl=%.1fh, max=%d)", tick_s, ttl_h, max_n)
+    try:
+        while True:
+            await asyncio.sleep(tick_s)
+            try:
+                if not _wa_enabled() or max_n <= 0:
+                    continue
+                async with pool.acquire() as conn:
+                    n = await resend_due_promotes(conn, ttl_hours=ttl_h, max_resends=max_n)
+                if n:
+                    logger.info("Promote reminder: re-sent %d pending gate(s)", n)
+            except Exception:  # noqa: BLE001 — a bad tick must never kill the loop
+                logger.exception("Promote reminder loop tick failed")
+    except asyncio.CancelledError:
+        logger.info("Promote reminder loop stopped")
+        raise
 
 
 async def _promote_for_wamid(conn, wamid: str | None) -> dict | None:
@@ -560,6 +675,11 @@ async def _apply_promote(conn, user, wa: str, dev_jc_id: int, approver_kind: str
 _PROMOTE_APPROVE_WORDS = {"APPROVE", "APPROVED"}
 _PROMOTE_REJECT_WORDS = {"REJECT", "REJECTED", "DECLINE", "DECLINED"}
 _PROMOTE_VERBS = _PROMOTE_APPROVE_WORDS | _PROMOTE_REJECT_WORDS
+# Bare yes/no synonyms — accepted ONLY as a whole-message reply (a single word), so a
+# multi-word NPD hold reason like "ok, hold this" is never mistaken for an approval.
+# Like the verbs, they only act when the sender has exactly one pending promote gate.
+_PROMOTE_APPROVE_SYNONYMS = {"YES", "Y", "OK", "OKAY", "CONFIRM", "CONFIRMED"}
+_PROMOTE_REJECT_SYNONYMS = {"NO", "N"}
 
 
 async def _resolve_jc_ref(conn, ref: str | None):
@@ -745,20 +865,31 @@ async def handle_inbound(conn, *, from_phone: str, text: str, context_id: str | 
     #     Only engages when the sender actually has a promote to act on, so real NPD-review
     #     traffic still falls through unchanged.
     first = body.split(maxsplit=1)[0].upper() if body else ""
-    if first in _PROMOTE_VERBS:
+    single = body.strip().upper()
+    syn_approve = single in _PROMOTE_APPROVE_SYNONYMS
+    syn_reject = single in _PROMOTE_REJECT_SYNONYMS
+    if first in _PROMOTE_VERBS or syn_approve or syn_reject:
         # A tap quoting a known NPD-REVIEW message is review traffic — leave it alone.
         review_ctx = bool(context_id) and await conn.fetchval(
             "SELECT 1 FROM wa_review_message WHERE wamid = $1", context_id)
-        if not review_ctx:
+        # A bare yes/no synonym must NOT swallow a one-word NPD hold reason: if this phone
+        # has an armed NPD hold, let a synonym-only reply fall through to the review flow.
+        # Real APPROVE/REJECT verbs keep priority. Non-destructive check (does not pop).
+        synonym_only = first not in _PROMOTE_VERBS
+        armed_hold = synonym_only and bool(await conn.fetchval(
+            "SELECT 1 FROM wa_pending_action WHERE wa_phone = $1", wa))
+        if not review_ctx and not armed_hold:
             u = await _resolve_user(conn, wa)
             if u is not None:
                 user = _WaUser(u["user_id"], u["role_name"])
                 parts = body.split(maxsplit=2)
-                jc_ref = parts[1] if len(parts) >= 2 else None
+                # A jc number can only trail an actual verb ("APPROVE 123"); a bare
+                # yes/no synonym is the whole message, so it never carries a ref.
+                jc_ref = parts[1] if (first in _PROMOTE_VERBS and len(parts) >= 2) else None
                 tgt = await _resolve_promote_target(conn, user, jc_ref=jc_ref)
                 if tgt["status"] == "ok":
                     dev_jc_id, kind = tgt["dev_jc_id"], tgt["approver_kind"]
-                    if first in _PROMOTE_REJECT_WORDS:
+                    if first in _PROMOTE_REJECT_WORDS or syn_reject:
                         inline = (parts[2].strip().lstrip(":-").strip()
                                   if jc_ref and len(parts) >= 3 else "")
                         if inline:

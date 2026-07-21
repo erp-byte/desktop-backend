@@ -41,6 +41,7 @@ from app.modules.production.services.master_ingest import run_master_ingest
 from app.webhooks.event_bus import event_bus, Event
 from app.webhooks.dispatcher import dispatcher_loop
 from app.webhooks.broadcaster import broadcaster_loop
+from app.modules.sample.services.whatsapp_service import promote_reminder_loop
 from app.webhooks.router import router as webhook_router
 from app.webhooks.ws_router import router as ws_router
 
@@ -102,6 +103,9 @@ async def lifespan(fastapi_app: FastAPI):
     bg_tasks = []
     bg_tasks.append(asyncio.create_task(dispatcher_loop(pool)))
     bg_tasks.append(asyncio.create_task(broadcaster_loop()))
+    # Resend unanswered promote-approval WhatsApp gates past the timeout. Like the
+    # loops above, this only ticks under a persistent server (uvicorn/ECS), not Lambda.
+    bg_tasks.append(asyncio.create_task(promote_reminder_loop(pool)))
     fastapi_app.state._webhook_tasks = bg_tasks
 
     yield

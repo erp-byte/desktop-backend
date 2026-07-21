@@ -19,9 +19,11 @@ from __future__ import annotations
 
 import logging
 import math
+from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, Query, Request, UploadFile
+from pydantic import BaseModel, Field
 
 from app.core.middleware.request_context import AuthError
 from app.modules.auth.middleware import AuthUser, require_permission
@@ -539,3 +541,73 @@ async def send_qc_intimation(
         invoice_no=body.invoice_no,
     )
     return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 8. POST /api/v1/po/walk-in-intimation  (no-PO / walk-in arrival intimation)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class WalkInItem(BaseModel):
+    sku_id: int | None = None
+    sku_name: str = Field(min_length=1)
+
+
+class WalkInIntimationRequest(BaseModel):
+    entity: str | None = None
+    vendor_name: str | None = None
+    vehicle_number: str | None = None
+    invoice_no: str | None = None
+    items: list[WalkInItem] = Field(min_length=1)
+
+
+@router.post("/walk-in-intimation")
+async def send_walk_in_intimation(
+    request: Request,
+    body: WalkInIntimationRequest,
+    user: AuthUser = Depends(require_permission("purchase", "po", action="edit")),
+):
+    """Record a QC arrival intimation for WALK-IN material that has NO purchase
+    order — articles are chosen from the global SKU master (/so/sku-lookup).
+
+    Mirrors the PO-based intimation but with po_number=None and a generated
+    ``WI-YYYYMMDDHHMMSS`` transaction id so QC can see the arrival as its own
+    group (distinct from PO ``TR-*`` transactions). Notifies QC over WhatsApp
+    (best-effort); arrivals are persisted first so they survive a WA outage.
+    """
+    if body.entity:
+        allowed = await _allowed_entities_for(request, user)
+        _check_entity_allowed(body.entity, allowed)
+
+    walk_in_txn = "WI-" + datetime.now().strftime("%Y%m%d%H%M%S")
+    vendor_name = (body.vendor_name or "").strip() or "Walk-in"
+    vehicle = (body.vehicle_number or "").strip() or None
+    invoice = (body.invoice_no or "").strip() or None
+    article_names = [it.sku_name for it in body.items]
+    lines = [
+        {"sku_id": it.sku_id, "sku_name": it.sku_name, "particulars": None}
+        for it in body.items
+    ]
+
+    pool = request.app.state.db_pool
+    await qc_intimation.record_arrivals(
+        pool,
+        po_number=None,
+        transaction_no=walk_in_txn,
+        supplier_id=None,
+        supplier_name=vendor_name,
+        entity=body.entity,
+        vehicle_no=vehicle,
+        invoice_no=invoice,
+        lines=lines,
+    )
+
+    result = await qc_intimation.send_intimation(
+        pool,
+        po_number=walk_in_txn,
+        vendor_name=vendor_name,
+        article_names=article_names,
+        vehicle_number=vehicle or "",
+        invoice_no=invoice or "",
+    )
+    return {**result, "transaction_no": walk_in_txn}
