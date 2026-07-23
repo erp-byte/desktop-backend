@@ -93,13 +93,33 @@ async def create_requisition(conn, *, payload: dict, user) -> dict:
 
     articles = payload.get("articles") or []
 
+    # Multiple NPD target articles (each its own product + qty). The requisition
+    # HEADER (npd_target_name / pcs / weight_per_piece / quantity) mirrors targets[0]
+    # for backward compat; the full list goes to the child table after insert.
+    targets = payload.get("targets")
+    if not targets and payload.get("npd_target_name"):     # legacy single-target payload
+        targets = [{"name": payload["npd_target_name"], "pcs": payload.get("pcs"),
+                    "weight_per_piece": payload.get("weight_per_piece")}]
+    targets = _derive_targets(targets)
+    if sample_type in ("NPD", "TRIAL") and not targets:
+        raise HTTPException(422, detail={"error": "no_target",
+                                         "message": "At least one target article is required for an NPD/TRIAL requisition",
+                                         "details": {}})
+
     # Quantity is derived from pcs × weight_per_piece when both are given (the NPD
-    # request captures pieces + per-piece weight); otherwise the sent quantity.
-    pcs = payload.get("pcs")
-    wpp = payload.get("weight_per_piece")
-    quantity = payload.get("quantity")
-    if pcs is not None and wpp is not None:
-        quantity = round(float(pcs) * float(wpp), 3)
+    # request captures pieces + per-piece weight); otherwise the sent quantity. When
+    # targets are present the header mirrors target #1.
+    if targets:
+        payload = {**payload, "npd_target_name": targets[0]["name"]}
+        pcs = targets[0].get("pcs")
+        wpp = targets[0].get("weight_per_piece")
+        quantity = targets[0].get("quantity")
+    else:
+        pcs = payload.get("pcs")
+        wpp = payload.get("weight_per_piece")
+        quantity = payload.get("quantity")
+        if pcs is not None and wpp is not None:
+            quantity = round(float(pcs) * float(wpp), 3)
 
     async with conn.transaction():
         # request_id is an app-supplied 8-digit time-based BIGINT (new_short_time_id,
@@ -151,6 +171,7 @@ async def create_requisition(conn, *, payload: dict, user) -> dict:
                 if _attempt == 4:
                     raise
         await _insert_articles(conn, req_id, articles)
+        await _insert_npd_targets(conn, req_id, targets)
         await audit_service.write_audit(
             conn, req_id, audit_service.EV_STATUS_CHANGE,
             new_value={"status": "DRAFT", "request_id": request_id},
@@ -192,8 +213,92 @@ async def _insert_articles(conn, req_id: int, articles: list[dict]) -> None:
         )
 
 
+async def _insert_npd_targets(conn, req_id: int, targets: list[dict], *, replace: bool = False) -> None:
+    """Persist the requisition's NPD target articles (080). replace=True wipes the
+    existing rows first (edit). Best-effort: a missing child table (080 not applied)
+    or a bad row must not break the create/update — the header mirror still carries
+    target #1, so the requisition stays usable. The savepoint keeps a failure here from
+    poisoning the outer transaction (which would then fail write_audit / the header)."""
+    if not targets and not replace:
+        return
+    try:
+        async with conn.transaction():   # savepoint
+            if replace:
+                await conn.execute(
+                    "DELETE FROM sample_requisition_npd_targets WHERE requisition_id = $1", req_id)
+            for i, t in enumerate(targets or []):
+                await conn.execute(
+                    """INSERT INTO sample_requisition_npd_targets
+                           (requisition_id, name, pcs, weight_per_piece, quantity, line_order)
+                       VALUES ($1, $2, $3, $4, $5, $6)""",
+                    req_id, t["name"], t.get("pcs"), t.get("weight_per_piece"),
+                    t.get("quantity"), i)
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to write NPD targets for requisition %s (migration 080 applied?)", req_id)
+
+
+def _derive_targets(targets: list[dict] | None) -> list[dict]:
+    """Normalise a targets payload: copy each row and derive quantity = pcs × weight."""
+    out = [dict(t) for t in (targets or [])]
+    for t in out:
+        tp, tw = t.get("pcs"), t.get("weight_per_piece")
+        t["quantity"] = round(float(tp) * float(tw), 3) if tp is not None and tw is not None else None
+    return out
+
+
+async def _sync_first_npd_target(conn, req_id: int) -> None:
+    """After a HEADER-only target edit (npd_target_name/pcs/weight — e.g. the NPD list
+    page's quick-edit, which doesn't send `targets`), mirror the header onto the FIRST
+    child target row so the detail target list reflects it — leaving targets #2..n
+    untouched. Inserts a row if the requisition had none. Best-effort savepoint."""
+    try:
+        async with conn.transaction():   # savepoint
+            hdr = await conn.fetchrow(
+                "SELECT npd_target_name, pcs, weight_per_piece, quantity "
+                "FROM sample_requisitions WHERE id = $1", req_id)
+            if not hdr or not hdr["npd_target_name"]:
+                return
+            first = await conn.fetchrow(
+                "SELECT id FROM sample_requisition_npd_targets WHERE requisition_id = $1 "
+                "ORDER BY line_order, id LIMIT 1", req_id)
+            if first:
+                await conn.execute(
+                    "UPDATE sample_requisition_npd_targets "
+                    "SET name = $2, pcs = $3, weight_per_piece = $4, quantity = $5 WHERE id = $1",
+                    first["id"], hdr["npd_target_name"], hdr["pcs"], hdr["weight_per_piece"], hdr["quantity"])
+            else:
+                await conn.execute(
+                    """INSERT INTO sample_requisition_npd_targets
+                           (requisition_id, name, pcs, weight_per_piece, quantity, line_order)
+                       VALUES ($1, $2, $3, $4, $5, 0)""",
+                    req_id, hdr["npd_target_name"], hdr["pcs"], hdr["weight_per_piece"], hdr["quantity"])
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to sync first NPD target for requisition %s", req_id)
+
+
+async def _npd_targets_for(conn, req: dict) -> list[dict]:
+    """The requisition's target articles (080). Legacy requisitions (pre-080) have no
+    child rows — synthesize a single target from the header mirror so the UI still
+    shows it. Best-effort read: a missing table degrades to the header synthesis."""
+    rows: list = []
+    try:
+        rows = await conn.fetch(
+            "SELECT id, name, pcs, weight_per_piece, quantity, line_order "
+            "FROM sample_requisition_npd_targets WHERE requisition_id = $1 ORDER BY line_order, id",
+            req["id"])
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to read NPD targets for requisition %s (migration 080 applied?)", req["id"])
+    if rows:
+        return [dict(r) for r in rows]
+    if req.get("npd_target_name"):
+        return [{"name": req["npd_target_name"], "pcs": req.get("pcs"),
+                 "weight_per_piece": req.get("weight_per_piece"), "quantity": req.get("quantity")}]
+    return []
+
+
 async def get_requisition(conn, req_id: int) -> dict:
     req = _require(await _fetch_req(conn, req_id), req_id)
+    req["npd_targets"] = await _npd_targets_for(conn, req)
     articles = await conn.fetch(
         "SELECT * FROM sample_requisition_articles WHERE requisition_id = $1 ORDER BY id",
         req_id)
@@ -274,6 +379,23 @@ async def list_requestors(conn, *, sample_types: list[str] | None = None) -> lis
     return [r["requestor_team"] for r in rows]
 
 
+async def list_business_heads(conn) -> list[str]:
+    """Names of active users holding the business_head role (primary or additional) —
+    feeds the requestor dropdown on the NPD request form, where a sales/admin user raises
+    a requisition ON BEHALF OF a business head."""
+    rows = await conn.fetch(
+        """SELECT DISTINCT u.full_name
+             FROM auth_user u
+             LEFT JOIN auth_role pr ON u.role_id = pr.role_id
+             LEFT JOIN auth_user_role ur ON ur.user_id = u.user_id
+             LEFT JOIN auth_role r ON ur.role_id = r.role_id
+            WHERE COALESCE(u.is_active, TRUE)
+              AND u.full_name IS NOT NULL AND btrim(u.full_name) <> ''
+              AND (pr.role_name = 'business_head' OR r.role_name = 'business_head')
+            ORDER BY u.full_name""")
+    return [r["full_name"] for r in rows]
+
+
 # ---------------------------------------------------------------------------
 # Mutations
 # ---------------------------------------------------------------------------
@@ -290,6 +412,16 @@ async def update_requisition(conn, req_id: int, *, payload: dict, user) -> dict:
         raise HTTPException(422, detail={"error": "invalid_warehouse",
                                          "message": f"warehouse must be one of {WAREHOUSES}",
                                          "details": {"warehouse": new_warehouse}})
+    # Multiple NPD target articles — when the patch sends `targets`, re-derive the
+    # header mirror (npd_target_name / pcs / weight / quantity) from target #1 and
+    # replace the child rows below. targets is None when the patch doesn't touch them.
+    targets = _derive_targets(payload.get("targets")) if payload.get("targets") is not None else None
+    if req["sample_type"] in ("NPD", "TRIAL") and targets is not None and not targets:
+        raise HTTPException(422, detail={"error": "no_target",
+                                         "message": "At least one target article is required"})
+    if targets:
+        payload = {**payload, "npd_target_name": targets[0]["name"],
+                   "pcs": targets[0].get("pcs"), "weight_per_piece": targets[0].get("weight_per_piece")}
     # Recompute quantity from the merged pcs × weight_per_piece (existing values
     # used where the patch omits one). Falls back to the sent quantity otherwise.
     eff_pcs = payload.get("pcs") if payload.get("pcs") is not None else req.get("pcs")
@@ -363,6 +495,11 @@ async def update_requisition(conn, req_id: int, *, payload: dict, user) -> dict:
             await conn.execute(
                 "DELETE FROM sample_requisition_articles WHERE requisition_id = $1", req_id)
             await _insert_articles(conn, req_id, payload["articles"])
+        if targets is not None:
+            await _insert_npd_targets(conn, req_id, targets, replace=True)
+        elif any(payload.get(k) is not None for k in ("npd_target_name", "pcs", "weight_per_piece")):
+            # Header-only target edit (no `targets` sent) — keep child target #1 in sync.
+            await _sync_first_npd_target(conn, req_id)
         await audit_service.write_audit(
             conn, req_id, audit_service.EV_ARTICLE_EDIT,
             actor_user_id=user.user_id, actor_role=user.role_name,

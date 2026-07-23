@@ -33,6 +33,12 @@ class ArticleIn(BaseModel):
     notes: Optional[str] = None
 
 
+class NpdTargetIn(BaseModel):
+    name: str = Field(min_length=1)          # target NPD article name (a new product)
+    pcs: float = Field(gt=0)                 # number of pieces
+    weight_per_piece: float = Field(gt=0)    # kg per piece — quantity derived server-side
+
+
 class RequisitionCreate(BaseModel):
     sample_type: SampleType
     warehouse: Warehouse
@@ -79,6 +85,7 @@ class RequisitionUpdate(BaseModel):
     mode_of_transport: Optional[str] = None
     expected_dispatch_date: Optional[date] = None
     confirmed_dispatch_date: Optional[date] = None
+    targets: Optional[list[NpdTargetIn]] = None   # multiple NPD target articles (replace on edit)
     articles: Optional[list[ArticleIn]] = None
     # Billing checklist (NPD/TRIAL): returnable XOR non_returnable; amount is 0
     # unless paid, else > 0 with at most 2 decimals (Amount2 rejects >2dp).
@@ -109,9 +116,13 @@ NpdWarehouse = Literal["W202", "A185", "A68", "F53", "A101"]
 
 class NpdRequisitionCreate(BaseModel):
     sample_type: NpdSampleType                               # required
-    npd_target_name: str = Field(min_length=1)               # required: target NPD article
-    pcs: float = Field(gt=0)                                 # required: number of pieces
-    weight_per_piece: float = Field(gt=0)                    # required: kg per piece
+    # Multiple target articles, each an independent product. The single-target
+    # fields below MIRROR targets[0] server-side (backward compat). At least one
+    # target is required — via `targets` or the legacy single fields (checked in service).
+    targets: Optional[list[NpdTargetIn]] = None
+    npd_target_name: Optional[str] = Field(default=None, min_length=1)   # legacy single target
+    pcs: Optional[float] = Field(default=None, gt=0)         # legacy single target pieces
+    weight_per_piece: Optional[float] = Field(default=None, gt=0)  # legacy single target kg/pc
     quantity: Optional[float] = None                         # computed server-side = pcs × weight
     warehouse: NpdWarehouse                                  # required
     company_name: str = Field(min_length=1)                  # required
@@ -207,6 +218,17 @@ class NpdLinesReplace(BaseModel):
 # ── Standalone NPD development job cards ───────────────────────────────────
 # Pure R&D, decoupled from sample requisitions. The recipe lines reuse NpdLineIn
 # (same name-based, sku_id-nullable shape as the requisition draft BOM lines).
+
+# One target article on a dev job card (082): its details + its own base BOM + recipe.
+class DevArticleIn(BaseModel):
+    name: str = Field(min_length=1)
+    pcs: Optional[float] = Field(default=None, ge=0)
+    weight_per_piece: Optional[float] = Field(default=None, ge=0)
+    base_bom_id: Optional[int] = None
+    base_bom_name: Optional[str] = None
+    lines: list[NpdLineIn] = Field(default_factory=list)
+
+
 class DevJobCardCreate(BaseModel):
     title: str
     description: Optional[str] = None
@@ -230,6 +252,26 @@ class DevJobCardCreate(BaseModel):
     confirmed_dispatch_date: Optional[date] = None
     clone_from_base: bool = False
     lines: list[NpdLineIn] = Field(default_factory=list)
+    # Per-article develop (082): each article its own product + base BOM + recipe. When
+    # present, the service mirrors article #1 onto the card-level fg_sku_name/pcs/weight.
+    articles: Optional[list[DevArticleIn]] = None
+
+
+class DevArticlesReplace(BaseModel):
+    # Replace ALL target articles + their recipes on a DRAFT/IN_DEVELOPMENT dev job card.
+    articles: list[DevArticleIn] = Field(default_factory=list)
+
+
+class DevCloseArticleIn(BaseModel):
+    # Per-article output + accounting at promote (082/083). Each article's FG is received
+    # into R&D under its own name (its own batch) and this output becomes its dispatchable
+    # balance. article_id identifies which article row these numbers belong to.
+    article_id: int
+    output_qty: Optional[float] = Field(default=None, ge=0)
+    output_uom: Optional[str] = None
+    rm_consumed_qty: Optional[float] = Field(default=None, ge=0)
+    wastage_qty: Optional[float] = Field(default=None, ge=0)
+    extra_give_away_qty: Optional[float] = Field(default=None, ge=0)
 
 
 class DevJobCardClose(BaseModel):
@@ -241,6 +283,9 @@ class DevJobCardClose(BaseModel):
     wastage_qty: Optional[float] = Field(default=None, ge=0)
     extra_give_away_qty: Optional[float] = Field(default=None, ge=0)
     output_notes: Optional[str] = None
+    # Per-article cards (082): the output/accounting entered PER article. When present the
+    # promote fans out — each article receives its own FG + gets its own dispatchable output.
+    articles: Optional[list[DevCloseArticleIn]] = None
 
 
 class PromoteApprovalBody(BaseModel):
@@ -264,6 +309,11 @@ class PromoteEmailReject(BaseModel):
 class DevDispatchBody(BaseModel):
     recipient: Optional[str] = None
     qty: Optional[float] = Field(default=None, ge=0)
+    # Per-article cards (083): dispatch THIS article's finalized output (from its own FG
+    # batch, bounded by its own output_qty). Omit for a legacy single-product card.
+    article_id: Optional[int] = None
+    # Custom unit for this part (084) — e.g. kg / g / pcs / box. Omit → the article's uom.
+    uom: Optional[str] = None
 
 
 # Trial phases (multi-day) on a development job card.

@@ -377,6 +377,19 @@ async def create_npd_requisition(
             conn, payload=payload, user=user)
 
 
+# Business-head names for the requestor dropdown on the NPD request form — a sales/admin
+# user raises a requisition on behalf of a BH. Gated on requisition-create so the whole
+# requesting side (sales / business_head / planner / npd_team / admin) can populate it.
+@router.get("/business-heads")
+async def list_business_heads(
+    request: Request,
+    user: AuthUser = Depends(require_permission("sample", "requisition", action="create")),
+):
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await requisition_service.list_business_heads(conn)
+
+
 @router.get("/requisitions")
 async def list_requisitions(
     request: Request,
@@ -708,6 +721,19 @@ async def replace_dev_lines(
             conn, dev_jc_id, lines=[ln.model_dump() for ln in body.lines], user=user)
 
 
+@router.put("/npd-dev-job-cards/{dev_jc_id}/articles")
+async def replace_dev_articles(
+    request: Request,
+    dev_jc_id: int,
+    body: schemas.DevArticlesReplace,
+    user: AuthUser = Depends(require_permission("sample", "npd", action="create")),
+):
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await npd_dev_service.replace_dev_articles(
+            conn, dev_jc_id, articles=[a.model_dump() for a in body.articles], user=user)
+
+
 @router.post("/npd-dev-job-cards/{dev_jc_id}/start")
 async def start_dev_job_card(
     request: Request,
@@ -758,7 +784,8 @@ async def dispatch_dev_sample(
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
         return await npd_dev_service.dispatch_dev_sample(
-            conn, dev_jc_id, recipient=body.recipient, qty=body.qty, user=user)
+            conn, dev_jc_id, recipient=body.recipient, qty=body.qty, article_id=body.article_id,
+            uom=body.uom, user=user)
 
 
 @router.post("/npd-dev-job-cards/{dev_jc_id}/cancel")

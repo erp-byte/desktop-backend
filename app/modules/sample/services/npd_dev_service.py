@@ -46,7 +46,8 @@ async def _fetch(conn, dev_jc_id: int) -> dict:
 
 async def _insert_lines(conn, dev_jc_id: int, lines: list[dict], *, phase_id=None) -> None:
     """Insert recipe lines. phase_id IS NULL = the card base recipe; a phase_id
-    ties the lines to one trial phase's recipe."""
+    ties the lines to one trial phase's recipe. (Card-level / phase recipes — does NOT
+    reference article_id, so it keeps working whether or not 082 is applied.)"""
     for i, ln in enumerate(lines):
         await conn.execute(
             """
@@ -61,10 +62,98 @@ async def _insert_lines(conn, dev_jc_id: int, lines: list[dict], *, phase_id=Non
             ln.get("line_order", i), ln.get("notes"))
 
 
+async def _insert_article_lines(conn, dev_jc_id: int, article_id: int, lines: list[dict]) -> None:
+    """Insert one target article's trial-recipe lines (082 — carries article_id). Separate
+    from _insert_lines so the card/phase recipe inserts never reference the article_id
+    column, isolating the 082 dependency to the per-article create path only."""
+    for i, ln in enumerate(lines):
+        await conn.execute(
+            """
+            INSERT INTO npd_dev_job_card_lines
+                (dev_jc_id, article_id, sku_id, sku_name, qty, uom, item_type,
+                 ownership, is_off_master, customer_lot_ref, received_qty, line_order, notes)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            """,
+            dev_jc_id, article_id, ln.get("sku_id"), ln["sku_name"], ln["qty"], ln["uom"], ln.get("item_type"),
+            ln.get("ownership", "OWN"), ln.get("is_off_master", False),
+            ln.get("customer_lot_ref"), ln.get("received_qty"),
+            ln.get("line_order", i), ln.get("notes"))
+
+
+async def _is_per_article(conn, dev_jc_id: int) -> bool:
+    """True if the card develops target ARTICLES (082) rather than one card-level recipe.
+    Best-effort — 082 not applied → no article rows → False. The probe runs in its own
+    savepoint so a missing-table error (082 absent) rolls back cleanly instead of poisoning
+    an enclosing transaction (this is called inside _finalize_promote's promote txn)."""
+    try:
+        async with conn.transaction():
+            return bool(await conn.fetchval(
+                "SELECT 1 FROM npd_dev_job_card_articles WHERE dev_jc_id = $1 LIMIT 1", dev_jc_id))
+    except Exception:  # noqa: BLE001 — 082 not applied
+        return False
+
+
+async def _write_dev_articles(conn, dev_jc_id: int, articles: list[dict], *, uom=None) -> None:
+    """Insert each target article (082) + its own trial recipe. Each article's recipe
+    comes from its explicit `lines`, else a clone of its base BOM's lines. article_id is
+    an app-supplied 8-digit BIGINT (new_short_time_id) with per-row collision retry."""
+    # Each article promotes into its own live BOM keyed by name (only one active BOM per
+    # fg_sku_name). Two same-named articles would silently supersede each other on promote —
+    # article #1's BOM deactivated by article #2 — so reject the clash up front.
+    names = [(a.get("name") or "").strip() for a in articles]
+    if len(set(names)) != len(names):
+        raise HTTPException(422, detail={"error": "duplicate_article_name",
+            "message": "Two articles share the same target product name — each must be unique (each becomes its own BOM)",
+            "details": {}})
+    for idx, a in enumerate(articles):
+        article_id = None
+        for _attempt in range(5):
+            cand = new_short_time_id()
+            try:
+                async with conn.transaction():
+                    await conn.execute(
+                        """INSERT INTO npd_dev_job_card_articles
+                               (article_id, dev_jc_id, name, pcs, weight_per_piece, quantity, uom,
+                                base_bom_id, base_bom_name, line_order)
+                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)""",
+                        cand, dev_jc_id, a["name"], a.get("pcs"), a.get("weight_per_piece"),
+                        a.get("quantity"), uom, a.get("base_bom_id"), a.get("base_bom_name"), idx)
+                article_id = cand
+                break
+            except asyncpg.UniqueViolationError:
+                if _attempt == 4:
+                    raise
+        # The frontend replicates the base-BOM recipe client-side and sends it in `lines`,
+        # so each article's recipe is always explicit — no server-side per-article clone.
+        a_lines = a.get("lines") or []
+        if a_lines:
+            await _insert_article_lines(conn, dev_jc_id, article_id, a_lines)
+
+
 async def create_dev_job_card(conn, *, payload: dict, user) -> dict:
-    """Create a standalone NPD development job card (optionally cloning a base BOM)."""
+    """Create a standalone NPD development job card. It develops one or more target
+    ARTICLES (082), each its own product with its own base BOM + trial recipe; the
+    card-level fg_sku_name / pcs / weight / target_qty / base_bom_id MIRROR article #1.
+    A legacy single-product payload (no `articles`) keeps the old card-base-recipe path,
+    so it works whether or not 082 is applied."""
     await npd_auth.require_npd_authorized(conn, user, "AUTHOR")
-    base_bom_id = payload.get("base_bom_id")
+    # Per-article path when `articles` is sent; else the legacy single-product mirror.
+    articles = payload.get("articles")
+    if articles:
+        articles = [dict(a) for a in articles]
+        for a in articles:
+            p, w = a.get("pcs"), a.get("weight_per_piece")
+            a["quantity"] = round(float(p) * float(w), 3) if p is not None and w is not None else None
+        first = articles[0]
+        base_bom_id = first.get("base_bom_id")
+        fg_sku_name = first.get("name")
+        target_qty = first.get("quantity")
+        mirror_pcs, mirror_wpp = first.get("pcs"), first.get("weight_per_piece")
+    else:
+        base_bom_id = payload.get("base_bom_id")
+        fg_sku_name = payload.get("fg_sku_name")
+        target_qty = payload.get("target_qty")
+        mirror_pcs = mirror_wpp = None   # taken from cust (source req) below
     async with conn.transaction():
         src_req = payload.get("source_requisition_id")
         # Customer + dispatch planning is attached to the job card: inherit each
@@ -105,12 +194,13 @@ async def create_dev_job_card(conn, *, payload: dict, user) -> dict:
                         """,
                         cand, payload["title"], payload.get("description"),
                         payload.get("warehouse"), base_bom_id, payload.get("fg_sku_id"),
-                        payload.get("fg_sku_name"), payload.get("target_qty"),
+                        fg_sku_name, target_qty,
                         payload.get("uom"), src_req,
                         cust["company_name"], cust["customer_name"], cust["customer_contact"],
                         cust["customer_ship_to_address"], cust["mode_of_transport"],
                         cust["expected_dispatch_date"], cust["confirmed_dispatch_date"],
-                        cust["pcs"], cust["weight_per_piece"],
+                        (mirror_pcs if articles else cust["pcs"]),
+                        (mirror_wpp if articles else cust["weight_per_piece"]),
                         # Billing inherited from the source requisition (NULL for a
                         # standalone/sourceless card — read-only copy, 072 is the source of truth).
                         cust["returnable"], cust["non_returnable"], cust["paid"], cust["amount"],
@@ -128,7 +218,9 @@ async def create_dev_job_card(conn, *, payload: dict, user) -> dict:
                 "UPDATE sample_requisitions SET linked_dev_jc_id = $1, updated_at = NOW() WHERE id = $2",
                 dev_jc_id, src_req)
 
-        if payload.get("clone_from_base") and base_bom_id:
+        if articles:
+            await _write_dev_articles(conn, dev_jc_id, articles, uom=payload.get("uom"))
+        elif payload.get("clone_from_base") and base_bom_id:
             base_lines = await conn.fetch(
                 "SELECT * FROM bom_line WHERE bom_id = $1 ORDER BY line_number", base_bom_id)
             await _insert_lines(conn, dev_jc_id, [
@@ -141,12 +233,84 @@ async def create_dev_job_card(conn, *, payload: dict, user) -> dict:
     return await get_dev_job_card(conn, dev_jc_id)
 
 
+async def replace_dev_articles(conn, dev_jc_id: int, *, articles: list[dict], user) -> dict:
+    """Replace ALL target articles + their recipes on a DRAFT/IN_DEVELOPMENT card (082),
+    and re-mirror the card header (fg_sku_name/pcs/weight/target_qty/base_bom_id) from
+    article #1. Deleting the article rows cascades their recipe lines (article_id FK)."""
+    jc = await _fetch(conn, dev_jc_id)
+    if jc["status"] not in ("DRAFT", "IN_DEVELOPMENT"):
+        raise HTTPException(409, detail={"error": "not_editable",
+                                         "message": "Articles are editable only while the card is DRAFT or IN_DEVELOPMENT",
+                                         "details": {"status": jc["status"]}})
+    await npd_auth.require_npd_authorized(conn, user, "AUTHOR")
+    arts = [dict(a) for a in (articles or [])]
+    for a in arts:
+        p, w = a.get("pcs"), a.get("weight_per_piece")
+        a["quantity"] = round(float(p) * float(w), 3) if p is not None and w is not None else None
+    if not arts:
+        raise HTTPException(422, detail={"error": "no_article",
+                                         "message": "A per-article dev job card needs at least one article",
+                                         "details": {}})
+    async with conn.transaction():
+        await conn.execute("DELETE FROM npd_dev_job_card_articles WHERE dev_jc_id = $1", dev_jc_id)
+        # Also clear any stale legacy card-level base recipe (article_id IS NULL AND
+        # phase_id IS NULL) — a card first created via the single-product path then edited
+        # into articles would otherwise keep those lines and pollute reads + promote.
+        await conn.execute(
+            "DELETE FROM npd_dev_job_card_lines WHERE dev_jc_id = $1 "
+            "AND article_id IS NULL AND phase_id IS NULL", dev_jc_id)
+        # And any trial phases (+ their lines, ON DELETE CASCADE): per-article cards don't
+        # use phases, so a legacy card with phases converted here would otherwise be left
+        # hasArticles && hasPhases — which hides BOTH promote surfaces (a dead-end).
+        await conn.execute("DELETE FROM npd_dev_job_card_phases WHERE dev_jc_id = $1", dev_jc_id)
+        await _write_dev_articles(conn, dev_jc_id, arts, uom=jc.get("uom"))
+        first = arts[0]
+        await conn.execute(
+            """UPDATE npd_dev_job_cards
+                  SET fg_sku_name = $2, base_bom_id = $3, pcs = $4, weight_per_piece = $5,
+                      target_qty = $6, updated_at = NOW()
+                WHERE id = $1""",
+            dev_jc_id, first["name"], first.get("base_bom_id"), first.get("pcs"),
+            first.get("weight_per_piece"), first.get("quantity"))
+    return await get_dev_job_card(conn, dev_jc_id)
+
+
+async def _dev_articles_for(conn, jc: dict, all_lines: list[dict]) -> list[dict]:
+    """The card's target articles (082) with each one's own base recipe lines. Legacy
+    cards (no article rows, or 082 not applied → read raises) synthesize a single article
+    from the card header + the card-level base recipe, so the UI still shows one article."""
+    rows: list = []
+    try:
+        rows = await conn.fetch(
+            "SELECT * FROM npd_dev_job_card_articles WHERE dev_jc_id = $1 ORDER BY line_order, article_id",
+            jc["id"])
+    except Exception:  # noqa: BLE001 — 082 not applied → degrade to the header synthesis
+        rows = []
+    if rows:
+        out = []
+        for r in rows:
+            a = dict(r)
+            a["lines"] = [l for l in all_lines
+                          if l.get("article_id") == a["article_id"] and l.get("phase_id") is None]
+            out.append(a)
+        return out
+    if jc.get("fg_sku_name") or jc.get("base_bom_id"):
+        return [{"article_id": None, "name": jc.get("fg_sku_name") or jc.get("title"),
+                 "pcs": jc.get("pcs"), "weight_per_piece": jc.get("weight_per_piece"),
+                 "quantity": jc.get("target_qty"), "uom": jc.get("uom"),
+                 "base_bom_id": jc.get("base_bom_id"), "base_bom_name": jc.get("base_bom_name"),
+                 "lines": [l for l in all_lines
+                           if l.get("phase_id") is None and l.get("article_id") is None]}]
+    return []
+
+
 async def get_dev_job_card(conn, dev_jc_id: int) -> dict:
     jc = await _fetch(conn, dev_jc_id)
     all_lines = [dict(r) for r in await conn.fetch(
         "SELECT * FROM npd_dev_job_card_lines WHERE dev_jc_id = $1 ORDER BY line_order, id", dev_jc_id)]
-    # Card base recipe = lines with no phase; each phase carries its own recipe.
-    jc["lines"] = [l for l in all_lines if l.get("phase_id") is None]
+    # Card base recipe = lines with no phase AND no article; each phase / article
+    # carries its own recipe (article_id may be absent when 082 isn't applied → None).
+    jc["lines"] = [l for l in all_lines if l.get("phase_id") is None and l.get("article_id") is None]
     # Open phases at the top (the active one first), completed phases at the
     # bottom: IN_PROGRESS -> PENDING -> COMPLETED, then by phase_number.
     phases = [dict(r) for r in await conn.fetch(
@@ -177,6 +341,19 @@ async def get_dev_job_card(conn, dev_jc_id: int) -> dict:
     jc["base_bom_name"] = (
         await conn.fetchval("SELECT fg_sku_name FROM bom_header WHERE bom_id = $1", jc["base_bom_id"])
         if jc.get("base_bom_id") else None)
+    # Target articles (082) + each one's own trial recipe. Legacy cards (no article rows,
+    # or 082 not applied) synthesize a single article from the card header + base recipe.
+    jc["articles"] = await _dev_articles_for(conn, jc, all_lines)
+    # Per-article dispatch balances (083): each article dispatches its OWN finalized output
+    # from its own FG batch, so attach its own ledger rows + dispatched_total + remaining_qty
+    # (article_id is absent from the dispatch rows when 083 isn't applied → .get() → None).
+    for a in jc["articles"]:
+        if a.get("article_id") is not None:
+            a_disp = [d for d in dispatches if d.get("article_id") == a["article_id"]]
+            a["dispatches"] = a_disp
+            a_total = sum(float(d["qty"]) for d in a_disp)
+            a["dispatched_total"] = a_total
+            a["remaining_qty"] = float(a.get("output_qty") or 0) - a_total
     # Pending dual-approval promote gate (None if no live request). Lets the
     # frontend render the two gate rows + their statuses. Best-effort: a couple
     # of SELECTs against the 069/070 tables.
@@ -352,12 +529,28 @@ async def start_development(conn, dev_jc_id: int, *, user) -> dict:
                                          "message": "Only a DRAFT development job card can be started",
                                          "details": {"status": jc["status"]}})
     await npd_auth.require_npd_authorized(conn, user, "AUTHOR")
-    n = await conn.fetchval(
-        "SELECT COUNT(*) FROM npd_dev_job_card_lines WHERE dev_jc_id = $1", dev_jc_id)
-    if not n:
-        raise HTTPException(422, detail={"error": "empty_recipe",
-                                         "message": "Add at least one recipe line before starting development",
-                                         "details": {"id": dev_jc_id}})
+    if await _is_per_article(conn, dev_jc_id):
+        # Per-article card: EVERY article must carry its own recipe (article_id lines) — an
+        # article with an empty recipe would otherwise pass the card-wide count here and only
+        # fail at promote (empty BOM). Catch it now, naming the offending article(s).
+        empties = await conn.fetch(
+            """SELECT a.name FROM npd_dev_job_card_articles a
+                WHERE a.dev_jc_id = $1
+                  AND NOT EXISTS (SELECT 1 FROM npd_dev_job_card_lines l
+                                   WHERE l.article_id = a.article_id AND l.phase_id IS NULL)
+                ORDER BY a.line_order, a.article_id""", dev_jc_id)
+        if empties:
+            names = ", ".join(e["name"] for e in empties)
+            raise HTTPException(422, detail={"error": "empty_recipe",
+                                             "message": f"Add a recipe to every article before starting — no recipe yet on: {names}",
+                                             "details": {"articles": [e["name"] for e in empties]}})
+    else:
+        n = await conn.fetchval(
+            "SELECT COUNT(*) FROM npd_dev_job_card_lines WHERE dev_jc_id = $1", dev_jc_id)
+        if not n:
+            raise HTTPException(422, detail={"error": "empty_recipe",
+                                             "message": "Add at least one recipe line before starting development",
+                                             "details": {"id": dev_jc_id}})
     await conn.execute(
         """UPDATE npd_dev_job_cards
               SET status = 'IN_DEVELOPMENT', started_by = $1, started_at = NOW(), updated_at = NOW()
@@ -391,6 +584,12 @@ async def add_phase(conn, dev_jc_id: int, *, name: str, clone_from_phase_id=None
         raise HTTPException(409, detail={"error": "wrong_status",
                                          "message": "Phases can be added only while the card is a DRAFT or IN_DEVELOPMENT",
                                          "details": {"status": jc["status"]}})
+    # Per-article cards (082) develop each article's own recipe directly — no shared trial
+    # phases (they'd merge every article's phase_id-IS-NULL lines into one phase's clone).
+    if await _is_per_article(conn, dev_jc_id):
+        raise HTTPException(409, detail={"error": "per_article_card",
+                                         "message": "This card develops per-article recipes — trial phases don't apply",
+                                         "details": {"dev_jc_id": dev_jc_id}})
     await npd_auth.require_npd_authorized(conn, user, "AUTHOR")
     async with conn.transaction():
         n = await conn.fetchval(
@@ -528,10 +727,43 @@ async def delete_phase(conn, dev_jc_id: int, phase_id: int, *, user) -> dict:
     return await get_dev_job_card(conn, dev_jc_id)
 
 
+async def _mint_bom(conn, *, fg_name: str, lines, note: str) -> int:
+    """Promote one recipe into a live bom_header + bom_line, returning the new bom_id.
+    Only ONE active BOM is allowed per fg_sku_name (uq_bom_header_active_fg), so supersede
+    any existing active BOM for this FG and mint the NEXT version (a repeated promote bumps
+    the version rather than 500'ing on the unique constraint)."""
+    await conn.execute(
+        "UPDATE bom_header SET is_active = FALSE WHERE fg_sku_name = $1 AND is_active = TRUE", fg_name)
+    next_ver = await conn.fetchval(
+        "SELECT COALESCE(MAX(version), 0) + 1 FROM bom_header WHERE fg_sku_name = $1", fg_name)
+    try:
+        new_bom_id = await conn.fetchval(
+            """INSERT INTO bom_header (fg_sku_name, version, is_active, entity, notes)
+               VALUES ($1, $2, TRUE, $3, $4) RETURNING bom_id""",
+            fg_name, next_ver, _BOM_ENTITY, note)
+    except asyncpg.UniqueViolationError as e:
+        raise HTTPException(409, detail={
+            "error": "bom_conflict",
+            "message": f"Couldn't promote — a live BOM for '{fg_name}' already exists. "
+                       "Rename the target product or deactivate the existing BOM.",
+            "details": {"fg_sku_name": fg_name}}) from e
+    for i, ln in enumerate(lines, 1):
+        await conn.execute(
+            """INSERT INTO bom_line
+                   (bom_id, line_number, material_sku_name, item_type, quantity_per_unit, uom)
+               VALUES ($1, $2, $3, $4, $5, $6)""",
+            new_bom_id, i, ln["sku_name"], ln["item_type"] or "rm", ln["qty"], ln["uom"])
+    return new_bom_id
+
+
 async def _finalize_promote(conn, dev_jc_id, *, promote_phase_id, close_payload: dict, user) -> dict:
     """IN_DEVELOPMENT -> CLOSED: record the trial output AND promote the recipe
     into a live bom_header + bom_line. Returns the closed job card with its
     promoted_bom_id set.
+
+    A per-article card (082) fans out — each article's own recipe is promoted into its
+    OWN live BOM (article.promoted_bom_id), and the card's promoted_bom_id MIRRORS
+    article #1. A single-recipe card promotes the chosen phase (else the card base recipe).
 
     This is the real promote body, run only once the dual-approval gate clears
     (see promote_approval_service.finalize_if_ready). It assumes it is authorized
@@ -546,34 +778,18 @@ async def _finalize_promote(conn, dev_jc_id, *, promote_phase_id, close_payload:
         raise HTTPException(409, detail={"error": "wrong_status",
                                          "message": "Job card is no longer IN_DEVELOPMENT",
                                          "details": {"status": jc["status"]}})
-    # Promote the recipe of the operator-chosen FINAL-TRIAL phase; fall back to
-    # the card base recipe (phase_id IS NULL) when no phase is given (a legacy /
-    # no-phase card). When a phase is chosen the card's output + accounting are
-    # INHERITED from that phase (already recorded when it was completed) — the
-    # close is a "pick the final trial and finish" step, not a second accounting
-    # entry. The card-level payload accounting is only used for no-phase cards.
-    phase = None
-    if promote_phase_id is not None:
-        phase = await _fetch_phase(conn, dev_jc_id, promote_phase_id)   # 404 if not on this card
-        lines = await conn.fetch(
-            "SELECT * FROM npd_dev_job_card_lines WHERE dev_jc_id = $1 AND phase_id = $2 "
-            "ORDER BY line_order, id", dev_jc_id, promote_phase_id)
-        if not lines:
-            raise HTTPException(422, detail={"error": "empty_recipe",
-                                             "message": "The chosen phase has no recipe lines to promote",
-                                             "details": {"phase_id": promote_phase_id}})
-    else:
-        lines = await conn.fetch(
-            "SELECT * FROM npd_dev_job_card_lines WHERE dev_jc_id = $1 AND phase_id IS NULL "
-            "ORDER BY line_order, id", dev_jc_id)
-        if not lines:
-            raise HTTPException(422, detail={"error": "empty_recipe",
-                                             "message": "Cannot close — pick a phase whose recipe to promote",
-                                             "details": {"id": dev_jc_id}})
-
+    # Per-article card (082) → each article promotes its own recipe into its own BOM.
+    per_article = await _is_per_article(conn, dev_jc_id)
     fg_name = jc["fg_sku_name"] or jc["title"]
+
+    # Accounting: a chosen FINAL-TRIAL phase's recorded output is INHERITED verbatim (the
+    # close is "pick the final trial and finish", not a second entry). No-phase single-product
+    # cards take the top-level close payload; per-article cards take the per-article `articles`
+    # output list (each article its own output → its own FG batch → its own dispatch balance).
+    phase = None
+    if not per_article and promote_phase_id is not None:
+        phase = await _fetch_phase(conn, dev_jc_id, promote_phase_id)   # 404 if not on this card
     if phase is not None:
-        # Inherit the final-trial phase's recorded output + accounting verbatim.
         out_qty = phase["output_qty"]
         out_uom = phase["output_uom"]
         rm_consumed = phase["rm_consumed_qty"]
@@ -581,8 +797,7 @@ async def _finalize_promote(conn, dev_jc_id, *, promote_phase_id, close_payload:
         ega = phase["extra_give_away_qty"]
         yield_pct = phase["yield_pct"]
     else:
-        # Legacy no-phase card — accounting comes from the close payload. Auto
-        # yield % = FG output / RM consumed × 100; falls back to supplied yield_pct.
+        # Auto yield % = FG output / RM consumed × 100; falls back to supplied yield_pct.
         out_qty = close_payload.get("output_qty")
         out_uom = close_payload.get("output_uom")
         rm_consumed = close_payload.get("rm_consumed_qty")
@@ -593,49 +808,104 @@ async def _finalize_promote(conn, dev_jc_id, *, promote_phase_id, close_payload:
             yield_pct = round(float(out_qty) / float(rm_consumed) * 100, 2)
     out_notes = close_payload.get("output_notes")
     async with conn.transaction():
-        # Promote the trial recipe into a live BOM. Only ONE active BOM is allowed
-        # per fg_sku_name (uq_bom_header_active_fg), and (fg_sku_name, version) is
-        # unique among active rows — so supersede any existing active BOM for this
-        # FG and mint the NEXT version, rather than always inserting version 1
-        # (which 500'd with a UniqueViolation on a repeated FG name).
-        await conn.execute(
-            "UPDATE bom_header SET is_active = FALSE WHERE fg_sku_name = $1 AND is_active = TRUE", fg_name)
-        next_ver = await conn.fetchval(
-            "SELECT COALESCE(MAX(version), 0) + 1 FROM bom_header WHERE fg_sku_name = $1", fg_name)
-        try:
-            new_bom_id = await conn.fetchval(
-                """
-                INSERT INTO bom_header (fg_sku_name, version, is_active, entity, notes)
-                VALUES ($1, $2, TRUE, $3, $4)
-                RETURNING bom_id
-                """,
-                fg_name, next_ver, _BOM_ENTITY,
-                f"Promoted from NPD development job card {jc['id']} (v{next_ver})")
-        except asyncpg.UniqueViolationError as e:
-            raise HTTPException(409, detail={
-                "error": "bom_conflict",
-                "message": f"Couldn't promote — a live BOM for '{fg_name}' already exists. "
-                           "Rename the target product or deactivate the existing BOM.",
-                "details": {"fg_sku_name": fg_name}}) from e
-        for i, ln in enumerate(lines, 1):
-            await conn.execute(
-                """
-                INSERT INTO bom_line
-                    (bom_id, line_number, material_sku_name, item_type, quantity_per_unit, uom)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                """,
-                new_bom_id, i, ln["sku_name"], ln["item_type"] or "rm", ln["qty"], ln["uom"])
+        if per_article:
+            # Promote EACH article's own recipe (article_id = X, phase_id IS NULL) into its
+            # own live BOM, AND receive its own finished FG sample into R&D (its own batch).
+            # The card header MIRRORS the totals across articles (display + legacy columns).
+            arts = [dict(r) for r in await conn.fetch(
+                "SELECT * FROM npd_dev_job_card_articles WHERE dev_jc_id = $1 ORDER BY line_order, article_id",
+                dev_jc_id)]
+            all_lines = [dict(r) for r in await conn.fetch(
+                "SELECT * FROM npd_dev_job_card_lines WHERE dev_jc_id = $1 ORDER BY line_order, id", dev_jc_id)]
+            if not arts:  # defensive — never close a per-article card with no BOM minted
+                raise HTTPException(422, detail={"error": "no_article",
+                                                 "message": "This card has no articles to promote",
+                                                 "details": {"id": dev_jc_id}})
+            # Per-article output/accounting from the close payload, keyed by article_id.
+            art_out = {int(o["article_id"]): o for o in (close_payload.get("articles") or [])
+                       if o.get("article_id") is not None}
+            new_bom_id = fg_batch_id = None
+            sum_out = sum_rm = sum_waste = sum_ega = 0.0
+            for a in arts:
+                a_lines = [l for l in all_lines
+                           if l.get("article_id") == a["article_id"] and l.get("phase_id") is None]
+                if not a_lines:
+                    raise HTTPException(422, detail={"error": "empty_recipe",
+                                                     "message": f"Article '{a['name']}' has no recipe to promote",
+                                                     "details": {"article_id": a["article_id"]}})
+                bom_id = await _mint_bom(conn, fg_name=a["name"], lines=a_lines,
+                                         note=f"Promoted from NPD development job card {jc['id']} · article {a['name']}")
+                o = art_out.get(a["article_id"], {})
+                a_out = o.get("output_qty")
+                a_uom = o.get("output_uom") or jc["uom"] or "kg"
+                a_rm = o.get("rm_consumed_qty")
+                a_waste = o.get("wastage_qty")
+                a_ega = o.get("extra_give_away_qty")
+                a_yield = (round(float(a_out) / float(a_rm) * 100, 2)
+                           if a_out is not None and a_rm not in (None, 0) and float(a_rm) > 0 else None)
+                # Each article's finished FG into R&D — its own batch, keyed by article_id.
+                # Uses a DISTINCT reference_type ('_ART') so the batch id lives in a disjoint
+                # namespace from the card-level FGSMP-NPD_DEV_JC-<dev_jc_id> batch — article_id
+                # and dev_jc_id are independent 8-digit id spaces that can otherwise collide
+                # on the same FGSMP id (create_batch would DO NOTHING and bind the wrong stock).
+                a_batch = None
+                if a_out and float(a_out) > 0:
+                    recv = await inv.receive_fg_sample(
+                        conn, sku_name=a["name"], qty_kg=float(a_out),
+                        reference_type="NPD_DEV_JC_ART", reference_id=a["article_id"], entity=_BOM_ENTITY,
+                        uom=a_uom, lot_number=str(jc["id"]), user=user)
+                    a_batch = recv["batch_id"]
+                await conn.execute(
+                    """UPDATE npd_dev_job_card_articles
+                          SET promoted_bom_id = $1, status = 'CLOSED', output_qty = $2, output_uom = $3,
+                              rm_consumed_qty = $4, wastage_qty = $5, extra_give_away_qty = $6,
+                              yield_pct = $7, fg_sample_batch_id = $8
+                        WHERE article_id = $9""",
+                    bom_id, a_out, a_uom, a_rm, a_waste, a_ega, a_yield, a_batch, a["article_id"])
+                if new_bom_id is None:
+                    new_bom_id, fg_batch_id = bom_id, a_batch   # card mirrors article #1
+                sum_out += float(a_out or 0)
+                sum_rm += float(a_rm or 0)
+                sum_waste += float(a_waste or 0)
+                sum_ega += float(a_ega or 0)
+            # Card header mirror = TOTALS across articles (card-level Output card + 046 mirror
+            # columns). Per-article dispatch uses each article's own batch, not this fg_batch_id.
+            out_qty = sum_out or None
+            out_uom = jc["uom"]
+            rm_consumed = sum_rm or None
+            wastage = sum_waste or None
+            ega = sum_ega or None
+            yield_pct = round(sum_out / sum_rm * 100, 2) if sum_out and sum_rm else None
+        else:
+            # Single-recipe card: the chosen final-trial phase, else the card base recipe.
+            if phase is not None:
+                lines = await conn.fetch(
+                    "SELECT * FROM npd_dev_job_card_lines WHERE dev_jc_id = $1 AND phase_id = $2 "
+                    "ORDER BY line_order, id", dev_jc_id, promote_phase_id)
+                empty_msg = "The chosen phase has no recipe lines to promote"
+            else:
+                lines = await conn.fetch(
+                    "SELECT * FROM npd_dev_job_card_lines WHERE dev_jc_id = $1 AND phase_id IS NULL "
+                    "ORDER BY line_order, id", dev_jc_id)
+                empty_msg = "Cannot close — pick a phase whose recipe to promote"
+            if not lines:
+                raise HTTPException(422, detail={"error": "empty_recipe", "message": empty_msg,
+                                                 "details": {"id": dev_jc_id}})
+            new_bom_id = await _mint_bom(conn, fg_name=fg_name, lines=lines,
+                                         note=f"Promoted from NPD development job card {jc['id']}")
 
         # Step B (NPD plan §1) — receive the finished trial sample into the R&D
-        # location when an output quantity was recorded.
-        fg_batch_id = None
-        if out_qty and float(out_qty) > 0:
-            recv = await inv.receive_fg_sample(
-                conn, sku_name=fg_name, qty_kg=float(out_qty),
-                reference_type="NPD_DEV_JC", reference_id=dev_jc_id, entity=_BOM_ENTITY,
-                uom=(out_uom or jc["uom"] or "kg"),
-                lot_number=str(jc["id"]), user=user)
-            fg_batch_id = recv["batch_id"]
+        # location when an output quantity was recorded. Single-product card only: a
+        # per-article card already received each article's own FG above (fg_batch_id set).
+        if not per_article:
+            fg_batch_id = None
+            if out_qty and float(out_qty) > 0:
+                recv = await inv.receive_fg_sample(
+                    conn, sku_name=fg_name, qty_kg=float(out_qty),
+                    reference_type="NPD_DEV_JC", reference_id=dev_jc_id, entity=_BOM_ENTITY,
+                    uom=(out_uom or jc["uom"] or "kg"),
+                    lot_number=str(jc["id"]), user=user)
+                fg_batch_id = recv["batch_id"]
 
         await conn.execute(
             """
@@ -678,14 +948,20 @@ async def request_promote(conn, dev_jc_id, *, payload: dict, user) -> dict:
     return await pas.open_promote_request(conn, dev_jc_id, payload=payload, user=user)
 
 
-async def dispatch_dev_sample(conn, dev_jc_id: int, *, recipient: str | None, qty, user) -> dict:
-    """Section 2 Step C — issue the developed FG sample out of the R&D location
-    (265) to a recipient, IN PARTS. A CLOSED card's finalized output can be
-    dispatched over multiple partial outs — each is one npd_dev_dispatch row + one
-    265 Goods Issue + its own outpass, and the running total is bounded by
-    output_qty (the SELECT … FOR UPDATE on the card makes the sum-check race-safe).
-    The card stays CLOSED; the dispatch_* columns mirror the LATEST partial. Omit
-    qty to dispatch the whole remaining balance."""
+async def dispatch_dev_sample(conn, dev_jc_id: int, *, recipient: str | None, qty, user,
+                              article_id: int | None = None, uom: str | None = None) -> dict:
+    """Section 2 Step C — issue the developed FG sample out of the R&D location (265) to a
+    recipient, IN PARTS. A CLOSED card's finalized output is dispatched over multiple partial
+    outs — each is one npd_dev_dispatch row + one 265 Goods Issue + its own outpass.
+
+    Per-article card (083): pass article_id to dispatch THAT article's own finalized output
+    from ITS own FG batch, bounded by ITS own output_qty. A single-product card omits it (the
+    card-level FG batch + the 046 dispatch_* mirror). The SELECT … FOR UPDATE on the card
+    serializes the sum-check either way. Omit qty to dispatch the whole remaining balance.
+
+    uom (084) is the custom unit for THIS part (else the article/card uom). ponytail: it's a
+    per-part label used on the 265 doc + the outpass — the qty is NOT unit-converted, so the
+    remaining balance stays in the article's output unit and the bound is numeric."""
     async with conn.transaction():
         jc = await conn.fetchrow(
             "SELECT * FROM npd_dev_job_cards WHERE id = $1 FOR UPDATE", dev_jc_id)
@@ -697,18 +973,51 @@ async def dispatch_dev_sample(conn, dev_jc_id: int, *, recipient: str | None, qt
             raise HTTPException(409, detail={"error": "wrong_status",
                                              "message": "Only a CLOSED development job card can dispatch its sample",
                                              "details": {"status": jc["status"]}})
-        if not jc["fg_sample_batch_id"]:
-            raise HTTPException(422, detail={"error": "no_fg_sample",
-                                             "message": "No FG sample to dispatch — close with an output quantity first",
-                                             "details": {"id": dev_jc_id}})
-        output_qty = float(jc["output_qty"] or 0)
-        dispatched = float(await conn.fetchval(
-            "SELECT COALESCE(SUM(qty), 0) FROM npd_dev_dispatch WHERE dev_jc_id = $1", dev_jc_id))
-        # Legacy safety net: a card dispatched under the old single-shot 046 model has
-        # dispatched_at + dispatch_qty set but no ledger row (if the 078 backfill was
-        # not run). Count the mirror so remaining can't overstate → no duplicate GI.
-        if dispatched == 0 and jc["dispatched_at"] is not None and jc["dispatch_qty"]:
-            dispatched = float(jc["dispatch_qty"])
+        if article_id is not None:
+            # This article's own FG batch + output balance (Σ dispatch scoped to the article).
+            art = await conn.fetchrow(
+                "SELECT * FROM npd_dev_job_card_articles WHERE article_id = $1 AND dev_jc_id = $2",
+                article_id, dev_jc_id)
+            if not art:
+                raise HTTPException(404, detail={"error": "article_not_found",
+                                                 "message": "That article is not on this job card",
+                                                 "details": {"article_id": article_id, "dev_jc_id": dev_jc_id}})
+            batch_id = art["fg_sample_batch_id"]
+            sku_name = art["name"]
+            src_uom = art["output_uom"] or jc["uom"] or "kg"
+            output_qty = float(art["output_qty"] or 0)
+            if not batch_id:
+                raise HTTPException(422, detail={"error": "no_fg_sample",
+                                                 "message": f"Article '{art['name']}' has no FG sample to dispatch — promote with an output quantity first",
+                                                 "details": {"article_id": article_id}})
+            dispatched = float(await conn.fetchval(
+                "SELECT COALESCE(SUM(qty), 0) FROM npd_dev_dispatch WHERE dev_jc_id = $1 AND article_id = $2",
+                dev_jc_id, article_id))
+        else:
+            # A per-article card must dispatch per article (its card-level output_qty is the
+            # SUM across articles but fg_sample_batch_id is only article #1's batch — a
+            # card-level dispatch would over-issue that one batch against the total). Require
+            # article_id so the balance + batch resolve to the right article.
+            if await _is_per_article(conn, dev_jc_id):
+                raise HTTPException(422, detail={"error": "article_required",
+                                                 "message": "This card develops per-article outputs — dispatch each article (article_id required)",
+                                                 "details": {"dev_jc_id": dev_jc_id}})
+            if not jc["fg_sample_batch_id"]:
+                raise HTTPException(422, detail={"error": "no_fg_sample",
+                                                 "message": "No FG sample to dispatch — close with an output quantity first",
+                                                 "details": {"id": dev_jc_id}})
+            batch_id = jc["fg_sample_batch_id"]
+            sku_name = jc["fg_sku_name"] or jc["title"]
+            src_uom = jc["uom"] or "kg"
+            output_qty = float(jc["output_qty"] or 0)
+            # NOTE: no article_id in this SQL — the legacy path must work when 083 is unapplied.
+            dispatched = float(await conn.fetchval(
+                "SELECT COALESCE(SUM(qty), 0) FROM npd_dev_dispatch WHERE dev_jc_id = $1", dev_jc_id))
+            # Legacy safety net: a card dispatched under the old single-shot 046 model has
+            # dispatched_at + dispatch_qty set but no ledger row (if the 078 backfill was
+            # not run). Count the mirror so remaining can't overstate → no duplicate GI.
+            if dispatched == 0 and jc["dispatched_at"] is not None and jc["dispatch_qty"]:
+                dispatched = float(jc["dispatch_qty"])
         remaining = output_qty - dispatched
         # Normalize to the ledger's 3-dp storage granularity so a value that rounds
         # to 0.000 is rejected here (not by the qty>0 CHECK as a 500); and treat an
@@ -723,37 +1032,64 @@ async def dispatch_dev_sample(conn, dev_jc_id: int, *, recipient: str | None, qt
                                              "message": f"Cannot dispatch {round(q, 3)} — only {round(remaining, 3)} remains of the finalized output",
                                              "details": {"requested": q, "remaining": round(remaining, 3),
                                                          "output_qty": output_qty, "dispatched": dispatched}})
-        # 265 Goods Issue for THIS part out of the R&D location.
+        # Custom unit for this part (084) — the label on the 265 doc + the outpass; qty is
+        # NOT converted (see the docstring). Falls back to the article/card uom.
+        disp_uom = (uom or src_uom or "kg").strip() or src_uom
+        # 265 Goods Issue for THIS part out of the R&D location (from the resolved batch).
         res = await inv.issue_named_batch(
-            conn, batch_id=jc["fg_sample_batch_id"], sku_name=(jc["fg_sku_name"] or jc["title"]),
+            conn, batch_id=batch_id, sku_name=sku_name,
             qty_kg=q, reference_id=dev_jc_id, reference_type="NPD_DEV_JC", entity=_BOM_ENTITY,
-            uom=(jc["uom"] or "kg"), to_location=(recipient or "SAMPLE_OUT"), user=user,
+            uom=disp_uom, to_location=(recipient or "SAMPLE_OUT"), user=user,
             notes=f"Dev sample partial dispatch ({jc['id']}) to {recipient or '-'}")
+        # seq is global per card (UNIQUE(dev_jc_id, seq)) — the outpass sub-number.
         seq = int(await conn.fetchval(
             "SELECT COALESCE(MAX(seq), 0) + 1 FROM npd_dev_dispatch WHERE dev_jc_id = $1", dev_jc_id))
+        # Persist the custom uom only if 084 is applied (the column exists) — else the row
+        # is written without it and the outpass falls back to the article uom. No exception,
+        # so the legacy/083-only path is unaffected.
+        has_uom = bool(await conn.fetchval(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name = 'npd_dev_dispatch' AND column_name = 'uom'"))
         # dispatch_id is an app-supplied 8-digit time-based BIGINT (new_short_time_id),
         # the same handle pattern as the phase/card ids. Retry on the rare collision.
+        # Per-article rows carry article_id (083); the legacy INSERT omits the column so it
+        # keeps working when 083 is unapplied.
         for _attempt in range(5):
             cand = new_short_time_id()
             try:
                 async with conn.transaction():
-                    await conn.execute(
-                        """INSERT INTO npd_dev_dispatch
-                               (dispatch_id, dev_jc_id, seq, qty, recipient, mat_doc_id, dispatched_by)
-                           VALUES ($1, $2, $3, $4, $5, $6, $7)""",
-                        cand, dev_jc_id, seq, q, recipient, res["mat_doc_id"], user.user_id)
+                    if article_id is not None and has_uom:
+                        await conn.execute(
+                            """INSERT INTO npd_dev_dispatch
+                                   (dispatch_id, dev_jc_id, article_id, seq, qty, uom, recipient, mat_doc_id, dispatched_by)
+                               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)""",
+                            cand, dev_jc_id, article_id, seq, q, disp_uom, recipient, res["mat_doc_id"], user.user_id)
+                    elif article_id is not None:
+                        await conn.execute(
+                            """INSERT INTO npd_dev_dispatch
+                                   (dispatch_id, dev_jc_id, article_id, seq, qty, recipient, mat_doc_id, dispatched_by)
+                               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)""",
+                            cand, dev_jc_id, article_id, seq, q, recipient, res["mat_doc_id"], user.user_id)
+                    else:
+                        await conn.execute(
+                            """INSERT INTO npd_dev_dispatch
+                                   (dispatch_id, dev_jc_id, seq, qty, recipient, mat_doc_id, dispatched_by)
+                               VALUES ($1, $2, $3, $4, $5, $6, $7)""",
+                            cand, dev_jc_id, seq, q, recipient, res["mat_doc_id"], user.user_id)
                 break
             except asyncpg.UniqueViolationError:
                 if _attempt == 4:
                     raise
-        # Mirror the latest partial onto the card (keeps the 046 columns + the
-        # existing list/detail/full-outpass display working).
-        await conn.execute(
-            """UPDATE npd_dev_job_cards
-                  SET dispatched_at = NOW(), dispatched_by = $1, dispatch_recipient = $2,
-                      dispatch_qty = $3, dispatch_mat_doc_id = $4, updated_at = NOW()
-                WHERE id = $5""",
-            user.user_id, recipient, q, res["mat_doc_id"], dev_jc_id)
+        # Mirror the latest partial onto the card (046 columns) — single-product card only.
+        # A per-article card's card-level dispatch_* would be ambiguous (which article?), so
+        # its per-article dispatch balances are read from the ledger rows instead.
+        if article_id is None:
+            await conn.execute(
+                """UPDATE npd_dev_job_cards
+                      SET dispatched_at = NOW(), dispatched_by = $1, dispatch_recipient = $2,
+                          dispatch_qty = $3, dispatch_mat_doc_id = $4, updated_at = NOW()
+                    WHERE id = $5""",
+                user.user_id, recipient, q, res["mat_doc_id"], dev_jc_id)
     return await get_dev_job_card(conn, dev_jc_id)
 
 
