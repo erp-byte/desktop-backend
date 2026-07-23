@@ -3024,6 +3024,7 @@ async def record_output(conn, *, job_card_id: int,
                         uom: str | None = None,
                         notes: str | None = None,
                         process_loss_kg: float | None = None,
+                        process_loss_remark: str | None = None,
                         recorded_by: str | None = None,
                         batch_id: int | None = None) -> dict:
     """Append an output row for this JC. The output_kind defaults to the
@@ -3071,14 +3072,14 @@ async def record_output(conn, *, job_card_id: int,
             INSERT INTO job_card_output_v2
                 (output_id, job_card_id, batch_id, rm_consumed_kg, output_qty_kg,
                  output_qty_units, output_kind, uom, yield_pct, notes,
-                 recorded_by, process_loss_kg)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                 recorded_by, process_loss_kg, process_loss_remark)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             RETURNING *
             """,
             new_short_time_id(),
             job_card_id, batch_id, rm_consumed_kg, output_qty_kg,
             output_qty_units, kind, uom, yield_pct, notes,
-            recorded_by, process_loss_kg or 0,
+            recorded_by, process_loss_kg or 0, process_loss_remark,
         )
     inserted = await insert_with_pk_retry(conn, _insert_output)
     return {"recorded": True, "output": _serialize(inserted), "yield_pct": yield_pct}
@@ -4689,6 +4690,10 @@ async def get_job_card(conn, job_card_id: int) -> dict | None:
         "fg_actual_units": int(round(agg_fg_units)) if (outputs and agg_fg_units is not None) else None,
         "rm_consumed_kg":  agg_rm       if outputs else None,
         "process_loss_kg": agg_loss     if outputs else None,
+        # Free-text remark from the latest output row (batch-unaware — the
+        # web form's per-batch read pulls the batch-scoped remark straight
+        # off detail.outputs instead).
+        "process_loss_remark": last_output.get("process_loss_remark") if last_output else None,
         "yield_pct":       agg_yield    if outputs else None,
         "created_at":      last_output.get("recorded_at") if last_output else None,
     }

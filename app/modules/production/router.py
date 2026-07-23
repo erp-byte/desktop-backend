@@ -6091,6 +6091,7 @@ class RecordOutputV2Request(BaseModel):
     fg_expected_kg:   float | None = None     # informational only — not stored
     fg_expected_units: int | None = None      # informational only — not stored
     process_loss_kg:  float | None = None     # persisted on the output row
+    process_loss_remark: str | None = None    # free-text note on the output row
     byproducts:       list[ByproductLineV2]    | None = None
     balance_materials: list[BalanceMaterialV2] | None = None  # job_card_balance_material_v2
     additives:        list[AdditiveLineV2]     | None = None  # job_card_additive_consumption_v2
@@ -6388,6 +6389,7 @@ async def record_output_v2(
                     uom=body.uom,
                     notes=body.notes,
                     process_loss_kg=body.process_loss_kg,
+                    process_loss_remark=body.process_loss_remark,
                     recorded_by=user.full_name or user.phone,
                     # Tag the output row with the batch it belongs to.
                     # Sibling persistence calls (upsert_consumption_lines,
@@ -8585,4 +8587,84 @@ async def routing_gaps_apply(
             result = await promote_articles(
                 conn, assignments, performed_by=performed_by,
             )
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  BOX SCAN — per-box scan capture anchored to a job card (box_scan table)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class BoxScanRequest(BaseModel):
+    """A single box scan. `code` is the scanned QR/box id — a PO/RM box
+    (po_box.box_id) or an SFG box (sfg_box.carton_id); the server auto-detects
+    which unless `source_type` pins it. net/gross/count are optional overrides —
+    omitted, the box's stored values are recorded."""
+    code:         str
+    source_type:  Literal["po", "sfg"] | None = None
+    net_weight:   float | None = None
+    gross_weight: float | None = None
+    count:        int | None = None
+
+
+@router.post("/job-cards-v2/{job_card_id}/box-scans")
+async def create_box_scan(
+    request: Request,
+    job_card_id: int,
+    body: BoxScanRequest,
+    user=Depends(get_current_user),
+):
+    """Scan (upsert) a box against this job card. Resolves article + batch from
+    the scanned box; floor/entity derive from the JC. Re-scanning the same box
+    updates its weights in place."""
+    from app.modules.production.services import box_scan_service as svc
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await svc.scan_box(
+                conn,
+                job_card_id=job_card_id,
+                code=body.code,
+                source_type=body.source_type,
+                net_weight=body.net_weight,
+                gross_weight=body.gross_weight,
+                count=body.count,
+                scanned_by=user.full_name or user.phone,
+            )
+    if result.get("error") == "job_card_not_found":
+        raise HTTPException(status_code=404, detail="Job card not found")
+    if result.get("error") == "box_not_found":
+        raise HTTPException(status_code=404, detail=f"No PO/SFG box matches '{body.code}'")
+    if result.get("error") == "article_unresolved":
+        raise HTTPException(status_code=422, detail=result)
+    return result
+
+
+@router.get("/job-cards-v2/{job_card_id}/box-scans")
+async def list_box_scans(
+    request: Request,
+    job_card_id: int,
+    user=Depends(get_current_user),
+):
+    """All box scans for this job card (enriched with floor/entity/SKU) + totals."""
+    from app.modules.production.services import box_scan_service as svc
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await svc.list_scans(conn, job_card_id=job_card_id)
+
+
+@router.delete("/job-cards-v2/{job_card_id}/box-scans/{code:path}")
+async def delete_box_scan(
+    request: Request,
+    job_card_id: int,
+    code: str,
+    user=Depends(get_current_user),
+):
+    """Un-scan a box (by its box_id or sfg carton_id) from this job card."""
+    from app.modules.production.services import box_scan_service as svc
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await svc.delete_scan(conn, job_card_id=job_card_id, code=code)
+    if result.get("error") == "scan_not_found":
+        raise HTTPException(status_code=404, detail=f"No scan for '{code}' on this job card")
     return result

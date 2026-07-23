@@ -389,9 +389,17 @@ async def get_plan(conn, plan_id: int) -> dict | None:
 
     line_rows = await conn.fetch(
         """
-        SELECT * FROM production_plan_line_v2
-        WHERE plan_id = $1
-        ORDER BY plan_line_id ASC
+        SELECT l.*,
+               -- Head cards only (one per chain) — a partial line can be
+               -- carded across several chains; this counts the cards the
+               -- operator actually created, matching lines_summary.
+               (SELECT COUNT(*) FROM job_card_v2 j
+                 WHERE j.plan_line_id = l.plan_line_id
+                   AND j.prev_job_card_id IS NULL
+                   AND j.deleted_at IS NULL) AS job_card_count
+        FROM production_plan_line_v2 l
+        WHERE l.plan_id = $1
+        ORDER BY l.plan_line_id ASC
         """,
         plan_id,
     )
