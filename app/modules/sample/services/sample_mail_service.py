@@ -79,8 +79,11 @@ def _send(subject, html, to_addrs, *, cc=None, msgid=None, in_reply_to=None):
 # the recipient-match auth. Hold links STRAIGHT to the sample page on the web app (no
 # backend hop) — the reviewer records the hold there, same as the in-app flow.
 def _accept_url(request_id, email: str) -> str:
+    from app.modules.sample.services.email_link_token import sign
     base = Settings().PUBLIC_BACKEND_URL.rstrip("/")
-    return f"{base}/api/v1/sample/email/npd-action?request_id={request_id}&status=accept&email={quote(email)}"
+    t = sign("npd", request_id, email)
+    return (f"{base}/api/v1/sample/email/npd-action?request_id={request_id}"
+            f"&status=accept&email={quote(email)}&t={t}")
 
 
 def _hold_url(pk_id) -> str:
@@ -331,9 +334,11 @@ async def notify_requestor_email(conn, req: dict, *, action: str, reason: str | 
 # Approve carries the recipient's email for the gate-match auth; Reject just needs
 # the dev_jc_id (it redirects to the portal job-card page to capture a reason).
 def _promote_approve_url(dev_jc_id, approver_kind: str, email: str) -> str:
+    from app.modules.sample.services.email_link_token import sign
     base = Settings().PUBLIC_BACKEND_URL.rstrip("/")
+    t = sign("promote", dev_jc_id, approver_kind, email)
     return (f"{base}/api/v1/sample/email/promote-action?dev_jc_id={dev_jc_id}"
-            f"&approver_kind={approver_kind}&status=approve&email={quote(email)}")
+            f"&approver_kind={approver_kind}&status=approve&email={quote(email)}&t={t}")
 
 
 def _promote_reject_url(dev_jc_id, approver_kind: str, email: str) -> str:

@@ -141,6 +141,7 @@ async def email_npd_action(
     request_id: int = Query(...),
     status: str = Query(...),
     email: str = Query(""),
+    t: str = Query(""),
 ):
     from app.config import Settings
     st = (status or "").strip().lower()
@@ -159,13 +160,16 @@ async def email_npd_action(
         return Response("<h3>Unknown action.</h3>", media_type="text/html", status_code=400)
     if not (email or "").strip():  # never auth a blank identifier
         return Response("<h3>This link is not authorised.</h3>", media_type="text/html", status_code=403)
+    from app.modules.sample.services.email_link_token import verify
+    if not verify(t, "npd", request_id, email):
+        return Response("<h3>This link is not authorised.</h3>", media_type="text/html", status_code=403)
 
     base = Settings().PUBLIC_BACKEND_URL.rstrip("/")
     return _confirm_page(
         heading="Accept this NPD sample request?",
         summary=f"Request {request_id}",
         action_url=f"{base}/api/v1/sample/email/npd-action",
-        hidden={"request_id": request_id, "email": email},
+        hidden={"request_id": request_id, "email": email, "t": t},
         button_label="✓ Confirm accept")
 
 
@@ -174,11 +178,15 @@ async def email_npd_action_confirm(
     request: Request,
     request_id: int = Form(...),
     email: str = Form(""),
+    t: str = Form(""),
 ):
     """The real accept — POST-only, behind the confirm button. Verify `email` is an
     ACTIVE npd_team reviewer, then accept (idempotent: only SUBMITTED/ON_HOLD). Auth
     fail / wrong state → no mutation, the call is ignored."""
     if not (email or "").strip():
+        return Response("<h3>This link is not authorised.</h3>", media_type="text/html", status_code=403)
+    from app.modules.sample.services.email_link_token import verify
+    if not verify(t, "npd", request_id, email):
         return Response("<h3>This link is not authorised.</h3>", media_type="text/html", status_code=403)
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -244,6 +252,7 @@ async def email_promote_action(
     approver_kind: str = Query(...),
     status: str = Query(...),
     email: str = Query(""),
+    t: str = Query(""),
 ):
     from app.config import Settings
     from urllib.parse import quote
@@ -266,13 +275,17 @@ async def email_promote_action(
     if not (email or "").strip():  # never auth a blank identifier
         return Response("<h3>This link is not authorised.</h3>", media_type="text/html", status_code=403)
 
+    from app.modules.sample.services.email_link_token import verify
+    if not verify(t, "promote", dev_jc_id, kind, email):
+        return Response("<h3>This link is not authorised.</h3>", media_type="text/html", status_code=403)
+
     base = Settings().PUBLIC_BACKEND_URL.rstrip("/")
     gate_label = "Inventory manager" if kind == "INV_MGR" else "Requestor (business head)"
     return _confirm_page(
         heading="Approve recipe promotion?",
         summary=f"Dev JC {dev_jc_id} · your gate: {gate_label}",
         action_url=f"{base}/api/v1/sample/email/promote-action",
-        hidden={"dev_jc_id": dev_jc_id, "approver_kind": kind, "email": email},
+        hidden={"dev_jc_id": dev_jc_id, "approver_kind": kind, "email": email, "t": t},
         button_label="✓ Confirm approve")
 
 
@@ -282,6 +295,7 @@ async def email_promote_action_confirm(
     dev_jc_id: int = Form(...),
     approver_kind: str = Form(...),
     email: str = Form(""),
+    t: str = Form(""),
 ):
     """The real approve — POST-only, behind the confirm button. Verify `email` owns the
     gate, then accept it (idempotent; promotes once BOTH gates clear). Auth fail / wrong
@@ -290,6 +304,9 @@ async def email_promote_action_confirm(
     if kind not in ("INV_MGR", "REQUESTOR_BH"):
         return Response("<h3>Unknown approval gate.</h3>", media_type="text/html", status_code=400)
     if not (email or "").strip():
+        return Response("<h3>This link is not authorised.</h3>", media_type="text/html", status_code=403)
+    from app.modules.sample.services.email_link_token import verify
+    if not verify(t, "promote", dev_jc_id, kind, email):
         return Response("<h3>This link is not authorised.</h3>", media_type="text/html", status_code=403)
 
     pool = request.app.state.db_pool
@@ -470,7 +487,7 @@ async def cancel_requisition(
     request: Request,
     req_id: int,
     body: schemas.CancelBody,
-    user: AuthUser = Depends(require_permission("sample", "requisition", action="edit")),
+    user: AuthUser = Depends(require_permission("sample", "requisition", action="delete")),
 ):
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -607,7 +624,7 @@ async def replace_npd_lines(
     request: Request,
     draft_id: int,
     body: schemas.NpdLinesReplace,
-    user: AuthUser = Depends(require_permission("sample", "npd", action="create")),
+    user: AuthUser = Depends(require_permission("sample", "npd", action="edit")),
 ):
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -713,7 +730,7 @@ async def replace_dev_lines(
     request: Request,
     dev_jc_id: int,
     body: schemas.NpdLinesReplace,
-    user: AuthUser = Depends(require_permission("sample", "npd", action="create")),
+    user: AuthUser = Depends(require_permission("sample", "npd", action="edit")),
 ):
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -726,7 +743,7 @@ async def replace_dev_articles(
     request: Request,
     dev_jc_id: int,
     body: schemas.DevArticlesReplace,
-    user: AuthUser = Depends(require_permission("sample", "npd", action="create")),
+    user: AuthUser = Depends(require_permission("sample", "npd", action="edit")),
 ):
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -738,7 +755,7 @@ async def replace_dev_articles(
 async def start_dev_job_card(
     request: Request,
     dev_jc_id: int,
-    user: AuthUser = Depends(require_permission("sample", "npd", action="create")),
+    user: AuthUser = Depends(require_permission("sample", "npd", action="edit")),
 ):
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -793,7 +810,7 @@ async def cancel_dev_job_card(
     request: Request,
     dev_jc_id: int,
     body: schemas.CancelBody,
-    user: AuthUser = Depends(require_permission("sample", "npd", action="create")),
+    user: AuthUser = Depends(require_permission("sample", "npd", action="delete")),
 ):
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -806,7 +823,7 @@ async def add_dev_phase(
     request: Request,
     dev_jc_id: int,
     body: schemas.DevPhaseCreate,
-    user: AuthUser = Depends(require_permission("sample", "npd", action="create")),
+    user: AuthUser = Depends(require_permission("sample", "npd", action="edit")),
 ):
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -821,7 +838,7 @@ async def replace_dev_phase_lines(
     dev_jc_id: int,
     phase_id: int,
     body: schemas.NpdLinesReplace,
-    user: AuthUser = Depends(require_permission("sample", "npd", action="create")),
+    user: AuthUser = Depends(require_permission("sample", "npd", action="edit")),
 ):
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -834,7 +851,7 @@ async def delete_dev_phase(
     request: Request,
     dev_jc_id: int,
     phase_id: int,
-    user: AuthUser = Depends(require_permission("sample", "npd", action="create")),
+    user: AuthUser = Depends(require_permission("sample", "npd", action="edit")),
 ):
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -846,7 +863,7 @@ async def start_dev_phase(
     request: Request,
     dev_jc_id: int,
     phase_id: int,
-    user: AuthUser = Depends(require_permission("sample", "npd", action="create")),
+    user: AuthUser = Depends(require_permission("sample", "npd", action="edit")),
 ):
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -859,7 +876,7 @@ async def complete_dev_phase(
     dev_jc_id: int,
     phase_id: int,
     body: schemas.DevPhaseComplete,
-    user: AuthUser = Depends(require_permission("sample", "npd", action="create")),
+    user: AuthUser = Depends(require_permission("sample", "npd", action="edit")),
 ):
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
