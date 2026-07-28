@@ -65,7 +65,7 @@ async def whatsapp_webhook_receive(request: Request):
     # loop, so an approver never gets an "NPD reviewer" reply. Entirely gated on
     # VISITOR_APPROVAL_FORWARD_URL: when unset, none of this runs and behaviour is unchanged.
     forwarded_ids: set[str] = set()
-    if whatsapp_service.VISITOR_APPROVAL_FORWARD_URL:
+    if whatsapp_service.visitor_forward_url():
         visitor_msgs = whatsapp_service.visitor_approval_messages(payload)
         if visitor_msgs:
             forwarded = await whatsapp_service.forward_visitor_approvals(
@@ -77,9 +77,12 @@ async def whatsapp_webhook_receive(request: Request):
     messages = [m for m in whatsapp_service.extract_messages(payload)
                 if m.get("id") not in forwarded_ids]
     if messages:
+        # `payload` is the machine id behind a tap (visitor sends "approve_<id>", NPD/promote
+        # send the button text) — log it, it's the only way to tell why routing chose a flow.
         logger.info("WhatsApp inbound %d msg(s): %s", len(messages),
                     [{"from": m.get("from"), "type": m.get("type"),
-                      "text": (m.get("text") or "")[:60], "ctx": m.get("context_id")}
+                      "text": (m.get("text") or "")[:60], "payload": m.get("payload"),
+                      "ctx": m.get("context_id")}
                      for m in messages])
     else:
         # No messages parsed → almost always a delivery/read STATUS callback (value
@@ -96,7 +99,7 @@ async def whatsapp_webhook_receive(request: Request):
                 try:
                     results.append(await whatsapp_service.handle_inbound(
                         conn, from_phone=m["from"], text=m["text"],
-                        context_id=m.get("context_id")))
+                        context_id=m.get("context_id"), raw=m.get("raw")))
                 except Exception:  # noqa: BLE001 — always 200 so Meta doesn't retry-storm
                     logger.exception("WhatsApp inbound handling failed")
         logger.info("WhatsApp inbound results: %s", results)

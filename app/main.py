@@ -82,7 +82,7 @@ async def lifespan(fastapi_app: FastAPI):
     # here so .env-based deploys actually enable sending. A value already present in
     # os.environ (real shell export / `uvicorn --env-file`) always wins.
     for _k in ("WHATSAPP_ENABLED", "WHATSAPP_ACCESS_TOKEN", "WHATSAPP_PHONE_NUMBER_ID",
-               "WHATSAPP_GRAPH_BASE"):
+               "WHATSAPP_GRAPH_BASE", "VISITOR_APPROVAL_FORWARD_URL"):
         _v = getattr(settings, _k, None)
         if _v is not None and str(_v) != "" and not os.environ.get(_k, "").strip():
             os.environ[_k] = str(_v)
