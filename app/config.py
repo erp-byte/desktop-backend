@@ -82,6 +82,10 @@ class Settings(BaseSettings):
     WHATSAPP_GRAPH_BASE: str = "https://graph.facebook.com/v21.0"
     WHATSAPP_INTIMATION_TEMPLATE_NAME: str = "qc_inward_intimation"
     WHATSAPP_INTIMATION_LANG: str = "en"
+    # Visitor Management shares this WABA; its approve_<id>/reject_<id> taps land on our
+    # webhook and get forwarded here. Declared so a .env-only deploy can set it — the
+    # sample whatsapp_service reads it from os.environ, hydrated in main.py's lifespan.
+    VISITOR_APPROVAL_FORWARD_URL: str = ""
 
     # ── AWS credentials (read from .env when not present in shell env) ────
     # pydantic-settings reads these from `.env` into the Settings instance;

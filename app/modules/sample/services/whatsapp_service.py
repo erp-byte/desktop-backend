@@ -133,7 +133,13 @@ VERIFY_TOKEN = os.environ.get("WHATSAPP_VERIFY_TOKEN", "")
 # the visitor webhook and skip NPD handling for them; left empty, this whole feature is a
 # no-op and the webhook behaves exactly as before (opt-in for ops). See
 # docs: 2026-06-18-whatsapp-visitor-approval-forwarding-design.md.
-VISITOR_APPROVAL_FORWARD_URL = os.environ.get("VISITOR_APPROVAL_FORWARD_URL", "").strip()
+# Read at CALL time, not import time: app/main.py's lifespan hydrates .env-only values into
+# os.environ, and that runs AFTER this module is imported — a module-level constant would
+# have been frozen to "" and silently disabled forwarding on every .env-based deploy.
+def visitor_forward_url() -> str:
+    return os.environ.get("VISITOR_APPROVAL_FORWARD_URL", "").strip()
+
+
 # Visitor quick-reply payloads are "<verb>_<numeric id>"; NPD/promote replies carry the
 # button TEXT ("Approve"/"Reject") with no "_<digits>", so this never matches NPD traffic.
 _VISITOR_APPROVAL_RE = re.compile(r"^(?:approve|reject)_\d+$", re.IGNORECASE)
@@ -809,14 +815,18 @@ class _WaUser:
         self.full_name = "WhatsApp"
 
 
-async def handle_inbound(conn, *, from_phone: str, text: str, context_id: str | None = None) -> dict:
+async def handle_inbound(conn, *, from_phone: str, text: str, context_id: str | None = None,
+                         raw: dict | None = None) -> dict:
     """Parse one inbound message from an NPD reviewer and act. Returns a small
     result dict (for the webhook log / tests). Never raises — replies guide the
     reviewer instead. The DB writes for act_npd_review run in its own txn.
 
     `context_id` is the wamid of the message the reply quotes — present when the
     reviewer taps an Accept/Hold quick-reply button — and is how a button tap (which
-    carries no request number) is mapped back to its request."""
+    carries no request number) is mapped back to its request.
+
+    `raw` is the original Meta message object, used only as the last-resort visitor
+    forward below."""
     from app.modules.sample.services import approval_service  # lazy: avoid import cycle
     from app.modules.sample.services import promote_approval_service as pas
 
@@ -916,6 +926,16 @@ async def handle_inbound(conn, *, from_phone: str, text: str, context_id: str | 
     # ── NPD review flow (unchanged) ──
     reviewer = await _resolve_reviewer(conn, wa)
     if reviewer is None:
+        # A BUTTON TAP that reaches here belongs to no ERP flow (sender is neither an
+        # NPD reviewer nor a promote approver) — on this shared WABA that means it's the
+        # visitor system's. Forward it instead of answering with an NPD message, so the
+        # separation survives a payload format we don't recognise. Typed text still gets
+        # the reply below (a real reviewer with an unregistered number needs to hear that).
+        tapped = _button_payload(raw or {})
+        if tapped and await forward_visitor_approvals([raw]):
+            logger.info("Unattributed button tap from %s forwarded to the visitor webhook "
+                        "(payload=%r)", wa, tapped)
+            return {"ok": True, "forwarded": "visitor", "payload": tapped}
         await _send_text(wa, "Sorry, this number isn't recognised as an NPD reviewer.")
         return {"ok": False, "reason": "unauthorised"}
     user = _WaUser(reviewer["user_id"], reviewer["role_name"])
@@ -969,6 +989,20 @@ async def handle_inbound(conn, *, from_phone: str, text: str, context_id: str | 
     return {"ok": True, "awaiting": "reason", "requisition_id": req["id"]}
 
 
+def _button_payload(m: dict) -> str | None:
+    """The machine payload behind a tap, whatever shape Meta used: a template
+    quick-reply's `button.payload`, or an interactive reply's `button_reply.id`.
+    None for text and everything else."""
+    t = m.get("type")
+    if t == "button":
+        return (m.get("button") or {}).get("payload")
+    if t == "interactive":
+        inter = m.get("interactive") or {}
+        br = inter.get("button_reply") or inter.get("list_reply") or {}
+        return br.get("id")
+    return None
+
+
 def extract_messages(payload: dict) -> list[dict]:
     """Flatten a Meta webhook payload into [{from, text, context_id, type}]. Pulls
     the text body from text / quick-reply button / interactive-reply message shapes
@@ -992,7 +1026,7 @@ def extract_messages(payload: dict) -> list[dict]:
                     text = ""
                 if frm:
                     out.append({"from": frm, "text": text, "type": t,
-                                "id": m.get("id"),
+                                "id": m.get("id"), "payload": _button_payload(m), "raw": m,
                                 "context_id": (m.get("context") or {}).get("id")})
     return out
 
@@ -1011,8 +1045,7 @@ def visitor_approval_messages(payload: dict) -> list[dict]:
     for entry in (payload or {}).get("entry", []):
         for change in entry.get("changes", []):
             for m in (change.get("value") or {}).get("messages", []):
-                if m.get("type") == "button" and is_visitor_approval_payload(
-                        (m.get("button") or {}).get("payload")):
+                if is_visitor_approval_payload(_button_payload(m)):
                     out.append(m)
     return out
 
@@ -1023,7 +1056,8 @@ async def forward_visitor_approvals(messages: list[dict],
     is wrapped in a minimal valid Meta envelope so the visitor backend parses it with its
     existing handler. Best-effort and config-gated (no URL → no-op): a forwarding failure
     must never break this ERP webhook, so this never raises. Returns the count accepted."""
-    if not VISITOR_APPROVAL_FORWARD_URL or not messages:
+    url = visitor_forward_url()
+    if not url or not messages:
         return 0
     headers = {"Content-Type": "application/json"}
     if signature:
@@ -1038,7 +1072,7 @@ async def forward_visitor_approvals(messages: list[dict],
                         "messaging_product": "whatsapp", "messages": [m]}}]}],
                 }
                 try:
-                    resp = await client.post(VISITOR_APPROVAL_FORWARD_URL, json=envelope, headers=headers)
+                    resp = await client.post(url, json=envelope, headers=headers)
                     if resp.status_code < 400:
                         ok += 1
                     else:
