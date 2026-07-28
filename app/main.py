@@ -87,6 +87,14 @@ async def lifespan(fastapi_app: FastAPI):
         if _v is not None and str(_v) != "" and not os.environ.get(_k, "").strip():
             os.environ[_k] = str(_v)
 
+    # This shared-WABA forward is silently env-gated: unset, every Visitor Management
+    # approve/reject tap falls through to the NPD review flow and the approver is told
+    # "this number isn't recognised as an NPD reviewer". Say so at boot — it went
+    # unnoticed for weeks otherwise.
+    _fwd = os.environ.get("VISITOR_APPROVAL_FORWARD_URL", "").strip()
+    logger.info("Visitor-approval forwarding %s", f"ENABLED -> {_fwd}" if _fwd else
+                "DISABLED (VISITOR_APPROVAL_FORWARD_URL unset; visitor taps will hit the NPD flow)")
+
     pool = await create_pool(settings)
     fastapi_app.state.db_pool = pool
 

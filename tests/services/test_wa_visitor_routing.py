@@ -4,6 +4,7 @@ Guards the router's discriminator only (pure functions, no DB/network): if these
 break, an approver gets "this number isn't recognised as an NPD reviewer" instead
 of their visitor being approved.
 """
+import asyncio
 import os
 
 from app.modules.sample.services import whatsapp_service as ws
@@ -59,6 +60,73 @@ def test_settings_declares_the_forward_url():
     never reaches Settings and the lifespan has nothing to hydrate."""
     from app.config import Settings
     assert "VISITOR_APPROVAL_FORWARD_URL" in Settings.model_fields
+
+
+class _NoRowsConn:
+    """asyncpg-shaped stub where the sender matches nothing: no reviewer, no promote
+    gate, no pending state — i.e. someone who is not an ERP user at all."""
+    async def fetchrow(self, *a, **k): return None
+    async def fetchval(self, *a, **k): return None
+    async def fetch(self, *a, **k): return []
+    async def execute(self, *a, **k): return None
+
+
+def _run_unknown_sender(raw: dict, text: str) -> tuple[dict, list, list]:
+    """handle_inbound for a sender the ERP doesn't know; returns (result, forwarded, replies)."""
+    forwarded, replies = [], []
+
+    async def _fake_forward(messages, signature=None):
+        forwarded.extend(messages)
+        return len(messages)
+
+    async def _fake_send(to, body):
+        replies.append(body)
+
+    orig_forward, orig_send = ws.forward_visitor_approvals, ws._send_text
+    ws.forward_visitor_approvals, ws._send_text = _fake_forward, _fake_send
+    try:
+        result = asyncio.run(ws.handle_inbound(
+            _NoRowsConn(), from_phone="919876543210", text=text,
+            context_id=None, raw=raw))
+    finally:
+        ws.forward_visitor_approvals, ws._send_text = orig_forward, orig_send
+    return result, forwarded, replies
+
+
+def test_unknown_sender_is_forwarded_not_told_about_npd():
+    """The reported bug: an approver gets "isn't recognised as an NPD reviewer" for
+    everything they send. Taps AND typed text must go to the visitor system instead."""
+    for raw, text in ((TEMPLATE_TAP, "Approve"),
+                      ({"id": "wamid.5", "from": "919876543210", "type": "text",
+                        "text": {"body": "APPROVE"}}, "APPROVE"),
+                      ({"id": "wamid.6", "from": "919876543210", "type": "text",
+                        "text": {"body": "hello"}}, "hello")):
+        result, forwarded, replies = _run_unknown_sender(raw, text)
+        assert result == {"ok": True, "forwarded": "visitor"}, (text, result)
+        assert forwarded == [raw], text
+        assert replies == [], (text, replies)
+
+
+def test_unknown_sender_still_gets_the_npd_reply_when_forwarding_is_off():
+    """Single-tenant deploys (no forward URL) must behave exactly as before."""
+    async def _no_forward(messages, signature=None):
+        return 0
+
+    replies = []
+
+    async def _fake_send(to, body):
+        replies.append(body)
+
+    orig_forward, orig_send = ws.forward_visitor_approvals, ws._send_text
+    ws.forward_visitor_approvals, ws._send_text = _no_forward, _fake_send
+    try:
+        result = asyncio.run(ws.handle_inbound(
+            _NoRowsConn(), from_phone="919876543210", text="hello",
+            context_id=None, raw={"id": "w", "from": "919876543210", "type": "text"}))
+    finally:
+        ws.forward_visitor_approvals, ws._send_text = orig_forward, orig_send
+    assert result == {"ok": False, "reason": "unauthorised"}
+    assert replies == ["Sorry, this number isn't recognised as an NPD reviewer."]
 
 
 def test_text_message_has_no_button_payload():
