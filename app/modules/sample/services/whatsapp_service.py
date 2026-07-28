@@ -926,16 +926,18 @@ async def handle_inbound(conn, *, from_phone: str, text: str, context_id: str | 
     # ── NPD review flow (unchanged) ──
     reviewer = await _resolve_reviewer(conn, wa)
     if reviewer is None:
-        # A BUTTON TAP that reaches here belongs to no ERP flow (sender is neither an
-        # NPD reviewer nor a promote approver) — on this shared WABA that means it's the
-        # visitor system's. Forward it instead of answering with an NPD message, so the
-        # separation survives a payload format we don't recognise. Typed text still gets
-        # the reply below (a real reviewer with an unregistered number needs to hear that).
-        tapped = _button_payload(raw or {})
-        if tapped and await forward_visitor_approvals([raw]):
-            logger.info("Unattributed button tap from %s forwarded to the visitor webhook "
-                        "(payload=%r)", wa, tapped)
-            return {"ok": True, "forwarded": "visitor", "payload": tapped}
+        # Anything reaching here belongs to no ERP flow: the sender is neither an NPD
+        # reviewer nor a promote approver, and nothing they sent resolved to a request or
+        # gate. On this shared WABA that makes them the visitor system's user, so hand the
+        # whole message over (taps AND typed text — the visitor backend accepts both) and
+        # stay silent rather than answering for a system they aren't talking to.
+        # No-ops when VISITOR_APPROVAL_FORWARD_URL is unset, so a single-tenant deploy
+        # keeps the reply below unchanged.
+        if raw is not None and await forward_visitor_approvals([raw]):
+            logger.info("Unattributed inbound from %s forwarded to the visitor webhook "
+                        "(type=%s payload=%r text=%r)",
+                        wa, raw.get("type"), _button_payload(raw), body[:60])
+            return {"ok": True, "forwarded": "visitor"}
         await _send_text(wa, "Sorry, this number isn't recognised as an NPD reviewer.")
         return {"ok": False, "reason": "unauthorised"}
     user = _WaUser(reviewer["user_id"], reviewer["role_name"])
