@@ -754,6 +754,21 @@ async def replace_dev_articles(
             conn, dev_jc_id, articles=[a.model_dump() for a in body.articles], user=user)
 
 
+@router.patch("/npd-dev-job-cards/{dev_jc_id}")
+async def update_dev_job_card_details(
+    request: Request,
+    dev_jc_id: int,
+    body: schemas.DevJobCardDetailsUpdate,
+    user: AuthUser = Depends(require_permission("sample", "npd", action="edit")),
+):
+    """Edit the card's customer & dispatch header (DRAFT/IN_DEVELOPMENT). PATCH — only the
+    sent fields are updated."""
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await npd_dev_service.update_dev_job_card_details(
+            conn, dev_jc_id, payload=body.model_dump(exclude_unset=True), user=user)
+
+
 @router.post("/npd-dev-job-cards/{dev_jc_id}/start")
 async def start_dev_job_card(
     request: Request,

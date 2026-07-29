@@ -35,6 +35,26 @@ _DISPATCH_FIELDS = (
 )
 
 
+def _normalize_billing(returnable, non_returnable, paid, amount):
+    """Enforce the sample billing checklist on the EFFECTIVE quartet: returnable XOR
+    non_returnable; amount is 0 unless paid, else must be > 0. Returns the normalized tuple
+    (amount forced to 0 when not paid). Raises 422 on a conflicting combo. Used post-inheritance
+    (create) and post-coalesce (update) so a partial/mixed payload can't persist an invalid state
+    — the per-field model validator can't see fields the caller omitted."""
+    if returnable and non_returnable:
+        raise HTTPException(422, detail={"error": "billing_conflict",
+                                         "message": "A sample can't be both returnable and non-returnable",
+                                         "details": {}})
+    if paid:
+        if amount is None or float(amount) <= 0:
+            raise HTTPException(422, detail={"error": "amount_required",
+                                             "message": "Amount is required and must be greater than 0 when paid",
+                                             "details": {}})
+    else:
+        amount = 0
+    return returnable, non_returnable, paid, amount
+
+
 async def _fetch(conn, dev_jc_id: int) -> dict:
     row = await conn.fetchrow("SELECT * FROM npd_dev_job_cards WHERE id = $1", dev_jc_id)
     if not row:
@@ -171,6 +191,11 @@ async def create_dev_job_card(conn, *, payload: dict, user) -> dict:
                 for k in inherit_cols:
                     if cust[k] is None:
                         cust[k] = rq[k]
+        # Normalize the EFFECTIVE billing (post-inheritance) so a mixed None/explicit payload
+        # from a direct caller can't persist an invalid combo (both returnable + non_returnable,
+        # or paid=false with amount>0) — the model validator only saw the sent fields.
+        (cust["returnable"], cust["non_returnable"], cust["paid"], cust["amount"]) = _normalize_billing(
+            cust["returnable"], cust["non_returnable"], cust["paid"], cust["amount"])
         # id is an app-supplied 8-digit time-based BIGINT (new_short_time_id, the
         # same handle pattern as request_id / job_card_id). It is the PK, so retry
         # on the rare unique collision via a per-attempt savepoint.
@@ -272,6 +297,42 @@ async def replace_dev_articles(conn, dev_jc_id: int, *, articles: list[dict], us
                 WHERE id = $1""",
             dev_jc_id, first["name"], first.get("base_bom_id"), first.get("pcs"),
             first.get("weight_per_piece"), first.get("quantity"))
+    return await get_dev_job_card(conn, dev_jc_id)
+
+
+async def update_dev_job_card_details(conn, dev_jc_id: int, *, payload: dict, user) -> dict:
+    """Update a dev job card's customer & dispatch header (company / customer / contact /
+    ship-to / mode-of-transport / expected-dispatch + billing). Editable while the card is
+    DRAFT or IN_DEVELOPMENT. PATCH: only the whitelisted fields present in `payload` are
+    written (the router passes model_dump(exclude_unset=True))."""
+    jc = await _fetch(conn, dev_jc_id)
+    if jc["status"] not in ("DRAFT", "IN_DEVELOPMENT"):
+        raise HTTPException(409, detail={"error": "not_editable",
+                                         "message": "Customer & dispatch details are editable only while the card is DRAFT or IN_DEVELOPMENT",
+                                         "details": {"status": jc["status"]}})
+    await npd_auth.require_npd_authorized(conn, user, "AUTHOR")
+    allowed = ("company_name", "customer_name", "customer_contact", "customer_ship_to_address",
+               "mode_of_transport", "expected_dispatch_date",
+               "returnable", "non_returnable", "paid", "amount")
+    fields = {k: payload[k] for k in allowed if k in payload}
+    # Billing must stay consistent even for a PARTIAL patch: coalesce each of the four against
+    # the current row, normalize (returnable XOR non_returnable; amount 0 unless paid), and
+    # write all four together — else e.g. PATCH {returnable:true} on a non_returnable card, or
+    # PATCH {amount:100} on an unpaid card, would persist an invalid combo.
+    _billing = ("returnable", "non_returnable", "paid", "amount")
+    if any(k in fields for k in _billing):
+        eff = _normalize_billing(fields.get("returnable", jc["returnable"]),
+                                 fields.get("non_returnable", jc["non_returnable"]),
+                                 fields.get("paid", jc["paid"]),
+                                 fields.get("amount", jc["amount"]))
+        (fields["returnable"], fields["non_returnable"], fields["paid"], fields["amount"]) = eff
+    if fields:
+        # Column names come from the fixed `allowed` whitelist (never user input → no
+        # injection); the values are parameterised.
+        cols = ", ".join(f"{k} = ${i + 2}" for i, k in enumerate(fields))
+        await conn.execute(
+            f"UPDATE npd_dev_job_cards SET {cols}, updated_at = NOW() WHERE id = $1",
+            dev_jc_id, *fields.values())
     return await get_dev_job_card(conn, dev_jc_id)
 
 

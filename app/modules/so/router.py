@@ -5,7 +5,7 @@ from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, UploadFile, File
 
-from app.modules.auth.middleware import get_current_user
+from app.modules.auth.middleware import get_current_user, require_permission
 from app.modules.production.services.response_filters import strip_cost_fields
 from app.modules.so.schemas import (
     SOUploadResponse,
@@ -46,7 +46,8 @@ router = APIRouter(prefix="/api/v1/so", tags=["Sales Orders"])
 
 
 @router.post("/upload", response_model=SOUploadResponse, status_code=201)
-async def upload_excel(request: Request, file: UploadFile = File(...)):
+async def upload_excel(request: Request, file: UploadFile = File(...),
+                       user=Depends(require_permission("so", action="create"))):
     """Upload a Sales Register Excel file. Processes entirely in memory."""
 
     if not file or not file.filename:
@@ -80,7 +81,8 @@ async def upload_excel(request: Request, file: UploadFile = File(...)):
 
 
 @router.post("/upload-so-book", response_model=SOUploadResponse, status_code=201)
-async def upload_so_book(request: Request, file: UploadFile = File(...)):
+async def upload_so_book(request: Request, file: UploadFile = File(...),
+                         user=Depends(require_permission("so", action="create"))):
     """Upload a Sales Order Book Excel file (state-machine parsed, GST apportioned to lines)."""
 
     if not file or not file.filename:
@@ -111,7 +113,8 @@ async def upload_so_book(request: Request, file: UploadFile = File(...)):
 
 
 @router.post("/update-preview", response_model=SOUpdatePreviewResponse)
-async def update_preview(request: Request, file: UploadFile = File(...)):
+async def update_preview(request: Request, file: UploadFile = File(...),
+                         user=Depends(require_permission("so", action="edit"))):
     """
     Upload an Excel file to preview changes against existing SOs.
     Only SOs with actual data differences are returned.
@@ -148,7 +151,8 @@ async def update_preview(request: Request, file: UploadFile = File(...)):
 
 
 @router.post("/update-confirm", response_model=SOUpdateConfirmResponse)
-async def update_confirm(request: Request, body: SOUpdateConfirmRequest, file_hash: str = Query(...)):
+async def update_confirm(request: Request, body: SOUpdateConfirmRequest, file_hash: str = Query(...),
+                         user=Depends(require_permission("so", action="edit"))):
     """
     Confirm and apply updates for the selected SOs.
     Pass the file_hash from the preview response and the so_ids to update.
@@ -179,7 +183,8 @@ async def update_confirm(request: Request, body: SOUpdateConfirmRequest, file_ha
 
 
 @router.put("/update", response_model=SOManualUpdateResponse)
-async def manual_update(request: Request, body: SOManualUpdateRequest):
+async def manual_update(request: Request, body: SOManualUpdateRequest,
+                        user=Depends(require_permission("so", action="edit"))):
     """
     Manually update a single SO.
     Frontend sends old state + new state; backend validates old state matches DB
@@ -203,7 +208,8 @@ async def manual_update(request: Request, body: SOManualUpdateRequest):
 
 
 @router.post("/create", response_model=SOUploadResponse, status_code=201)
-async def create_so(request: Request, body: SOCreateRequest):
+async def create_so(request: Request, body: SOCreateRequest,
+                    user=Depends(require_permission("so", action="create"))):
     """Manually create a single SO with multiple articles (JSON body)."""
 
     if not body.lines:
@@ -613,7 +619,7 @@ async def view_all_sos(
     article: str = Query(None),
     so_number: str = Query(None),
     fulfillment_status: str = Query(None, pattern="^(pending|fulfilled)$"),
-    user=Depends(get_current_user),
+    user=Depends(require_permission("so", action="view")),
 ):
     """View Sales Orders with server-side pagination, filtering, sorting, and search.
 
@@ -767,7 +773,7 @@ async def export_sos(
     so_number: str = Query(None),
     fulfillment_status: str = Query(None, pattern="^(pending|fulfilled)$"),
     limit: int = Query(10000, ge=1, le=50000),
-    user=Depends(get_current_user),
+    user=Depends(require_permission("so", action="view")),
 ):
     """Export filtered Sales Orders (no pagination) for download.
 
@@ -822,7 +828,8 @@ async def export_sos(
 
 
 @router.get("/gst-reconciliation/summary", response_model=GSTReconSummary)
-async def get_gst_summary(request: Request):
+async def get_gst_summary(request: Request,
+                          user=Depends(require_permission("so", action="view"))):
     """Aggregate GST reconciliation summary across all SOs."""
     pool = request.app.state.db_pool
 
@@ -856,6 +863,7 @@ async def sku_lookup(
     sales_group: str = Query(None),
     search: str = Query(None),
     particulars: str = Query(None),
+    user=Depends(require_permission("so", action="view")),
 ):
     """
     Cascading dropdown lookup against the all_sku master table.
@@ -961,7 +969,7 @@ async def sku_lookup(
 
 
 @router.get("/{so_id}", response_model=SOHeaderOut)
-async def get_so(request: Request, so_id: int, user=Depends(get_current_user)):
+async def get_so(request: Request, so_id: int, user=Depends(require_permission("so", action="view"))):
     """Get SO header with all line items.
 
     B13 cost-metric gate: the per-SO detail surfaces every ₹ field on each
@@ -1026,7 +1034,8 @@ async def get_so(request: Request, so_id: int, user=Depends(get_current_user)):
 
 
 @router.get("/{so_id}/gst-reconciliation", response_model=GSTReconResponse)
-async def get_gst_reconciliation(request: Request, so_id: int):
+async def get_gst_reconciliation(request: Request, so_id: int,
+                                 user=Depends(require_permission("so", action="view"))):
     """Get GST reconciliation results for an SO."""
     pool = request.app.state.db_pool
 

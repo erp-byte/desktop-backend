@@ -1009,6 +1009,7 @@ async def create_job_cards_for_line(
     qty_units=None,
     wip_steps: list[dict],
     pkg_floor: str,
+    pkg_process: str = "Packaging",
 ) -> dict:
     """Create one chained job_card_v2 per WIP process → a terminating Packaging
     JC for a SINGLE plan line, and dispatch each to its floor.
@@ -1016,6 +1017,10 @@ async def create_job_cards_for_line(
     Driven by the wizard's per-article inputs (NOT the plan's snapshot steps):
       * wip_steps: [{process, floor, sfg_output}] in operator order;
       * pkg_floor: the packaging (Final FG) floor.
+      * pkg_process: the terminal step's process name — defaults to
+        "Packaging" but carries the operator's (possibly merged, e.g.
+        "Sorting + Packing") label from the unified process list. The stage
+        stays 'packaging'/FG regardless of the name.
 
     Behaviour mirrors create_job_cards_from_plan's chain machinery so the rest
     of the system (lock/handoff/indents/PDF/annexure) keeps working:
@@ -1138,7 +1143,7 @@ async def create_job_cards_for_line(
     # Packaging is the terminal Final-FG stage. Stamp an explicit 'packaging'
     # stage so is_packing_stage() recognises it for EGA (never string-derive it).
     steps_spec.append({
-        "process_name": "Packaging",
+        "process_name": (str(pkg_process).strip() or "Packaging"),
         "stage":        "packaging",
         "floor":        str(pkg_floor).strip(),
         "sfg_output":   None,
@@ -1358,14 +1363,17 @@ async def get_line_job_card_config(conn, plan_line_id: int) -> dict:
         if steps:
             if len(steps) >= 2:
                 wip_src, pkg_floor = steps[:-1], steps[-1]["floor"]
+                pkg_process = steps[-1]["process_name"]
             else:  # single-step route: use it as the lone WIP, reuse its floor for packaging
                 wip_src, pkg_floor = steps, steps[0]["floor"]
+                pkg_process = "Packaging"
             out["wip_steps"] = [
                 {"process": s["process_name"], "floor": s["floor"],
                  "sfg_output": None, "job_card_id": None, "started": False}
                 for s in wip_src
             ]
             out["pkg_floor"] = pkg_floor
+            out["pkg_process"] = pkg_process
         return out
 
     started = any(r["status"] not in _JC_EDITABLE_STATUSES for r in rows)
@@ -1395,6 +1403,7 @@ async def get_line_job_card_config(conn, plan_line_id: int) -> dict:
             for r in wip_rows
         ],
         "pkg_floor": pkg_row["floor"],
+        "pkg_process": pkg_row["process_name"],
         "pkg_job_card_id": pkg_row["job_card_id"],
         "pkg_status": pkg_row["status"],
         "pkg_started": pkg_row["status"] not in _JC_EDITABLE_STATUSES,
@@ -1409,6 +1418,7 @@ async def replace_job_cards_for_line(
     qty_units=None,
     wip_steps: list[dict],
     pkg_floor: str,
+    pkg_process: str = "Packaging",
 ) -> dict:
     """Edit a line's job cards by REPLACING them: delete the current chain and
     recreate it from the wizard's inputs. Only valid while the chain is still
@@ -1428,7 +1438,7 @@ async def replace_job_cards_for_line(
         # Nothing to replace — fall through to a plain create.
         return await create_job_cards_for_line(
             conn, plan_line_id, qty_kg=qty_kg, qty_units=qty_units,
-            wip_steps=wip_steps, pkg_floor=pkg_floor,
+            wip_steps=wip_steps, pkg_floor=pkg_floor, pkg_process=pkg_process,
         )
 
     if any(r["status"] not in _JC_EDITABLE_STATUSES for r in existing):
@@ -1445,7 +1455,7 @@ async def replace_job_cards_for_line(
     # Recreate from the new inputs (its per-line guard now passes — no JC remains).
     result = await create_job_cards_for_line(
         conn, plan_line_id, qty_kg=qty_kg, qty_units=qty_units,
-        wip_steps=wip_steps, pkg_floor=pkg_floor,
+        wip_steps=wip_steps, pkg_floor=pkg_floor, pkg_process=pkg_process,
     )
     if "error" not in result:
         result["replaced"] = len(existing)
@@ -1624,6 +1634,7 @@ async def apply_live_job_card_edits(
     qty_kg, qty_units=None,
     steps: list[dict],
     pkg_floor: str | None = None,
+    pkg_process: str | None = None,
     pkg_job_card_id: int | None = None,
     user: str | None = None,
     remove_reasons: dict | None = None,
@@ -1837,7 +1848,10 @@ async def apply_live_job_card_edits(
 
         if is_last:
             desired_floor = (str(pkg_floor).strip() if pkg_floor else None) or r["floor"]
-            desired_proc = r["process_name"]
+            # Allow renaming the terminal step (e.g. a merged "Sorting + Packing")
+            # while keeping its packaging stage. Started/terminal cards preserve
+            # their process below regardless (real material flow is untouched).
+            desired_proc = (str(pkg_process).strip() if pkg_process else None) or r["process_name"]
             desired_stage = r["stage"]
             sfg_out = None
         else:
@@ -2301,7 +2315,7 @@ def _jc_sort_expr(sort_col: str) -> str:
         )
     return f"jc.{sort_col}"
 _JC_DATE_FIELDS    = frozenset({"created_at", "start_time", "end_time"})
-_JC_PENDENCY_CHIPS = frozenset({"overdue", "due_today", "due_this_week", "future"})
+_JC_PENDENCY_CHIPS = frozenset({"overdue", "due_today", "due_this_week", "future", "pending_signoff"})
 
 
 async def list_job_cards(
@@ -2470,6 +2484,15 @@ async def list_job_cards(
         pendency_predicate = (
             "(SELECT pl.deadline_date FROM production_plan_line_v2 pl "
             "  WHERE pl.plan_line_id = jc.plan_line_id) > CURRENT_DATE + INTERVAL '7 days'"
+        )
+    elif pendency == "pending_signoff":
+        # Completed production still awaiting the required production_head
+        # signature — the JC can't be closed until it lands (see
+        # close_job_card / REQUIRED_SIGN_OFFS).
+        pendency_predicate = (
+            "jc.status = 'completed' AND NOT EXISTS ("
+            "  SELECT 1 FROM job_card_sign_off_v2 s "
+            "   WHERE s.job_card_id = jc.job_card_id AND s.role = 'production_head')"
         )
 
     where_for_list = " AND ".join(conditions + ([pendency_predicate] if pendency_predicate else []))

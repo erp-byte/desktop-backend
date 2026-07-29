@@ -346,6 +346,29 @@ SQL_FILES = [
     # legacy RTV line model: adds sale_group + conversion TEXT to cfpl/cdpl
     # customer_return_lines (dropped by the initial 070 port). Additive/idempotent.
     DB_DIR / "074_cr_line_sale_group_conversion.sql",
+    # 075 rbac_notes_catalog — the "Roles & Permission" spec (Purchase /
+    # Production / NPD) as auth_permission 4-tuples + role grants. Adds the
+    # Material In, Planning-dispatch, Job batch-wise (overview/accounting/
+    # quality/remark/box_printing/stage_chain/material_scan) and NPD edit/delete
+    # rows the routers now gate on; creates the so_creator role. Middleware
+    # unchanged. Idempotent (ON CONFLICT DO NOTHING).
+    DB_DIR / "075_rbac_notes_catalog.sql",
+    # 076 de-duplicates auth_permission. The UNIQUE (module, sub_module,
+    # sub_sub_module, action) is NULLS DISTINCT (PG default), so ON CONFLICT
+    # never suppresses re-inserts of NULL-column rows and this runner re-runs
+    # every seed each deploy -> duplicate permissions -> duplicate checkboxes in
+    # the admin permission tree. Registered LAST + idempotent: keeps the lowest
+    # id per tuple, repoints grants, deletes the dupes. Self-heals every deploy.
+    DB_DIR / "076_dedupe_permissions.sql",
+    # 077 cr_email_routing — moves the Customer-Returns approval e-mail routing
+    # (business-head / sales-POC / warehouse-owner / constant-CC / notify-to) out
+    # of hardcoded literals into a DB table, served by GET
+    # /api/v1/customer-returns/email-routing. Company-agnostic; idempotent seed.
+    DB_DIR / "077_cr_email_routing.sql",
+    # 078 cr_approval_audit — approval audit columns (approved_by/at/remark) on the
+    # CR headers for the email magic-link + in-app approve flow, plus bare cold-unit
+    # warehouse_cc rows for backend recipient matching. Additive/idempotent.
+    DB_DIR / "078_cr_approval_audit.sql",
 ]
 
 # ── Optional: drop the v1 legacy job-card stack (TEST / Supabase DB ONLY) ──────

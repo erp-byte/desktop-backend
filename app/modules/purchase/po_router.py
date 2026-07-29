@@ -405,6 +405,8 @@ async def get_receipt_summary(
     lines: list[dict] = []
     any_box = False
     all_matched = True
+    total_received = 0.0
+    total_ordered = 0.0
     for row in rows:
         ordered_weight = float(row["po_weight"]) if row["po_weight"] is not None else None
         received_weight = float(row["received_weight"] or 0)
@@ -413,6 +415,8 @@ async def get_receipt_summary(
         n_boxes = int(row["received_boxes"] or 0)
         if n_boxes > 0:
             any_box = True
+        total_received += received_weight
+        total_ordered += ordered_weight or 0
         weight_matched = ordered_weight is None or received_weight >= ordered_weight * factor
         count_matched = ordered_count is None or received_count >= ordered_count
         matched = weight_matched and count_matched
@@ -432,10 +436,18 @@ async def get_receipt_summary(
             "matched": matched,
         })
 
+    if not any_box:
+        status = "pending"
+    elif total_received > total_ordered:
+        status = "extra received"
+    else:
+        status = "partially received"
+
     return {
         "transaction_no": transaction_no,
         "entity": header.get("entity"),
         "completed": any_box and all_matched,
+        "status": status,
         "total_lines": len(lines),
         "lines": lines,
     }
@@ -492,7 +504,7 @@ async def send_qc_intimation(
     request: Request,
     transaction_no: str,
     body: PoIntimationRequest,
-    user: AuthUser = Depends(require_permission("purchase", "po", action="edit")),
+    user: AuthUser = Depends(require_permission("purchase", "material_in", "point", action="create")),
 ):
     """Send a QC Inward Intimation WhatsApp message to all active qc_member /
     qc_manager users, with a generated article-list PNG as the header image.
@@ -565,7 +577,7 @@ class WalkInIntimationRequest(BaseModel):
 async def send_walk_in_intimation(
     request: Request,
     body: WalkInIntimationRequest,
-    user: AuthUser = Depends(require_permission("purchase", "po", action="edit")),
+    user: AuthUser = Depends(require_permission("purchase", "material_in", "qcint", action="create")),
 ):
     """Record a QC arrival intimation for WALK-IN material that has NO purchase
     order — articles are chosen from the global SKU master (/so/sku-lookup).

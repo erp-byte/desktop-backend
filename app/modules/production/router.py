@@ -25,7 +25,18 @@ from app.core.warehouse_scope import user_has_warehouse
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/v1/production", tags=["Production"])
+# SECURITY FLOOR: every production route requires a valid access token. This
+# closes the historical gap where handlers with no explicit auth dependency
+# (inventory/store/fulfillment/indent writes) were reachable unauthenticated.
+# Endpoints that also declare require_permission(...) still enforce the finer
+# permission on top; the shared request.state.user_dict cache means the token
+# is validated once per request. (App-level GET /health stays public — this
+# only floors /api/v1/production/*, whose own /health is a debug/DB-count tool.)
+router = APIRouter(
+    prefix="/api/v1/production",
+    tags=["Production"],
+    dependencies=[Depends(get_current_user)],
+)
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +231,7 @@ async def production_health(request: Request):
 # ---------------------------------------------------------------------------
 
 @router.post("/fulfillment/sync")
-async def sync_fulfillment(request: Request, body: FulfillmentSyncRequest):
+async def sync_fulfillment(request: Request, body: FulfillmentSyncRequest, user: AuthUser = Depends(require_permission("production", "fulfillment", action="create"))):
     """Sync all FG SO lines into so_fulfillment. Idempotent."""
     from app.modules.production.services.fulfillment import sync_fulfillment as _sync
     pool = request.app.state.db_pool
@@ -243,6 +254,7 @@ async def list_fulfillment(
     search: str = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(200, ge=1, le=500),
+    user: AuthUser = Depends(require_permission("production", "fulfillment", action="view")),
 ):
     """Paginated list of fulfillment records with filters."""
     from app.modules.production.services.fulfillment import get_fulfillment_list
@@ -265,6 +277,7 @@ async def list_fulfillment_all(
     so_number: str = Query(None),
     article: str = Query(None),
     search: str = Query(None),
+    user: AuthUser = Depends(require_permission("production", "fulfillment", action="view")),
 ):
     """All fulfillment records matching filters, no pagination."""
     from app.modules.production.services.fulfillment import get_fulfillment_list
@@ -283,6 +296,7 @@ async def demand_summary(
     request: Request,
     entity: str = Query(None),
     financial_year: str = Query(None),
+    user: AuthUser = Depends(require_permission("production", "fulfillment", action="view")),
 ):
     """Aggregated pending demand grouped by product + customer."""
     from app.modules.production.services.fulfillment import get_demand_summary
@@ -300,7 +314,7 @@ async def chart_summary(
     so_number: str = Query(None),
     article: str = Query(None),
     status: str = Query(None),
-    user=Depends(get_current_user),
+    user: AuthUser = Depends(require_permission("production", "fulfillment", action="view")),
 ):
     """Aggregated data for dashboard charts — not paginated.
 
@@ -328,6 +342,7 @@ async def filter_options(
     customer: str = Query(None),
     so_number: str = Query(None),
     article: str = Query(None),
+    user: AuthUser = Depends(require_permission("production", "fulfillment", action="view")),
 ):
     """Distinct values for Customer, SO Number, Article dropdowns.
     Supports smart cross-filtering: pass current sibling selections to
@@ -348,7 +363,7 @@ async def customer_view(
     entity: str = Query(None),
     financial_year: str = Query(None),
     customer: str = Query(None),
-    user=Depends(get_current_user),
+    user: AuthUser = Depends(require_permission("production", "fulfillment", action="view")),
 ):
     """Customer-grouped fulfillment with BOM details, process route + floors, and inventory status.
 
@@ -372,7 +387,7 @@ async def fy_review(
     request: Request,
     entity: str = Query(None),
     financial_year: str = Query(None),
-    user=Depends(get_current_user),
+    user: AuthUser = Depends(require_permission("production", "fulfillment", action="view")),
 ):
     """All unfulfilled orders for FY close review.
 
@@ -390,7 +405,7 @@ async def fy_review(
 
 
 @router.get("/fulfillment/{fulfillment_id}/detail")
-async def get_fulfillment_detail_endpoint(request: Request, fulfillment_id: int):
+async def get_fulfillment_detail_endpoint(request: Request, fulfillment_id: int, user: AuthUser = Depends(require_permission("production", "fulfillment", action="view"))):
     """Get full fulfillment detail: BOM lines with inventory status, floor machines, linked SO, revision log."""
     from app.modules.production.services.fulfillment import get_fulfillment_detail
     pool = request.app.state.db_pool
@@ -402,7 +417,7 @@ async def get_fulfillment_detail_endpoint(request: Request, fulfillment_id: int)
 
 
 @router.get("/fulfillment/{fulfillment_id}/bom-override")
-async def get_bom_override(request: Request, fulfillment_id: int):
+async def get_bom_override(request: Request, fulfillment_id: int, user: AuthUser = Depends(require_permission("production", "fulfillment", action="view"))):
     """Get current BOM overrides for a fulfillment with master values for comparison."""
     from app.modules.production.services.fulfillment import get_bom_overrides
     pool = request.app.state.db_pool
@@ -430,7 +445,7 @@ class BomOverrideRequest(BaseModel):
 
 
 @router.put("/fulfillment/{fulfillment_id}/bom-override")
-async def save_bom_override(request: Request, fulfillment_id: int, body: BomOverrideRequest):
+async def save_bom_override(request: Request, fulfillment_id: int, body: BomOverrideRequest, user: AuthUser = Depends(require_permission("production", "fulfillment", action="edit"))):
     """Save per-fulfillment BOM overrides. Does NOT change the master BOM."""
     from app.modules.production.services.fulfillment import save_bom_overrides
     pool = request.app.state.db_pool
@@ -463,7 +478,7 @@ class FloorStockRequest(BaseModel):
 
 
 @router.get("/fulfillment/{fulfillment_id}/floor-stock")
-async def get_floor_stock(request: Request, fulfillment_id: int):
+async def get_floor_stock(request: Request, fulfillment_id: int, user: AuthUser = Depends(require_permission("production", "fulfillment", action="view"))):
     """Get floor stock entries for a fulfillment."""
     from app.modules.production.services.fulfillment import get_floor_stock
     pool = request.app.state.db_pool
@@ -472,7 +487,7 @@ async def get_floor_stock(request: Request, fulfillment_id: int):
 
 
 @router.put("/fulfillment/{fulfillment_id}/floor-stock")
-async def save_floor_stock(request: Request, fulfillment_id: int, body: FloorStockRequest):
+async def save_floor_stock(request: Request, fulfillment_id: int, body: FloorStockRequest, user: AuthUser = Depends(require_permission("production", "fulfillment", action="edit"))):
     """Save floor stock entries for a fulfillment."""
     from app.modules.production.services.fulfillment import save_floor_stock
     pool = request.app.state.db_pool
@@ -500,7 +515,7 @@ async def list_floors(request: Request, entity: str = Query(None)):
 
 
 @router.post("/fulfillment/carryforward")
-async def carryforward(request: Request, body: CarryforwardRequest):
+async def carryforward(request: Request, body: CarryforwardRequest, user: AuthUser = Depends(require_permission("production", "fulfillment", action="create"))):
     """Bulk carry forward selected fulfillment records to a new FY."""
     from app.modules.production.services.fulfillment import carryforward_orders
     pool = request.app.state.db_pool
@@ -510,7 +525,7 @@ async def carryforward(request: Request, body: CarryforwardRequest):
 
 
 @router.put("/fulfillment/{fulfillment_id}/revise")
-async def revise(request: Request, fulfillment_id: int, body: ReviseRequest):
+async def revise(request: Request, fulfillment_id: int, body: ReviseRequest, user: AuthUser = Depends(require_permission("production", "fulfillment", action="edit"))):
     """Revise qty or deadline on a fulfillment record."""
     from app.modules.production.services.fulfillment import revise_order
     pool = request.app.state.db_pool
@@ -543,6 +558,7 @@ async def list_fulfillment_v2(
     search: str = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(200, ge=1, le=500),
+    user: AuthUser = Depends(require_permission("production", "fulfillment", action="view")),
 ):
     """Paginated v2 fulfillment list — drop-in for v1 GET /fulfillment."""
     from app.modules.production.services.fulfillment_v2 import list_fulfillment
@@ -563,6 +579,7 @@ async def filter_options_v2(
     customer: str = Query(None),
     so_number: str = Query(None),
     article: str = Query(None),
+    user: AuthUser = Depends(require_permission("production", "fulfillment", action="view")),
 ):
     """Distinct dropdown values for v2 fulfillment filters."""
     from app.modules.production.services.fulfillment_v2 import get_filter_options
@@ -575,7 +592,7 @@ async def filter_options_v2(
 
 
 @router.post("/fulfillment-v2/sync")
-async def sync_fulfillment_v2(request: Request, body: FulfillmentV2SyncRequest):
+async def sync_fulfillment_v2(request: Request, body: FulfillmentV2SyncRequest, user: AuthUser = Depends(require_permission("production", "fulfillment", action="create"))):
     """Sync FG SO lines into so_fulfillment_v2. Idempotent."""
     from app.modules.production.services.fulfillment_v2 import sync_fulfillment as _sync
     pool = request.app.state.db_pool
@@ -587,7 +604,7 @@ async def sync_fulfillment_v2(request: Request, body: FulfillmentV2SyncRequest):
 
 
 @router.post("/fulfillment-v2/by-so-lines")
-async def fulfillment_v2_by_so_lines(request: Request, body: FulfillmentBySoLinesRequest):
+async def fulfillment_v2_by_so_lines(request: Request, body: FulfillmentBySoLinesRequest, user: AuthUser = Depends(require_permission("production", "fulfillment", action="view"))):
     """Resolve SO line ids to their fulfillment rows (list shape).
 
     Read-only. Backs the SO-Creation "Selected for Plan" panel: returns the
@@ -607,6 +624,7 @@ async def demand_summary_v2(
     request: Request,
     entity: str = Query(None),
     financial_year: str = Query(None),
+    user: AuthUser = Depends(require_permission("production", "fulfillment", action="view")),
 ):
     from app.modules.production.services.fulfillment_v2 import get_demand_summary
     pool = request.app.state.db_pool
@@ -623,7 +641,7 @@ async def chart_summary_v2(
     so_number: str = Query(None),
     article: str = Query(None),
     status: str = Query(None),
-    user=Depends(get_current_user),
+    user: AuthUser = Depends(require_permission("production", "fulfillment", action="view")),
 ):
     """B13 cost-metric gate applied — same rationale as v1 chart-summary."""
     from app.modules.production.services.fulfillment_v2 import get_chart_summary
@@ -646,7 +664,7 @@ async def customer_view_v2(
     entity: str = Query(None),
     financial_year: str = Query(None),
     customer: str = Query(None),
-    user=Depends(get_current_user),
+    user: AuthUser = Depends(require_permission("production", "fulfillment", action="view")),
 ):
     """B13 cost-metric gate applied — same rationale as v1 customer-view."""
     from app.modules.production.services.fulfillment_v2 import get_enriched_fulfillment
@@ -667,7 +685,7 @@ async def fy_review_v2(
     request: Request,
     entity: str = Query(None),
     financial_year: str = Query(None),
-    user=Depends(get_current_user),
+    user: AuthUser = Depends(require_permission("production", "fulfillment", action="view")),
 ):
     """B13 cost-metric gate applied — same rationale as v1 fy-review."""
     from app.modules.production.services.fulfillment_v2 import get_fy_review
@@ -682,7 +700,7 @@ async def fy_review_v2(
 
 
 @router.post("/fulfillment-v2/cancel")
-async def cancel_fulfillment_v2(request: Request, body: CancelV2Request):
+async def cancel_fulfillment_v2(request: Request, body: CancelV2Request, user: AuthUser = Depends(require_permission("production", "fulfillment", action="delete"))):
     """Cancel selected v2 fulfillment rows with reason."""
     from app.modules.production.services.fulfillment_v2 import cancel_orders
     pool = request.app.state.db_pool
@@ -695,7 +713,7 @@ async def cancel_fulfillment_v2(request: Request, body: CancelV2Request):
 
 
 @router.post("/fulfillment-v2/carryforward")
-async def carryforward_v2(request: Request, body: CarryforwardV2Request):
+async def carryforward_v2(request: Request, body: CarryforwardV2Request, user: AuthUser = Depends(require_permission("production", "fulfillment", action="create"))):
     """Bulk carry forward selected v2 fulfillment rows to a new FY."""
     from app.modules.production.services.fulfillment_v2 import carryforward_orders
     pool = request.app.state.db_pool
@@ -707,7 +725,7 @@ async def carryforward_v2(request: Request, body: CarryforwardV2Request):
 
 
 @router.put("/fulfillment-v2/{so_fulfillment_id}/revise")
-async def revise_v2(request: Request, so_fulfillment_id: int, body: ReviseV2Request):
+async def revise_v2(request: Request, so_fulfillment_id: int, body: ReviseV2Request, user: AuthUser = Depends(require_permission("production", "fulfillment", action="edit"))):
     """Revise qty or deadline on a v2 fulfillment row with audit log."""
     from app.modules.production.services.fulfillment_v2 import revise_order
     pool = request.app.state.db_pool
@@ -730,7 +748,7 @@ async def revise_v2(request: Request, so_fulfillment_id: int, body: ReviseV2Requ
 
 
 @router.get("/fulfillment-v2/{so_fulfillment_id}/detail")
-async def detail_v2(request: Request, so_fulfillment_id: int):
+async def detail_v2(request: Request, so_fulfillment_id: int, user: AuthUser = Depends(require_permission("production", "fulfillment", action="view"))):
     """Full v2 fulfillment detail (drop-in shape for v1's modal)."""
     from app.modules.production.services.fulfillment_v2 import get_fulfillment_detail
     pool = request.app.state.db_pool
@@ -742,7 +760,7 @@ async def detail_v2(request: Request, so_fulfillment_id: int):
 
 
 @router.get("/fulfillment-v2/{so_fulfillment_id}/bom-override")
-async def get_bom_override_v2(request: Request, so_fulfillment_id: int):
+async def get_bom_override_v2(request: Request, so_fulfillment_id: int, user: AuthUser = Depends(require_permission("production", "fulfillment", action="view"))):
     from app.modules.production.services.fulfillment_v2 import get_bom_overrides
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -753,7 +771,7 @@ async def get_bom_override_v2(request: Request, so_fulfillment_id: int):
 
 
 @router.put("/fulfillment-v2/{so_fulfillment_id}/bom-override")
-async def save_bom_override_v2(request: Request, so_fulfillment_id: int, body: BomOverrideV2Request):
+async def save_bom_override_v2(request: Request, so_fulfillment_id: int, body: BomOverrideV2Request, user: AuthUser = Depends(require_permission("production", "fulfillment", action="edit"))):
     from app.modules.production.services.fulfillment_v2 import save_bom_overrides
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -769,7 +787,7 @@ async def save_bom_override_v2(request: Request, so_fulfillment_id: int, body: B
 
 
 @router.get("/fulfillment-v2/{so_fulfillment_id}/floor-stock")
-async def get_floor_stock_v2(request: Request, so_fulfillment_id: int):
+async def get_floor_stock_v2(request: Request, so_fulfillment_id: int, user: AuthUser = Depends(require_permission("production", "fulfillment", action="view"))):
     from app.modules.production.services.fulfillment_v2 import get_floor_stock
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -780,7 +798,7 @@ async def get_floor_stock_v2(request: Request, so_fulfillment_id: int):
 
 
 @router.put("/fulfillment-v2/{so_fulfillment_id}/floor-stock")
-async def save_floor_stock_v2(request: Request, so_fulfillment_id: int, body: FloorStockV2Request):
+async def save_floor_stock_v2(request: Request, so_fulfillment_id: int, body: FloorStockV2Request, user: AuthUser = Depends(require_permission("production", "fulfillment", action="edit"))):
     from app.modules.production.services.fulfillment_v2 import save_floor_stock
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -833,7 +851,7 @@ class CreatePlanWithAIRequest(BaseModel):
 
 
 @router.post("/plans/create-with-ai")
-async def create_plan_with_ai(request: Request, body: CreatePlanWithAIRequest):
+async def create_plan_with_ai(request: Request, body: CreatePlanWithAIRequest, user=Depends(require_permission("production", "plans", action="create"))):
     """Generate a production plan using Claude AI from selected fulfillment items.
 
     Two-call pattern:
@@ -1028,6 +1046,7 @@ async def list_plans(
     date_to: str = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(200, ge=1, le=500),
+    user=Depends(require_permission("production", "plans", action="view")),
 ):
     """Paginated list of production plans with filters."""
     pool = request.app.state.db_pool
@@ -1098,6 +1117,7 @@ async def list_plans_all(
     plan_type: str = Query(None),
     date_from: str = Query(None),
     date_to: str = Query(None),
+    user=Depends(require_permission("production", "plans", action="view")),
 ):
     """All plans matching filters, no pagination."""
     result = await list_plans(request, entity, status, plan_type, date_from, date_to, page=1, page_size=100000)
@@ -1105,7 +1125,7 @@ async def list_plans_all(
 
 
 @router.get("/plans/{plan_id}")
-async def get_plan_detail(request: Request, plan_id: int):
+async def get_plan_detail(request: Request, plan_id: int, user=Depends(require_permission("production", "plans", action="view"))):
     """Get plan detail with all lines, material check, and risk flags."""
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -1145,6 +1165,7 @@ async def mrp_availability(
     material: str = Query(...),
     qty: float = Query(...),
     entity: str = Query(...),
+    user: AuthUser = Depends(require_permission("production", "mrp", action="view")),
 ):
     """Quick single-material availability check."""
     from app.modules.production.services.mrp import check_availability
@@ -1169,6 +1190,7 @@ async def list_indents(
     date_to: str = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(200, ge=1, le=500),
+    user: AuthUser = Depends(require_permission("production", "indents", action="view")),
 ):
     """List purchase indents with filters."""
     pool = request.app.state.db_pool
@@ -1237,6 +1259,7 @@ async def list_indents_all(
     search: str = Query(None),
     date_from: str = Query(None),
     date_to: str = Query(None),
+    user: AuthUser = Depends(require_permission("production", "indents", action="view")),
 ):
     """All indents matching filters, no pagination."""
     result = await list_indents(request, entity, status, source, search, date_from, date_to, page=1, page_size=100000)
@@ -1244,7 +1267,7 @@ async def list_indents_all(
 
 
 @router.get("/indents/{indent_id}")
-async def get_indent(request: Request, indent_id: int):
+async def get_indent(request: Request, indent_id: int, user: AuthUser = Depends(require_permission("production", "indents", action="view"))):
     """Get indent detail with linked plan line info."""
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -1277,6 +1300,7 @@ async def list_alerts(
     entity: str = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(200, ge=1, le=500),
+    user: AuthUser = Depends(require_permission("production", "alerts", action="view")),
 ):
     """List store alerts with filters."""
     pool = request.app.state.db_pool
@@ -1322,7 +1346,7 @@ async def list_alerts(
 
 
 @router.put("/alerts/{alert_id}/read")
-async def mark_alert_read(request: Request, alert_id: int):
+async def mark_alert_read(request: Request, alert_id: int, user: AuthUser = Depends(require_permission("production", "alerts", action="edit"))):
     """Mark an alert as read."""
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -1348,7 +1372,7 @@ class GenerateJobCardsRequest(BaseModel):
 
 
 @router.post("/orders/create-from-plan")
-async def create_orders_from_plan(request: Request, body: CreateOrdersRequest):
+async def create_orders_from_plan(request: Request, body: CreateOrdersRequest, user=Depends(require_permission("production", "plans", action="create"))):
     """Create production orders from all lines in an approved plan."""
     from app.modules.production.services.job_card_engine import create_production_orders
     pool = request.app.state.db_pool
@@ -1367,6 +1391,7 @@ async def list_orders(
     status: str = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(200, ge=1, le=500),
+    user: AuthUser = Depends(require_permission("production", "orders", action="view")),
 ):
     """List production orders with filters."""
     pool = request.app.state.db_pool
@@ -1398,6 +1423,7 @@ async def list_orders_all(
     request: Request,
     entity: str = Query(None),
     status: str = Query(None),
+    user: AuthUser = Depends(require_permission("production", "orders", action="view")),
 ):
     """All production orders matching filters, no pagination."""
     result = await list_orders(request, entity, status, page=1, page_size=100000)
@@ -1405,7 +1431,7 @@ async def list_orders_all(
 
 
 @router.get("/orders/{prod_order_id}/job-card-chain")
-async def job_card_chain(request: Request, prod_order_id: int):
+async def job_card_chain(request: Request, prod_order_id: int, user=Depends(require_permission("production", "job_cards", "stage_chain", action="view"))):
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -1441,7 +1467,7 @@ async def job_card_chain(request: Request, prod_order_id: int):
 
 
 @router.get("/orders/{prod_order_id}")
-async def get_order_detail(request: Request, prod_order_id: int):
+async def get_order_detail(request: Request, prod_order_id: int, user: AuthUser = Depends(require_permission("production", "orders", action="view"))):
     """Get production order detail with job cards."""
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -1519,6 +1545,7 @@ async def store_pending_allocations(
     page: int = Query(1, ge=1),
     page_size: int = Query(200, ge=1, le=500),
     size: int = Query(None, ge=1, le=500),
+    user: AuthUser = Depends(require_permission("production", "store", action="view")),
 ):
     """List all pending allocation requests for store team."""
     from app.modules.production.services.store_controller import get_pending_allocations
@@ -1538,6 +1565,7 @@ async def store_pending_allocations_all(
     entity: str = Query(None),
     job_card_id: int = Query(None),
     material: str = Query(None),
+    user: AuthUser = Depends(require_permission("production", "store", action="view")),
 ):
     """All pending allocations matching filters, no pagination."""
     from app.modules.production.services.store_controller import get_pending_allocations
@@ -1551,7 +1579,7 @@ async def store_pending_allocations_all(
 
 
 @router.get("/store/dashboard")
-async def store_dashboard(request: Request, entity: str = Query(...)):
+async def store_dashboard(request: Request, entity: str = Query(...), user: AuthUser = Depends(require_permission("production", "store", action="view"))):
     """Aggregated store dashboard stats."""
     from app.modules.production.services.store_controller import get_store_dashboard
     pool = request.app.state.db_pool
@@ -1560,7 +1588,7 @@ async def store_dashboard(request: Request, entity: str = Query(...)):
 
 
 @router.post("/store/decide")
-async def store_decide(request: Request, body: AllocationRequest, entity: str = Query(...)):
+async def store_decide(request: Request, body: AllocationRequest, entity: str = Query(...), user: AuthUser = Depends(require_permission("production", "store", action="edit"))):
     """Submit allocation decisions (approve/reject/partial)."""
     from app.modules.production.services.store_controller import decide_allocation
     pool = request.app.state.db_pool
@@ -1575,7 +1603,7 @@ async def store_decide(request: Request, body: AllocationRequest, entity: str = 
 
 
 @router.post("/store/verify-floor-stock")
-async def store_verify_floor(request: Request, body: FloorVerifyRequest, entity: str = Query(...)):
+async def store_verify_floor(request: Request, body: FloorVerifyRequest, entity: str = Query(...), user: AuthUser = Depends(require_permission("production", "store", action="edit"))):
     """Store verifies material already on production floor."""
     from app.modules.production.services.store_controller import verify_floor_stock
     pool = request.app.state.db_pool
@@ -1589,7 +1617,7 @@ async def store_verify_floor(request: Request, body: FloorVerifyRequest, entity:
 
 
 @router.post("/store/suggest-alternative")
-async def store_suggest_alt(request: Request, body: SuggestAlternativeRequest, entity: str = Query(...)):
+async def store_suggest_alt(request: Request, body: SuggestAlternativeRequest, entity: str = Query(...), user: AuthUser = Depends(require_permission("production", "store", action="create"))):
     """Store suggests off-grade alternative."""
     from app.modules.production.services.store_controller import suggest_alternative
     pool = request.app.state.db_pool
@@ -1605,7 +1633,7 @@ async def store_suggest_alt(request: Request, body: SuggestAlternativeRequest, e
 
 
 @router.get("/job-cards/{job_card_id}/allocations")
-async def job_card_allocations(request: Request, job_card_id: int):
+async def job_card_allocations(request: Request, job_card_id: int, user=Depends(require_permission("production", "job_cards", action="view"))):
     """Get store allocation records for a specific job card."""
     from app.modules.production.services.store_controller import get_allocation_summary
     pool = request.app.state.db_pool
@@ -1619,6 +1647,7 @@ async def dispatch_to_next(
     job_card_id: int,
     body: DispatchToNextRequest,
     entity: str = Query(...),
+    user=Depends(require_permission("production", "job_cards", "overview", action="complete")),
 ):
     from app.modules.production.services.job_card_engine import dispatch_partial_to_next_stage
     from app.webhooks import events
@@ -1663,6 +1692,7 @@ async def list_batches(
     status: str = Query(None),
     floor_id: str = Query(None),
     warehouse_id: str = Query(None),
+    user: AuthUser = Depends(require_permission("production", "inventory", action="view")),
 ):
     from app.modules.production.services.inventory_service import get_available_batches, get_inventory_summary
     pool = request.app.state.db_pool
@@ -1679,7 +1709,7 @@ async def list_batches(
 
 
 @router.get("/inventory/batch/{batch_id}")
-async def get_batch_detail(request: Request, batch_id: str):
+async def get_batch_detail(request: Request, batch_id: str, user: AuthUser = Depends(require_permission("production", "inventory", action="view"))):
     from app.modules.production.services.inventory_service import get_batch, get_batch_history
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -1697,7 +1727,7 @@ class BatchFlagRequest(BaseModel):
 
 
 @router.post("/inventory/batch/{batch_id}/flag")
-async def flag_batch_endpoint(request: Request, batch_id: str, body: BatchFlagRequest):
+async def flag_batch_endpoint(request: Request, batch_id: str, body: BatchFlagRequest, user: AuthUser = Depends(require_permission("production", "inventory", action="edit"))):
     from app.modules.production.services.inventory_service import flag_batch
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -1713,7 +1743,7 @@ class BatchBlockRequest(BaseModel):
 
 
 @router.post("/inventory/batch/{batch_id}/block")
-async def block_batch_endpoint(request: Request, batch_id: str, body: BatchBlockRequest):
+async def block_batch_endpoint(request: Request, batch_id: str, body: BatchBlockRequest, user: AuthUser = Depends(require_permission("production", "inventory", action="edit"))):
     from app.modules.production.services.inventory_service import block_batch
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -1729,31 +1759,23 @@ class ForceReassignRequest(BaseModel):
 
 
 @router.post("/inventory/batch/{batch_id}/force-reassign")
-async def force_reassign_endpoint(request: Request, batch_id: str, body: ForceReassignRequest,
-                                   entity: str = Query(...)):
+async def force_reassign_endpoint(
+    request: Request, batch_id: str, body: ForceReassignRequest,
+    entity: str = Query(...),
+    user: AuthUser = Depends(
+        require_permission("production", "inventory", "force_reassign", action="create")),
+):
+    # Auth is enforced by require_permission (was a hand-rolled check that both
+    # skipped when the Authorization header was absent AND queried the retired
+    # auth_session.session_token, so it 403'd real JWT users and let anonymous
+    # ones through). Actor is the authenticated user, not a forgeable body field.
     from app.modules.production.services.inventory_service import force_reassign_batch
-    # Permission check: require FORCE_REASSIGN permission
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
-        # Check auth permission if session exists
-        session_token = request.headers.get('Authorization', '').replace('Bearer ', '')
-        if session_token:
-            has_perm = await conn.fetchval("""
-                SELECT 1 FROM auth_session s
-                JOIN auth_user u ON s.user_id = u.user_id
-                JOIN auth_role_permission rp ON u.role_id = rp.role_id
-                JOIN auth_permission p ON rp.permission_id = p.permission_id
-                WHERE s.session_token = $1 AND s.is_active = TRUE
-                  AND p.action = 'force_reassign'
-                LIMIT 1
-            """, session_token)
-            # If auth is configured but user lacks permission, reject
-            auth_configured = await conn.fetchval("SELECT COUNT(*) FROM auth_user")
-            if auth_configured and auth_configured > 0 and not has_perm:
-                raise HTTPException(status_code=403, detail="FORCE_REASSIGN permission required")
         async with conn.transaction():
             result = await force_reassign_batch(conn, batch_id, body.new_so_id,
-                                                body.override_by, body.override_note, entity)
+                                                user.full_name or body.override_by,
+                                                body.override_note, entity)
     return result
 
 
@@ -1772,7 +1794,7 @@ class LegacyImportRequest(BaseModel):
 
 @router.post("/inventory/legacy-import")
 async def legacy_import_endpoint(request: Request, body: LegacyImportRequest,
-                                  entity: str = Query(...)):
+                                  entity: str = Query(...), user: AuthUser = Depends(require_permission("production", "inventory", action="create"))):
     from app.modules.production.services.inventory_service import import_legacy_batches
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -1795,7 +1817,7 @@ class InternalIssueRequest(BaseModel):
 
 @router.post("/inventory/internal-issue")
 async def create_internal_issue_endpoint(request: Request, body: InternalIssueRequest,
-                                          entity: str = Query(...)):
+                                          entity: str = Query(...), user: AuthUser = Depends(require_permission("production", "inventory", action="create"))):
     from app.modules.production.services.inventory_service import create_internal_issue
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -1814,7 +1836,7 @@ class ApproveIssueRequest(BaseModel):
 
 @router.post("/inventory/internal-issue/{note_id}/approve")
 async def approve_internal_issue_endpoint(request: Request, note_id: int,
-                                           body: ApproveIssueRequest):
+                                           body: ApproveIssueRequest, user: AuthUser = Depends(require_permission("production", "inventory", action="edit"))):
     from app.modules.production.services.inventory_service import approve_internal_issue
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -1829,7 +1851,7 @@ async def check_shortfall_endpoint(request: Request,
                                     required_qty: float = Query(...),
                                     entity: str = Query(...),
                                     so_id: int = Query(None),
-                                    job_card_id: int = Query(None)):
+                                    job_card_id: int = Query(None), user: AuthUser = Depends(require_permission("production", "inventory", action="view"))):
     from app.modules.production.services.inventory_service import check_shortfall
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -1838,7 +1860,7 @@ async def check_shortfall_endpoint(request: Request,
 
 
 @router.get("/inventory/reconcile")
-async def reconcile_endpoint(request: Request, entity: str = Query(...)):
+async def reconcile_endpoint(request: Request, entity: str = Query(...), user: AuthUser = Depends(require_permission("production", "inventory", action="view"))):
     from app.modules.production.services.inventory_service import reconcile_quantities
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -1855,7 +1877,7 @@ class BatchRejectRequest(BaseModel):
 
 @router.post("/inventory/batch/{batch_id}/reject")
 async def reject_batch_endpoint(request: Request, batch_id: str, body: BatchRejectRequest,
-                                 entity: str = Query(...)):
+                                 entity: str = Query(...), user: AuthUser = Depends(require_permission("production", "inventory", action="edit"))):
     from app.modules.production.services.inventory_service import log_batch_rejection
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -1872,7 +1894,7 @@ class ResolveFlagRequest(BaseModel):
 
 
 @router.post("/inventory/batch/{batch_id}/resolve")
-async def resolve_batch_endpoint(request: Request, batch_id: str, body: ResolveFlagRequest):
+async def resolve_batch_endpoint(request: Request, batch_id: str, body: ResolveFlagRequest, user: AuthUser = Depends(require_permission("production", "inventory", action="edit"))):
     from app.modules.production.services.inventory_service import resolve_flagged_batch
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -1889,7 +1911,7 @@ class ReturnBatchRequest(BaseModel):
 
 
 @router.post("/inventory/batch/{batch_id}/return")
-async def return_batch_endpoint(request: Request, batch_id: str, body: ReturnBatchRequest):
+async def return_batch_endpoint(request: Request, batch_id: str, body: ReturnBatchRequest, user: AuthUser = Depends(require_permission("production", "inventory", action="edit"))):
     from app.modules.production.services.inventory_service import return_batch
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -1899,7 +1921,7 @@ async def return_batch_endpoint(request: Request, batch_id: str, body: ReturnBat
 
 
 @router.get("/inventory/batch/{batch_id}/rejections")
-async def batch_rejections_endpoint(request: Request, batch_id: str):
+async def batch_rejections_endpoint(request: Request, batch_id: str, user: AuthUser = Depends(require_permission("production", "inventory", action="view"))):
     from app.modules.production.services.inventory_service import get_batch_rejections
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -1909,7 +1931,7 @@ async def batch_rejections_endpoint(request: Request, batch_id: str):
 @router.post("/inventory/internal-issue/{note_id}/approve-constrained")
 async def approve_constrained_endpoint(request: Request, note_id: int,
                                         body: ApproveIssueRequest,
-                                        space_constrained: bool = Query(False)):
+                                        space_constrained: bool = Query(False), user: AuthUser = Depends(require_permission("production", "inventory", action="edit"))):
     from app.modules.production.services.inventory_service import approve_internal_issue_with_space_constraint
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -1924,7 +1946,7 @@ class RejectIssueRequest(BaseModel):
 
 
 @router.post("/inventory/internal-issue/{note_id}/reject")
-async def reject_internal_issue_endpoint(request: Request, note_id: int, body: RejectIssueRequest):
+async def reject_internal_issue_endpoint(request: Request, note_id: int, body: RejectIssueRequest, user: AuthUser = Depends(require_permission("production", "inventory", action="edit"))):
     from app.modules.production.services.inventory_service import reject_internal_issue
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -1934,7 +1956,7 @@ async def reject_internal_issue_endpoint(request: Request, note_id: int, body: R
 
 @router.get("/inventory/internal-issues")
 async def list_internal_issues_endpoint(request: Request, entity: str = Query(...),
-                                         status: str = Query(None)):
+                                         status: str = Query(None), user: AuthUser = Depends(require_permission("production", "inventory", action="view"))):
     from app.modules.production.services.inventory_service import list_internal_issues
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -1942,7 +1964,7 @@ async def list_internal_issues_endpoint(request: Request, entity: str = Query(..
 
 
 @router.get("/inventory/legacy-log")
-async def legacy_import_log_endpoint(request: Request, entity: str = Query(...)):
+async def legacy_import_log_endpoint(request: Request, entity: str = Query(...), user: AuthUser = Depends(require_permission("production", "inventory", action="view"))):
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -1952,7 +1974,7 @@ async def legacy_import_log_endpoint(request: Request, entity: str = Query(...))
 
 
 @router.get("/inventory/reconciliation-failures")
-async def reconciliation_failures_endpoint(request: Request, entity: str = Query(...)):
+async def reconciliation_failures_endpoint(request: Request, entity: str = Query(...), user: AuthUser = Depends(require_permission("production", "inventory", action="view"))):
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -1962,7 +1984,7 @@ async def reconciliation_failures_endpoint(request: Request, entity: str = Query
 
 
 @router.post("/job-cards/generate")
-async def generate_job_cards(request: Request, body: GenerateJobCardsRequest):
+async def generate_job_cards(request: Request, body: GenerateJobCardsRequest, user=Depends(require_permission("production", "job_cards", "generate", action="create"))):
     """Generate sequential job cards for a production order."""
     from app.modules.production.services.job_card_engine import create_job_cards
     pool = request.app.state.db_pool
@@ -1993,7 +2015,7 @@ async def list_job_cards(
     page_size: int = Query(200, ge=1, le=500),
     size: int = Query(None, ge=1, le=500),
     include_cancelled: bool = Query(False),
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", action="view")),
 ):
     """List job cards. For non-admin users with a floor / warehouse lock,
     the result is restricted to JCs on those floors / warehouses regardless
@@ -2110,6 +2132,7 @@ async def list_job_cards_all(
     date_from: str = Query(None),
     date_to: str = Query(None),
     include_cancelled: bool = Query(False),
+    user=Depends(require_permission("production", "job_cards", action="view")),
 ):
     """All job cards matching filters, no pagination."""
     result = await list_job_cards(request, entity, status, team_leader, floor, factory, stage, search, customer, article, date_from, date_to, page=1, page_size=100000, include_cancelled=include_cancelled)
@@ -2124,6 +2147,7 @@ async def team_dashboard(
     date_from: str = Query(None),
     date_to: str = Query(None),
     include_cancelled: bool = Query(False),
+    user=Depends(require_permission("production", "job_cards", action="view")),
 ):
     """Job cards assigned to a team leader, priority-sorted. All filters optional."""
     pool = request.app.state.db_pool
@@ -2161,6 +2185,7 @@ async def floor_dashboard(
     floor: str = Query(None),
     stage: str = Query(None),
     include_cancelled: bool = Query(False),
+    user=Depends(require_permission("production", "job_cards", action="view")),
 ):
     """Job cards on a floor, optionally filtered by stage. All filters optional."""
     pool = request.app.state.db_pool
@@ -2185,7 +2210,7 @@ async def floor_dashboard(
 
 
 @router.get("/job-cards/{job_card_id}/floor-stock-status")
-async def floor_stock_status(request: Request, job_card_id: int):
+async def floor_stock_status(request: Request, job_card_id: int, user=Depends(require_permission("production", "job_cards", action="view"))):
     """Per-material floor stock status for a job card (RM + PM)."""
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -2286,7 +2311,7 @@ async def floor_stock_status(request: Request, job_card_id: int):
 
 
 @router.get("/job-cards/{job_card_id}/dispatch-log")
-async def dispatch_log(request: Request, job_card_id: int):
+async def dispatch_log(request: Request, job_card_id: int, user=Depends(require_permission("production", "job_cards", action="view"))):
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -2313,7 +2338,7 @@ async def dispatch_log(request: Request, job_card_id: int):
 
 
 @router.get("/job-cards/{job_card_id}")
-async def get_job_card(request: Request, job_card_id: int):
+async def get_job_card(request: Request, job_card_id: int, user=Depends(require_permission("production", "job_cards", action="view"))):
     """Get full job card detail matching CFC/PRD/JC/V3.0 PDF structure."""
     from app.modules.production.services.job_card_engine import get_job_card_detail
     pool = request.app.state.db_pool
@@ -2325,7 +2350,7 @@ async def get_job_card(request: Request, job_card_id: int):
 
 
 @router.patch("/job-cards/{job_card_id}")
-async def update_job_card(request: Request, job_card_id: int, body: JobCardPatchRequest):
+async def update_job_card(request: Request, job_card_id: int, body: JobCardPatchRequest, user=Depends(require_permission("production", "job_cards", "overview", action="start"))):
     """Partial update of editable header fields. Only fields supplied in
     the request body are written; all other columns retain their current
     values. Returns 404 if not found, 409 if status is non-editable,
@@ -2351,7 +2376,7 @@ async def update_job_card(request: Request, job_card_id: int, body: JobCardPatch
 
 
 @router.delete("/job-cards/{job_card_id}")
-async def cancel_job_card_endpoint(request: Request, job_card_id: int, body: JobCardCancelRequest):
+async def cancel_job_card_endpoint(request: Request, job_card_id: int, body: JobCardCancelRequest, user=Depends(require_permission("production", "job_cards", "overview", action="close"))):
     """Soft-delete with cancellation reason. Allowed only when status ∈
     {locked, unlocked, assigned}. Returns 409 once material has been
     received — use force-unlock + close instead."""
@@ -2417,7 +2442,7 @@ class ReceiveMaterialRequest(BaseModel):
 
 
 @router.put("/job-cards/{job_card_id}/assign")
-async def assign_jc(request: Request, job_card_id: int, body: AssignRequest):
+async def assign_jc(request: Request, job_card_id: int, body: AssignRequest, user=Depends(require_permission("production", "job_cards", "overview", action="assign"))):
     from app.modules.production.services.job_card_engine import assign_job_card
     from app.webhooks import events
     pool = request.app.state.db_pool
@@ -2438,7 +2463,7 @@ async def assign_jc(request: Request, job_card_id: int, body: AssignRequest):
 
 
 @router.post("/job-cards/{job_card_id}/receive-material")
-async def receive_material(request: Request, job_card_id: int, body: ReceiveMaterialRequest):
+async def receive_material(request: Request, job_card_id: int, body: ReceiveMaterialRequest, user=Depends(require_permission("production", "job_cards", "receive_material", action="create"))):
     from app.modules.production.services.qr_service import receive_material_via_qr
     from app.webhooks import events
     pool = request.app.state.db_pool
@@ -2465,7 +2490,7 @@ class ManualAckRequest(BaseModel):
 
 
 @router.post("/job-cards/{job_card_id}/acknowledge-material")
-async def acknowledge_material(request: Request, job_card_id: int, body: ManualAckRequest):
+async def acknowledge_material(request: Request, job_card_id: int, body: ManualAckRequest, user=Depends(require_permission("production", "job_cards", "receive_material", action="create"))):
     from app.modules.production.services.qr_service import manual_acknowledge_material, manual_acknowledge_all
     from app.webhooks import events
     pool = request.app.state.db_pool
@@ -2490,7 +2515,7 @@ async def acknowledge_material(request: Request, job_card_id: int, body: ManualA
 
 
 @router.put("/job-cards/{job_card_id}/start")
-async def start_jc(request: Request, job_card_id: int):
+async def start_jc(request: Request, job_card_id: int, user=Depends(require_permission("production", "job_cards", "overview", action="start"))):
     from app.modules.production.services.job_card_engine import start_job_card
     from app.webhooks import events
     pool = request.app.state.db_pool
@@ -2511,7 +2536,7 @@ async def start_jc(request: Request, job_card_id: int):
 
 
 @router.put("/job-cards/{job_card_id}/complete-step")
-async def complete_step(request: Request, job_card_id: int, body: CompleteStepRequest):
+async def complete_step(request: Request, job_card_id: int, body: CompleteStepRequest, user=Depends(require_permission("production", "job_cards", "overview", action="complete"))):
     from app.modules.production.services.job_card_engine import complete_process_step
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -2522,7 +2547,7 @@ async def complete_step(request: Request, job_card_id: int, body: CompleteStepRe
 
 
 @router.put("/job-cards/{job_card_id}/record-output")
-async def record_jc_output(request: Request, job_card_id: int, body: RecordOutputRequest):
+async def record_jc_output(request: Request, job_card_id: int, body: RecordOutputRequest, user=Depends(require_permission("production", "job_cards", "output", action="create"))):
     from app.modules.production.services.job_card_engine import record_output
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -2534,7 +2559,7 @@ async def record_jc_output(request: Request, job_card_id: int, body: RecordOutpu
 
 
 @router.put("/job-cards/{job_card_id}/complete")
-async def complete_jc(request: Request, job_card_id: int):
+async def complete_jc(request: Request, job_card_id: int, user=Depends(require_permission("production", "job_cards", "overview", action="complete"))):
     from app.modules.production.services.job_card_engine import complete_job_card
     from app.webhooks import events
     pool = request.app.state.db_pool
@@ -2552,7 +2577,7 @@ async def complete_jc(request: Request, job_card_id: int):
 
 
 @router.put("/job-cards/{job_card_id}/sign-off")
-async def sign_off_jc(request: Request, job_card_id: int, body: SignOffRequest):
+async def sign_off_jc(request: Request, job_card_id: int, body: SignOffRequest, user=Depends(require_permission("production", "job_cards", "sign_offs", action="create"))):
     from app.modules.production.services.job_card_engine import sign_off
     from app.webhooks import events
     pool = request.app.state.db_pool
@@ -2571,7 +2596,7 @@ async def sign_off_jc(request: Request, job_card_id: int, body: SignOffRequest):
 
 
 @router.put("/job-cards/{job_card_id}/close")
-async def close_jc(request: Request, job_card_id: int):
+async def close_jc(request: Request, job_card_id: int, user=Depends(require_permission("production", "job_cards", "overview", action="close"))):
     """Close a job card and, when every JC on the linked plan has reached a
     terminal state, auto-transition the plan_v2 row to 'executed'.
 
@@ -2607,7 +2632,7 @@ async def close_jc(request: Request, job_card_id: int):
 
 
 @router.put("/job-cards/{job_card_id}/force-unlock")
-async def force_unlock_jc(request: Request, job_card_id: int, body: ForceUnlockRequest):
+async def force_unlock_jc(request: Request, job_card_id: int, body: ForceUnlockRequest, user=Depends(require_permission("production", "job_cards", "force_unlock", action="create"))):
     from app.modules.production.services.job_card_engine import force_unlock
     from app.webhooks import events
     pool = request.app.state.db_pool
@@ -2693,7 +2718,7 @@ class RemarkRequest(BaseModel):
 
 
 @router.post("/job-cards/{job_card_id}/environment")
-async def add_environment(request: Request, job_card_id: int, body: EnvironmentRequest):
+async def add_environment(request: Request, job_card_id: int, body: EnvironmentRequest, user=Depends(require_permission("production", "job_cards", "quality", action="create"))):
     """Record Annexure C — environmental parameters."""
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -2706,7 +2731,7 @@ async def add_environment(request: Request, job_card_id: int, body: EnvironmentR
 
 
 @router.post("/job-cards/{job_card_id}/metal-detection")
-async def add_metal_detection(request: Request, job_card_id: int, body: MetalDetectionRequest):
+async def add_metal_detection(request: Request, job_card_id: int, body: MetalDetectionRequest, user=Depends(require_permission("production", "job_cards", "quality", action="create"))):
     """Record Annexure A/B — metal detection validation."""
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -2728,7 +2753,7 @@ async def add_metal_detection(request: Request, job_card_id: int, body: MetalDet
 
 
 @router.post("/job-cards/{job_card_id}/weight-checks")
-async def add_weight_checks(request: Request, job_card_id: int, body: WeightCheckRequest):
+async def add_weight_checks(request: Request, job_card_id: int, body: WeightCheckRequest, user=Depends(require_permission("production", "job_cards", "quality", action="create"))):
     """Record Annexure B — 20-sample weight/leak checks."""
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -2747,7 +2772,7 @@ async def add_weight_checks(request: Request, job_card_id: int, body: WeightChec
 
 
 @router.post("/job-cards/{job_card_id}/loss-reconciliation")
-async def add_loss_reconciliation(request: Request, job_card_id: int, body: LossReconciliationRequest):
+async def add_loss_reconciliation(request: Request, job_card_id: int, body: LossReconciliationRequest, user=Depends(require_permission("production", "job_cards", "quality", action="create"))):
     """Record Annexure D — loss reconciliation."""
     pool = request.app.state.db_pool
     total_budgeted = 0
@@ -2773,7 +2798,7 @@ async def add_loss_reconciliation(request: Request, job_card_id: int, body: Loss
 
 
 @router.post("/job-cards/{job_card_id}/remarks")
-async def add_remarks(request: Request, job_card_id: int, body: RemarkRequest):
+async def add_remarks(request: Request, job_card_id: int, body: RemarkRequest, user=Depends(require_permission("production", "job_cards", "remark", action="create"))):
     """Record Annexure E — remarks & deviations."""
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -2808,6 +2833,7 @@ async def list_floor_inventory(
     search: str = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(200, ge=1, le=500),
+    user: AuthUser = Depends(require_permission("production", "inventory", action="view")),
 ):
     """List floor inventory items with filters."""
     from app.modules.production.services.floor_tracker import get_floor_detail
@@ -2837,7 +2863,7 @@ async def list_floor_inventory(
 
 
 @router.get("/floor-inventory/summary")
-async def floor_summary(request: Request, entity: str = Query(...)):
+async def floor_summary(request: Request, entity: str = Query(...), user: AuthUser = Depends(require_permission("production", "inventory", action="view"))):
     """Aggregated stock per floor location."""
     from app.modules.production.services.floor_tracker import get_floor_summary
     pool = request.app.state.db_pool
@@ -2861,7 +2887,7 @@ class InventorySeedRequest(BaseModel):
 
 
 @router.post("/floor-inventory/seed")
-async def seed_floor_inventory(request: Request, body: InventorySeedRequest):
+async def seed_floor_inventory(request: Request, body: InventorySeedRequest, user: AuthUser = Depends(require_permission("production", "inventory", action="create"))):
     """Manually seed opening stock for PM/FG or any store that wasn't in the Excel ingest.
     overwrite=false adds to existing qty; overwrite=true sets it absolutely."""
     pool = request.app.state.db_pool
@@ -2899,7 +2925,7 @@ async def seed_floor_inventory(request: Request, body: InventorySeedRequest):
 
 
 @router.post("/floor-inventory/move")
-async def move_material_endpoint(request: Request, body: MoveRequest):
+async def move_material_endpoint(request: Request, body: MoveRequest, user: AuthUser = Depends(require_permission("production", "inventory", "move", action="create"))):
     """Manual material movement between floors."""
     from app.modules.production.services.floor_tracker import move_material
     pool = request.app.state.db_pool
@@ -2928,6 +2954,7 @@ async def movement_history(
     job_card_id: int = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(200, ge=1, le=500),
+    user: AuthUser = Depends(require_permission("production", "inventory", action="view")),
 ):
     """Movement audit trail with filters."""
     from app.modules.production.services.floor_tracker import get_movement_history
@@ -2941,7 +2968,7 @@ async def movement_history(
 
 
 @router.post("/floor-inventory/check-idle")
-async def check_idle(request: Request, entity: str = Query(...)):
+async def check_idle(request: Request, entity: str = Query(...), user: AuthUser = Depends(require_permission("production", "inventory", "idle", action="create"))):
     """Trigger idle material check. Creates alerts for materials idle 3-5 days."""
     from app.modules.production.services.idle_checker import check_idle_materials
     pool = request.app.state.db_pool
@@ -2976,6 +3003,7 @@ async def list_offgrade(
     item_group: str = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(200, ge=1, le=500),
+    user: AuthUser = Depends(require_permission("production", "offgrade", action="view")),
 ):
     """List off-grade inventory."""
     pool = request.app.state.db_pool
@@ -3005,7 +3033,7 @@ async def list_offgrade(
 
 
 @router.get("/offgrade/rules")
-async def list_offgrade_rules(request: Request):
+async def list_offgrade_rules(request: Request, user: AuthUser = Depends(require_permission("production", "offgrade", action="view"))):
     """List all off-grade reuse rules."""
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -3014,7 +3042,7 @@ async def list_offgrade_rules(request: Request):
 
 
 @router.post("/offgrade/rules/create")
-async def create_offgrade_rule(request: Request, body: OffgradeRuleCreate):
+async def create_offgrade_rule(request: Request, body: OffgradeRuleCreate, user: AuthUser = Depends(require_permission("production", "offgrade", "rules", action="create"))):
     """Create an off-grade reuse rule."""
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -3032,7 +3060,7 @@ async def create_offgrade_rule(request: Request, body: OffgradeRuleCreate):
 
 
 @router.put("/offgrade/rules/{rule_id}")
-async def update_offgrade_rule(request: Request, rule_id: int, body: OffgradeRuleUpdate):
+async def update_offgrade_rule(request: Request, rule_id: int, body: OffgradeRuleUpdate, user: AuthUser = Depends(require_permission("production", "offgrade", "rules", action="create"))):
     """Update an off-grade reuse rule."""
     pool = request.app.state.db_pool
     sent = body.model_fields_set
@@ -3068,6 +3096,7 @@ async def loss_analysis(
     date_from: str = Query(None),
     date_to: str = Query(None),
     group_by: str = Query("product"),  # product, stage, month
+    user: AuthUser = Depends(require_permission("production", "loss", action="view")),
 ):
     """Loss analysis with aggregation."""
     pool = request.app.state.db_pool
@@ -3116,6 +3145,7 @@ async def loss_anomalies(
     request: Request,
     entity: str = Query(None),
     threshold_multiplier: float = Query(2.0),
+    user: AuthUser = Depends(require_permission("production", "loss", action="view")),
 ):
     """Batches with loss significantly above average (default: 2x avg)."""
     pool = request.app.state.db_pool
@@ -3153,6 +3183,7 @@ async def yield_summary(
     entity: str = Query(None),
     product_name: str = Query(None),
     period: str = Query(None),
+    user: AuthUser = Depends(require_permission("production", "yield", action="view")),
 ):
     """Yield summary by product/period."""
     pool = request.app.state.db_pool
@@ -3220,6 +3251,7 @@ async def day_end_summary(
     request: Request,
     entity: str = Query(...),
     target_date: str = Query(None),
+    user: AuthUser = Depends(require_permission("production", "day_end", action="view")),
 ):
     """Today's completed final-stage job cards with dispatch data."""
     from app.modules.production.services.day_end import get_day_end_summary
@@ -3230,7 +3262,7 @@ async def day_end_summary(
 
 
 @router.put("/day-end/dispatch")
-async def day_end_dispatch(request: Request, body: BulkDispatchRequest):
+async def day_end_dispatch(request: Request, body: BulkDispatchRequest, user: AuthUser = Depends(require_permission("production", "day_end", "dispatch", action="create"))):
     """Bulk update dispatch quantities for completed job cards."""
     from app.modules.production.services.day_end import bulk_dispatch
     pool = request.app.state.db_pool
@@ -3245,7 +3277,7 @@ async def day_end_dispatch(request: Request, body: BulkDispatchRequest):
 
 
 @router.post("/balance-scan/submit")
-async def submit_scan(request: Request, body: BalanceScanSubmitRequest):
+async def submit_scan(request: Request, body: BalanceScanSubmitRequest, user: AuthUser = Depends(require_permission("production", "day_end", "scan", action="create"))):
     """Submit a day-end balance scan for a floor."""
     from app.modules.production.services.day_end import submit_balance_scan
     pool = request.app.state.db_pool
@@ -3262,6 +3294,7 @@ async def scan_status(
     request: Request,
     entity: str = Query(...),
     target_date: str = Query(None),
+    user: AuthUser = Depends(require_permission("production", "day_end", action="view")),
 ):
     """Today's scan submission status per floor."""
     from app.modules.production.services.day_end import get_scan_status
@@ -3272,7 +3305,7 @@ async def scan_status(
 
 
 @router.get("/balance-scan/{scan_id}")
-async def scan_detail(request: Request, scan_id: int):
+async def scan_detail(request: Request, scan_id: int, user: AuthUser = Depends(require_permission("production", "day_end", action="view"))):
     """Get balance scan detail with all line items."""
     from app.modules.production.services.day_end import get_scan_detail
     pool = request.app.state.db_pool
@@ -3284,7 +3317,7 @@ async def scan_detail(request: Request, scan_id: int):
 
 
 @router.put("/balance-scan/{scan_id}/reconcile")
-async def reconcile_scan_endpoint(request: Request, scan_id: int, body: ReconcileRequest):
+async def reconcile_scan_endpoint(request: Request, scan_id: int, body: ReconcileRequest, user: AuthUser = Depends(require_permission("production", "day_end", "reconcile", action="create"))):
     """Reconcile a balance scan — adjust floor_inventory to match physical count."""
     from app.modules.production.services.day_end import reconcile_scan
     pool = request.app.state.db_pool
@@ -3300,7 +3333,7 @@ async def reconcile_scan_endpoint(request: Request, scan_id: int, body: Reconcil
 
 
 @router.post("/balance-scan/check-missing")
-async def check_missing(request: Request, entity: str = Query(...), target_date: str = Query(None)):
+async def check_missing(request: Request, entity: str = Query(...), target_date: str = Query(None), user: AuthUser = Depends(require_permission("production", "day_end", "missing", action="create"))):
     """Check which floors haven't submitted balance scans. Creates alerts."""
     from app.modules.production.services.day_end import check_missing_scans
     pool = request.app.state.db_pool
@@ -3316,7 +3349,7 @@ async def check_missing(request: Request, entity: str = Query(...), target_date:
 
 
 @router.post("/fulfillment/cancel")
-async def cancel_fulfillment(request: Request, body: FulfillmentCancelRequest):
+async def cancel_fulfillment(request: Request, body: FulfillmentCancelRequest, user: AuthUser = Depends(require_permission("production", "fulfillment", action="delete"))):
     """Cancel selected fulfillment records with reason."""
     pool = request.app.state.db_pool
     cancelled = 0
@@ -3342,7 +3375,7 @@ async def cancel_fulfillment(request: Request, body: FulfillmentCancelRequest):
 
 
 @router.get("/plans/{plan_id}/revision-history")
-async def revision_history(request: Request, plan_id: int):
+async def revision_history(request: Request, plan_id: int, user=Depends(require_permission("production", "plans", action="view"))):
     """Get the chain of revisions for a plan."""
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -3405,7 +3438,7 @@ class DiscrepancyResolveRequest(BaseModel):
 
 
 @router.post("/discrepancy/report")
-async def report_discrepancy_endpoint(request: Request, body: DiscrepancyReportRequest):
+async def report_discrepancy_endpoint(request: Request, body: DiscrepancyReportRequest, user: AuthUser = Depends(require_permission("production", "discrepancy", action="create"))):
     """Report an internal discrepancy. Auto-holds affected job cards."""
     from app.modules.production.services.discrepancy_manager import report_discrepancy
     pool = request.app.state.db_pool
@@ -3429,6 +3462,7 @@ async def list_discrepancies(
     severity: str = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(200, ge=1, le=500),
+    user: AuthUser = Depends(require_permission("production", "discrepancy", action="view")),
 ):
     """List discrepancy reports with filters."""
     pool = request.app.state.db_pool
@@ -3460,7 +3494,7 @@ async def list_discrepancies(
 
 
 @router.get("/discrepancy/{discrepancy_id}")
-async def get_discrepancy(request: Request, discrepancy_id: int):
+async def get_discrepancy(request: Request, discrepancy_id: int, user: AuthUser = Depends(require_permission("production", "discrepancy", action="view"))):
     """Get discrepancy detail with affected job cards."""
     from app.modules.production.services.discrepancy_manager import get_discrepancy_detail
     pool = request.app.state.db_pool
@@ -3472,7 +3506,7 @@ async def get_discrepancy(request: Request, discrepancy_id: int):
 
 
 @router.put("/discrepancy/{discrepancy_id}/resolve")
-async def resolve_discrepancy_endpoint(request: Request, discrepancy_id: int, body: DiscrepancyResolveRequest):
+async def resolve_discrepancy_endpoint(request: Request, discrepancy_id: int, body: DiscrepancyResolveRequest, user: AuthUser = Depends(require_permission("production", "discrepancy", "resolve", action="create"))):
     """Resolve a discrepancy with one of 5 resolution types."""
     from app.modules.production.services.discrepancy_manager import resolve_discrepancy
     pool = request.app.state.db_pool
@@ -3511,6 +3545,7 @@ async def list_ai_recommendations(
     status: str = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(200, ge=1, le=500),
+    user: AuthUser = Depends(require_permission("production", "ai", action="view")),
 ):
     """List all AI recommendations."""
     pool = request.app.state.db_pool
@@ -3542,7 +3577,7 @@ async def list_ai_recommendations(
 
 
 @router.put("/ai/recommendations/{rec_id}/feedback")
-async def ai_feedback(request: Request, rec_id: int, body: AIFeedbackRequest):
+async def ai_feedback(request: Request, rec_id: int, body: AIFeedbackRequest, user: AuthUser = Depends(require_permission("production", "ai", action="edit"))):
     """Accept or reject an AI recommendation with feedback."""
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -3569,6 +3604,7 @@ async def list_production_indents(
     date_to: str = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(200, ge=1, le=500),
+    user: AuthUser = Depends(require_permission("production", "production_indents", action="view")),
 ):
     from app.modules.production.services.production_indent_service import list_production_indents as _list
     pool = request.app.state.db_pool
@@ -3579,7 +3615,7 @@ async def list_production_indents(
 
 
 @router.get("/production-indents/{indent_id}")
-async def get_production_indent(request: Request, indent_id: str):
+async def get_production_indent(request: Request, indent_id: str, user: AuthUser = Depends(require_permission("production", "production_indents", action="view"))):
     from app.modules.production.services.production_indent_service import get_production_indent as _get
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -3605,7 +3641,7 @@ class ProductionIndentCreate(BaseModel):
 
 
 @router.post("/production-indents")
-async def create_production_indent(request: Request, body: ProductionIndentCreate):
+async def create_production_indent(request: Request, body: ProductionIndentCreate, user: AuthUser = Depends(require_permission("production", "production_indents", action="create"))):
     from app.modules.production.services.production_indent_service import create_production_indent as _create
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -3617,7 +3653,7 @@ async def create_production_indent(request: Request, body: ProductionIndentCreat
 
 
 @router.put("/production-indents/{indent_id}/submit")
-async def submit_production_indent(request: Request, indent_id: str):
+async def submit_production_indent(request: Request, indent_id: str, user: AuthUser = Depends(require_permission("production", "production_indents", action="create"))):
     from app.modules.production.services.production_indent_service import submit_indent
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -3630,7 +3666,7 @@ class CheckerAction(BaseModel):
 
 
 @router.put("/production-indents/{indent_id}/approve")
-async def approve_production_indent(request: Request, indent_id: str, body: CheckerAction):
+async def approve_production_indent(request: Request, indent_id: str, body: CheckerAction, user: AuthUser = Depends(require_permission("production", "production_indents", "approve", action="create"))):
     from app.modules.production.services.production_indent_service import approve_indent
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -3639,7 +3675,7 @@ async def approve_production_indent(request: Request, indent_id: str, body: Chec
 
 
 @router.put("/production-indents/{indent_id}/return")
-async def return_production_indent(request: Request, indent_id: str, body: CheckerAction):
+async def return_production_indent(request: Request, indent_id: str, body: CheckerAction, user: AuthUser = Depends(require_permission("production", "production_indents", "approve", action="create"))):
     from app.modules.production.services.production_indent_service import return_indent
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -3652,7 +3688,7 @@ class CancelBody(BaseModel):
 
 
 @router.put("/production-indents/{indent_id}/cancel")
-async def cancel_production_indent(request: Request, indent_id: str, body: CancelBody):
+async def cancel_production_indent(request: Request, indent_id: str, body: CancelBody, user: AuthUser = Depends(require_permission("production", "production_indents", "approve", action="create"))):
     from app.modules.production.services.production_indent_service import cancel_indent
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -3660,7 +3696,7 @@ async def cancel_production_indent(request: Request, indent_id: str, body: Cance
 
 
 @router.post("/production-indents/{indent_id}/create-internal-order")
-async def create_internal_order(request: Request, indent_id: str):
+async def create_internal_order(request: Request, indent_id: str, user: AuthUser = Depends(require_permission("production", "production_indents", action="create"))):
     from app.modules.production.services.production_indent_service import create_internal_order as _create
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -3682,6 +3718,7 @@ async def get_lots(
     warehouse: str = Query(None),
     job_card_id: str = Query(None),
     entity: str = Query("cfpl"),
+    user: AuthUser = Depends(require_permission("production", "lots", action="view")),
 ):
     from app.modules.production.services.lot_issuance_service import get_lots as _get
     pool = request.app.state.db_pool
@@ -3696,6 +3733,7 @@ async def get_lots_other_warehouses(
     item_description: str = Query(""),
     exclude_warehouse: str = Query(None),
     entity: str = Query("cfpl"),
+    user: AuthUser = Depends(require_permission("production", "lots", action="view")),
 ):
     from app.modules.production.services.lot_issuance_service import get_lots_other_warehouses as _get
     pool = request.app.state.db_pool
@@ -3715,7 +3753,7 @@ class FifoSkipBody(BaseModel):
 
 
 @router.post("/lots/fifo-skip")
-async def fifo_skip(request: Request, body: FifoSkipBody):
+async def fifo_skip(request: Request, body: FifoSkipBody, user: AuthUser = Depends(require_permission("production", "lots", action="create"))):
     from app.modules.production.services.lot_issuance_service import record_fifo_skip
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -3731,7 +3769,7 @@ class ForceAssignBody(BaseModel):
 
 
 @router.post("/lots/force-assign")
-async def force_assign(request: Request, body: ForceAssignBody):
+async def force_assign(request: Request, body: ForceAssignBody, user: AuthUser = Depends(require_permission("production", "lots", action="create"))):
     from app.modules.production.services.lot_issuance_service import force_assign_lot
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -3740,7 +3778,7 @@ async def force_assign(request: Request, body: ForceAssignBody):
 
 
 @router.get("/boxes/{box_id}")
-async def get_box(request: Request, box_id: str):
+async def get_box(request: Request, box_id: str, user: AuthUser = Depends(require_permission("production", "inventory", action="view"))):
     from app.modules.production.services.lot_issuance_service import get_box as _get
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -3755,7 +3793,7 @@ class ScanIdentifyBody(BaseModel):
 
 
 @router.post("/scan-identify")
-async def scan_identify(request: Request, body: ScanIdentifyBody):
+async def scan_identify(request: Request, body: ScanIdentifyBody, user: AuthUser = Depends(require_permission("production", "inventory", action="view"))):
     """Universal box identify: which table does this scanned box belong to."""
     from app.modules.production.services.box_identify_service import identify_box
     pool = request.app.state.db_pool
@@ -3789,7 +3827,7 @@ class IssueNoteCreate(BaseModel):
 
 
 @router.post("/issue-notes")
-async def create_issue_note(request: Request, body: IssueNoteCreate):
+async def create_issue_note(request: Request, body: IssueNoteCreate, user: AuthUser = Depends(require_permission("production", "inventory", "move", action="create"))):
     from app.modules.production.services.lot_issuance_service import create_issue_note as _create
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -3817,7 +3855,7 @@ class RaiseIndentBody(BaseModel):
 
 
 @router.post("/indents/raise")
-async def raise_indent(request: Request, body: RaiseIndentBody):
+async def raise_indent(request: Request, body: RaiseIndentBody, user: AuthUser = Depends(require_permission("production", "inventory", "move", action="create"))):
     from app.modules.production.services.lot_issuance_service import raise_purchase_indent
     from app.webhooks import events
     pool = request.app.state.db_pool
@@ -3870,6 +3908,7 @@ async def list_rtv_dispositions(
     request: Request,
     entity: str = Query(None),
     status: str = Query(None),
+    user: AuthUser = Depends(require_permission("production", "rtv", action="view")),
 ):
     from app.modules.production.services.rtv_disposition_service import list_dispositions
     pool = request.app.state.db_pool
@@ -3886,7 +3925,7 @@ class RtvDispositionBody(BaseModel):
 
 
 @router.post("/rtv/dispositions")
-async def assign_rtv_disposition(request: Request, body: RtvDispositionBody):
+async def assign_rtv_disposition(request: Request, body: RtvDispositionBody, user: AuthUser = Depends(require_permission("production", "rtv", action="create"))):
     from app.modules.production.services.rtv_disposition_service import assign_disposition
     from app.modules.production.services.mail_service import BUSINESS_HEADS
     if body.business_head and body.business_head not in BUSINESS_HEADS:
@@ -3908,7 +3947,7 @@ class DiscardBody(BaseModel):
 
 
 @router.post("/rtv/discard")
-async def approve_discard(request: Request, body: DiscardBody):
+async def approve_discard(request: Request, body: DiscardBody, user: AuthUser = Depends(require_permission("production", "rtv", action="create"))):
     from app.modules.production.services.rtv_disposition_service import approve_discard
     from app.modules.production.services.mail_service import BUSINESS_HEADS
     if body.business_head and body.business_head not in BUSINESS_HEADS:
@@ -4106,7 +4145,7 @@ class JobCardOutputV2Request(BaseModel):
 
 
 @router.post("/job-cards/{job_card_id}/output")
-async def record_output_v2(request: Request, job_card_id: int, body: JobCardOutputV2Request):
+async def record_output_v2(request: Request, job_card_id: int, body: JobCardOutputV2Request, user=Depends(require_permission("production", "job_cards", "output", action="create"))):
     """V2 consolidated: record FG output, byproducts, balance materials, and QC in one atomic call."""
     from app.modules.production.services.job_card_engine import record_output_v2 as _record
     from app.webhooks import events
@@ -4128,7 +4167,7 @@ async def record_output_v2(request: Request, job_card_id: int, body: JobCardOutp
 
 
 @router.get("/job-cards/{job_card_id}/output")
-async def get_output_v2(request: Request, job_card_id: int):
+async def get_output_v2(request: Request, job_card_id: int, user=Depends(require_permission("production", "job_cards", action="view"))):
     """Get full output summary: output row + byproducts + balance materials + loss recon."""
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -4180,7 +4219,7 @@ async def get_output_v2(request: Request, job_card_id: int):
 
 @router.patch("/job-cards/{job_card_id}/environment/{env_id}")
 async def update_environment(request: Request, job_card_id: int, env_id: int,
-                             body: EnvironmentPatchRequest):
+                             body: EnvironmentPatchRequest, user=Depends(require_permission("production", "job_cards", "quality", action="edit"))):
     from app.modules.production.services import jc_editor
     from app.webhooks import events
     pool = request.app.state.db_pool
@@ -4205,7 +4244,7 @@ async def update_environment(request: Request, job_card_id: int, env_id: int,
 
 @router.delete("/job-cards/{job_card_id}/environment/{env_id}")
 async def delete_environment_endpoint(request: Request, job_card_id: int, env_id: int,
-                                      body: AnnexureDeleteRequest):
+                                      body: AnnexureDeleteRequest, user=Depends(require_permission("production", "job_cards", "quality", action="edit"))):
     from app.modules.production.services import jc_editor
     from app.webhooks import events
     pool = request.app.state.db_pool
@@ -4229,7 +4268,7 @@ async def delete_environment_endpoint(request: Request, job_card_id: int, env_id
 
 @router.patch("/job-cards/{job_card_id}/metal-detection/{detection_id}")
 async def update_metal_detection(request: Request, job_card_id: int, detection_id: int,
-                                 body: MetalDetectionPatchRequest):
+                                 body: MetalDetectionPatchRequest, user=Depends(require_permission("production", "job_cards", "quality", action="edit"))):
     from app.modules.production.services import jc_editor
     from app.webhooks import events
     pool = request.app.state.db_pool
@@ -4254,7 +4293,7 @@ async def update_metal_detection(request: Request, job_card_id: int, detection_i
 
 @router.delete("/job-cards/{job_card_id}/metal-detection/{detection_id}")
 async def delete_metal_detection_endpoint(request: Request, job_card_id: int, detection_id: int,
-                                          body: AnnexureDeleteRequest):
+                                          body: AnnexureDeleteRequest, user=Depends(require_permission("production", "job_cards", "quality", action="edit"))):
     from app.modules.production.services import jc_editor
     from app.webhooks import events
     pool = request.app.state.db_pool
@@ -4278,7 +4317,7 @@ async def delete_metal_detection_endpoint(request: Request, job_card_id: int, de
 
 @router.patch("/job-cards/{job_card_id}/weight-checks/{check_id}")
 async def update_weight_check(request: Request, job_card_id: int, check_id: int,
-                              body: WeightCheckPatchRequest):
+                              body: WeightCheckPatchRequest, user=Depends(require_permission("production", "job_cards", "quality", action="edit"))):
     from app.modules.production.services import jc_editor
     from app.webhooks import events
     pool = request.app.state.db_pool
@@ -4303,7 +4342,7 @@ async def update_weight_check(request: Request, job_card_id: int, check_id: int,
 
 @router.delete("/job-cards/{job_card_id}/weight-checks/{check_id}")
 async def delete_weight_check_endpoint(request: Request, job_card_id: int, check_id: int,
-                                       body: AnnexureDeleteRequest):
+                                       body: AnnexureDeleteRequest, user=Depends(require_permission("production", "job_cards", "quality", action="edit"))):
     from app.modules.production.services import jc_editor
     from app.webhooks import events
     pool = request.app.state.db_pool
@@ -4327,7 +4366,7 @@ async def delete_weight_check_endpoint(request: Request, job_card_id: int, check
 
 @router.patch("/job-cards/{job_card_id}/loss-reconciliation/{recon_id}")
 async def update_loss_reconciliation(request: Request, job_card_id: int, recon_id: int,
-                                     body: LossReconciliationPatchRequest):
+                                     body: LossReconciliationPatchRequest, user=Depends(require_permission("production", "job_cards", "quality", action="edit"))):
     from app.modules.production.services import jc_editor
     from app.webhooks import events
     pool = request.app.state.db_pool
@@ -4352,7 +4391,7 @@ async def update_loss_reconciliation(request: Request, job_card_id: int, recon_i
 
 @router.delete("/job-cards/{job_card_id}/loss-reconciliation/{recon_id}")
 async def delete_loss_reconciliation_endpoint(request: Request, job_card_id: int, recon_id: int,
-                                              body: AnnexureDeleteRequest):
+                                              body: AnnexureDeleteRequest, user=Depends(require_permission("production", "job_cards", "quality", action="edit"))):
     from app.modules.production.services import jc_editor
     from app.webhooks import events
     pool = request.app.state.db_pool
@@ -4376,7 +4415,7 @@ async def delete_loss_reconciliation_endpoint(request: Request, job_card_id: int
 
 @router.patch("/job-cards/{job_card_id}/remarks/{remark_id}")
 async def update_remark(request: Request, job_card_id: int, remark_id: int,
-                        body: RemarkPatchRequest):
+                        body: RemarkPatchRequest, user=Depends(require_permission("production", "job_cards", "remark", action="edit"))):
     from app.modules.production.services import jc_editor
     from app.webhooks import events
     pool = request.app.state.db_pool
@@ -4401,7 +4440,7 @@ async def update_remark(request: Request, job_card_id: int, remark_id: int,
 
 @router.delete("/job-cards/{job_card_id}/remarks/{remark_id}")
 async def delete_remark_endpoint(request: Request, job_card_id: int, remark_id: int,
-                                 body: AnnexureDeleteRequest):
+                                 body: AnnexureDeleteRequest, user=Depends(require_permission("production", "job_cards", "remark", action="edit"))):
     from app.modules.production.services import jc_editor
     from app.webhooks import events
     pool = request.app.state.db_pool
@@ -4430,7 +4469,7 @@ async def delete_remark_endpoint(request: Request, job_card_id: int, remark_id: 
 async def create_plan_v2(
     request: Request,
     body: PlanV2Create,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "plans", action="create")),
 ):
     """Create a plan with header + lines; steps auto-snapshotted from BOM.
 
@@ -4487,7 +4526,7 @@ async def list_plans_v2(
     search: str = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=500),
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "plans", action="view")),
 ):
     """List plans. For non-admin users with a warehouse lock, the result set
     is restricted to their assigned warehouses regardless of the `warehouse`
@@ -4521,7 +4560,7 @@ async def list_plans_v2(
 
 
 @router.get("/plans-v2/{plan_id}")
-async def get_plan_v2(request: Request, plan_id: int):
+async def get_plan_v2(request: Request, plan_id: int, user=Depends(require_permission("production", "plans", action="view"))):
     """Full nested plan: header + lines + ordered steps."""
     from app.modules.production.services.plan_v2 import get_plan
     pool = request.app.state.db_pool
@@ -4533,7 +4572,7 @@ async def get_plan_v2(request: Request, plan_id: int):
 
 
 @router.get("/plans-v2/{plan_id}/job-card-groups")
-async def plan_job_card_groups(request: Request, plan_id: int, user=Depends(get_current_user)):
+async def plan_job_card_groups(request: Request, plan_id: int, user=Depends(require_permission("production", "plans", action="view"))):
     """Plan's job cards grouped per plan-line (one product per group) with a
     per-group summary, so the Job Cards view can render each product's stage
     chain as its own section instead of one interleaved flat list.
@@ -4557,7 +4596,7 @@ async def plan_job_card_groups(request: Request, plan_id: int, user=Depends(get_
 
 
 @router.put("/plans-v2/{plan_id}")
-async def update_plan_v2(request: Request, plan_id: int, body: PlanV2Update):
+async def update_plan_v2(request: Request, plan_id: int, body: PlanV2Update, user=Depends(require_permission("production", "plans", action="edit"))):
     from app.modules.production.services.plan_v2 import update_plan
     pool = request.app.state.db_pool
     fields = {k: v for k, v in body.model_dump().items() if v is not None}
@@ -4572,7 +4611,7 @@ async def update_plan_v2(request: Request, plan_id: int, body: PlanV2Update):
 
 
 @router.post("/plans-v2/{plan_id}/approve")
-async def approve_plan_v2(request: Request, plan_id: int, body: PlanV2Approve):
+async def approve_plan_v2(request: Request, plan_id: int, body: PlanV2Approve, user=Depends(require_permission("production", "plans", "approve", action="create"))):
     from app.modules.production.services.plan_v2 import approve_plan
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -4590,7 +4629,7 @@ async def split_plan_v2(
     request: Request,
     plan_id: int,
     mode: Literal["per_line", "sku", "customer"] = Query("per_line"),
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "plans", action="edit")),
 ):
     """Split a DRAFT plan's lines into separate plans (one product per plan).
 
@@ -4625,7 +4664,7 @@ async def cancel_plan_v2(
     request: Request,
     plan_id: int,
     body: PlanV2Cancel,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "plans", action="delete")),
 ):
     """Cancel a v2 plan. **Admin-only** — the cancel_plan service releases
     every line's planned_qty back to the linked so_fulfillment_v2 rows
@@ -4654,7 +4693,7 @@ async def delete_plan_v2(
     request: Request,
     plan_id: int,
     body: PlanV2Delete,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "plans", action="delete")),
 ):
     """Delete an APPROVED plan and notify every active admin by email.
 
@@ -4726,7 +4765,7 @@ async def delete_plan_v2(
 # --- Plan line-level edits ---
 
 @router.put("/plans-v2/lines/{plan_line_id}")
-async def update_plan_line_v2(request: Request, plan_line_id: int, body: PlanLineV2Patch):
+async def update_plan_line_v2(request: Request, plan_line_id: int, body: PlanLineV2Patch, user=Depends(require_permission("production", "plans", action="edit"))):
     """Partial update for a plan line. Mirrors PUT /plans-v2/{plan_id} —
     server filters None-valued keys and applies only the supplied fields.
 
@@ -4753,7 +4792,7 @@ async def update_plan_line_v2(request: Request, plan_line_id: int, body: PlanLin
 # --- Step-level endpoints ---
 
 @router.put("/plans-v2/lines/{plan_line_id}/steps/reorder")
-async def reorder_steps_v2(request: Request, plan_line_id: int, body: StepV2Reorder):
+async def reorder_steps_v2(request: Request, plan_line_id: int, body: StepV2Reorder, user=Depends(require_permission("production", "plans", action="edit"))):
     """Bulk reorder: step_ids[0] becomes step_order=1, etc."""
     from app.modules.production.services.plan_v2 import reorder_steps
     pool = request.app.state.db_pool
@@ -4770,7 +4809,7 @@ async def add_step_v2(
     request: Request,
     plan_line_id: int,
     body: StepV2Add,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "plans", action="edit")),
 ):
     """Append a step at the end of the line.
 
@@ -4810,6 +4849,9 @@ class JobCardLineCreate(BaseModel):
     qty_units: float | None = None
     wip_steps: list[JobCardLineCreateStep]
     pkg_floor: str
+    # Terminal step's process name (unified process list — the last row). May be
+    # a merged label like "Sorting + Packing"; stage stays packaging/FG.
+    pkg_process: str = "Packaging"
     # Same-article merge: other plan lines (same SKU + BOM, same plan) to fold
     # INTO this primary line before building ONE chain — qty_kg/qty_units above
     # must already be the COMBINED total. Empty => plain single-line create.
@@ -4821,7 +4863,7 @@ async def create_line_job_cards_v2(
     request: Request,
     plan_line_id: int,
     body: JobCardLineCreate,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", "generate", action="create")),
 ):
     """Create the chained job cards for ONE plan line (the Plan-List
     "Create Job Card" wizard) and dispatch each to its floor.
@@ -4862,6 +4904,7 @@ async def create_line_job_cards_v2(
                     qty_units=body.qty_units,
                     wip_steps=[s.model_dump() for s in body.wip_steps],
                     pkg_floor=body.pkg_floor,
+                    pkg_process=body.pkg_process,
                 )
                 # If this create means EVERY article on the plan now has job
                 # cards, release the plan (draft -> approved). No-op on error /
@@ -4888,7 +4931,7 @@ async def create_line_job_cards_v2(
 
 
 @router.get("/plans-v2/lines/{plan_line_id}/job-cards")
-async def get_line_job_cards_v2(request: Request, plan_line_id: int):
+async def get_line_job_cards_v2(request: Request, plan_line_id: int, user=Depends(require_permission("production", "plans", action="view"))):
     """Return the current job-card config for a plan line, shaped to prefill the
     Edit-Job-Card wizard ({exists, editable, qty_kg, qty_units, wip_steps, pkg_floor})."""
     from app.modules.production.services.job_card_v2 import get_line_job_card_config
@@ -4902,7 +4945,7 @@ async def replace_line_job_cards_v2(
     request: Request,
     plan_line_id: int,
     body: JobCardLineCreate,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", "generate", action="create")),
 ):
     """Edit (replace) a plan line's job cards from the wizard. Deletes the
     current chain and recreates it; refused once any stage has started. Same
@@ -4927,6 +4970,7 @@ async def replace_line_job_cards_v2(
                 qty_units=body.qty_units,
                 wip_steps=[s.model_dump() for s in body.wip_steps],
                 pkg_floor=body.pkg_floor,
+                pkg_process=body.pkg_process,
             )
     err = result.get("error")
     if err == "line_not_found":
@@ -4956,6 +5000,7 @@ class JobCardLineApplyEdits(BaseModel):
     qty_units: float | None = None
     steps: list[JobCardLineEditStep]
     pkg_floor: str
+    pkg_process: str | None = None
     pkg_job_card_id: int | None = None
     remove_reasons: dict[str, str] | None = None
 
@@ -4965,7 +5010,7 @@ async def apply_line_job_card_edits_v2(
     request: Request,
     plan_line_id: int,
     body: JobCardLineApplyEdits,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "plans", action="edit")),
 ):
     """Apply constrained LIVE edits to a plan line's job cards even after stages
     have started: real-time floor change, add a process (un-started tail), qty
@@ -4994,6 +5039,7 @@ async def apply_line_job_card_edits_v2(
                     qty_units=body.qty_units,
                     steps=[s.model_dump() for s in body.steps],
                     pkg_floor=body.pkg_floor,
+                    pkg_process=body.pkg_process,
                     pkg_job_card_id=body.pkg_job_card_id,
                     user=actor,
                     remove_reasons=body.remove_reasons or {},
@@ -5019,7 +5065,7 @@ async def apply_line_job_card_edits_v2(
 async def get_line_dispatch_info_v2(
     request: Request,
     plan_line_id: int,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "plans", action="view")),
 ):
     """Prefill payload for the FG-dispatch modal: the packaging (FG) job card +
     its batches (the batch selector source, defaulting to the packaging stage)
@@ -5047,7 +5093,7 @@ async def dispatch_line_fg_v2(
     request: Request,
     plan_line_id: int,
     body: FgDispatchBody,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "plans", "dispatch", action="create")),
 ):
     """Raise an FG dispatch for one article + packaging batch: emails To
     (billing, candor_operations, store_head) + CC (business_head,
@@ -5080,7 +5126,7 @@ async def update_step_v2(
     request: Request,
     step_id: int,
     body: StepV2Patch,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "plans", action="edit")),
 ):
     """Patch a step's floor / notes / std_time_min / loss_pct / name / stage.
 
@@ -5116,7 +5162,7 @@ async def update_step_v2(
 
 
 @router.delete("/plans-v2/steps/{step_id}")
-async def delete_step_v2(request: Request, step_id: int):
+async def delete_step_v2(request: Request, step_id: int, user=Depends(require_permission("production", "plans", action="edit"))):
     from app.modules.production.services.plan_v2 import delete_step
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -5134,7 +5180,7 @@ async def delete_step_v2(request: Request, step_id: int):
 
 
 @router.get("/plans-v2/bom/{bom_id}")
-async def get_bom_summary_v2(request: Request, bom_id: int, full: bool = False):
+async def get_bom_summary_v2(request: Request, bom_id: int, full: bool = False, user=Depends(require_permission("production", "plans", action="view"))):
     """Lightweight BOM summary intended for the Plan Detail BOM hover-card.
 
     Returns the header, a compact list of materials (truncated at 30 for the
@@ -5216,7 +5262,7 @@ async def get_bom_summary_v2(request: Request, bom_id: int, full: bool = False):
 async def create_bom_master_v2(
     request: Request,
     body: BomCreateV2Request,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "plans", action="create")),
 ):
     """Create/supersede the master BOM for one FG SKU so plan creation
     (POST /plans-v2) resolves it via bom_header ILIKE + is_active."""
@@ -5268,9 +5314,9 @@ async def list_job_cards_v2(
     date_field: Literal["created_at", "start_time", "end_time"] = Query("created_at"),
     date_from:  date | None = Query(None),
     date_to:    date | None = Query(None),
-    pendency:   Literal["overdue", "due_today", "due_this_week", "future"] | None = Query(
+    pendency:   Literal["overdue", "due_today", "due_this_week", "future", "pending_signoff"] | None = Query(
         None,
-        description="overdue | due_today | due_this_week | future",
+        description="overdue | due_today | due_this_week | future | pending_signoff",
     ),
     sort_by:    Literal[
         "created_at", "start_time", "end_time", "plan_id",
@@ -5280,7 +5326,7 @@ async def list_job_cards_v2(
     sort_order: Literal["ASC", "DESC", "asc", "desc"] = Query("DESC"),
     page:       int = Query(1, ge=1),
     page_size:  int = Query(100, ge=1, le=500),
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", action="view")),
 ):
     """Paginated list of v2 job cards with R3.D filter / sort / counter
     extensions. Non-admin users with a factory / floor lock get the result
@@ -5353,7 +5399,7 @@ async def search_job_cards_v2(
     entity:  str | None = Query(None),
     factory: str | None = Query(None),
     floor:   str | None = Query(None),
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", action="view")),
 ):
     """Free-text search across the v2 job-card surface.
 
@@ -5405,7 +5451,7 @@ async def sfg_inventory_v2(
     sku_name: str = Query(..., description="The SFG#### code to look up"),
     entity: str = Query(...),
     floor_id: str | None = Query(None),
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", action="view")),
 ):
     """Slice 5 — Stage-2 SFG inventory picker source. Lists AVAILABLE WIP/SFG
     batches (inventory_batch item_type='wip') for the given SFG#### code in FIFO
@@ -5449,7 +5495,7 @@ async def sfg_master_v2(
     sfg_code: str | None = Query(None, description="exact SFG#### code"),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=500),
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", action="view")),
 ):
     """The dedicated SFG catalogue (design ref §8.1) — projected from the
     sfg_master view over all_sku(item_type='sfg'). Entity-agnostic (the SFG
@@ -5473,7 +5519,7 @@ async def sfg_where_used_v2(
     request: Request,
     sfg_code: str = Query(..., description="the SFG#### code to reverse-look-up"),
     entity: str | None = Query(None),
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", action="view")),
 ):
     """Reverse index (design ref §9.2): which FGs consume this SFG####.
     Sourced from the sfg_where_used view. Entity-scoped for non-admins.
@@ -5503,7 +5549,7 @@ async def sfg_wip_stock_v2(
     search: str | None = Query(None, description="match SFG#### code or name"),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=500),
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", action="view")),
 ):
     """WIP/SFG on-hand stock grouped by SFG#### (design ref §9.5 WIP-stock view),
     from the inventory_batch item_type='wip' ledger. Entity-scoped for non-admins.
@@ -5530,7 +5576,7 @@ async def sfg_binding_v2(
     fg_sku_name: str | None = Query(None),
     sfg_code: str | None = Query(None),
     entity: str | None = Query(None),
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", action="view")),
 ):
     """FG↔stage↔SFG#### binding (design ref §9.2) from the fg_sfg_binding view.
     Filter by FG (bom_id or name), SFG code, and/or entity. Entity-scoped for
@@ -5558,7 +5604,7 @@ async def sfg_binding_v2(
 async def get_job_card_v2(
     request: Request,
     job_card_id: int,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", action="view")),
 ):
     """Full v2 job card detail — header + shifts + outputs + indents + sign-offs.
 
@@ -5588,7 +5634,7 @@ async def get_job_card_v2(
 async def job_card_chain_v2(
     request: Request,
     job_card_id: int,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", "stage_chain", action="view")),
 ):
     """Stage chain for a v2 JC — siblings on the same plan_line ordered by
     step_number. The current JC is marked with ``is_current: true`` so the
@@ -5668,7 +5714,7 @@ async def start_shift_v2(
     request: Request,
     job_card_id: int,
     body: ShiftStartRequest,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", "overview", action="start")),
 ):
     """Open a new shift segment on this v2 job card.
 
@@ -5702,7 +5748,7 @@ async def stop_shift_v2(
     request: Request,
     log_id: int,
     body: ShiftStopRequest,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", "overview", action="complete")),
 ):
     """Close an open shift segment + recompute the v2 JC's total_time_min."""
     from app.modules.production.services.job_card_v2 import stop_shift
@@ -5728,7 +5774,7 @@ async def stop_shift_v2(
 async def list_shifts_v2(
     request: Request,
     job_card_id: int,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", action="view")),
 ):
     """Return all shift segments for the v2 job card, ordered by start_at."""
     from app.modules.production.services.job_card_v2 import list_shifts
@@ -5750,7 +5796,7 @@ async def assign_team_v2(
     request: Request,
     job_card_id: int,
     body: AssignTeamV2Request,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", "overview", action="assign")),
 ):
     """Assign a team leader and optional members to a v2 JC.
 
@@ -5863,7 +5909,7 @@ async def get_accounting_v2(
     request: Request,
     job_card_id: int,
     batch_id: int | None = Query(None),
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", "accounting", action="view")),
 ):
     """Full accounting view for a v2 JC. Includes:
        stage context (step number, position, prev/next IDs, carried qty),
@@ -5898,7 +5944,7 @@ async def save_consumption_v2(
     request: Request,
     job_card_id: int,
     body: AccountingConsumptionRequest,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", "accounting", action="edit")),
 ):
     """Upsert consumption rows on this JC. The (job_card_id,
     material_sku_name) unique index makes re-saves an UPDATE."""
@@ -5922,7 +5968,7 @@ async def save_byproducts_v2(
     request: Request,
     job_card_id: int,
     body: AccountingByproductsRequest,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", "accounting", action="edit")),
 ):
     """Upsert byproduct rows. Zero-qty saves let the UI clear a row."""
     from app.modules.production.services.jc_accounting_v2 import save_byproducts
@@ -5945,7 +5991,7 @@ async def save_accounting_summary_v2(
     request: Request,
     job_card_id: int,
     body: AccountingSummaryRequest,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", "accounting", action="close")),
 ):
     """Save the summary balance row. Backend computes is_balanced and the
     loss percentages; returns the saved row + the residual difference."""
@@ -5990,7 +6036,7 @@ async def dispatch_to_next_v2(
     request: Request,
     job_card_id: int,
     body: DispatchToNextRequest,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", "overview", action="complete")),
 ):
     """Hand qty from this JC to its next_job_card_id partner. Auto-unlocks
     the downstream JC when it was waiting on the previous stage."""
@@ -6135,7 +6181,7 @@ async def record_output_v2(
     request: Request,
     job_card_id: int,
     body: RecordOutputV2Request,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", "output", action="create")),
 ):
     """Append an output row (RM consumed + output qty + yield) for this JC.
 
@@ -6601,7 +6647,7 @@ async def batch_open_v2(
     request: Request,
     job_card_id: int,
     body: BatchOpenRequest | None = None,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", "overview", action="start")),
 ):
     """R13: open a new batch row for this JC. Stage 1 still enforces "at
     most one open batch per JC" (drops in Stage 2)."""
@@ -6633,7 +6679,7 @@ async def batch_close_v2(
     job_card_id: int,
     batch_id: int,
     body: BatchCloseRequest,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", "overview", action="complete")),
 ):
     """R13: close a batch. In one txn: stamp batch row, write the output,
     auto-dispatch to next JC, unlock downstream if it was waiting."""
@@ -6679,7 +6725,7 @@ async def batch_close_v2(
 async def batch_list_v2(
     request: Request,
     job_card_id: int,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", action="view")),
 ):
     """R13: list all batches (open + closed + cancelled) for the JC,
     ordered by batch_number."""
@@ -6696,7 +6742,7 @@ async def batch_cancel_v2(
     job_card_id: int,
     batch_id: int,
     body: BatchCancelRequest | None = None,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", "overview", action="close")),
 ):
     """R13: cancel an open batch that has no attached output / dispatch /
     shift rows. Useful for batches opened by mistake."""
@@ -6728,7 +6774,7 @@ async def batch_rename_v2(
     job_card_id: int,
     batch_id: int,
     body: BatchRenameRequest | None = None,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", "overview", action="start")),
 ):
     """072: set/clear a batch's free-text name (shown instead of "Batch N")."""
     from app.modules.production.services import job_card_batch_v2 as svc
@@ -6769,7 +6815,7 @@ async def notify_qc_v2(
     request: Request,
     job_card_id: int,
     body: NotifyQCRequest | None = None,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", "quality", action="create")),
 ):
     """Alert the QC team scoped to this JC's entity / factory / floor.
     Allowed only when the JC is in status='completed'. Logs every
@@ -6896,7 +6942,7 @@ async def sign_off_v2(
     request: Request,
     job_card_id: int,
     body: SignOffRequest,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", "sign_offs", action="create")),
 ):
     """Record a per-role sign-off. UNIQUE (job_card_id, role) — re-signing
     under the same role refreshes the row instead of erroring.
@@ -7053,7 +7099,7 @@ class CancelJobCardV2Request(BaseModel):
 async def start_jc_v2(
     request: Request,
     job_card_id: int,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", "overview", action="start")),
 ):
     """Move a v2 JC into 'in_progress'."""
     from app.modules.production.services.job_card_v2 import start_job_card
@@ -7093,7 +7139,7 @@ async def complete_jc_v2(
     request: Request,
     job_card_id: int,
     body: CompleteJCV2Request | None = None,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", "overview", action="complete")),
 ):
     """Move a v2 JC from 'in_progress' to 'completed'. Refuses when:
       * An open shift segment is still running (would skew total_time_min)
@@ -7137,13 +7183,18 @@ async def force_unlock_v2(
     request: Request,
     job_card_id: int,
     body: ForceUnlockV2Request,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", "force_unlock", action="create")),
 ):
     """Admin override: flip a locked JC to 'unlocked' regardless of
     upstream-handoff state. Stamps force_unlocked + audit fields."""
     from app.modules.production.services.job_card_v2 import force_unlock
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
+        # Record-based scope guard: a floor/factory-locked user may only
+        # force-unlock a JC on their own floor/factory (admins bypass). The
+        # target is resolved from the JC row, closing the query-param scope
+        # bypass (omitting ?floor= no longer defeats allowed_floors).
+        await _assert_jc_writable_by_user(conn, job_card_id=job_card_id, user=user)
         async with conn.transaction():
             result = await force_unlock(
                 conn,
@@ -7163,7 +7214,7 @@ async def stop_jc_v2(
     request: Request,
     job_card_id: int,
     body: StopJobCardV2Request,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", "overview", action="complete")),
 ):
     """R1 Stop Process: mid-run cancel for JCs already receiving material
     or in_progress. Cancels any open R13 phase first inside the same txn,
@@ -7196,7 +7247,7 @@ async def patch_jc_v2(
     request: Request,
     job_card_id: int,
     body: PatchJobCardV2Request,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", "overview", action="start")),
 ):
     """Partial update of header fields. Use lifecycle endpoints for
     status / start / complete / close / cancel — those aren't patchable
@@ -7229,7 +7280,7 @@ async def cancel_jc_v2(
     request: Request,
     job_card_id: int,
     body: CancelJobCardV2Request,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", "overview", action="close")),
 ):
     """Soft-cancel a v2 JC. Allowed only before 'in_progress' — past that
     point, finish via complete/close instead. **Admin-only** — non-admin
@@ -7275,7 +7326,7 @@ class CloseJobCardV2Request(BaseModel):
 async def backfill_indents_v2(
     request: Request,
     job_card_id: int,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", "overview", action="start")),
 ):
     """Retro-materialise RM/PM indent rows for a v2 JC that was created
     before indent materialisation was wired into ``create_job_cards_from_plan``.
@@ -7303,7 +7354,7 @@ async def close_job_card_v2(
     request: Request,
     job_card_id: int,
     body: CloseJobCardV2Request | None = None,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", "overview", action="close")),
 ):
     """Close a v2 job card. Refuses on missing sign-offs or an open shift
     segment. After a successful close, if every JC on the linked plan has
@@ -7321,6 +7372,9 @@ async def close_job_card_v2(
     pool = request.app.state.db_pool
     plan_closed = False
     async with pool.acquire() as conn:
+        # Record-based scope guard (see _assert_jc_writable_by_user): a
+        # floor/factory-locked user may only close a JC on their own scope.
+        await _assert_jc_writable_by_user(conn, job_card_id=job_card_id, user=user)
         async with conn.transaction():
             result = await close_job_card(
                 conn, job_card_id=job_card_id, allow_partial=allow_partial,
@@ -7408,7 +7462,7 @@ class AnnexureDeleteRequest(BaseModel):
 @router.post("/job-cards-v2/{job_card_id}/metal-detection")
 async def add_metal_detection_v2(
     request: Request, job_card_id: int,
-    body: MetalDetectionAddRequest, user=Depends(get_current_user),
+    body: MetalDetectionAddRequest, user=Depends(require_permission("production", "job_cards", "quality", action="create")),
 ):
     from app.modules.production.services.jc_annexures_v2 import add_metal_detection
     pool = request.app.state.db_pool
@@ -7430,7 +7484,7 @@ async def add_metal_detection_v2(
 @router.patch("/job-cards-v2/{job_card_id}/metal-detection/{detection_id}")
 async def patch_metal_detection_v2(
     request: Request, job_card_id: int, detection_id: int,
-    body: MetalDetectionPatchRequest, user=Depends(get_current_user),
+    body: MetalDetectionPatchRequest, user=Depends(require_permission("production", "job_cards", "quality", action="edit")),
 ):
     from app.modules.production.services.jc_annexures_v2 import patch_metal_detection
     pool = request.app.state.db_pool
@@ -7453,7 +7507,7 @@ async def patch_metal_detection_v2(
 )
 async def delete_metal_detection_v2(
     request: Request, job_card_id: int, detection_id: int,
-    body: AnnexureDeleteRequest | None = None, user=Depends(get_current_user),
+    body: AnnexureDeleteRequest | None = None, user=Depends(require_permission("production", "job_cards", "quality", action="edit")),
 ):
     from app.modules.production.services.jc_annexures_v2 import delete_metal_detection
     pool = request.app.state.db_pool
@@ -7491,7 +7545,7 @@ class WeightCheckPatchRequest(BaseModel):
 @router.post("/job-cards-v2/{job_card_id}/weight-checks")
 async def add_weight_check_v2(
     request: Request, job_card_id: int,
-    body: WeightCheckAddRequest, user=Depends(get_current_user),
+    body: WeightCheckAddRequest, user=Depends(require_permission("production", "job_cards", "quality", action="create")),
 ):
     from app.modules.production.services.jc_annexures_v2 import add_weight_check
     pool = request.app.state.db_pool
@@ -7510,7 +7564,7 @@ async def add_weight_check_v2(
 @router.patch("/job-cards-v2/{job_card_id}/weight-checks/{check_id}")
 async def patch_weight_check_v2(
     request: Request, job_card_id: int, check_id: int,
-    body: WeightCheckPatchRequest, user=Depends(get_current_user),
+    body: WeightCheckPatchRequest, user=Depends(require_permission("production", "job_cards", "quality", action="edit")),
 ):
     from app.modules.production.services.jc_annexures_v2 import patch_weight_check
     pool = request.app.state.db_pool
@@ -7532,7 +7586,7 @@ async def patch_weight_check_v2(
 )
 async def delete_weight_check_v2(
     request: Request, job_card_id: int, check_id: int,
-    body: AnnexureDeleteRequest | None = None, user=Depends(get_current_user),
+    body: AnnexureDeleteRequest | None = None, user=Depends(require_permission("production", "job_cards", "quality", action="edit")),
 ):
     from app.modules.production.services.jc_annexures_v2 import delete_weight_check
     pool = request.app.state.db_pool
@@ -7568,7 +7622,7 @@ class EnvironmentPatchRequest(BaseModel):
 @router.post("/job-cards-v2/{job_card_id}/environment")
 async def add_environment_v2(
     request: Request, job_card_id: int,
-    body: EnvironmentAddRequest, user=Depends(get_current_user),
+    body: EnvironmentAddRequest, user=Depends(require_permission("production", "job_cards", "quality", action="create")),
 ):
     from app.modules.production.services.jc_annexures_v2 import add_environment
     pool = request.app.state.db_pool
@@ -7587,7 +7641,7 @@ async def add_environment_v2(
 @router.patch("/job-cards-v2/{job_card_id}/environment/{env_id}")
 async def patch_environment_v2(
     request: Request, job_card_id: int, env_id: int,
-    body: EnvironmentPatchRequest, user=Depends(get_current_user),
+    body: EnvironmentPatchRequest, user=Depends(require_permission("production", "job_cards", "quality", action="edit")),
 ):
     from app.modules.production.services.jc_annexures_v2 import patch_environment
     pool = request.app.state.db_pool
@@ -7609,7 +7663,7 @@ async def patch_environment_v2(
 )
 async def delete_environment_v2(
     request: Request, job_card_id: int, env_id: int,
-    body: AnnexureDeleteRequest | None = None, user=Depends(get_current_user),
+    body: AnnexureDeleteRequest | None = None, user=Depends(require_permission("production", "job_cards", "quality", action="edit")),
 ):
     from app.modules.production.services.jc_annexures_v2 import delete_environment
     pool = request.app.state.db_pool
@@ -7653,7 +7707,7 @@ class LossReconPatchRequest(BaseModel):
 @router.post("/job-cards-v2/{job_card_id}/loss-reconciliation")
 async def add_loss_recon_v2(
     request: Request, job_card_id: int,
-    body: LossReconAddRequest, user=Depends(get_current_user),
+    body: LossReconAddRequest, user=Depends(require_permission("production", "job_cards", "quality", action="create")),
 ):
     from app.modules.production.services.jc_annexures_v2 import add_loss_reconciliation
     pool = request.app.state.db_pool
@@ -7672,7 +7726,7 @@ async def add_loss_recon_v2(
 @router.patch("/job-cards-v2/{job_card_id}/loss-reconciliation/{recon_id}")
 async def patch_loss_recon_v2(
     request: Request, job_card_id: int, recon_id: int,
-    body: LossReconPatchRequest, user=Depends(get_current_user),
+    body: LossReconPatchRequest, user=Depends(require_permission("production", "job_cards", "quality", action="edit")),
 ):
     from app.modules.production.services.jc_annexures_v2 import patch_loss_reconciliation
     pool = request.app.state.db_pool
@@ -7694,7 +7748,7 @@ async def patch_loss_recon_v2(
 )
 async def delete_loss_recon_v2(
     request: Request, job_card_id: int, recon_id: int,
-    body: AnnexureDeleteRequest | None = None, user=Depends(get_current_user),
+    body: AnnexureDeleteRequest | None = None, user=Depends(require_permission("production", "job_cards", "quality", action="edit")),
 ):
     from app.modules.production.services.jc_annexures_v2 import delete_loss_reconciliation
     pool = request.app.state.db_pool
@@ -7726,7 +7780,7 @@ class RemarkPatchRequest(BaseModel):
 @router.post("/job-cards-v2/{job_card_id}/remarks")
 async def add_remark_v2(
     request: Request, job_card_id: int,
-    body: RemarkAddRequest, user=Depends(get_current_user),
+    body: RemarkAddRequest, user=Depends(require_permission("production", "job_cards", "remark", action="create")),
 ):
     from app.modules.production.services.jc_annexures_v2 import add_remark
     pool = request.app.state.db_pool
@@ -7746,7 +7800,7 @@ async def add_remark_v2(
 @router.patch("/job-cards-v2/{job_card_id}/remarks/{remark_id}")
 async def patch_remark_v2(
     request: Request, job_card_id: int, remark_id: int,
-    body: RemarkPatchRequest, user=Depends(get_current_user),
+    body: RemarkPatchRequest, user=Depends(require_permission("production", "job_cards", "remark", action="edit")),
 ):
     from app.modules.production.services.jc_annexures_v2 import patch_remark
     pool = request.app.state.db_pool
@@ -7768,7 +7822,7 @@ async def patch_remark_v2(
 )
 async def delete_remark_v2(
     request: Request, job_card_id: int, remark_id: int,
-    body: AnnexureDeleteRequest | None = None, user=Depends(get_current_user),
+    body: AnnexureDeleteRequest | None = None, user=Depends(require_permission("production", "job_cards", "remark", action="edit")),
 ):
     from app.modules.production.services.jc_annexures_v2 import delete_remark
     pool = request.app.state.db_pool
@@ -7794,7 +7848,7 @@ async def job_card_pdf_v2(
     request: Request,
     job_card_id: int,
     mode: Literal['bom', 'full'] = Query('full'),
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", "box_printing", action="view")),
 ):
     """Render a v2 job card to PDF using the same fpdf renderer as v1.
     The renderer reads `section_1_product` / `section_3_team` / etc. from
@@ -7840,7 +7894,7 @@ async def job_card_pdf_v1(
     request: Request,
     job_card_id: int,
     mode: Literal['bom', 'full'] = Query('full'),
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", "box_printing", action="view")),
 ):
     """v1 PDF for legacy job_card rows. Auth-required — when the row
     isn't in v1 (because it's a v2 JC and the caller hit this URL by
@@ -7924,7 +7978,7 @@ class CreateFgCartonsRequest(BaseModel):
 @router.post("/job-cards-v2/{job_card_id}/wip-boxes")
 async def create_wip_boxes_endpoint(
     request: Request, job_card_id: int, body: CreateWipBoxesRequest,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", "box_printing", action="create")),
 ):
     """Split a WIP-stage JC's net SFG into weighed boxes; mint a
     "<8-digit-time-base>-<per-JC counter>" box_id (the QR payload) per box, the
@@ -7949,7 +8003,7 @@ async def create_wip_boxes_endpoint(
 @router.put("/job-cards-v2/{job_card_id}/wip-boxes")
 async def update_wip_boxes_endpoint(
     request: Request, job_card_id: int, body: UpdateWipBoxesRequest,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", "box_printing", action="create")),
 ):
     """Edit mutable fields (net/gross weight, batch link, count) of already-saved
     SFG boxes. Only PRINTED boxes are editable; received/consumed ones are skipped."""
@@ -7971,7 +8025,7 @@ async def update_wip_boxes_endpoint(
 
 @router.get("/job-cards-v2/{job_card_id}/wip-boxes")
 async def list_wip_boxes_endpoint(
-    request: Request, job_card_id: int, user=Depends(get_current_user),
+    request: Request, job_card_id: int, user=Depends(require_permission("production", "job_cards", "box_printing", action="view")),
 ):
     """List the boxes produced by a WIP-stage JC (+ Σ net weight)."""
     from app.modules.production.services.sfg_box_service import get_boxes_for_jc
@@ -7986,7 +8040,7 @@ async def list_wip_boxes_endpoint(
 
 @router.get("/job-cards-v2/{job_card_id}/edit-log")
 async def job_card_edit_log_endpoint(
-    request: Request, job_card_id: int, user=Depends(get_current_user),
+    request: Request, job_card_id: int, user=Depends(require_permission("production", "job_cards", action="view")),
 ):
     """Whole-job-card change history (header/tabs + box data) from amendment_log.
     The frontend uses each row's field_name to paint the ever-edited value red."""
@@ -7999,7 +8053,7 @@ async def job_card_edit_log_endpoint(
 
 @router.get("/job-cards-v2/{job_card_id}/wip-boxes/labels.pdf")
 async def wip_box_labels_endpoint(
-    request: Request, job_card_id: int, user=Depends(get_current_user),
+    request: Request, job_card_id: int, user=Depends(require_permission("production", "job_cards", "box_printing", action="view")),
 ):
     """One QR label per box for a WIP-stage JC (labels carry no cost figures)."""
     from app.modules.production.services.sfg_box_service import get_boxes_for_jc
@@ -8020,7 +8074,7 @@ async def wip_box_labels_endpoint(
 @router.post("/job-cards-v2/{job_card_id}/scan-sfg-boxes")
 async def scan_sfg_boxes_endpoint(
     request: Request, job_card_id: int, body: ScanSfgBoxesRequest,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", "material_scan", action="scan")),
 ):
     """Scan SFG box QR ids into a downstream consuming JC (verify SFG + source)."""
     from app.modules.production.services.sfg_box_service import scan_receive_sfg_box
@@ -8042,7 +8096,7 @@ async def scan_sfg_boxes_endpoint(
 
 @router.get("/sfg-boxes/{box_id}")
 async def get_sfg_box_endpoint(
-    request: Request, box_id: str, user=Depends(get_current_user),
+    request: Request, box_id: str, user=Depends(require_permission("production", "job_cards", action="view")),
 ):
     """Single SFG box lookup (mirror of GET /boxes/{box_id} for po_box)."""
     from app.modules.production.services.sfg_box_service import get_box
@@ -8067,7 +8121,7 @@ async def get_sfg_box_endpoint(
 
 @router.get("/job-cards-v2/{job_card_id}/sfg-genealogy")
 async def jc_sfg_genealogy_endpoint(
-    request: Request, job_card_id: int, user=Depends(get_current_user),
+    request: Request, job_card_id: int, user=Depends(require_permission("production", "job_cards", action="view")),
 ):
     """Phase 7 — per-JC SFG box genealogy.
 
@@ -8100,7 +8154,7 @@ async def jc_sfg_genealogy_endpoint(
 
 @router.get("/sfg-boxes/{box_id}/genealogy")
 async def sfg_box_genealogy_endpoint(
-    request: Request, box_id: str, user=Depends(get_current_user),
+    request: Request, box_id: str, user=Depends(require_permission("production", "job_cards", action="view")),
 ):
     """Phase 7 — single-box upstream ancestry chain.
 
@@ -8137,7 +8191,7 @@ async def sfg_box_genealogy_endpoint(
 @router.get("/sfg-canonical/search")
 async def sfg_canonical_search_endpoint(
     request: Request, q: str = "", entity: str | None = None, limit: int = 20,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", action="view")),
 ):
     """Typeahead over the canonical SFG catalogue (``sfg_canonical_map``) for the
     Create/Edit Job-Card SFG-output autocomplete (SFG canonicalization design
@@ -8155,7 +8209,7 @@ async def sfg_canonical_search_endpoint(
 @router.post("/job-cards-v2/{job_card_id}/fg-cartons")
 async def create_fg_cartons_endpoint(
     request: Request, job_card_id: int, body: CreateFgCartonsRequest,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", "box_printing", action="create")),
 ):
     """Pack a terminal FG/packing JC's output into cartons; mint an 8-digit
     carton_id (the QR payload) per carton. Print stickers via
@@ -8181,7 +8235,7 @@ async def create_fg_cartons_endpoint(
 
 @router.get("/job-cards-v2/{job_card_id}/fg-cartons")
 async def list_fg_cartons_endpoint(
-    request: Request, job_card_id: int, user=Depends(get_current_user),
+    request: Request, job_card_id: int, user=Depends(require_permission("production", "job_cards", "box_printing", action="view")),
 ):
     """List the cartons packed by a terminal FG/packing JC (+ Σ net weight)."""
     from app.modules.production.services.sfg_box_service import get_cartons_for_jc
@@ -8196,7 +8250,7 @@ async def list_fg_cartons_endpoint(
 
 @router.get("/job-cards-v2/{job_card_id}/fg-cartons/labels.pdf")
 async def fg_carton_labels_endpoint(
-    request: Request, job_card_id: int, user=Depends(get_current_user),
+    request: Request, job_card_id: int, user=Depends(require_permission("production", "job_cards", "box_printing", action="view")),
 ):
     """One QR sticker per carton for a packing JC (stickers carry no cost figures)."""
     from app.modules.production.services.sfg_box_service import get_cartons_for_jc
@@ -8216,7 +8270,7 @@ async def fg_carton_labels_endpoint(
 
 @router.get("/fg-cartons/{carton_id}/label.pdf")
 async def fg_carton_single_label_endpoint(
-    request: Request, carton_id: str, user=Depends(get_current_user),
+    request: Request, carton_id: str, user=Depends(require_permission("production", "job_cards", "box_printing", action="view")),
 ):
     """Single carton sticker. Entity-scoped for non-admins (mirror of the box reads)."""
     from app.modules.production.services.sfg_box_service import get_box
@@ -8240,7 +8294,7 @@ async def fg_carton_single_label_endpoint(
 
 @router.get("/fg-cartons/{carton_id}/genealogy")
 async def fg_carton_genealogy_endpoint(
-    request: Request, carton_id: str, user=Depends(get_current_user),
+    request: Request, carton_id: str, user=Depends(require_permission("production", "job_cards", action="view")),
 ):
     """Carton upstream trace: carton → SFG boxes consumed into the packing JC →
     each box's box→lot lineage. ``level`` 0 = the carton; increases upstream."""
@@ -8267,7 +8321,7 @@ async def fg_carton_genealogy_endpoint(
 
 @router.get("/job-cards-v2/{job_card_id}/allocations")
 async def get_allocations_v2(
-    request: Request, job_card_id: int, user=Depends(get_current_user),
+    request: Request, job_card_id: int, user=Depends(require_permission("production", "job_cards", action="view")),
 ):
     """Store allocations recorded against this v2 JC's batch. Reads the
     shared store_allocation table by joining on batch_number."""
@@ -8298,7 +8352,7 @@ async def get_allocations_v2(
 
 @router.get("/job-cards-v2/{job_card_id}/floor-stock-status")
 async def get_floor_stock_status_v2(
-    request: Request, job_card_id: int, user=Depends(get_current_user),
+    request: Request, job_card_id: int, user=Depends(require_permission("production", "job_cards", action="view")),
 ):
     """Live floor-stock for this JC's batch. Excludes terminal statuses
     so the consumer sees what's still actionable on the floor."""
@@ -8354,7 +8408,7 @@ class AcknowledgeMaterialV2Request(BaseModel):
 @router.post("/job-cards-v2/{job_card_id}/receive-material")
 async def receive_material_v2(
     request: Request, job_card_id: int,
-    body: ReceiveMaterialV2Request, user=Depends(get_current_user),
+    body: ReceiveMaterialV2Request, user=Depends(require_permission("production", "job_cards", "receive_material", action="create")),
 ):
     """Attach QR-scanned boxes to this v2 JC's RM indent. Looks each
     box up in po_box, matches material_sku_name to the indent row,
@@ -8447,7 +8501,7 @@ async def receive_material_v2(
 @router.post("/job-cards-v2/{job_card_id}/acknowledge-material")
 async def acknowledge_material_v2(
     request: Request, job_card_id: int,
-    body: AcknowledgeMaterialV2Request, user=Depends(get_current_user),
+    body: AcknowledgeMaterialV2Request, user=Depends(require_permission("production", "job_cards", "receive_material", action="create")),
 ):
     """Mark RM indent rows on this JC as fulfilled. With `indent_id`,
     acknowledges just that row; otherwise acknowledges every row on the
@@ -8521,7 +8575,7 @@ async def routing_gaps(
     request: Request,
     entity: str | None = Query(None, description="filter by cfpl/cdpl"),
     family: str | None = Query(None, description="filter by classify_family value"),
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "plans", action="view")),
 ):
     """Grouped list of FG articles still missing a routing (Process Category).
 
@@ -8544,7 +8598,7 @@ async def routing_gaps_worksheet(
     request: Request,
     entity: str | None = Query(None),
     family: str | None = Query(None),
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "plans", action="view")),
 ):
     """Download the outstanding gap list as a CSV worksheet for production to
     fill (columns: article, family, in_all_sku, suggested_process_category,
@@ -8611,7 +8665,7 @@ async def create_box_scan(
     request: Request,
     job_card_id: int,
     body: BoxScanRequest,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", "material_scan", action="scan")),
 ):
     """Scan (upsert) a box against this job card. Resolves article + batch from
     the scanned box; floor/entity derive from the JC. Re-scanning the same box
@@ -8643,7 +8697,7 @@ async def create_box_scan(
 async def list_box_scans(
     request: Request,
     job_card_id: int,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", "material_scan", action="scan")),
 ):
     """All box scans for this job card (enriched with floor/entity/SKU) + totals."""
     from app.modules.production.services import box_scan_service as svc
@@ -8657,7 +8711,7 @@ async def delete_box_scan(
     request: Request,
     job_card_id: int,
     code: str,
-    user=Depends(get_current_user),
+    user=Depends(require_permission("production", "job_cards", "material_scan", action="scan")),
 ):
     """Un-scan a box (by its box_id or sfg carton_id) from this job card."""
     from app.modules.production.services import box_scan_service as svc

@@ -250,11 +250,54 @@ class DevJobCardCreate(BaseModel):
     mode_of_transport: Optional[str] = None
     expected_dispatch_date: Optional[date] = None
     confirmed_dispatch_date: Optional[date] = None
+    # Billing checklist (same rule as the requisition). Left None → inherited from the
+    # source requisition; an explicit value (incl. on a standalone card) wins.
+    returnable: Optional[bool] = None
+    non_returnable: Optional[bool] = None
+    paid: Optional[bool] = None
+    amount: Amount2 = None
     clone_from_base: bool = False
     lines: list[NpdLineIn] = Field(default_factory=list)
     # Per-article develop (082): each article its own product + base BOM + recipe. When
     # present, the service mirrors article #1 onto the card-level fg_sku_name/pcs/weight.
     articles: Optional[list[DevArticleIn]] = None
+
+    @model_validator(mode="after")
+    def _check_billing(self):
+        if self.returnable and self.non_returnable:
+            raise ValueError("returnable and non_returnable cannot both be selected")
+        if self.paid:
+            if not self.amount or self.amount <= 0:
+                raise ValueError("amount is required and must be greater than 0 when paid")
+        elif self.paid is False:   # explicitly not paid → amount locked to 0 (None = inherit)
+            self.amount = 0
+        return self
+
+
+class DevJobCardDetailsUpdate(BaseModel):
+    """Edit a dev job card's customer & dispatch header (company/customer/contact/ship-to/
+    transport/expected-dispatch + billing) while it is DRAFT/IN_DEVELOPMENT. PATCH semantics —
+    only the fields actually sent are updated (the service uses model_dump(exclude_unset=True))."""
+    company_name: Optional[str] = None
+    customer_name: Optional[str] = None
+    customer_contact: Optional[str] = None
+    customer_ship_to_address: Optional[str] = None
+    mode_of_transport: Optional[str] = None
+    expected_dispatch_date: Optional[date] = None
+    returnable: Optional[bool] = None
+    non_returnable: Optional[bool] = None
+    paid: Optional[bool] = None
+    amount: Amount2 = None
+
+    @model_validator(mode="after")
+    def _check_billing(self):
+        if self.returnable and self.non_returnable:
+            raise ValueError("returnable and non_returnable cannot both be selected")
+        if self.paid and (not self.amount or self.amount <= 0):
+            raise ValueError("amount is required and must be greater than 0 when paid")
+        if self.paid is False:
+            self.amount = 0
+        return self
 
 
 class DevArticlesReplace(BaseModel):

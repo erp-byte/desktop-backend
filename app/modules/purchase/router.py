@@ -4,8 +4,10 @@ import logging
 import math
 from datetime import date, datetime
 
-from fastapi import APIRouter, HTTPException, Query, Request, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, UploadFile, File
 from pydantic import BaseModel
+
+from app.modules.auth.middleware import require_permission
 
 from app.modules.purchase.schemas import (
     POHeaderOut,
@@ -46,6 +48,34 @@ def _coerce_date(v):
         return None
 
 
+async def _refresh_receiving_status(conn, transaction_no: str) -> None:
+    """Set po_header.status from what's been received via boxes. Called on every
+    box change so the Material In dashboard reflects receiving immediately:
+      • 'extra received'     — total received net weight > total ordered po_weight
+      • 'partially received' — at least one box exists
+      • 'pending'            — no boxes
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT
+            (SELECT COUNT(*)                     FROM po_box  WHERE transaction_no = $1) AS n_boxes,
+            (SELECT COALESCE(SUM(net_weight), 0) FROM po_box  WHERE transaction_no = $1) AS rec_net,
+            (SELECT COALESCE(SUM(po_weight), 0)  FROM po_line WHERE transaction_no = $1) AS ord_wt
+        """,
+        transaction_no,
+    )
+    if (row["n_boxes"] or 0) == 0:
+        status = "pending"
+    elif float(row["rec_net"] or 0) > float(row["ord_wt"] or 0):
+        status = "extra received"
+    else:
+        status = "partially received"
+    await conn.execute(
+        "UPDATE po_header SET status = $2 WHERE transaction_no = $1",
+        transaction_no, status,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Purchase Team: Upload
 # ---------------------------------------------------------------------------
@@ -56,6 +86,7 @@ async def upload_po_book_endpoint(
     request: Request,
     file: UploadFile = File(...),
     entity: str = Query(..., pattern="^(cfpl|cdpl)$"),
+    user=Depends(require_permission("purchase", "po", action="create")),
 ):
     """Upload a Purchase Order Book Excel file."""
     if not file or not file.filename:
@@ -110,6 +141,7 @@ async def view_pos(
     item_category: str = Query(None),
     sub_category: str = Query(None),
     item_type: str = Query(None),
+    user=Depends(require_permission("purchase", "po", action="read")),
 ):
     pool = request.app.state.db_pool
 
@@ -249,6 +281,7 @@ async def export_pos(
     item_category: str = Query(None),
     sub_category: str = Query(None),
     item_type: str = Query(None),
+    user=Depends(require_permission("purchase", "po", action="read")),
 ):
     pool = request.app.state.db_pool
 
@@ -298,6 +331,7 @@ async def get_summary(
     item_category: str = Query(None),
     sub_category: str = Query(None),
     item_type: str = Query(None),
+    user=Depends(require_permission("purchase", "po", action="read")),
 ):
     pool = request.app.state.db_pool
 
@@ -356,6 +390,7 @@ async def get_po(
         True,
         description="When false, sections omit box rows (counts only); boxes load lazily via GET /{txn}/boxes.",
     ),
+    user=Depends(require_permission("purchase", "po", action="read")),
 ):
     pool = request.app.state.db_pool
     header = await pool.fetchrow(
@@ -407,6 +442,7 @@ async def list_section_boxes(
     section_number: int = Query(..., description="Section within the line"),
     page: int = Query(1, ge=1),
     page_size: int = Query(200, ge=1, le=1000),
+    user=Depends(require_permission("purchase", "material_in", action="view")),
 ):
     """Paginated boxes for ONE section — loaded lazily when a section is expanded."""
     pool = request.app.state.db_pool
@@ -439,6 +475,7 @@ async def list_section_boxes_for_print(
     from_box: int | None = Query(None, description="Lowest box_number to include (inclusive)"),
     to_box: int | None = Query(None, description="Highest box_number to include (inclusive)"),
     limit: int = Query(20000, ge=1, le=50000),
+    user=Depends(require_permission("purchase", "material_in", action="view")),
 ):
     """All boxes for a section, or a box_number range — for label printing (no pagination)."""
     pool = request.app.state.db_pool
@@ -489,7 +526,8 @@ class StoresReceiveRequest(BaseModel):
 
 
 @router.put("/{transaction_no}/receive", response_model=POHeaderOut)
-async def stores_receive(request: Request, transaction_no: str, body: StoresReceiveRequest):
+async def stores_receive(request: Request, transaction_no: str, body: StoresReceiveRequest,
+                         user=Depends(require_permission("purchase", "material_in", action="edit"))):
     """
     Stores Team: Update header logistics + line dates/weights.
     Only updates Stores-owned fields — never touches Purchase Team data.
@@ -591,7 +629,8 @@ class UpdateSectionsRequest(BaseModel):
 
 
 @router.put("/{transaction_no}/boxes", response_model=POHeaderOut)
-async def stores_update_boxes(request: Request, transaction_no: str, body: UpdateSectionsRequest):
+async def stores_update_boxes(request: Request, transaction_no: str, body: UpdateSectionsRequest,
+                              user=Depends(require_permission("purchase", "material_in", action="edit"))):
     """
     Stores Team: Update existing sections and boxes.
     Uses COALESCE — only overwrites fields you provide, leaves others untouched.
@@ -648,6 +687,7 @@ async def stores_update_boxes(request: Request, transaction_no: str, body: Updat
                             for b in section.boxes
                         ],
                     )
+            await _refresh_receiving_status(conn, transaction_no)
 
     updated = await pool.fetchrow(
         "SELECT * FROM po_header WHERE transaction_no = $1", transaction_no
@@ -687,7 +727,8 @@ class AddSectionsRequest(BaseModel):
 
 
 @router.post("/{transaction_no}/boxes", response_model=POHeaderOut, status_code=201)
-async def stores_add_boxes(request: Request, transaction_no: str, body: AddSectionsRequest):
+async def stores_add_boxes(request: Request, transaction_no: str, body: AddSectionsRequest,
+                           user=Depends(require_permission("purchase", "material_in", action="create"))):
     """
     Stores Team: Add sections with boxes for a transaction.
     Append only — never deletes existing sections/boxes.
@@ -877,6 +918,7 @@ async def stores_add_boxes(request: Request, transaction_no: str, body: AddSecti
                                 $8, $8, $9, 'rm_store', $10)
                         ON CONFLICT (batch_id) DO NOTHING
                     """, batch_rows)
+            await _refresh_receiving_status(conn, transaction_no)
 
     updated = await pool.fetchrow(
         "SELECT * FROM po_header WHERE transaction_no = $1", transaction_no

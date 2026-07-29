@@ -68,35 +68,13 @@ _SORTABLE_COLUMNS: frozenset[str] = frozenset({
 # receipt-summary endpoint apply the exact same rule.
 _WEIGHT_MATCH_FACTOR = 0.99
 
-# A transaction is "completed" for the Material In dashboard when the Stores team
-# has received material that fully matches the ordered PO quantity on BOTH weight
-# AND count: it has ≥1 weighed box AND no line is short. A line is "short" when
-#   • its ordered po_weight is present and SUM(received net_weight) < po_weight*factor, OR
-#   • its ordered pack_count is present and received count < pack_count.
-# Received count = SUM(po_box.count), or the number of boxes when box counts are
-# absent. A line with no ordered value on a dimension doesn't constrain that
-# dimension (unknown, not short). Subqueries correlate on po_header.transaction_no.
-_FULLY_RECEIVED_PREDICATE = f"""
-    EXISTS (
-        SELECT 1 FROM po_box b
-         WHERE b.transaction_no = po_header.transaction_no
-    )
-    AND NOT EXISTS (
-        SELECT 1 FROM po_line l
-        LEFT JOIN LATERAL (
-            SELECT COALESCE(SUM(b.net_weight), 0)           AS rec_wt,
-                   COALESCE(SUM(b.count), COUNT(b.box_id))  AS rec_cnt
-              FROM po_box b
-             WHERE b.transaction_no = l.transaction_no
-               AND b.line_number    = l.line_number
-        ) r ON TRUE
-         WHERE l.transaction_no = po_header.transaction_no
-           AND (
-                (l.po_weight  IS NOT NULL AND r.rec_wt  < l.po_weight * {_WEIGHT_MATCH_FACTOR})
-             OR (l.pack_count IS NOT NULL AND r.rec_cnt < l.pack_count)
-           )
-    )
-""".strip()
+# A transaction is "received" (→ the Material In "Completed" section) as soon as
+# the Stores team enters ANY box for it — the dashboard moves it there on the
+# first box change. How much was received (partially vs extra) is a status label
+# on po_header, refreshed on every box change (router._refresh_receiving_status).
+_RECEIVED_PREDICATE = (
+    "EXISTS (SELECT 1 FROM po_box b WHERE b.transaction_no = po_header.transaction_no)"
+)
 
 _VALID_SECTIONS: frozenset[str] = frozenset({"today", "pending", "completed"})
 
@@ -206,8 +184,8 @@ def build_where(
 
     # Material In dashboard section partition (today / pending / completed).
     #   today     — po_date is the client's local today, whatever the receipt state
-    #   completed — NOT today AND received material fully matches ordered qty (wt+count)
-    #   pending   — NOT today AND NOT fully received
+    #   completed — NOT today AND any box has been received (partially/extra)
+    #   pending   — NOT today AND no box received yet
     # The three are mutually exclusive (Today takes priority), matching the
     # client's partition, so each section paginates independently server side.
     section = filters.get("section")
@@ -231,9 +209,9 @@ def build_where(
             else:
                 conditions.append("po_date IS DISTINCT FROM CURRENT_DATE")
             conditions.append(
-                f"({_FULLY_RECEIVED_PREDICATE})"
+                f"({_RECEIVED_PREDICATE})"
                 if section == "completed"
-                else f"NOT ({_FULLY_RECEIVED_PREDICATE})"
+                else f"NOT ({_RECEIVED_PREDICATE})"
             )
 
     # Visibility
@@ -296,6 +274,7 @@ def header_row_to_listitem(row) -> dict:
         "narration": row["narration"],
         "vendor_supplier_name": row["vendor_supplier_name"],
         "supplier_id": row["supplier_id"] if "supplier_id" in row.keys() else None,
+        "status": row["status"] if "status" in row.keys() else None,
         "gross_total": _f(row["gross_total"]),
         "total_amount": _f(row["total_amount"]),
         "sgst_amount": _f(row["sgst_amount"]),

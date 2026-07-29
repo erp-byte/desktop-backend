@@ -715,11 +715,11 @@ async def me(conn, *, user_id: int) -> dict:
     if role_ids:
         perms_rows = await conn.fetch(
             """
-            SELECT DISTINCT p.module, p.sub_module, p.action
+            SELECT DISTINCT p.module, p.sub_module, p.sub_sub_module, p.action
               FROM auth_role_permission rp
               JOIN auth_permission p ON rp.permission_id = p.permission_id
              WHERE rp.role_id = ANY($1)
-             ORDER BY p.module, p.sub_module, p.action
+             ORDER BY p.module, p.sub_module, p.sub_sub_module, p.action
             """,
             role_ids,
         )
@@ -745,7 +745,8 @@ async def me(conn, *, user_id: int) -> dict:
         "is_admin": is_admin,
         "roles": _roles_payload(roles),
         "permissions": [
-            {"module": r["module"], "sub_module": r["sub_module"], "action": r["action"]}
+            {"module": r["module"], "sub_module": r["sub_module"],
+             "sub_sub_module": r["sub_sub_module"], "action": r["action"]}
             for r in perms_rows
         ],
         "entities": entities,

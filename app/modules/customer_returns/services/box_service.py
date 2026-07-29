@@ -134,17 +134,19 @@ async def bulk_save_boxes(conn, company: str, cr_id: str,
                 )
                 updated += 1
             else:
-                box_id = f"{_base8()}-{num}-{inserted}"
+                # box_id stays NULL until the box is actually Printed (upsert_box) —
+                # a bulk save is not a print. Minting one here would make the row read
+                # back as "printed", freezing it in the UI though no label was produced.
                 await conn.execute(
                     f"""
                     INSERT INTO {tables['boxes']}
                         (rtv_id, article_description, box_number, box_id, uom, conversion,
                          net_weight, gross_weight, lot_number, item_mark, spl_remarks, vakkal, count)
-                    VALUES ($1,$2,$3,$4,$5,$6,
-                            COALESCE($7::numeric, 0), COALESCE($8::numeric, 0),
-                            $9,$10,$11,$12,$13)
+                    VALUES ($1,$2,$3,NULL,$4,$5,
+                            COALESCE($6::numeric, 0), COALESCE($7::numeric, 0),
+                            $8,$9,$10,$11,$12)
                     """,
-                    cr_id, art, num, box_id, b.uom, b.conversion, b.net_weight, b.gross_weight,
+                    cr_id, art, num, b.uom, b.conversion, b.net_weight, b.gross_weight,
                     b.lot_number, b.item_mark, b.spl_remarks, b.vakkal, b.count,
                 )
                 inserted += 1
