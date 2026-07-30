@@ -369,6 +369,10 @@ SQL_FILES = [
     # CR headers for the email magic-link + in-app approve flow, plus bare cold-unit
     # warehouse_cc rows for backend recipient matching. Additive/idempotent.
     DB_DIR / "078_cr_approval_audit.sql",
+    # 080 so_creator_fulfillment — 075 gave so_creator module='so' only, so the
+    # SO Creation page's two production calls (fulfillment-v2 sync + by-so-lines)
+    # 403'd. Grants production/fulfillment view+create. Idempotent.
+    DB_DIR / "080_so_creator_fulfillment.sql",
 ]
 
 # ── Optional: drop the v1 legacy job-card stack (TEST / Supabase DB ONLY) ──────
