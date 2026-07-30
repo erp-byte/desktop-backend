@@ -4930,6 +4930,127 @@ async def create_line_job_cards_v2(
     return result
 
 
+class ProcessMergeValidateRequest(BaseModel):
+    """POST /plans-v2/merge-process/validate — the selected plans to cluster."""
+    plan_ids: list[int]
+
+
+@router.post("/plans-v2/merge-process/validate")
+async def validate_process_merge_v2(
+    request: Request,
+    body: ProcessMergeValidateRequest,
+    user=Depends(require_permission("production", "plans", action="view")),
+):
+    """Cluster the selected plans' uncarded lines into cross-product process-merge
+    groups (same factory + entity + stage-1 floor + RM-article set). Read-only —
+    the UI uses it to show which selected products can share one merged process
+    run and why the rest cannot.
+    """
+    from app.modules.production.services.plan_v2 import validate_process_merge
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await validate_process_merge(conn, body.plan_ids)
+
+
+class ProcessMergeStepIn(BaseModel):
+    """One shared process step in the merged-process wizard."""
+    process: str
+    floor: str
+    sfg_output: str | None = None
+
+
+class ProcessMergeMemberIn(BaseModel):
+    """Per-product packaging config for one member of the merged run."""
+    plan_line_id: int
+    pkg_floor: str
+    pkg_process: str = "Packaging"
+    qty_kg: float | None = None
+    qty_units: float | None = None
+
+
+class ProcessMergeCreateRequest(BaseModel):
+    """POST /plans-v2/merge-process — build one shared process run."""
+    plan_line_ids: list[int]
+    wip_steps: list[ProcessMergeStepIn]
+    per_member: list[ProcessMergeMemberIn]
+
+
+@router.post("/plans-v2/merge-process")
+async def create_merged_process_run_v2(
+    request: Request,
+    body: ProcessMergeCreateRequest,
+    user=Depends(require_permission("production", "job_cards", "generate", action="create")),
+):
+    """Merge several products that share factory + floor + RM articles into ONE
+    shared process job card (summed qty) whose output feeds each product's own
+    packaging card. All cards are tagged with a single process_group_id.
+    """
+    floors = [s.floor for s in body.wip_steps] + [m.pkg_floor for m in body.per_member]
+    if not user.is_admin and user.allowed_floors:
+        bad = sorted({f for f in floors if f and f not in user.allowed_floors})
+        if bad:
+            raise HTTPException(status_code=403,
+                                detail=f"User is not assigned to floor(s): {', '.join(bad)}")
+
+    from app.modules.production.services.job_card_v2 import (
+        create_merged_process_run, maybe_release_plan_from_jcs,
+    )
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await create_merged_process_run(
+                conn,
+                plan_line_ids=body.plan_line_ids,
+                wip_steps=[s.model_dump() for s in body.wip_steps],
+                per_member=[m.model_dump() for m in body.per_member],
+                created_by=(getattr(user, "full_name", None) or None),
+            )
+            if "error" not in result:
+                # A merged run can card lines across several plans — release any
+                # plan that is now fully carded (no-op otherwise).
+                plan_ids = [r["plan_id"] for r in await conn.fetch(
+                    "SELECT DISTINCT plan_id FROM production_plan_line_v2 "
+                    "WHERE plan_line_id = ANY($1::int[])", body.plan_line_ids)]
+                for pid in plan_ids:
+                    await maybe_release_plan_from_jcs(
+                        conn, pid, approved_by=(getattr(user, "full_name", None) or None))
+    err = result.get("error")
+    if err in ("need_two_lines", "no_wip_steps", "bad_member", "member_mismatch",
+               "invalid_qty", "missing_pkg_floor", "exceeds_balance"):
+        raise HTTPException(status_code=400, detail=result.get("message"))
+    if err in ("line_not_found",):
+        raise HTTPException(status_code=404, detail=result.get("message"))
+    if err in ("not_a_group", "already_carded"):
+        raise HTTPException(status_code=409, detail=result.get("message"))
+    if err:
+        raise HTTPException(status_code=400, detail=result.get("message") or err)
+    return result
+
+
+@router.post("/job-cards-v2/{process_job_card_id}/dispatch-group")
+async def dispatch_process_group_v2(
+    request: Request,
+    process_job_card_id: int,
+    user=Depends(require_permission("production", "job_cards", "lifecycle", action="edit")),
+):
+    """Fan-out the shared process card's produced SFG to every member packaging
+    card in its merged group (unlock + carry qty + materialise WIP per member).
+    """
+    from app.modules.production.services.job_card_v2 import dispatch_process_group
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await dispatch_process_group(
+                conn, process_job_card_id=process_job_card_id,
+                dispatched_by=(getattr(user, "full_name", None) or None))
+    err = result.get("error")
+    if err in ("job_card_not_found",):
+        raise HTTPException(status_code=404, detail=result.get("message") or err)
+    if err:
+        raise HTTPException(status_code=400, detail=result.get("message") or err)
+    return result
+
+
 @router.get("/plans-v2/lines/{plan_line_id}/job-cards")
 async def get_line_job_cards_v2(request: Request, plan_line_id: int, user=Depends(require_permission("production", "plans", action="view"))):
     """Return the current job-card config for a plan line, shaped to prefill the
@@ -6622,6 +6743,9 @@ class BatchCloseRequest(BaseModel):
     is_balanced:            bool  | None = None
     balance_difference_qty: float | None = None
     closure_remarks:        str   | None = None
+    # Admin maker-checker override: close the batch even though its accounting
+    # is unbalanced. Only honoured for admins (enforced in the endpoint).
+    allow_unbalanced:       bool         = False
     # Stage 3 final: per-batch partial dispatch.  When omitted, the
     # full produced_qty_kg goes to the next JC (legacy behaviour).
     # When supplied, only `dispatch_qty_kg` flows downstream and the
@@ -6706,6 +6830,8 @@ async def batch_close_v2(
                 closure_remarks=body.closure_remarks,
                 dispatch_qty_kg=body.dispatch_qty_kg,
                 notes=body.notes,
+                # Override is admin-only — a non-admin's allow_unbalanced is ignored.
+                allow_unbalanced=(body.allow_unbalanced and bool(getattr(user, "is_admin", False))),
                 closed_by=user.full_name or user.phone,
             )
     _raise_if_locked(result)
@@ -6715,6 +6841,10 @@ async def batch_close_v2(
         raise HTTPException(status_code=404, detail=result)
     if result.get("error") in ("batch_not_open", "batch_already_open",
                                 "batch_date_taken", "batch_number_taken"):
+        raise HTTPException(status_code=409, detail=result)
+    if result.get("error") == "batch_unbalanced":
+        # 409 — the batch's accounting doesn't net out; the UI surfaces the
+        # variance + offers the admin override.
         raise HTTPException(status_code=409, detail=result)
     if result.get("error") in ("invalid_produced_qty", "yield_unreasonable"):
         raise HTTPException(status_code=400, detail=result.get("message", result["error"]))

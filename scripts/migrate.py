@@ -373,6 +373,13 @@ SQL_FILES = [
     # SO Creation page's two production calls (fulfillment-v2 sync + by-so-lines)
     # 403'd. Grants production/fulfillment view+create. Idempotent.
     DB_DIR / "080_so_creator_fulfillment.sql",
+    # 081 process_loss_remark — record_output writes a free-text
+    # process_loss_remark on job_card_output_v2; the column shipped in code only,
+    # 500ing output recording. Adds nullable TEXT. Idempotent.
+    DB_DIR / "081_jc_output_process_loss_remark.sql",
+    # 082 process_group — cross-product process merge tags every job card in a
+    # merged run with a shared process_group_id (+ partial index). Idempotent.
+    DB_DIR / "082_process_group.sql",
 ]
 
 # ── Optional: drop the v1 legacy job-card stack (TEST / Supabase DB ONLY) ──────

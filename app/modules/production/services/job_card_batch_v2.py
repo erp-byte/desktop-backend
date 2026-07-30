@@ -216,6 +216,10 @@ async def close_batch(conn, *, batch_id: int,
                       # stays at this JC's stage.
                       dispatch_qty_kg: float | None = None,
                       notes: str | None = None,
+                      # Balance lock: an unbalanced batch may not close. The UI
+                      # passes is_balanced from the live accounting (per-BOM
+                      # tolerance). allow_unbalanced=True is the admin override.
+                      allow_unbalanced: bool = False,
                       closed_by: str | None = None) -> dict:
     """Close a batch and propagate its produced qty downstream in one txn.
 
@@ -320,6 +324,40 @@ async def close_batch(conn, *, batch_id: int,
                 ),
             }
         yield_pct = round(raw_yield, 3)
+
+    # ── BALANCE LOCK (R9 at batch level) ──────────────────────────────────
+    # An unbalanced batch may NOT close. Gate on the AUTHORITATIVE per-batch
+    # accounting verdict (job_card_accounting_v2 — the same source
+    # complete_job_card checks, computed against the per-BOM tolerance in
+    # jc_accounting_v2: bom_header.allowed_balance_tolerance_pct, default 0.1%).
+    # Fall back to the UI's passed is_balanced only when no accounting row is
+    # persisted yet. NULL / FALSE / missing all block — the operator must resolve
+    # + save balanced accounting first. This mirrors close_job_card /
+    # complete_job_card, moved earlier so a mismatch can't be saved at batch
+    # close. `allow_unbalanced` is the admin maker-checker override.
+    if not allow_unbalanced:
+        acct = await conn.fetchrow(
+            "SELECT is_balanced, balance_difference_qty "
+            "FROM   job_card_accounting_v2 "
+            "WHERE  job_card_id=$1 AND COALESCE(batch_id,0)=COALESCE($2,0)",
+            resolved_jc_id, batch_id,
+        )
+        bal = acct["is_balanced"] if acct else is_balanced
+        if bal is not True:
+            diff = (acct["balance_difference_qty"] if acct else None)
+            if diff is None:
+                diff = balance_difference_qty
+            return {
+                "error": "batch_unbalanced",
+                "is_balanced": (bool(bal) if bal is not None else None),
+                "balance_difference_qty": (float(diff) if diff is not None else None),
+                "message": (
+                    ("This batch's accounting is not balanced"
+                     + (f" (off by {abs(float(diff)):.3f} kg)" if diff is not None else ""))
+                    if acct else
+                    "This batch has no saved balanced accounting to verify against"
+                ) + ". Resolve the variance and save the accounting before closing, or apply an admin override.",
+            }
 
     # ── 1. Close the batch row. Notes APPEND, not replace.
     # Stage 2: also writes the per-batch accounting summary + IST

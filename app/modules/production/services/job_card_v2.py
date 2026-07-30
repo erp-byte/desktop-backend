@@ -1300,6 +1300,323 @@ async def create_job_cards_for_line(
     }
 
 
+async def create_merged_process_run(
+    conn,
+    *,
+    plan_line_ids: list[int],
+    wip_steps: list[dict],
+    per_member: list[dict],
+    created_by: str | None = None,
+) -> dict:
+    """Cross-product process merge: build ONE shared PROCESS chain (summed qty,
+    producing a shared SFG) whose output feeds each product's OWN packaging card.
+
+    The member lines must share (factory, entity, stage-1 floor, RM-article set)
+    and be uncarded — RE-VALIDATED here against the DB, never trusted from the
+    client. Every card created is stamped with one process_group_id.
+
+    Structure built (mirrors create_job_cards_for_line's insert contract exactly
+    so downstream lock/handoff/box-scan/PDF keep working):
+      * PROCESS chain on the PRIMARY line — the wip_steps; stage-1 input=RM /
+        unlocked; the LAST wip step promoted to an SFG producer carrying the
+        shared group SFG code. planned_qty_kg = Σ member qty. The combined RM
+        indent is materialised on stage-1 by summing EACH member's own bom RM
+        (native _materialise_indents per member, RM-only) — exact, not a
+        primary-bom approximation.
+      * One PACKAGING card per member on its OWN line: prev = the last process
+        card, input_code = the shared SFG, output=FG, status locked (awaiting the
+        process handoff), planned_qty_kg = that member's qty. PM is materialised
+        per member on its own packaging card (PM-only).
+
+    The last process card's next_job_card_id is left NULL — a single scalar can't
+    fan to N packagings — so close_batch records its output and SKIPS the 1:1
+    auto-dispatch; distribution is done by dispatch_process_group. RM actual
+    consumption books on the ONE process card (primary line): with a single
+    physical process card, per-member RM costing is not separable — that is an
+    accepted consequence of the "one process card" model.
+
+    MUST run inside an outer transaction. Returns
+    {process_group_id, primary_plan_line_id, process_job_card_ids, packaging:
+    [{plan_line_id, job_card_id, ...}], count} or {error, message}.
+    """
+    # ---- validate shape --------------------------------------------------
+    member_ids = [int(x) for x in (plan_line_ids or []) if x is not None]
+    if len(member_ids) < 2:
+        return {"error": "need_two_lines", "message": "Select at least two products to merge."}
+    if not wip_steps:
+        return {"error": "no_wip_steps", "message": "At least one shared process step is required."}
+    pm_by_line: dict[int, dict] = {}
+    for m in (per_member or []):
+        try:
+            plid = int(m.get("plan_line_id"))
+        except (TypeError, ValueError):
+            return {"error": "bad_member", "message": "Each member needs a plan_line_id."}
+        pm_by_line[plid] = m
+    if set(pm_by_line) != set(member_ids):
+        return {"error": "member_mismatch",
+                "message": "per_member must cover exactly the selected plan_line_ids."}
+
+    # ---- re-validate eligibility against the DB (never trust the client) --
+    rows = await conn.fetch(
+        """
+        SELECT l.plan_line_id, l.plan_id, l.bom_id, l.fg_sku_name, l.customer_name,
+               l.planned_qty_kg,
+               lower(trim(p.warehouse)) AS factory,
+               lower(trim(p.entity))    AS entity, p.entity AS entity_raw,
+               p.warehouse AS warehouse_raw,
+               (SELECT lower(trim(s.floor)) FROM production_plan_step_v2 s
+                 WHERE s.plan_line_id = l.plan_line_id ORDER BY s.step_order LIMIT 1) AS floor1,
+               (SELECT string_agg(DISTINCT lower(trim(bl.material_sku_name)), ' | '
+                                  ORDER BY lower(trim(bl.material_sku_name)))
+                  FROM bom_line bl WHERE bl.bom_id = l.bom_id AND lower(bl.item_type)='rm') AS rm_fp,
+               -- STARTED = any card past the editable locked/unlocked state.
+               -- Carded-but-unstarted lines are mergeable; the merge rebuilds
+               -- their (unstarted) cards. Only STARTED chains are refused.
+               (SELECT COUNT(*) FROM job_card_v2 j
+                 WHERE j.plan_line_id = l.plan_line_id AND j.deleted_at IS NULL
+                   AND j.status NOT IN ('locked','unlocked')) AS jc_started
+        FROM production_plan_line_v2 l
+        JOIN production_plan_v2 p ON p.plan_id = l.plan_id
+        WHERE l.plan_line_id = ANY($1::int[])
+        FOR UPDATE OF l
+        """,
+        member_ids,
+    )
+    if len(rows) != len(member_ids):
+        return {"error": "line_not_found", "message": "One or more selected lines no longer exist."}
+    by_line = {r["plan_line_id"]: r for r in rows}
+    keys = {(r["factory"], r["entity"], r["floor1"], r["rm_fp"]) for r in rows}
+    if len(keys) != 1 or any(k is None for k in next(iter(keys))):
+        return {"error": "not_a_group",
+                "message": "Selected lines don't share one factory + floor + RM-article set."}
+    started = [r["plan_line_id"] for r in rows if r["jc_started"]]
+    if started:
+        return {"error": "already_started",
+                "message": (f"Lines have already-started job cards: {started}. Only "
+                            "un-started chains can be merged.")}
+
+    # ---- qty per member + shared totals ----------------------------------
+    def _fq(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
+    member_qty: dict[int, float] = {}
+    member_units: dict[int, float | None] = {}
+    for plid in member_ids:
+        m = pm_by_line[plid]
+        qk = _fq(m.get("qty_kg"))
+        planned = _fq(by_line[plid]["planned_qty_kg"])
+        if qk <= 0:
+            qk = planned  # default to the line's planned qty
+        if planned > 0 and qk > planned + 0.001:
+            return {"error": "exceeds_balance",
+                    "message": f"Line {plid}: {qk} kg exceeds planned {planned} kg."}
+        if not m.get("pkg_floor") or not str(m["pkg_floor"]).strip():
+            return {"error": "missing_pkg_floor", "message": f"Line {plid} needs a packaging floor."}
+        member_qty[plid] = qk
+        u = m.get("qty_units")
+        member_units[plid] = float(u) if u not in (None, "") and _fq(u) > 0 else None
+    merged_qty = round(sum(member_qty.values()), 3)
+    if merged_qty <= 0:
+        return {"error": "invalid_qty", "message": "Merged quantity must be greater than 0."}
+
+    primary = by_line[member_ids[0]]
+    primary_line_id = primary["plan_line_id"]
+    plan_id = primary["plan_id"]
+    factory = primary["warehouse_raw"]
+    entity  = primary["entity_raw"]
+    group_id = new_short_time_id()
+
+    # Shared SFG code the process chain produces and every packaging consumes.
+    # Prefer the operator's last-step sfg_output; else the primary's routed seam.
+    shared_sfg = (str(wip_steps[-1].get("sfg_output") or "").strip() or None)
+    if not shared_sfg:
+        shared_sfg = await _resolve_sfg_seam_code(conn, primary["bom_id"])
+    # shared_sfg may be None (unrouted RM): packaging still binds to the process
+    # card by prev_job_card_id, which the box-scan gate accepts on its own.
+
+    def _stage_for(name: str) -> str:
+        return (name or "").strip().lower().replace(" ", "_") or "wip"
+
+    async def _insert_card(*, plan_line_id, plan_step_id, bom_id, step_number,
+                           process_name, stage, floor, fg_sku_name, customer_name,
+                           batch_number, qty_kg, qty_units, input_kind, output_kind,
+                           is_locked, status, locked_reason, prev_jc, input_code,
+                           output_code, job_card_number):
+        async def _do():
+            return await conn.fetchval(
+                """
+                INSERT INTO job_card_v2 (
+                    job_card_id, job_card_number,
+                    plan_id, plan_line_id, plan_step_id, bom_id,
+                    step_number, process_name, stage,
+                    fg_sku_name, customer_name, batch_number,
+                    planned_qty_kg, planned_qty_units, uom,
+                    input_kind, output_kind,
+                    factory, floor, entity,
+                    is_locked, locked_reason, status,
+                    prev_job_card_id,
+                    input_code, output_code,
+                    process_group_id
+                ) VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                    $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23,
+                    $24, $25, $26, $27
+                )
+                RETURNING job_card_id
+                """,
+                new_short_time_id(), job_card_number,
+                plan_id, plan_line_id, plan_step_id, bom_id,
+                step_number, process_name, stage,
+                fg_sku_name, customer_name, batch_number,
+                qty_kg, qty_units, 'KGS',
+                input_kind, output_kind,
+                factory, floor, entity,
+                is_locked, locked_reason, status,
+                prev_jc,
+                input_code, output_code,
+                group_id,
+            )
+        return await insert_with_pk_retry(conn, _do)
+
+    async def _insert_step(plan_line_id, step_order, process_name, stage, floor):
+        async def _do():
+            return await conn.fetchval(
+                """
+                INSERT INTO production_plan_step_v2
+                    (step_id, plan_line_id, step_order, process_name, stage, floor)
+                VALUES ($1, $2, $3, $4, $5, $6) RETURNING step_id
+                """,
+                new_short_time_id(), plan_line_id, step_order, process_name, stage, floor,
+            )
+        return await insert_with_pk_retry(conn, _do)
+
+    # Merge may re-shape UNSTARTED existing chains (carded-but-not-started
+    # lines): hard-delete every member's cards first — matching
+    # replace_job_cards_for_line — so the plan_step_id RESTRICT FK releases
+    # before the steps are replaced. The `started` guard above guarantees no
+    # running card is touched.
+    await conn.execute(
+        "DELETE FROM job_card_v2 WHERE plan_line_id = ANY($1::int[])", member_ids)
+
+    # ---- build the shared PROCESS chain on the primary line --------------
+    await conn.execute("DELETE FROM production_plan_step_v2 WHERE plan_line_id=$1", primary_line_id)
+    n_wip = len(wip_steps)
+    process_jc_ids: list[int] = []
+    prev_jc_id: int | None = None
+    prev_output_code: str | None = None
+    for idx, s in enumerate(wip_steps):
+        is_first = idx == 0
+        is_last  = idx == n_wip - 1
+        proc = (s.get("process") or "").strip() or "Process"
+        floor = (s.get("floor") or "").strip() or None
+        stage = _stage_for(proc)
+        # Last process step is the SFG producer feeding every packaging; earlier
+        # steps follow the normal declared-SFG-or-plain-WIP rule.
+        if is_last:
+            output_kind = 'SFG' if shared_sfg else 'WIP'
+            output_code = shared_sfg
+        elif (s.get("sfg_output") or "").strip():
+            output_kind = 'SFG'
+            output_code = (s.get("sfg_output") or "").strip()
+        else:
+            output_kind = 'WIP'
+            output_code = None
+        input_kind  = 'RM' if is_first else 'SFG'
+        input_code  = prev_output_code
+        step_id = await _insert_step(primary_line_id, idx + 1, proc, stage, floor)
+        jc_id = await _insert_card(
+            plan_line_id=primary_line_id, plan_step_id=step_id, bom_id=primary["bom_id"],
+            step_number=idx + 1, process_name=proc, stage=stage, floor=floor,
+            fg_sku_name=primary["fg_sku_name"], customer_name=primary["customer_name"],
+            batch_number=_batch_number(plan_id, primary_line_id, idx + 1),
+            qty_kg=merged_qty, qty_units=None,
+            input_kind=input_kind, output_kind=output_kind,
+            is_locked=not is_first, status='unlocked' if is_first else 'locked',
+            locked_reason=None if is_first else 'awaiting_previous_stage',
+            prev_jc=prev_jc_id, input_code=input_code, output_code=output_code,
+            job_card_number=f"MPG-{group_id}-P{idx + 1}",
+        )
+        process_jc_ids.append(jc_id)
+        if prev_jc_id is not None:
+            await conn.execute(
+                "UPDATE job_card_v2 SET next_job_card_id=$1 WHERE job_card_id=$2", jc_id, prev_jc_id)
+        prev_jc_id = jc_id
+        prev_output_code = output_code
+
+    last_process_jc = process_jc_ids[-1]
+
+    # ---- combined RM indent on stage-1: sum EACH member's own bom RM ------
+    stage1_jc = process_jc_ids[0]
+    for plid in member_ids:
+        r = by_line[plid]
+        if r["bom_id"]:
+            await _materialise_indents(
+                conn, job_card_id=stage1_jc, bom_id=r["bom_id"],
+                planned_qty_kg=member_qty[plid], is_first_stage=True,
+                fg_sku_name=r["fg_sku_name"], planned_qty_units=member_units[plid],
+                include_rm=True, include_pm=False,
+            )
+
+    # ---- one PACKAGING card per member, fed by the shared process --------
+    packaging: list[dict] = []
+    for plid in member_ids:
+        r = by_line[plid]
+        m = pm_by_line[plid]
+        pkg_floor = str(m["pkg_floor"]).strip()
+        pkg_proc  = (str(m.get("pkg_process") or "").strip() or "Packaging")
+        # The primary line's steps were already replaced above (process steps
+        # 1..n_wip); its packaging is simply the next step_order. Non-primary
+        # lines get their snapshot steps replaced with a single packaging step.
+        if plid != primary_line_id:
+            await conn.execute("DELETE FROM production_plan_step_v2 WHERE plan_line_id=$1", plid)
+        pkg_order = (n_wip + 1) if plid == primary_line_id else 1
+        step_id = await _insert_step(plid, pkg_order, pkg_proc, 'packaging', pkg_floor)
+        jc_id = await _insert_card(
+            plan_line_id=plid, plan_step_id=step_id, bom_id=r["bom_id"],
+            step_number=pkg_order, process_name=pkg_proc, stage='packaging', floor=pkg_floor,
+            fg_sku_name=r["fg_sku_name"], customer_name=r["customer_name"],
+            batch_number=_batch_number(r["plan_id"], plid, pkg_order),
+            qty_kg=member_qty[plid], qty_units=member_units[plid],
+            input_kind='SFG', output_kind='FG',
+            # Per the merge spec, packaging is created UNLOCKED (workable right
+            # away) rather than awaiting the process handoff. dispatch_process_group
+            # still carries qty + mints WIP into it (its unlock CASE just no-ops).
+            is_locked=False, status='unlocked', locked_reason=None,
+            prev_jc=last_process_jc, input_code=shared_sfg, output_code=None,
+            job_card_number=f"MPG-{group_id}-PK{plid}",
+        )
+        # PM (packaging material) is per-product — materialise on THIS card.
+        if r["bom_id"]:
+            await _materialise_indents(
+                conn, job_card_id=jc_id, bom_id=r["bom_id"],
+                planned_qty_kg=member_qty[plid], is_first_stage=True,
+                fg_sku_name=r["fg_sku_name"], planned_qty_units=member_units[plid],
+                include_rm=False, include_pm=True,
+            )
+        packaging.append({
+            "plan_line_id": plid, "job_card_id": jc_id,
+            "fg_sku_name": r["fg_sku_name"], "qty_kg": member_qty[plid],
+            "pkg_floor": pkg_floor, "pkg_process": pkg_proc,
+        })
+
+    logger.info(
+        "Merged process run %s: %d process card(s) (%.3f kg) feeding %d packaging card(s) "
+        "across lines %s (shared SFG=%s)",
+        group_id, len(process_jc_ids), merged_qty, len(packaging), member_ids, shared_sfg,
+    )
+    return {
+        "process_group_id": group_id,
+        "primary_plan_line_id": primary_line_id,
+        "merged_qty_kg": merged_qty,
+        "shared_sfg_code": shared_sfg,
+        "process_job_card_ids": process_jc_ids,
+        "packaging": packaging,
+        "count": len(process_jc_ids) + len(packaging),
+    }
+
+
 # A job card is still EDITABLE only while it hasn't started moving — i.e. it is
 # in the initial locked/unlocked state with no material received / time logged.
 # Once the floor begins (material_received, in_progress, …) the chain carries
@@ -3034,6 +3351,139 @@ async def dispatch_to_next(conn, *, job_card_id: int, qty_kg: float,
         )
     return {"dispatched": True, "dispatch": _serialize(audit),
             "wip_batch_id": wip_batch_id}
+
+
+async def dispatch_process_group(conn, *, process_job_card_id: int,
+                                 dispatched_by: str | None = None) -> dict:
+    """Fan-out handoff for a merged process run (create_merged_process_run):
+    distribute the shared PROCESS card's produced SFG to EVERY member packaging
+    card hanging off it (prev_job_card_id = this card). Mirrors dispatch_to_next /
+    close_batch's per-consumer side-effects EXACTLY — partial-dispatch audit,
+    the producer's dispatched_to_next_kg, the consumer's carried_qty_kg + unlock,
+    and one materialise_wip_dispatch (WIP batch + synthetic consumption +
+    floor_movement) per consumer — but loops N consumers instead of the single
+    next_job_card_id (which the merged process card leaves NULL).
+
+    Qty split: each packaging receives its own planned_qty_kg, scaled down
+    proportionally when the process produced less than the group total (loss),
+    and capped so cumulative dispatch never exceeds produced. A packaging already
+    fed (carried_qty_kg > 0) is skipped, so a re-run only tops up the rest.
+
+    MUST run inside an outer transaction.
+    """
+    src = await conn.fetchrow(
+        """
+        SELECT job_card_id, output_kind, output_code, fg_sku_name, entity,
+               status, dispatched_to_next_kg, process_group_id
+        FROM   job_card_v2
+        WHERE  job_card_id=$1 AND deleted_at IS NULL
+        FOR    UPDATE
+        """,
+        process_job_card_id,
+    )
+    if not src:
+        return {"error": "job_card_not_found"}
+    if src["process_group_id"] is None:
+        return {"error": "not_a_group",
+                "message": "This card is not part of a merged process group."}
+    if (src["output_kind"] or "").upper() not in ('SFG', 'WIP'):
+        return {"error": "not_a_producer",
+                "message": "This card is not an SFG/WIP producer — nothing to fan out."}
+    if (src["output_kind"] or "").upper() == 'SFG' and not src["output_code"]:
+        return {"error": "missing_seam",
+                "message": "SFG producer has a NULL output_code; refusing to dispatch."}
+    if (src["status"] or "") == 'cancelled':
+        return {"error": "jc_terminal", "message": "Process card is cancelled."}
+
+    produced = float(await conn.fetchval(
+        "SELECT COALESCE(SUM(output_qty_kg),0) FROM job_card_output_v2 WHERE job_card_id=$1",
+        process_job_card_id,
+    ) or 0)
+    if produced <= 0:
+        return {"error": "no_output",
+                "message": "Record the process output before distributing to packaging."}
+
+    consumers = await conn.fetch(
+        """
+        SELECT job_card_id, plan_line_id, planned_qty_kg, planned_qty_units,
+               carried_qty_kg, status, locked_reason
+        FROM   job_card_v2
+        WHERE  prev_job_card_id=$1 AND deleted_at IS NULL
+        ORDER  BY job_card_id
+        FOR    UPDATE
+        """,
+        process_job_card_id,
+    )
+    if not consumers:
+        return {"error": "no_consumers",
+                "message": "No packaging cards hang off this process card."}
+
+    # Only feed consumers not yet fed. Split the remaining produced budget across
+    # their planned qty proportionally, capping cumulative dispatch at produced.
+    pending = [c for c in consumers if float(c["carried_qty_kg"] or 0) <= 0]
+    if not pending:
+        return {"dispatched": True, "process_group_id": src["process_group_id"],
+                "produced_kg": produced, "results": [],
+                "message": "All packaging cards already fed."}
+    demand  = sum(float(c["planned_qty_kg"] or 0) for c in pending)
+    already = float(src["dispatched_to_next_kg"] or 0)
+    budget  = max(0.0, produced - already)
+    scale   = min(1.0, (budget / demand) if demand > 0 else 0.0)
+
+    results: list[dict] = []
+    for c in pending:
+        want = round(float(c["planned_qty_kg"] or 0) * scale, 3)
+        if want <= 0:
+            continue
+        cu = c["planned_qty_units"]
+
+        async def _ins(_to=c["job_card_id"], _q=want, _u=cu):
+            return await conn.fetchrow(
+                """
+                INSERT INTO job_card_partial_dispatch_v2
+                    (dispatch_id, from_job_card_id, to_job_card_id, qty_kg, qty_units,
+                     dispatched_by, notes)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                RETURNING *
+                """,
+                new_short_time_id(), process_job_card_id, _to, _q, _u,
+                dispatched_by, f"Merged process fan-out (group {src['process_group_id']})",
+            )
+        audit = await insert_with_pk_retry(conn, _ins)
+
+        await conn.execute(
+            "UPDATE job_card_v2 SET dispatched_to_next_kg = dispatched_to_next_kg + $1 "
+            "WHERE job_card_id=$2",
+            want, process_job_card_id,
+        )
+        await conn.execute(
+            """
+            UPDATE job_card_v2
+               SET carried_qty_kg = carried_qty_kg + $1,
+                   is_locked      = CASE WHEN locked_reason='awaiting_previous_stage' THEN FALSE ELSE is_locked END,
+                   status         = CASE WHEN status='locked' AND locked_reason='awaiting_previous_stage'
+                                         THEN 'unlocked' ELSE status END,
+                   locked_reason  = CASE WHEN locked_reason='awaiting_previous_stage' THEN NULL ELSE locked_reason END
+             WHERE job_card_id=$2
+            """,
+            want, c["job_card_id"],
+        )
+        wip_batch_id = await materialise_wip_dispatch(
+            conn,
+            producer_job_card_id=process_job_card_id,
+            consumer_job_card_id=c["job_card_id"],
+            sfg_code=src["output_code"], fg_sku_name=src["fg_sku_name"],
+            qty_kg=want, dispatch_id=audit["dispatch_id"],
+            entity=src["entity"], recorded_by=dispatched_by,
+        )
+        results.append({
+            "packaging_job_card_id": c["job_card_id"],
+            "plan_line_id": c["plan_line_id"], "qty_kg": want,
+            "wip_batch_id": wip_batch_id,
+        })
+
+    return {"dispatched": True, "process_group_id": src["process_group_id"],
+            "produced_kg": produced, "results": results}
 
 
 # ---------------------------------------------------------------------------

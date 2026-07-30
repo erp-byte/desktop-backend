@@ -688,6 +688,124 @@ async def approve_plan(conn, plan_id: int, approved_by: str) -> dict:
 _SPLIT_MODES = ("per_line", "sku", "customer")
 
 
+async def validate_process_merge(conn, plan_ids: list[int]) -> dict:
+    """Group the selected plans' UNCARDED lines into cross-product process-merge
+    clusters. Two lines can share a merged process run iff they match on
+    (factory, entity, stage-1 floor, RM-article set). The RM set is the DISTINCT
+    material_sku_name of the line's BOM where item_type='rm' — so two DIFFERENT
+    FGs whose BOMs list the same raw materials qualify (the "same BOM RM
+    articles" rule), NOT bom_id equality.
+
+    Read-only. Returns {"groups": [...], "ineligible": [...]}: every group with
+    >=2 members is mergeable; singletons and carded / RM-less lines come back as
+    ineligible with a reason so the UI can explain why nothing merged.
+    """
+    ids = [int(p) for p in (plan_ids or []) if p is not None]
+    if not ids:
+        return {"groups": [], "ineligible": []}
+
+    rows = await conn.fetch(
+        """
+        SELECT l.plan_line_id, l.plan_id, l.fg_sku_name, l.bom_id,
+               l.planned_qty_kg, l.planned_qty_units,
+               lower(trim(p.warehouse)) AS factory,
+               lower(trim(p.entity))    AS entity,
+               -- RM is consumed at the FIRST step, so that step's floor is the
+               -- merge-relevant floor (a line's later steps sit on other floors).
+               (SELECT lower(trim(s.floor))
+                  FROM production_plan_step_v2 s
+                 WHERE s.plan_line_id = l.plan_line_id
+                 ORDER BY s.step_order
+                 LIMIT 1)                AS floor1,
+               -- Fingerprint = sorted DISTINCT RM article names for the line's
+               -- BOM. Equal fingerprints => "same BOM RM articles" across
+               -- different bom_ids / different FGs.
+               (SELECT string_agg(DISTINCT lower(trim(bl.material_sku_name)), ' | '
+                                  ORDER BY lower(trim(bl.material_sku_name)))
+                  FROM bom_line bl
+                 WHERE bl.bom_id = l.bom_id
+                   AND lower(bl.item_type) = 'rm')  AS rm_fingerprint,
+               (SELECT COUNT(*) FROM job_card_v2 j
+                 WHERE j.plan_line_id = l.plan_line_id
+                   AND j.deleted_at IS NULL)         AS jc_count,
+               -- A line's chain is "started" (non-mergeable) once ANY card has
+               -- moved past the editable locked/unlocked state. Carded-but-
+               -- unstarted lines ARE mergeable — the merge rebuilds them.
+               (SELECT COUNT(*) FROM job_card_v2 j
+                 WHERE j.plan_line_id = l.plan_line_id
+                   AND j.deleted_at IS NULL
+                   AND j.status NOT IN ('locked','unlocked')) AS jc_started
+        FROM production_plan_line_v2 l
+        JOIN production_plan_v2 p ON p.plan_id = l.plan_id
+        WHERE l.plan_id = ANY($1::int[])
+        ORDER BY l.plan_line_id
+        """,
+        ids,
+    )
+
+    # Each line's planned process steps — the "processes to be merged" the modal
+    # lists so the operator sees what's being folded into the shared process.
+    line_ids = [r["plan_line_id"] for r in rows]
+    steps_by_line: dict[int, list] = {}
+    if line_ids:
+        for s in await conn.fetch(
+            "SELECT plan_line_id, step_order, process_name, stage, floor "
+            "FROM production_plan_step_v2 WHERE plan_line_id = ANY($1::int[]) "
+            "ORDER BY plan_line_id, step_order",
+            line_ids,
+        ):
+            steps_by_line.setdefault(s["plan_line_id"], []).append({
+                "step_order": s["step_order"], "process_name": s["process_name"],
+                "stage": s["stage"], "floor": s["floor"],
+            })
+
+    groups: dict[tuple, dict] = {}
+    ineligible: list[dict] = []
+    for r in rows:
+        base = {
+            "plan_id": r["plan_id"],
+            "plan_line_id": r["plan_line_id"],
+            "fg_sku_name": r["fg_sku_name"],
+            "bom_id": r["bom_id"],
+            "planned_qty_kg": float(r["planned_qty_kg"]) if r["planned_qty_kg"] is not None else None,
+            "planned_qty_units": float(r["planned_qty_units"]) if r["planned_qty_units"] is not None else None,
+            "steps": steps_by_line.get(r["plan_line_id"], []),
+            # Carded-but-unstarted: mergeable, but the merge REBUILDS the existing
+            # (unstarted) cards — the UI badges it so the operator knows.
+            "carded": bool(r["jc_count"]),
+        }
+        if r["jc_started"]:
+            ineligible.append({**base, "reason": "Job cards already started"})
+            continue
+        if not r["rm_fingerprint"]:
+            ineligible.append({**base, "reason": "BOM has no raw-material lines"})
+            continue
+        if not r["floor1"]:
+            ineligible.append({**base, "reason": "Line has no process step / floor"})
+            continue
+        key = (r["factory"], r["entity"], r["floor1"], r["rm_fingerprint"])
+        g = groups.setdefault(key, {
+            "key": {
+                "factory": r["factory"], "entity": r["entity"], "floor": r["floor1"],
+                "rm_articles": [a for a in r["rm_fingerprint"].split(" | ") if a],
+            },
+            "members": [], "total_qty_kg": 0.0, "total_qty_units": 0.0,
+        })
+        g["members"].append(base)
+        g["total_qty_kg"] += base["planned_qty_kg"] or 0.0
+        g["total_qty_units"] += base["planned_qty_units"] or 0.0
+
+    out_groups: list[dict] = []
+    for g in groups.values():
+        if len(g["members"]) >= 2:
+            g["mergeable"] = True
+            out_groups.append(g)
+        else:  # a lone member of its cluster — surface WHY it can't merge
+            m = g["members"][0]
+            ineligible.append({**m, "reason": "No other selected product shares its factory + floor + RM articles"})
+    return {"groups": out_groups, "ineligible": ineligible}
+
+
 async def split_plan(conn, plan_id: int, mode: str = "per_line") -> dict:
     """Split a DRAFT plan's lines into separate plans.
 
