@@ -11,18 +11,12 @@ from fastapi import HTTPException
 
 from app.modules.customer_returns.tables import cr_table_names
 
+# _rtv_header carries every header column the module reads (extra id/approved_* are
+# harmless), so the header SELECT/RETURNING list is unchanged.
 HEADER_COLS = (
     "rtv_id, rtv_date, factory_unit, customer, invoice_number, challan_no, dn_no, "
     "conversion, sales_poc, sales_poc_email, business_head, remark, vehicle_number, "
     "transporter_name, driver_name, inward_manager, status, created_by, created_ts, updated_at"
-)
-LINE_COLS = (
-    "rtv_id, item_description, material_type, item_category, sub_category, sale_group, uom, qty, rate, "
-    "value, conversion, net_weight, carton_weight, lot_number, item_mark, spl_remarks, vakkal, created_at, updated_at"
-)
-BOX_COLS = (
-    "rtv_id, article_description, box_number, box_id, uom, conversion, lot_number, item_mark, "
-    "spl_remarks, vakkal, net_weight, gross_weight, count, created_at, updated_at"
 )
 
 
@@ -151,9 +145,41 @@ def _map_box_row(r: dict) -> dict:
     }
 
 
+# Legacy _rtv_* lines/boxes are keyed by header_id (no rtv_id column) — surface the
+# rtv_id from the header join so the row mappers see the module's expected shape.
+# (sale_group + line-level conversion are CFERP-only columns added to _rtv_lines by
+# out-of-band migration 079.)
+_RTV_LINE_SELECT = (
+    "h.rtv_id AS rtv_id, l.item_description, l.material_type, l.item_category, l.sub_category, "
+    "l.sale_group, l.uom, l.qty, l.rate, l.value, l.conversion, "
+    "l.net_weight, l.carton_weight, l.lot_number, l.item_mark, l.spl_remarks, l.vakkal, "
+    "l.created_at, l.updated_at"
+)
+_RTV_BOX_SELECT = (
+    "h.rtv_id AS rtv_id, b.article_description, b.box_number, b.box_id, b.uom, b.conversion, "
+    "b.lot_number, b.item_mark, b.spl_remarks, b.vakkal, b.net_weight, b.gross_weight, "
+    "b.count, b.created_at, b.updated_at"
+)
+
+
+async def resolve_header_id(conn, tables: dict, cr_id: str) -> int:
+    """The legacy surrogate header id for a natural rtv_id (lines/boxes FK it).
+    404 if the CR is absent — the single existence check for every write path."""
+    hid = await conn.fetchval(f"SELECT id FROM {tables['header']} WHERE rtv_id = $1", cr_id)
+    if hid is None:
+        raise HTTPException(
+            404,
+            detail={"error": "customer_return_not_found",
+                    "message": f"No customer return {cr_id}", "details": {"rtv_id": cr_id}},
+        )
+    return hid
+
+
 async def _fetch_lines(conn, tables: dict, cr_id: str) -> list:
     rows = await conn.fetch(
-        f"SELECT {LINE_COLS} FROM {tables['lines']} WHERE rtv_id = $1 ORDER BY item_description",
+        f"SELECT {_RTV_LINE_SELECT} FROM {tables['lines']} l "
+        f"JOIN {tables['header']} h ON l.header_id = h.id "
+        "WHERE h.rtv_id = $1 ORDER BY l.item_description",
         cr_id,
     )
     return [_map_line_row(dict(r)) for r in rows]
@@ -161,8 +187,9 @@ async def _fetch_lines(conn, tables: dict, cr_id: str) -> list:
 
 async def _fetch_boxes(conn, tables: dict, cr_id: str) -> list:
     rows = await conn.fetch(
-        f"SELECT {BOX_COLS} FROM {tables['boxes']} WHERE rtv_id = $1 "
-        "ORDER BY article_description, box_number",
+        f"SELECT {_RTV_BOX_SELECT} FROM {tables['boxes']} b "
+        f"JOIN {tables['header']} h ON b.header_id = h.id "
+        "WHERE h.rtv_id = $1 ORDER BY b.article_description, b.box_number",
         cr_id,
     )
     return [_map_box_row(dict(r)) for r in rows]
@@ -233,10 +260,10 @@ async def list_crs(conn, *, company: str, page: int, per_page: int,
     rows = await conn.fetch(
         f"""
         SELECT {HEADER_COLS},
-               (SELECT COUNT(*) FROM {tables['lines']} l WHERE l.rtv_id = h.rtv_id) AS items_count,
-               (SELECT COUNT(*) FROM {tables['boxes']} b WHERE b.rtv_id = h.rtv_id) AS boxes_count,
-               (SELECT COALESCE(SUM(l.qty),0) FROM {tables['lines']} l WHERE l.rtv_id = h.rtv_id) AS total_qty,
-               (SELECT COALESCE(SUM(b.net_weight),0) FROM {tables['boxes']} b WHERE b.rtv_id = h.rtv_id) AS total_net_weight
+               (SELECT COUNT(*) FROM {tables['lines']} l WHERE l.header_id = h.id) AS items_count,
+               (SELECT COUNT(*) FROM {tables['boxes']} b WHERE b.header_id = h.id) AS boxes_count,
+               (SELECT COALESCE(SUM(l.qty),0) FROM {tables['lines']} l WHERE l.header_id = h.id) AS total_qty,
+               (SELECT COALESCE(SUM(b.net_weight),0) FROM {tables['boxes']} b WHERE b.header_id = h.id) AS total_net_weight
           FROM {tables['header']} h
          WHERE {where}
          ORDER BY h.{col} {direction}, h.rtv_id {direction}
@@ -351,9 +378,10 @@ async def export_cr_records(conn, *, company: str, status=None, customer=None,
                b.net_weight AS box_net_weight, b.gross_weight AS box_gross_weight,
                b.lot_number AS box_lot_number, b.count AS box_count
           FROM {tables['header']} h
-          LEFT JOIN {tables['lines']} l ON l.rtv_id = h.rtv_id
+          LEFT JOIN {tables['lines']} l ON l.header_id = h.id
           LEFT JOIN {tables['boxes']} b
-                 ON b.rtv_id = h.rtv_id AND b.article_description = l.item_description
+                 ON b.header_id = h.id AND b.article_description = l.item_description
+                AND (b.rtv_line_id = l.id OR b.rtv_line_id IS NULL)
          WHERE {where}
          ORDER BY h.{col} {direction}, l.item_description ASC, b.box_number ASC
         """,

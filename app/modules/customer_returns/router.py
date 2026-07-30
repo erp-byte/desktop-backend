@@ -56,6 +56,26 @@ def _actor(user: AuthUser) -> str:
     return user.email or user.full_name or str(user.user_id)
 
 
+# ── Read-only gate ────────────────────────────────────────────────────────────
+# Phase 2 (write path on the shared live _rtv_* tables) is built + verified, so
+# writes are ENABLED. The guard mechanism is retained as a one-line kill switch:
+# set CR_READ_ONLY = True to instantly fall back to the read-only phase (all 9
+# mutating endpoints 403, email-action shows an "approvals paused" card).
+CR_READ_ONLY = False
+
+
+def _ensure_writable() -> None:
+    if CR_READ_ONLY:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "read_only",
+                "message": "Customer Returns is read-only in CFERP for now — "
+                           "create or edit returns in IMS.",
+            },
+        )
+
+
 @router.get("/export")
 async def export_customer_returns(
     request: Request,
@@ -88,7 +108,8 @@ async def export_customer_returns(
     )
 
 
-@router.post("/box-edit-log", response_model=schemas.CRBoxEditLogResponse)
+@router.post("/box-edit-log", response_model=schemas.CRBoxEditLogResponse,
+             dependencies=[Depends(_ensure_writable)])
 async def log_customer_return_box_edits(
     body: schemas.CRBoxEditLogRequest,
     request: Request,
@@ -126,6 +147,11 @@ async def customer_return_email_action(token: str, request: Request):
     Applies the decision idempotently, fires the threaded status mail, and renders
     a self-closing confirmation card. Declared BEFORE /{company} routes.
     """
+    if CR_READ_ONLY:
+        return HTMLResponse(
+            _action_page("Approvals paused", "Customer-return approvals are handled in IMS for now. No action was taken.", "#e67e22"),
+            status_code=403,
+        )
     claims = verify_action_token(token)
     if not claims:
         return HTMLResponse(
@@ -149,7 +175,8 @@ async def customer_return_email_action(token: str, request: Request):
     return HTMLResponse(_action_page(f'Customer return {result["status"]}', f'{cr_id} is now “{result["status"]}”. You can close this tab.', "#27ae60"))
 
 
-@router.post("/{company}", status_code=201, response_model=schemas.CRWithDetails)
+@router.post("/{company}", status_code=201, response_model=schemas.CRWithDetails,
+             dependencies=[Depends(_ensure_writable)])
 async def create_customer_return(
     company: str,
     body: schemas.CRCreate,
@@ -197,7 +224,8 @@ async def get_customer_return(
         return await query_service.get_cr(conn, company, cr_id)
 
 
-@router.put("/{company}/{cr_id}", response_model=schemas.CRHeaderResponse)
+@router.put("/{company}/{cr_id}", response_model=schemas.CRHeaderResponse,
+            dependencies=[Depends(_ensure_writable)])
 async def update_customer_return(
     company: str,
     cr_id: str,
@@ -210,7 +238,8 @@ async def update_customer_return(
         return await create_service.update_cr(conn, company, cr_id, body)
 
 
-@router.put("/{company}/{cr_id}/lines", response_model=schemas.CRLinesUpdateResponse)
+@router.put("/{company}/{cr_id}/lines", response_model=schemas.CRLinesUpdateResponse,
+            dependencies=[Depends(_ensure_writable)])
 async def update_customer_return_lines(
     company: str,
     cr_id: str,
@@ -223,7 +252,8 @@ async def update_customer_return_lines(
         return await create_service.update_cr_lines(conn, company, cr_id, body)
 
 
-@router.delete("/{company}/{cr_id}", response_model=schemas.CRDeleteResponse)
+@router.delete("/{company}/{cr_id}", response_model=schemas.CRDeleteResponse,
+               dependencies=[Depends(_ensure_writable)])
 async def delete_customer_return(
     company: str,
     cr_id: str,
@@ -235,7 +265,8 @@ async def delete_customer_return(
         return await create_service.delete_cr(conn, company, cr_id)
 
 
-@router.put("/{company}/{cr_id}/box", response_model=schemas.CRBoxUpsertResponse)
+@router.put("/{company}/{cr_id}/box", response_model=schemas.CRBoxUpsertResponse,
+            dependencies=[Depends(_ensure_writable)])
 async def upsert_customer_return_box(
     company: str,
     cr_id: str,
@@ -248,7 +279,8 @@ async def upsert_customer_return_box(
         return await box_service.upsert_box(conn, company, cr_id, body)
 
 
-@router.put("/{company}/{cr_id}/boxes", response_model=schemas.CRBulkBoxUpdateResponse)
+@router.put("/{company}/{cr_id}/boxes", response_model=schemas.CRBulkBoxUpdateResponse,
+            dependencies=[Depends(_ensure_writable)])
 async def bulk_save_customer_return_boxes(
     company: str,
     cr_id: str,
@@ -265,7 +297,8 @@ async def bulk_save_customer_return_boxes(
             notify_discrepancy=notify_discrepancy, allow_clear=allow_clear)
 
 
-@router.post("/{company}/{cr_id}/send-for-approval")
+@router.post("/{company}/{cr_id}/send-for-approval",
+             dependencies=[Depends(_ensure_writable)])
 async def send_customer_return_for_approval(
     company: str,
     cr_id: str,
@@ -289,7 +322,8 @@ async def send_customer_return_for_approval(
     }
 
 
-@router.post("/{company}/{cr_id}/approve")
+@router.post("/{company}/{cr_id}/approve",
+             dependencies=[Depends(_ensure_writable)])
 async def decide_customer_return(
     company: str,
     cr_id: str,

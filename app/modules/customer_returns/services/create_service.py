@@ -23,7 +23,11 @@ def _generate_cr_id() -> str:
     return "CR-" + datetime.now(_IST).strftime("%Y%m%d%H%M%S")
 
 
-async def _insert_line(conn, tables: dict, cr_id: str, line: schemas.CRLineCreate) -> None:
+async def _insert_line(conn, tables: dict, header_id: int, line: schemas.CRLineCreate) -> None:
+    # Legacy _rtv_lines is keyed by header_id + surrogate id (no rtv_id, no natural
+    # unique constraint) — a plain INSERT. Callers always insert under a fresh header
+    # (create) or after DELETE-ing the header's lines (update_cr_lines), so there is
+    # never a live conflict to upsert against.
     qty = int(q._to_float(line.qty) or 0)
     rate = q._to_float(line.rate) or 0.0
     value = q._line_value(qty, rate, line.value)
@@ -32,20 +36,12 @@ async def _insert_line(conn, tables: dict, cr_id: str, line: schemas.CRLineCreat
     await conn.execute(
         f"""
         INSERT INTO {tables['lines']}
-            (rtv_id, item_description, material_type, item_category, sub_category, sale_group,
+            (header_id, item_description, material_type, item_category, sub_category, sale_group,
              uom, qty, rate, value, conversion, net_weight, carton_weight,
              lot_number, item_mark, spl_remarks, vakkal)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
-        ON CONFLICT (rtv_id, item_description) DO UPDATE SET
-            material_type=EXCLUDED.material_type, item_category=EXCLUDED.item_category,
-            sub_category=EXCLUDED.sub_category, sale_group=EXCLUDED.sale_group,
-            uom=EXCLUDED.uom, qty=EXCLUDED.qty, rate=EXCLUDED.rate, value=EXCLUDED.value,
-            conversion=EXCLUDED.conversion, net_weight=EXCLUDED.net_weight,
-            carton_weight=EXCLUDED.carton_weight, lot_number=EXCLUDED.lot_number,
-            item_mark=EXCLUDED.item_mark, spl_remarks=EXCLUDED.spl_remarks,
-            vakkal=EXCLUDED.vakkal, updated_at=NOW()
         """,
-        cr_id, line.item_description, line.material_type, line.item_category,
+        header_id, line.item_description, line.material_type, line.item_category,
         line.sub_category, line.sale_group, line.uom, qty, rate, value, line.conversion,
         net_weight, carton_weight,
         line.lot_number, line.item_mark, line.spl_remarks, line.vakkal,
@@ -53,14 +49,17 @@ async def _insert_line(conn, tables: dict, cr_id: str, line: schemas.CRLineCreat
 
 
 async def _insert_header(conn, tables: dict, header: schemas.CRHeaderCreate,
-                         created_by: str) -> str:
+                         created_by: str) -> tuple[str, int]:
+    """Insert the header; return (rtv_id, surrogate id). The id is the FK lines/boxes
+    hang off in the legacy _rtv_* schema. rtv_id is UNIQUE — a same-second collision
+    retries with a numeric suffix inside a SAVEPOINT."""
     base = _generate_cr_id()
     conversion = q._to_float(header.conversion) or 0.0
     for attempt in range(6):
         cand = base if attempt == 0 else f"{base}-{attempt}"
         try:
-            async with conn.transaction():  # SAVEPOINT — isolates PK-collision retry
-                await conn.execute(
+            async with conn.transaction():  # SAVEPOINT — isolates rtv_id-collision retry
+                row = await conn.fetchrow(
                     f"""
                     INSERT INTO {tables['header']}
                         (rtv_id, factory_unit, customer, invoice_number, challan_no, dn_no,
@@ -68,6 +67,7 @@ async def _insert_header(conn, tables: dict, header: schemas.CRHeaderCreate,
                          vehicle_number, transporter_name, driver_name, inward_manager,
                          status, created_by)
                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'Pending',$16)
+                    RETURNING id
                     """,
                     cand, header.factory_unit, header.customer, header.invoice_number,
                     header.challan_no, header.dn_no, conversion, header.sales_poc,
@@ -75,7 +75,7 @@ async def _insert_header(conn, tables: dict, header: schemas.CRHeaderCreate,
                     header.vehicle_number, header.transporter_name, header.driver_name,
                     header.inward_manager, created_by,
                 )
-            return cand
+            return cand, row["id"]
         except asyncpg.UniqueViolationError:
             continue
     raise HTTPException(
@@ -95,9 +95,9 @@ async def create_cr(conn, company: str, data: schemas.CRCreate, created_by: str)
         )
     tables = cr_table_names(company)
     async with conn.transaction():
-        cr_id = await _insert_header(conn, tables, data.header, created_by)
+        cr_id, header_id = await _insert_header(conn, tables, data.header, created_by)
         for line in data.lines:
-            await _insert_line(conn, tables, cr_id, line)
+            await _insert_line(conn, tables, header_id, line)
     # Read back AFTER commit so the response matches get/list exactly.
     return await q.get_cr(conn, company, cr_id)
 
@@ -144,40 +144,35 @@ async def update_cr(conn, company: str, cr_id: str, data: schemas.CRHeaderUpdate
 async def update_cr_lines(conn, company: str, cr_id: str,
                           data: schemas.CRLinesUpdateRequest) -> dict:
     tables = cr_table_names(company)
-    exists = await conn.fetchval(
-        f"SELECT 1 FROM {tables['header']} WHERE rtv_id = $1", cr_id
-    )
-    if not exists:
-        raise HTTPException(
-            404,
-            detail={"error": "customer_return_not_found",
-                    "message": f"No customer return {cr_id}", "details": {"rtv_id": cr_id}},
-        )
-    lines_count = len({l.item_description for l in data.lines})
+    header_id = await q.resolve_header_id(conn, tables, cr_id)
+    lines_count = len(data.lines)  # rows actually inserted (duplicate descriptions allowed)
     async with conn.transaction():
-        await conn.execute(f"DELETE FROM {tables['lines']} WHERE rtv_id = $1", cr_id)
+        await conn.execute(f"DELETE FROM {tables['lines']} WHERE header_id = $1", header_id)
         for line in data.lines:
-            await _insert_line(conn, tables, cr_id, line)
+            await _insert_line(conn, tables, header_id, line)
+        # DELETE-ing the lines nulled every box's rtv_line_id (FK ON DELETE SET NULL);
+        # re-point each box to its re-created line so IMS's box->line join survives.
+        await conn.execute(
+            f"""
+            UPDATE {tables['boxes']} b SET rtv_line_id = l.id
+              FROM {tables['lines']} l
+             WHERE b.header_id = $1 AND l.header_id = $1
+               AND b.article_description = l.item_description
+            """,
+            header_id,
+        )
     return {"status": "updated", "rtv_id": cr_id, "lines_count": lines_count}
 
 
 async def delete_cr(conn, company: str, cr_id: str) -> dict:
     tables = cr_table_names(company)
-    hdr = await conn.fetchrow(
-        f"SELECT rtv_id FROM {tables['header']} WHERE rtv_id = $1", cr_id
-    )
-    if not hdr:
-        raise HTTPException(
-            404,
-            detail={"error": "customer_return_not_found",
-                    "message": f"No customer return {cr_id}", "details": {"rtv_id": cr_id}},
-        )
+    header_id = await q.resolve_header_id(conn, tables, cr_id)
     lines_count = await conn.fetchval(
-        f"SELECT COUNT(*) FROM {tables['lines']} WHERE rtv_id = $1", cr_id)
+        f"SELECT COUNT(*) FROM {tables['lines']} WHERE header_id = $1", header_id)
     boxes_count = await conn.fetchval(
-        f"SELECT COUNT(*) FROM {tables['boxes']} WHERE rtv_id = $1", cr_id)
+        f"SELECT COUNT(*) FROM {tables['boxes']} WHERE header_id = $1", header_id)
     async with conn.transaction():
-        # FK ON DELETE CASCADE removes lines/boxes with the header.
+        # FK ON DELETE CASCADE (lines.header_id / boxes.header_id) removes them with the header.
         await conn.execute(f"DELETE FROM {tables['header']} WHERE rtv_id = $1", cr_id)
     return {"success": True, "message": f"Customer return {cr_id} deleted",
             "rtv_id": cr_id, "lines_count": int(lines_count or 0),
