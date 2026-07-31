@@ -1385,10 +1385,16 @@ async def create_merged_process_run(
     if len(rows) != len(member_ids):
         return {"error": "line_not_found", "message": "One or more selected lines no longer exist."}
     by_line = {r["plan_line_id"]: r for r in rows}
-    keys = {(r["factory"], r["entity"], r["floor1"], r["rm_fp"]) for r in rows}
-    if len(keys) != 1 or any(k is None for k in next(iter(keys))):
+    loc = {(r["factory"], r["entity"], r["floor1"]) for r in rows}
+    if len(loc) != 1 or any(k is None for k in next(iter(loc))):
         return {"error": "not_a_group",
-                "message": "Selected lines don't share one factory + floor + RM-article set."}
+                "message": "Selected lines don't share one factory + entity + stage-1 floor."}
+    # Relaxed RM rule: members need only share AT LEAST ONE common RM article
+    # (not the whole set). Intersect their RM sets; empty => not mergeable.
+    rm_sets = [set((r["rm_fp"] or "").split(" | ")) - {""} for r in rows]
+    if not (set.intersection(*rm_sets) if rm_sets else set()):
+        return {"error": "no_common_rm",
+                "message": "Selected lines share no common raw-material article."}
     started = [r["plan_line_id"] for r in rows if r["jc_started"]]
     if started:
         return {"error": "already_started",

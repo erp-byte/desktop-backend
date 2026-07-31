@@ -5020,7 +5020,7 @@ async def create_merged_process_run_v2(
         raise HTTPException(status_code=400, detail=result.get("message"))
     if err in ("line_not_found",):
         raise HTTPException(status_code=404, detail=result.get("message"))
-    if err in ("not_a_group", "already_carded"):
+    if err in ("not_a_group", "already_started", "no_common_rm"):
         raise HTTPException(status_code=409, detail=result.get("message"))
     if err:
         raise HTTPException(status_code=400, detail=result.get("message") or err)

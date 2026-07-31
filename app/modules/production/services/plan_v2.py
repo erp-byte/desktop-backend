@@ -759,8 +759,8 @@ async def validate_process_merge(conn, plan_ids: list[int]) -> dict:
                 "stage": s["stage"], "floor": s["floor"],
             })
 
-    groups: dict[tuple, dict] = {}
     ineligible: list[dict] = []
+    eligible: list[tuple] = []   # (base, factory, entity, floor1, rm_set)
     for r in rows:
         base = {
             "plan_id": r["plan_id"],
@@ -783,26 +783,47 @@ async def validate_process_merge(conn, plan_ids: list[int]) -> dict:
         if not r["floor1"]:
             ineligible.append({**base, "reason": "Line has no process step / floor"})
             continue
-        key = (r["factory"], r["entity"], r["floor1"], r["rm_fingerprint"])
-        g = groups.setdefault(key, {
-            "key": {
-                "factory": r["factory"], "entity": r["entity"], "floor": r["floor1"],
-                "rm_articles": [a for a in r["rm_fingerprint"].split(" | ") if a],
-            },
-            "members": [], "total_qty_kg": 0.0, "total_qty_units": 0.0,
-        })
-        g["members"].append(base)
-        g["total_qty_kg"] += base["planned_qty_kg"] or 0.0
-        g["total_qty_units"] += base["planned_qty_units"] or 0.0
+        rm_set = [a for a in r["rm_fingerprint"].split(" | ") if a]
+        eligible.append((base, r["factory"], r["entity"], r["floor1"], rm_set))
+
+    # Cluster by (factory, entity, stage-1 floor, ONE shared RM article). A line
+    # is bucketed under EVERY RM it carries, so any two lines that share >=1 RM
+    # (same factory/floor/entity) land in the same bucket — the "one common RM is
+    # enough" rule. Buckets with an identical member set are then folded into one
+    # group, unioning their shared-RM labels (that is the old exact-set case).
+    by_rm: dict[tuple, list] = {}
+    for base, factory, entity, floor1, rm_set in eligible:
+        for rm in rm_set:
+            by_rm.setdefault((factory, entity, floor1, rm), []).append(base)
 
     out_groups: list[dict] = []
-    for g in groups.values():
-        if len(g["members"]) >= 2:
-            g["mergeable"] = True
-            out_groups.append(g)
-        else:  # a lone member of its cluster — surface WHY it can't merge
-            m = g["members"][0]
-            ineligible.append({**m, "reason": "No other selected product shares its factory + floor + RM articles"})
+    by_memberset: dict[frozenset, dict] = {}
+    for (factory, entity, floor1, rm), members in by_rm.items():
+        if len(members) < 2:
+            continue
+        mset = frozenset(m["plan_line_id"] for m in members)
+        grp = by_memberset.get(mset)
+        if grp is None:
+            grp = {
+                "key": {"factory": factory, "entity": entity, "floor": floor1,
+                        "rm_articles": [rm]},
+                "members": members,
+                "total_qty_kg": sum(m["planned_qty_kg"] or 0.0 for m in members),
+                "total_qty_units": sum(m["planned_qty_units"] or 0.0 for m in members),
+                "mergeable": True,
+            }
+            by_memberset[mset] = grp
+            out_groups.append(grp)
+        elif rm not in grp["key"]["rm_articles"]:
+            grp["key"]["rm_articles"].append(rm)
+
+    # Any eligible line that joined NO group (nothing else shares its
+    # factory/floor + any RM) is surfaced with a reason.
+    grouped = {m["plan_line_id"] for g in out_groups for m in g["members"]}
+    for base, *_ in eligible:
+        if base["plan_line_id"] not in grouped:
+            ineligible.append({**base, "reason": "No other selected product shares its factory + floor + any RM article"})
+
     return {"groups": out_groups, "ineligible": ineligible}
 
 
