@@ -1087,6 +1087,88 @@ async def forward_visitor_approvals(messages: list[dict],
     return ok
 
 
+# ── maintenance ticket bot forwarding (shared WABA, third tenant) ────────────
+# A THIRD system on this number: an internal maintenance ticket bot. Its button/list
+# ids are namespaced ("mnt:...", "tkt:..."); its form also collects free typed answers
+# (asset name, fault description) and photos, which carry no prefix to match on — so
+# plain text/image inbound is relayed too and the bot ignores what isn't its own.
+# Purely ADDITIVE: unlike the visitor block above, nothing here removes a message from
+# the NPD / promote / reason-capture flows — they see exactly what they saw before.
+# Read the URL at CALL time — see visitor_forward_url() above for why a module-level
+# constant silently freezes to "" on every .env-based deploy.
+_MAINT_PREFIXES = ("mod:", "mnt:", "qc:", "inv:", "hr:", "it:", "tkt:")
+_MAINT_TYPES_DEFAULT = "text,image"
+# asyncio keeps only WEAK references to tasks: without this set a fire-and-forget
+# forward can be garbage-collected mid-flight and vanish with no log line.
+_maint_tasks: set[asyncio.Task] = set()
+
+
+def maintenance_forward_url() -> str:
+    return os.environ.get("MAINTENANCE_FORWARD_URL", "").strip()
+
+
+def _maint_types() -> set[str]:
+    raw = os.environ.get("MAINTENANCE_FORWARD_TYPES", _MAINT_TYPES_DEFAULT)
+    return {t.strip().lower() for t in raw.split(",") if t.strip()}
+
+
+def is_maintenance_message(m: dict) -> bool:
+    """True if this Meta message object belongs to the maintenance bot: a namespaced
+    tap (interactive button_reply/list_reply id, or a template quick-reply payload —
+    _button_payload covers all three shapes), or a plain text/image, since the bot's
+    form answers carry no prefix. Cannot collide with ERP traffic (NPD/promote quick
+    replies carry the button TEXT "Accept"/"Hold"/"Approve"/"Reject") or with visitor
+    traffic ("approve_<digits>"/"reject_<digits>")."""
+    if (_button_payload(m) or "").strip().lower().startswith(_MAINT_PREFIXES):
+        return True
+    return (m.get("type") or "").lower() in _maint_types()
+
+
+def has_maintenance_message(payload: dict) -> bool:
+    """True if ANY message in this webhook body is maintenance traffic. The decision is
+    per-BODY, not per-message, because the whole raw body is what gets forwarded — a
+    rebuilt subset would invalidate the X-Hub-Signature-256 that signs the original
+    bytes. Only `value.messages` is scanned, so delivery/read `value.statuses`
+    callbacks are never forwarded."""
+    return any(is_maintenance_message(m)
+               for e in (payload or {}).get("entry", [])
+               for c in e.get("changes", [])
+               for m in (c.get("value") or {}).get("messages", []))
+
+
+async def _post_maintenance(raw: bytes, signature: str | None) -> None:
+    headers = {"Content-Type": "application/json"}
+    if signature:
+        headers["X-Hub-Signature-256"] = signature   # signs the bytes below, so it stays valid
+    try:
+        # content=raw — the ORIGINAL bytes, unmodified (metadata / contacts / entry.id
+        # all intact). httpx `json=` would re-serialise and change key order/spacing,
+        # breaking the HMAC the header signs.
+        # ponytail: 30s timeout, no retry — the target is a free-tier Render instance
+        # that cold-starts ~30-50s. Add one bounded retry if drops show up in the logs.
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(maintenance_forward_url(), content=raw, headers=headers)
+        if resp.status_code >= 400:
+            logger.warning("Maintenance forward rejected: status=%s body=%s",
+                           resp.status_code, resp.text[:300])
+    except Exception:  # noqa: BLE001 — a background forward must never surface anywhere
+        logger.exception("Maintenance forward failed")
+
+
+def forward_maintenance(raw: bytes, payload: dict, signature: str | None) -> bool:
+    """Relay the full raw webhook body to the maintenance ticket backend. Returns
+    whether a forward was queued. Fire-and-forget on purpose: Meta retries the webhook
+    (→ DUPLICATE tickets on their side) if we don't 200 quickly, and the target
+    cold-starts slowly, so this must never sit on the request path. No-op when
+    MAINTENANCE_FORWARD_URL is unset — the webhook then behaves exactly as before."""
+    if not maintenance_forward_url() or not has_maintenance_message(payload):
+        return False
+    t = asyncio.create_task(_post_maintenance(raw, signature))
+    _maint_tasks.add(t)
+    t.add_done_callback(_maint_tasks.discard)
+    return True
+
+
 def verify_signature(raw_body: bytes, signature_header: str | None) -> bool:
     """Validate Meta's X-Hub-Signature-256 over the raw body. Only enforced when
     WHATSAPP_APP_SECRET is configured; otherwise returns True (open)."""

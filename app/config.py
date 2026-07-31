@@ -86,6 +86,16 @@ class Settings(BaseSettings):
     # webhook and get forwarded here. Declared so a .env-only deploy can set it — the
     # sample whatsapp_service reads it from os.environ, hydrated in main.py's lifespan.
     VISITOR_APPROVAL_FORWARD_URL: str = ""
+    # An internal maintenance ticket bot is the third system on this WABA. Same
+    # declare-here-or-pydantic-drops-the-.env-line rule as the URL above; the sample
+    # whatsapp_service reads both from os.environ, hydrated in main.py's lifespan.
+    MAINTENANCE_FORWARD_URL: str = ""
+    MAINTENANCE_FORWARD_TYPES: str = "text,image"
+    # Meta app secret for the inbound X-Hub-Signature-256 check. EMPTY = the webhook is
+    # OPEN — verify_signature() returns True for every body, so anyone who can reach the
+    # public URL can inject inbound (and get it relayed on to the visitor / maintenance
+    # backends). Set it: Meta App Dashboard -> Settings -> Basic -> App Secret.
+    WHATSAPP_APP_SECRET: str = ""
 
     # ── AWS credentials (read from .env when not present in shell env) ────
     # pydantic-settings reads these from `.env` into the Settings instance;

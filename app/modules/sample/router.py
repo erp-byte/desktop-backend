@@ -60,6 +60,14 @@ async def whatsapp_webhook_receive(request: Request):
     except ValueError:
         payload = {}
 
+    # Maintenance ticket bot — a THIRD system on this shared WABA. Relay the full raw body
+    # to its backend. Purely additive and fire-and-forget: nothing below is skipped, and we
+    # never wait on their (slow-to-cold-start) endpoint, so Meta always gets its prompt 200
+    # and never retry-storms us into duplicate tickets on their side.
+    if whatsapp_service.forward_maintenance(
+            raw, payload, request.headers.get("X-Hub-Signature-256")):
+        logger.info("Relayed webhook body to the maintenance backend")
+
     # Visitor Management approvals (approve_<id>/reject_<id>) share this WABA but belong to
     # the separate visitor system. Forward them to its webhook and exclude them from the NPD
     # loop, so an approver never gets an "NPD reviewer" reply. Entirely gated on

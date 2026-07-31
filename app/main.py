@@ -82,7 +82,8 @@ async def lifespan(fastapi_app: FastAPI):
     # here so .env-based deploys actually enable sending. A value already present in
     # os.environ (real shell export / `uvicorn --env-file`) always wins.
     for _k in ("WHATSAPP_ENABLED", "WHATSAPP_ACCESS_TOKEN", "WHATSAPP_PHONE_NUMBER_ID",
-               "WHATSAPP_GRAPH_BASE", "VISITOR_APPROVAL_FORWARD_URL"):
+               "WHATSAPP_GRAPH_BASE", "WHATSAPP_APP_SECRET", "VISITOR_APPROVAL_FORWARD_URL",
+               "MAINTENANCE_FORWARD_URL", "MAINTENANCE_FORWARD_TYPES"):
         _v = getattr(settings, _k, None)
         if _v is not None and str(_v) != "" and not os.environ.get(_k, "").strip():
             os.environ[_k] = str(_v)
@@ -94,6 +95,14 @@ async def lifespan(fastapi_app: FastAPI):
     _fwd = os.environ.get("VISITOR_APPROVAL_FORWARD_URL", "").strip()
     logger.info("Visitor-approval forwarding %s", f"ENABLED -> {_fwd}" if _fwd else
                 "DISABLED (VISITOR_APPROVAL_FORWARD_URL unset; visitor taps will hit the NPD flow)")
+    _mnt = os.environ.get("MAINTENANCE_FORWARD_URL", "").strip()
+    logger.info("Maintenance forwarding %s", f"ENABLED -> {_mnt}" if _mnt else
+                "DISABLED (MAINTENANCE_FORWARD_URL unset)")
+    # Same silent-gate problem, higher stakes: with no app secret the inbound signature
+    # check passes everything, so a spoofed body is accepted AND relayed to both tenants.
+    logger.warning("WhatsApp inbound signature check %s", "ENFORCED"
+                   if os.environ.get("WHATSAPP_APP_SECRET", "").strip() else
+                   "OPEN (WHATSAPP_APP_SECRET unset — any caller can post to the webhook)")
 
     pool = await create_pool(settings)
     fastapi_app.state.db_pool = pool
