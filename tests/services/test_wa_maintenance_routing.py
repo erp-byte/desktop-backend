@@ -65,11 +65,56 @@ def test_erp_and_visitor_taps_are_never_stolen():
         assert not ws.is_maintenance_message(m), m["button"]["payload"]
 
 
+def test_typed_erp_commands_are_excluded():
+    """The WhatsApp fallback for the same actions: "ACCEPT <req#>" / "HOLD <req#> reason"
+    / "APPROVE <jc#>" / "REJECT". Only the FIRST word decides, so the trailing request
+    number and free-text reason don't matter."""
+    for body in ("ACCEPT 12345678", "accept", "HOLD 12345678 line was down",
+                 "Approve 20260731", "reject", "DECLINE", "approved"):
+        m = {"id": "w", "from": "919876543210", "type": "text", "text": {"body": body}}
+        assert not ws.is_maintenance_message(m), body
+
+
+def test_erp_verb_only_matches_the_first_word():
+    """"…the compressor was rejected by QC" is a maintenance report, not a promote
+    reject. Matching anywhere in the body would swallow ordinary fault descriptions."""
+    for body in ("the compressor was rejected by QC", "please accept my apologies — motor dead",
+                 "asset A-12 on hold since morning"):
+        m = {"id": "w", "from": "919876543210", "type": "text", "text": {"body": body}}
+        assert ws.is_maintenance_message(m), body
+
+
+def test_promote_synonyms_are_still_forwarded():
+    """Deliberate: the promote gate also accepts bare YES/OK/NO, but it only ACTS on them
+    when the sender has a pending gate. "yes" answered to a maintenance prompt is far more
+    common, so excluding it would break the common case to protect the rare one."""
+    for body in ("yes", "ok", "OK", "no", "confirm"):
+        m = {"id": "w", "from": "919876543210", "type": "text", "text": {"body": body}}
+        assert ws.is_maintenance_message(m), body
+
+
 def test_plain_text_and_image_are_forwarded():
     """The bot's form answers (asset name, fault description, problem photo) carry no
-    prefix at all — type alone is the only thing left to match on."""
+    prefix at all."""
     assert ws.has_maintenance_message(_envelope(TEXT))
     assert ws.has_maintenance_message(_envelope(IMAGE))
+
+
+def test_every_other_message_shape_is_forwarded():
+    """THE denylist contract. An allowlist of types silently drops whatever the bot adds
+    next — a voice note, a PDF work order, a pinned location. Anything that is not ERP or
+    visitor traffic goes, whether or not we anticipated its shape."""
+    for t in ("audio", "video", "document", "location", "contacts",
+              "sticker", "reaction", "order", "unsupported", "button_unknown"):
+        m = {"id": f"wamid.{t}", "from": "919876543210", "type": t}
+        assert ws.is_maintenance_message(m), t
+
+
+def test_unprefixed_interactive_tap_is_forwarded():
+    """Their namespacing is a convention, not a guarantee — a tap id we don't recognise
+    is still not ours, so it goes."""
+    assert ws.is_maintenance_message(_tap("wamid.u", "start_over"))
+    assert ws.is_maintenance_message(_tap("wamid.u2", "1", shape="list_reply"))
 
 
 def test_status_callback_body_is_not_forwarded():
@@ -110,7 +155,8 @@ def test_settings_declares_the_new_keys():
     """pydantic-settings ignores undeclared keys, so without these fields the .env lines
     never reach Settings and the lifespan has nothing to hydrate."""
     from app.config import Settings
-    for k in ("MAINTENANCE_FORWARD_URL", "MAINTENANCE_FORWARD_TYPES", "WHATSAPP_APP_SECRET"):
+    for k in ("MAINTENANCE_FORWARD_URL", "MAINTENANCE_FORWARD_SECRET",
+              "WHATSAPP_APP_SECRET"):
         assert k in Settings.model_fields, k
 
 
@@ -120,7 +166,8 @@ def test_main_hydrates_the_new_keys():
     from pathlib import Path
     # …/app/modules/sample/services/whatsapp_service.py → parents[3] is app/
     src = Path(ws.__file__).parents[3].joinpath("main.py").read_text(encoding="utf-8")
-    for k in ("MAINTENANCE_FORWARD_URL", "MAINTENANCE_FORWARD_TYPES", "WHATSAPP_APP_SECRET"):
+    for k in ("MAINTENANCE_FORWARD_URL", "MAINTENANCE_FORWARD_SECRET",
+              "WHATSAPP_APP_SECRET"):
         assert f'"{k}"' in src, k
 
 
@@ -133,14 +180,9 @@ def test_no_url_is_a_total_noop():
             os.environ["MAINTENANCE_FORWARD_URL"] = prev
 
 
-def test_forwarded_bytes_are_identical_and_signature_passed_through():
-    """THE contract. If this fails, the maintenance backend's signature check breaks:
-    the header signs Meta's exact bytes, so any re-serialisation (httpx `json=`) that
-    reorders keys or changes spacing invalidates it."""
-    body = _envelope(_tap("wamid.1", "mnt:open"))
-    # Key order deliberately not what json.dumps(sort_keys=True) would produce.
-    raw = json.dumps(body, separators=(",", ":")).encode()
-    sig = "sha256=abc123"
+def _capture_forward(raw: bytes, sig: str | None, **env: str) -> dict:
+    """Run _post_maintenance against a stubbed httpx and return {url, kw} of the POST.
+    `env` entries are set for the call and restored after (an empty value = unset)."""
     seen = {}
 
     class _FakeClient:
@@ -154,17 +196,48 @@ def test_forwarded_bytes_are_identical_and_signature_passed_through():
                 text = "ok"
             return _R()
 
-    prev = os.environ.get("MAINTENANCE_FORWARD_URL")
+    env.setdefault("MAINTENANCE_FORWARD_URL", "https://example/api/whatsapp/webhook")
+    prev = {k: os.environ.get(k) for k in env}
     orig = ws.httpx.AsyncClient
-    os.environ["MAINTENANCE_FORWARD_URL"] = "https://example/api/whatsapp/webhook"
     ws.httpx.AsyncClient = _FakeClient
     try:
+        for k, v in env.items():
+            os.environ[k] = v if v else ""
+            if not v:
+                os.environ.pop(k, None)
         asyncio.run(ws._post_maintenance(raw, sig))
     finally:
         ws.httpx.AsyncClient = orig
-        os.environ.pop("MAINTENANCE_FORWARD_URL", None)
-        if prev is not None:
-            os.environ["MAINTENANCE_FORWARD_URL"] = prev
+        for k, v in prev.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+    return seen
+
+
+def test_forward_secret_header_sent_when_configured():
+    """Proves the relay came from US — Meta's signature authenticates META, and would
+    still be valid on a body someone captured and replayed."""
+    seen = _capture_forward(b"{}", None, MAINTENANCE_FORWARD_SECRET="s3cr3t")
+    assert seen["kw"]["headers"]["X-Forward-Secret"] == "s3cr3t"
+
+
+def test_forward_secret_header_omitted_when_unset():
+    """Lets us deploy the header BEFORE the maintenance side enforces it. If they
+    enforce first and we haven't shipped, every relay 401s into a black hole."""
+    seen = _capture_forward(b"{}", None, MAINTENANCE_FORWARD_SECRET="")
+    assert "X-Forward-Secret" not in seen["kw"]["headers"]
+
+
+def test_forwarded_bytes_are_identical_and_signature_passed_through():
+    """THE contract. If this fails, the maintenance backend's signature check breaks:
+    the header signs Meta's exact bytes, so any re-serialisation (httpx `json=`) that
+    reorders keys or changes spacing invalidates it."""
+    body = _envelope(_tap("wamid.1", "mnt:open"))
+    # Key order deliberately not what json.dumps(sort_keys=True) would produce.
+    raw = json.dumps(body, separators=(",", ":")).encode()
+    sig = "sha256=abc123"
+    seen = _capture_forward(raw, sig)
 
     assert seen["url"] == "https://example/api/whatsapp/webhook"
     assert seen["kw"]["content"] == raw                      # byte-identical, not rebuilt

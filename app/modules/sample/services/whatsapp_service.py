@@ -1088,16 +1088,23 @@ async def forward_visitor_approvals(messages: list[dict],
 
 
 # ── maintenance ticket bot forwarding (shared WABA, third tenant) ────────────
-# A THIRD system on this number: an internal maintenance ticket bot. Its button/list
-# ids are namespaced ("mnt:...", "tkt:..."); its form also collects free typed answers
-# (asset name, fault description) and photos, which carry no prefix to match on — so
-# plain text/image inbound is relayed too and the bot ignores what isn't its own.
+# A THIRD system on this number: an internal maintenance ticket bot. It owns the DEFAULT
+# conversation on this number, so the rule is a DENYLIST: relay everything except the two
+# flows we know are ours (NPD/promote) or the visitor system's. An allowlist was tried
+# first and is wrong here — the bot's form answers are free text, photos, voice notes,
+# documents, locations… i.e. every remaining message shape, so enumerating them just
+# means silently dropping the next one they add.
 # Purely ADDITIVE: unlike the visitor block above, nothing here removes a message from
 # the NPD / promote / reason-capture flows — they see exactly what they saw before.
 # Read the URL at CALL time — see visitor_forward_url() above for why a module-level
 # constant silently freezes to "" on every .env-based deploy.
-_MAINT_PREFIXES = ("mod:", "mnt:", "qc:", "inv:", "hr:", "it:", "tkt:")
-_MAINT_TYPES_DEFAULT = "text,image"
+#
+# ERP-owned quick replies carry the button TEXT as their payload (NPD review sends
+# "Accept"/"Hold", the promote gate sends "Approve"/"Reject") — there is no id namespace
+# to match on, which is why this set exists. Maintenance ids ARE namespaced ("mnt:…",
+# "tkt:…") so they can never be caught by it.
+_ERP_VERBS = {"accept", "approve", "approved", "hold",
+              "reject", "rejected", "decline", "declined"}
 # asyncio keeps only WEAK references to tasks: without this set a fire-and-forget
 # forward can be garbage-collected mid-flight and vanish with no log line.
 _maint_tasks: set[asyncio.Task] = set()
@@ -1107,21 +1114,31 @@ def maintenance_forward_url() -> str:
     return os.environ.get("MAINTENANCE_FORWARD_URL", "").strip()
 
 
-def _maint_types() -> set[str]:
-    raw = os.environ.get("MAINTENANCE_FORWARD_TYPES", _MAINT_TYPES_DEFAULT)
-    return {t.strip().lower() for t in raw.split(",") if t.strip()}
+def is_erp_or_visitor_message(m: dict) -> bool:
+    """True for inbound that belongs to a flow ALREADY on this webhook: a Visitor
+    Management approve_<id>/reject_<id> tap, or an NPD-review / promote-gate action
+    (quick-reply tap or the equivalent typed command).
+
+    Deliberately NOT excluded — the bare yes/no synonyms the promote gate also accepts
+    (YES/OK/CONFIRM/NO/N). The ERP only acts on those when the sender has a pending
+    promote gate, whereas "yes" answered to a maintenance prompt is ordinary traffic;
+    excluding them would break the far more common case to protect the rarer one."""
+    p = (_button_payload(m) or "").strip()
+    if is_visitor_approval_payload(p):
+        return True
+    if p.lower() in _ERP_VERBS:
+        return True
+    if (m.get("type") or "") == "text":
+        words = ((m.get("text") or {}).get("body") or "").strip().split(maxsplit=1)
+        return bool(words) and words[0].lower() in _ERP_VERBS
+    return False
 
 
 def is_maintenance_message(m: dict) -> bool:
-    """True if this Meta message object belongs to the maintenance bot: a namespaced
-    tap (interactive button_reply/list_reply id, or a template quick-reply payload —
-    _button_payload covers all three shapes), or a plain text/image, since the bot's
-    form answers carry no prefix. Cannot collide with ERP traffic (NPD/promote quick
-    replies carry the button TEXT "Accept"/"Hold"/"Approve"/"Reject") or with visitor
-    traffic ("approve_<digits>"/"reject_<digits>")."""
-    if (_button_payload(m) or "").strip().lower().startswith(_MAINT_PREFIXES):
-        return True
-    return (m.get("type") or "").lower() in _maint_types()
+    """Everything that isn't ours or the visitor system's belongs to the maintenance bot.
+    Over-forwarding is cheap — they dedupe on wamid and ignore what isn't theirs —
+    whereas under-forwarding silently breaks their conversation."""
+    return not is_erp_or_visitor_message(m)
 
 
 def has_maintenance_message(payload: dict) -> bool:
@@ -1140,17 +1157,36 @@ async def _post_maintenance(raw: bytes, signature: str | None) -> None:
     headers = {"Content-Type": "application/json"}
     if signature:
         headers["X-Hub-Signature-256"] = signature   # signs the bytes below, so it stays valid
+    # Shared secret proving the relay really came from this ERP webhook. Meta's signature
+    # can't do that job: it authenticates META, not us, and anyone replaying a body they
+    # captured would carry a valid one. Unset → header omitted, so we can ship this before
+    # the maintenance side starts enforcing it (enforce-first would black-hole every relay).
+    secret = os.environ.get("MAINTENANCE_FORWARD_SECRET", "").strip()
+    if secret:
+        headers["X-Forward-Secret"] = secret
     try:
         # content=raw — the ORIGINAL bytes, unmodified (metadata / contacts / entry.id
         # all intact). httpx `json=` would re-serialise and change key order/spacing,
         # breaking the HMAC the header signs.
-        # ponytail: 30s timeout, no retry — the target is a free-tier Render instance
-        # that cold-starts ~30-50s. Add one bounded retry if drops show up in the logs.
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(maintenance_forward_url(), content=raw, headers=headers)
-        if resp.status_code >= 400:
-            logger.warning("Maintenance forward rejected: status=%s body=%s",
-                           resp.status_code, resp.text[:300])
+        # 60s + one retry, per the maintenance team's spec: their host is free-tier Render
+        # (30-60s cold start, so the FIRST relay after idle usually times out) and they
+        # dedupe on wamid, so a duplicate relay is dropped and never doubles a reply.
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            for attempt in (1, 2):
+                try:
+                    resp = await client.post(maintenance_forward_url(), content=raw,
+                                             headers=headers)
+                    if resp.status_code < 400:
+                        return
+                    # 4xx won't fix itself (bad secret, wrong path) — don't burn the retry.
+                    if resp.status_code < 500 or attempt == 2:
+                        logger.warning("Maintenance forward rejected: status=%s body=%s",
+                                       resp.status_code, resp.text[:300])
+                        return
+                except httpx.HTTPError:
+                    if attempt == 2:
+                        raise
+                logger.info("Maintenance forward attempt %d failed — retrying once", attempt)
     except Exception:  # noqa: BLE001 — a background forward must never surface anywhere
         logger.exception("Maintenance forward failed")
 
@@ -1161,7 +1197,12 @@ def forward_maintenance(raw: bytes, payload: dict, signature: str | None) -> boo
     (→ DUPLICATE tickets on their side) if we don't 200 quickly, and the target
     cold-starts slowly, so this must never sit on the request path. No-op when
     MAINTENANCE_FORWARD_URL is unset — the webhook then behaves exactly as before."""
-    if not maintenance_forward_url() or not has_maintenance_message(payload):
+    if not maintenance_forward_url():
+        return False
+    if not has_maintenance_message(payload):
+        # Logged because a silent "nothing relayed" is indistinguishable from a denylist
+        # that has started over-matching and is swallowing the bot's traffic.
+        logger.info("Nothing to relay to maintenance — body is all ERP/visitor traffic")
         return False
     t = asyncio.create_task(_post_maintenance(raw, signature))
     _maint_tasks.add(t)

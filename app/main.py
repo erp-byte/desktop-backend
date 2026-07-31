@@ -83,7 +83,7 @@ async def lifespan(fastapi_app: FastAPI):
     # os.environ (real shell export / `uvicorn --env-file`) always wins.
     for _k in ("WHATSAPP_ENABLED", "WHATSAPP_ACCESS_TOKEN", "WHATSAPP_PHONE_NUMBER_ID",
                "WHATSAPP_GRAPH_BASE", "WHATSAPP_APP_SECRET", "VISITOR_APPROVAL_FORWARD_URL",
-               "MAINTENANCE_FORWARD_URL", "MAINTENANCE_FORWARD_TYPES"):
+               "MAINTENANCE_FORWARD_URL", "MAINTENANCE_FORWARD_SECRET"):
         _v = getattr(settings, _k, None)
         if _v is not None and str(_v) != "" and not os.environ.get(_k, "").strip():
             os.environ[_k] = str(_v)
@@ -96,8 +96,9 @@ async def lifespan(fastapi_app: FastAPI):
     logger.info("Visitor-approval forwarding %s", f"ENABLED -> {_fwd}" if _fwd else
                 "DISABLED (VISITOR_APPROVAL_FORWARD_URL unset; visitor taps will hit the NPD flow)")
     _mnt = os.environ.get("MAINTENANCE_FORWARD_URL", "").strip()
-    logger.info("Maintenance forwarding %s", f"ENABLED -> {_mnt}" if _mnt else
-                "DISABLED (MAINTENANCE_FORWARD_URL unset)")
+    logger.info("Maintenance forwarding %s [X-Forward-Secret %s]",
+                f"ENABLED -> {_mnt}" if _mnt else "DISABLED (MAINTENANCE_FORWARD_URL unset)",
+                "set" if os.environ.get("MAINTENANCE_FORWARD_SECRET", "").strip() else "UNSET")
     # Same silent-gate problem, higher stakes: with no app secret the inbound signature
     # check passes everything, so a spoofed body is accepted AND relayed to both tenants.
     logger.warning("WhatsApp inbound signature check %s", "ENFORCED"

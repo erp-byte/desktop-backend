@@ -90,7 +90,9 @@ class Settings(BaseSettings):
     # declare-here-or-pydantic-drops-the-.env-line rule as the URL above; the sample
     # whatsapp_service reads both from os.environ, hydrated in main.py's lifespan.
     MAINTENANCE_FORWARD_URL: str = ""
-    MAINTENANCE_FORWARD_TYPES: str = "text,image"
+    # Shared secret sent as X-Forward-Secret on every relayed body, so the maintenance
+    # backend can tell a real relay from anyone else POSTing at its public webhook.
+    MAINTENANCE_FORWARD_SECRET: str = ""
     # Meta app secret for the inbound X-Hub-Signature-256 check. EMPTY = the webhook is
     # OPEN — verify_signature() returns True for every body, so anyone who can reach the
     # public URL can inject inbound (and get it relayed on to the visitor / maintenance
