@@ -169,6 +169,66 @@ The ordering below matters — each step isolates one failure mode.
 
 **Rollback:** remove `MAINTENANCE_FORWARD_URL` and restart. One line, no code revert.
 
+## Why nothing is arriving yet — answers to maintenance's debugging section
+
+Both of their questions are answered by the log excerpt they sent (2026-07-31 10:43).
+
+**Q1 — "Does Meta actually call your handler?" → YES.** Their own excerpt proves it:
+
+```
+10:43:07 WhatsApp inbound 1 msg(s): [{'from': '918856056214', 'type': 'text', 'text': 'Hi', …}]
+10:43:07 Unattributed inbound from 918856056214 forwarded to the visitor webhook
+```
+
+Meta delivers, the Netlify→FastAPI rewrite works, our handler runs and parses the
+message. Nothing to investigate on the Meta side; the subscription is healthy.
+
+**Q2 — "Does your forward execute?" → No: the relay code is not on the running box.**
+
+The proof is a line that is *missing*. `app/main.py` logs the maintenance state
+**unconditionally** at startup, ENABLED or DISABLED, immediately after the visitor line:
+
+```
+Visitor-approval forwarding ENABLED -> https://8bndl5pqs1…/prod/api/whatsapp/webhook
+Maintenance forwarding DISABLED (MAINTENANCE_FORWARD_URL unset) [X-Forward-Secret UNSET]
+WhatsApp inbound signature check OPEN (WHATSAPP_APP_SECRET unset — …)
+```
+
+Their startup excerpt has the first line and not the second or third. A deployed build
+with this change would print all three no matter how the env vars are set — so the
+running build **predates the change**. It is not a routing bug, a filter, a dropped
+coroutine, or a serverless-lifecycle problem.
+
+**Fix: deploy `5df5bb7` and set two env vars.** Nothing else is required. Their
+"if nothing arrives" checklist (`console.log`, `context.waitUntil`, dropped promises)
+does not apply — see the Netlify note above; this is FastAPI, and the relay is a
+tracked `asyncio` task, not a floating promise.
+
+### Their sample code would not work on this stack
+
+Their FastAPI sample reads config at **module import time**:
+
+```python
+MAINTENANCE_WEBHOOK = os.environ["MAINTENANCE_WEBHOOK_URL"]   # ← breaks here
+```
+
+Two failure modes, both real on this codebase: `os.environ[...]` raises `KeyError` at
+import and takes the whole app down, and even the `.get()` form freezes to `""` because
+`main.py`'s lifespan hydrates `.env` into `os.environ` *after* this module is imported.
+That is the exact bug that silently disabled visitor forwarding for weeks. Our
+implementation reads the URL and secret at **call** time for this reason.
+
+Also note our env var is `MAINTENANCE_FORWARD_URL`, not `MAINTENANCE_WEBHOOK_URL` — the
+name is local to our side; only the **value** and the header name `X-Forward-Secret` must
+agree between us.
+
+### Answer to "keep your interactive ids out of `mnt:`/`mod:`"
+
+Agreed, and already true. The ERP sends **no interactive messages at all** — only
+templates, whose quick replies come back carrying the button *text*
+(`Accept`/`Hold`/`Approve`/`Reject`). Grepped: none of `mod: mnt: qc: inv: hr: it: tkt:`
+appears anywhere in the ERP codebase.
+
 ## Conversation ownership — needs a decision before go-live
 
 Maintenance asked us to pick (a) "maintenance bot owns it, ERP stays silent" or (b) "ERP
@@ -192,6 +252,44 @@ The two "yes" rows are fixable precisely: skip the relay for a phone that has a 
 `wa_pending_action` or `wa_promote_pending`. One indexed lookup, and it makes
 "in the ERP flow" authoritative without exposing a session endpoint. Not implemented —
 it needs `forward_maintenance` to become async and take a connection. Say the word.
+
+### Maintenance's own doc contradicts itself here — resolve before go-live
+
+"Which module gets the message?" proposes prefix routing (`mnt:`/`mod:` → maintenance)
+and says plain text needs an explicit owner. "Who owns the conversation" says
+"(a) … forward everything … **We assumed (a)**". These are different systems.
+
+We implemented **(a)**, matching their stated assumption and their rule 4
+("anything with `value.messages[]`"). Prefix routing is the weaker option: their form
+answers — asset name, fault description, photo — carry no prefix by construction, so a
+prefix-only rule delivers the button taps and drops every answer to them.
+
+### ⚠️ Unflagged consequence of (a): plain text now reaches TWO bots
+
+Their own log line is the evidence:
+
+```
+10:43:07 Unattributed inbound from 918856056214 forwarded to the visitor webhook
+```
+
+Commit `4e00810` made the ERP forward **every** unattributed inbound to the visitor
+backend, not just approve/reject taps. That behaviour is unchanged. So once this deploys,
+`"Hi"` goes to **visitor *and* maintenance**, and both may answer.
+
+The ERP itself stays silent for these senders — `handle_inbound` returns
+`{'ok': True, 'forwarded': 'visitor'}` with no reply — so this is **not** an ERP double
+reply. It is visitor-vs-maintenance, and neither team has raised it.
+
+Three ways out, in increasing order of disruption:
+
+1. **Do nothing** if the visitor backend ignores non-`approve_`/`reject_` traffic. Most
+   likely true, but nobody has confirmed it. **Confirm this first** — it may already be a
+   non-issue.
+2. Narrow the visitor forward back to approve/reject taps only, reverting `4e00810`. That
+   commit exists to fix a real bug (approvers being told "you aren't an NPD reviewer"), so
+   this needs the visitor team's agreement.
+3. Route greetings explicitly, which is what maintenance's "decide this explicitly" asks
+   for — but it needs a shared notion of session state that does not exist today.
 
 ## Open items
 
