@@ -928,16 +928,24 @@ async def handle_inbound(conn, *, from_phone: str, text: str, context_id: str | 
     if reviewer is None:
         # Anything reaching here belongs to no ERP flow: the sender is neither an NPD
         # reviewer nor a promote approver, and nothing they sent resolved to a request or
-        # gate. On this shared WABA that makes them the visitor system's user, so hand the
-        # whole message over (taps AND typed text — the visitor backend accepts both) and
-        # stay silent rather than answering for a system they aren't talking to.
-        # No-ops when VISITOR_APPROVAL_FORWARD_URL is unset, so a single-tenant deploy
-        # keeps the reply below unchanged.
-        if raw is not None and await forward_visitor_approvals([raw]):
-            logger.info("Unattributed inbound from %s forwarded to the visitor webhook "
-                        "(type=%s payload=%r text=%r)",
-                        wa, raw.get("type"), _button_payload(raw), body[:60])
-            return {"ok": True, "forwarded": "visitor"}
+        # gate. Hand it to whichever tenant owns it and stay SILENT — replying for a
+        # system they aren't talking to is what made visitor approvers see "you aren't an
+        # NPD reviewer" for everything (4e00810).
+        #   • approve_<id>/reject_<id> → the visitor system. ONLY these: it accepts
+        #     nothing else, and 4e00810's "forward every unattributed inbound" made a
+        #     plain "Hi" fan out to visitor AND the maintenance bot, both of which reply.
+        #   • everything else ("Hi", an asset name, a photo) → already relayed to the
+        #     maintenance bot by the webhook, so say nothing and let it own the reply.
+        # Both legs are config-gated: with neither URL set, the reply below is unchanged.
+        if raw is not None and is_visitor_approval_payload(_button_payload(raw)):
+            if await forward_visitor_approvals([raw]):
+                logger.info("Unattributed visitor tap from %s forwarded to the visitor "
+                            "webhook (payload=%r)", wa, _button_payload(raw))
+                return {"ok": True, "forwarded": "visitor"}
+        elif maintenance_forward_url():
+            logger.info("Unattributed inbound from %s left to the maintenance bot "
+                        "(type=%s text=%r)", wa, (raw or {}).get("type"), body[:60])
+            return {"ok": True, "forwarded": "maintenance"}
         await _send_text(wa, "Sorry, this number isn't recognised as an NPD reviewer.")
         return {"ok": False, "reason": "unauthorised"}
     user = _WaUser(reviewer["user_id"], reviewer["role_name"])

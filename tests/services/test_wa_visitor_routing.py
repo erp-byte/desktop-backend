@@ -93,22 +93,42 @@ def _run_unknown_sender(raw: dict, text: str) -> tuple[dict, list, list]:
     return result, forwarded, replies
 
 
-def test_unknown_sender_is_forwarded_not_told_about_npd():
-    """The reported bug: an approver gets "isn't recognised as an NPD reviewer" for
-    everything they send. Taps AND typed text must go to the visitor system instead."""
-    for raw, text in ((TEMPLATE_TAP, "Approve"),
-                      ({"id": "wamid.5", "from": "919876543210", "type": "text",
-                        "text": {"body": "APPROVE"}}, "APPROVE"),
-                      ({"id": "wamid.6", "from": "919876543210", "type": "text",
-                        "text": {"body": "hello"}}, "hello")):
-        result, forwarded, replies = _run_unknown_sender(raw, text)
-        assert result == {"ok": True, "forwarded": "visitor"}, (text, result)
-        assert forwarded == [raw], text
-        assert replies == [], (text, replies)
+def test_visitor_tap_from_unknown_sender_still_goes_to_visitor():
+    """The original bug (4e00810): an approver got "isn't recognised as an NPD reviewer"
+    for everything they sent. Their approve_/reject_ taps must still reach the visitor
+    system, silently."""
+    for raw in (TEMPLATE_TAP, INTERACTIVE_TAP):
+        result, forwarded, replies = _run_unknown_sender(raw, "Approve")
+        assert result == {"ok": True, "forwarded": "visitor"}, result
+        assert forwarded == [raw]
+        assert replies == []
+
+
+def test_plain_text_goes_to_maintenance_never_to_visitor():
+    """The collision fix. 4e00810 forwarded EVERY unattributed inbound to visitor, so
+    once the maintenance relay went live a plain "Hi" reached visitor AND the maintenance
+    bot and both answered. Visitor now only ever receives approve_/reject_; everything
+    else is left to maintenance and the ERP stays silent."""
+    prev = os.environ.get("MAINTENANCE_FORWARD_URL")
+    os.environ["MAINTENANCE_FORWARD_URL"] = "https://example/api/whatsapp/webhook"
+    try:
+        for body in ("hello", "Hi", "APPROVE", "Compressor 3 is down"):
+            raw = {"id": "wamid.x", "from": "919876543210", "type": "text",
+                   "text": {"body": body}}
+            result, forwarded, replies = _run_unknown_sender(raw, body)
+            assert result == {"ok": True, "forwarded": "maintenance"}, (body, result)
+            assert forwarded == [], (body, forwarded)    # visitor must NOT see it
+            assert replies == [], (body, replies)        # and we must not answer either
+    finally:
+        os.environ.pop("MAINTENANCE_FORWARD_URL", None)
+        if prev is not None:
+            os.environ["MAINTENANCE_FORWARD_URL"] = prev
 
 
 def test_unknown_sender_still_gets_the_npd_reply_when_forwarding_is_off():
-    """Single-tenant deploys (no forward URL) must behave exactly as before."""
+    """Single-tenant deploys (neither forward URL set) must behave exactly as before."""
+    prev = os.environ.pop("MAINTENANCE_FORWARD_URL", None)
+
     async def _no_forward(messages, signature=None):
         return 0
 
@@ -125,6 +145,8 @@ def test_unknown_sender_still_gets_the_npd_reply_when_forwarding_is_off():
             context_id=None, raw={"id": "w", "from": "919876543210", "type": "text"}))
     finally:
         ws.forward_visitor_approvals, ws._send_text = orig_forward, orig_send
+        if prev is not None:
+            os.environ["MAINTENANCE_FORWARD_URL"] = prev
     assert result == {"ok": False, "reason": "unauthorised"}
     assert replies == ["Sorry, this number isn't recognised as an NPD reviewer."]
 

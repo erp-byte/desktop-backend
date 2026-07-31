@@ -264,32 +264,40 @@ We implemented **(a)**, matching their stated assumption and their rule 4
 answers — asset name, fault description, photo — carry no prefix by construction, so a
 prefix-only rule delivers the button taps and drops every answer to them.
 
-### ⚠️ Unflagged consequence of (a): plain text now reaches TWO bots
+### Plain text reaching two bots — FIXED
 
-Their own log line is the evidence:
+Their own log line was the evidence of the problem:
 
 ```
 10:43:07 Unattributed inbound from 918856056214 forwarded to the visitor webhook
 ```
 
 Commit `4e00810` made the ERP forward **every** unattributed inbound to the visitor
-backend, not just approve/reject taps. That behaviour is unchanged. So once this deploys,
-`"Hi"` goes to **visitor *and* maintenance**, and both may answer.
+backend, not just approve/reject taps. Once the maintenance relay went live, `"Hi"` would
+have reached **visitor *and* maintenance**, and both answer.
 
-The ERP itself stays silent for these senders — `handle_inbound` returns
-`{'ok': True, 'forwarded': 'visitor'}` with no reply — so this is **not** an ERP double
-reply. It is visitor-vs-maintenance, and neither team has raised it.
+Narrowed: the visitor system now receives **only** `approve_<id>`/`reject_<id>`, on both
+paths — the webhook-level relay (which was already narrow) and the `handle_inbound`
+dead-end (which was not). Everything else is left to the maintenance bot.
 
-Three ways out, in increasing order of disruption:
+Routing after the fix, for a sender the ERP doesn't own:
 
-1. **Do nothing** if the visitor backend ignores non-`approve_`/`reject_` traffic. Most
-   likely true, but nobody has confirmed it. **Confirm this first** — it may already be a
-   non-issue.
-2. Narrow the visitor forward back to approve/reject taps only, reverting `4e00810`. That
-   commit exists to fix a real bug (approvers being told "you aren't an NPD reviewer"), so
-   this needs the visitor team's agreement.
-3. Route greetings explicitly, which is what maintenance's "decide this explicitly" asks
-   for — but it needs a shared notion of session state that does not exist today.
+| Inbound | Visitor | Maintenance | ERP replies |
+|---|---|---|---|
+| `approve_123` / `reject_123` tap | ✅ | — | no |
+| `"Hi"`, asset name, photo, any other type | — | ✅ | no |
+| anything, with neither forward URL set | — | — | yes (legacy "not recognised") |
+
+The ERP stays silent in both relay cases — `handle_inbound` returns
+`{'ok': True, 'forwarded': 'visitor'}` or `{'ok': True, 'forwarded': 'maintenance'}` and
+sends nothing. The original `4e00810` bug (approvers told "you aren't an NPD reviewer")
+stays fixed: their taps still route to visitor, and their other messages now get a real
+answer from maintenance instead of a wrong one from us.
+
+> **One consequence to confirm with the visitor team.** The visitor backend no longer
+> receives typed text from its own users. If any visitor flow asks a follow-up question
+> expecting a typed answer, that answer now goes to maintenance instead. Nothing in the
+> ERP suggests such a flow exists, but only they can confirm it.
 
 ## Open items
 
