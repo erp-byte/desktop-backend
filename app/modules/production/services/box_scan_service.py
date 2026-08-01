@@ -13,6 +13,8 @@ the natural key — there is no surrogate PK.
 """
 from __future__ import annotations
 
+from app.modules.production.services.box_identify_service import identify_box
+
 
 async def _resolve_box(conn, code: str, source_hint: str | None) -> dict | None:
     """Resolve a scanned code to its source box.
@@ -74,11 +76,22 @@ async def _resolve_box(conn, code: str, source_hint: str | None) -> dict | None:
 
 async def scan_box(conn, *, job_card_id: int, code: str,
                    source_type: str | None = None,
+                   article: str | None = None,
                    net_weight=None, gross_weight=None, count=None,
                    scanned_by: str | None = None) -> dict:
-    """Upsert a box scan against a job card. The client's net/gross/count
-    override the box's stored values when supplied; otherwise the box's own
-    values are recorded."""
+    """Upsert a box scan against a job card.
+
+    The scanned code is resolved WIDELY: first po_box / sfg_box (which also
+    carries the SFG batch), then — via the universal box-identify — the legacy
+    warehouse / cold tables. When it resolves anywhere, the article + weights
+    are auto-filled (a client-supplied value still wins). When it resolves
+    NOWHERE, the box is still stored using the operator-entered ``article``
+    (required) + weights/count, so any physical box can be recorded.
+
+    Resolution runs in AUTOCOMMIT on purpose: identify_box swallows
+    missing-legacy-table errors, which would poison a surrounding transaction —
+    so the caller must NOT wrap this in one (the single upsert is atomic anyway).
+    """
     jc = await conn.fetchval(
         "SELECT 1 FROM job_card_v2 WHERE job_card_id = $1 AND deleted_at IS NULL",
         job_card_id,
@@ -86,17 +99,51 @@ async def scan_box(conn, *, job_card_id: int, code: str,
     if not jc:
         return {"error": "job_card_not_found"}
 
+    code = (code or "").strip()
+    if not code:
+        return {"error": "box_not_found", "code": code}
+    entered = (article or "").strip() or None
+
+    # po_box / sfg_box first (fast, carries the SFG batch); then widen to the
+    # legacy warehouse/cold tables the universal identify covers.
     box = await _resolve_box(conn, code, source_type)
     if box is None:
-        return {"error": "box_not_found", "code": code}
-    if not box["article"]:
-        return {"error": "article_unresolved", "code": code,
-                "source_type": box["source_type"]}
+        ident = await identify_box(conn, code)
+        if ident.get("found"):
+            b = ident.get("box") or {}
+            is_sfg = ident.get("table") == "sfg_box"
+            box = {
+                "source_type":    "sfg" if is_sfg else "po",
+                "sfg_box_id":     code if is_sfg else None,
+                "transaction_no": None if is_sfg else b.get("transaction_no"),
+                "box_id":         None if is_sfg else code,
+                "batch_id":       None,  # identify doesn't carry a v2 batch id
+                "article":        b.get("item_description"),
+                "net_weight":     b.get("net_weight"),
+                "gross_weight":   b.get("gross_weight"),
+                "count":          b.get("count"),
+            }
+    if box is None:
+        # Unknown everywhere — record it as a PO/RM-side box with entered detail.
+        if not entered:
+            return {"error": "article_required", "code": code}
+        box = {"source_type": "po", "sfg_box_id": None, "transaction_no": None,
+               "box_id": code, "batch_id": None, "article": entered,
+               "net_weight": None, "gross_weight": None, "count": None}
 
-    # Client-weighed values win; fall back to the box's stored values.
+    final_article = entered or box.get("article")
+    if not final_article:
+        return {"error": "article_required", "code": code}
+
+    # Client-supplied values win; fall back to the resolved box's own values.
     nw = net_weight   if net_weight   is not None else box["net_weight"]
     gw = gross_weight if gross_weight is not None else box["gross_weight"]
     cnt = count       if count        is not None else box["count"]
+    if cnt is not None:
+        try:
+            cnt = int(float(cnt))  # identify may hand back a string count
+        except (TypeError, ValueError):
+            cnt = None
 
     if box["source_type"] == "sfg":
         row = await conn.fetchrow(
@@ -115,7 +162,7 @@ async def scan_box(conn, *, job_card_id: int, code: str,
             RETURNING *
             """,
             job_card_id, box["batch_id"], box["sfg_box_id"],
-            box["article"], nw, gw, cnt, scanned_by,
+            final_article, nw, gw, cnt, scanned_by,
         )
     else:
         row = await conn.fetchrow(
@@ -134,7 +181,7 @@ async def scan_box(conn, *, job_card_id: int, code: str,
             RETURNING *
             """,
             job_card_id, box["batch_id"], box["transaction_no"], box["box_id"],
-            box["article"], nw, gw, cnt, scanned_by,
+            final_article, nw, gw, cnt, scanned_by,
         )
     return {"scanned": True, "scan": dict(row)}
 

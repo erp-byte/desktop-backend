@@ -8779,12 +8779,13 @@ async def routing_gaps_apply(
 # ═══════════════════════════════════════════════════════════════════════════
 
 class BoxScanRequest(BaseModel):
-    """A single box scan. `code` is the scanned QR/box id — a PO/RM box
-    (po_box.box_id) or an SFG box (sfg_box.carton_id); the server auto-detects
-    which unless `source_type` pins it. net/gross/count are optional overrides —
-    omitted, the box's stored values are recorded."""
+    """A single box scan. `code` is the scanned QR/box id — resolved widely
+    (po_box, sfg_box, then the legacy warehouse/cold tables). article/net/gross/
+    count are optional overrides; for a box that resolves NOWHERE, `article` is
+    required so the box can still be stored with operator-entered detail."""
     code:         str
     source_type:  Literal["po", "sfg"] | None = None
+    article:      str | None = None
     net_weight:   float | None = None
     gross_weight: float | None = None
     count:        int | None = None
@@ -8802,24 +8803,27 @@ async def create_box_scan(
     updates its weights in place."""
     from app.modules.production.services import box_scan_service as svc
     pool = request.app.state.db_pool
+    # No surrounding transaction: scan_box's widened resolve uses identify_box,
+    # which swallows missing-legacy-table errors that would poison a txn. The
+    # single upsert it runs is atomic on its own.
     async with pool.acquire() as conn:
-        async with conn.transaction():
-            result = await svc.scan_box(
-                conn,
-                job_card_id=job_card_id,
-                code=body.code,
-                source_type=body.source_type,
-                net_weight=body.net_weight,
-                gross_weight=body.gross_weight,
-                count=body.count,
-                scanned_by=user.full_name or user.phone,
-            )
+        result = await svc.scan_box(
+            conn,
+            job_card_id=job_card_id,
+            code=body.code,
+            source_type=body.source_type,
+            article=body.article,
+            net_weight=body.net_weight,
+            gross_weight=body.gross_weight,
+            count=body.count,
+            scanned_by=user.full_name or user.phone,
+        )
     if result.get("error") == "job_card_not_found":
         raise HTTPException(status_code=404, detail="Job card not found")
+    if result.get("error") == "article_required":
+        raise HTTPException(status_code=422, detail=f"'{body.code}' isn't in any catalogue — enter an article to store it.")
     if result.get("error") == "box_not_found":
-        raise HTTPException(status_code=404, detail=f"No PO/SFG box matches '{body.code}'")
-    if result.get("error") == "article_unresolved":
-        raise HTTPException(status_code=422, detail=result)
+        raise HTTPException(status_code=400, detail="No box code provided")
     return result
 
 
