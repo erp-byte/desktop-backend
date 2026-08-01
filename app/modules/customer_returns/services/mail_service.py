@@ -25,6 +25,7 @@ from email.utils import make_msgid
 from html import escape
 
 from app.config import Settings
+from app.core.mail_identity import Module, SubjectPolicy, stamp
 from app.modules.customer_returns.approval_token import make_action_token
 
 logger = logging.getLogger(__name__)
@@ -175,6 +176,12 @@ def _send_sync(subject: str, plain: str, html: str, to_addrs: list[str], cc_addr
         msg["References"] = f"<{in_reply_to}>"
     msg.set_content(plain)
     msg.add_alternative(html, subtype="html")
+
+    # ANCHOR: customer returns thread one conversation per CR, and that depends on
+    # every mail sharing the exact subject. Only the constant module glyph is added.
+    stamp(msg, module=Module.RETURNS, policy=SubjectPolicy.ANCHOR,
+          entity_type="CustomerReturn", sender=sender)
+
     try:
         with smtplib.SMTP(host, s.SMTP_PORT, timeout=20) as srv:
             srv.starttls(context=ssl.create_default_context())

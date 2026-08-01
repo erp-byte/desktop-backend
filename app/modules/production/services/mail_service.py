@@ -9,6 +9,7 @@ import ssl
 from email.message import EmailMessage
 
 from app.config import Settings
+from app.core.mail_identity import Module, SubjectPolicy, stamp
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +48,10 @@ async def _lookup_user_email(conn, identifier: str | None) -> str | None:
     return row["email"] if row and row["email"] else None
 
 
-def _send(subject: str, body: str, to_addrs: list[str], cc_addrs: list[str]) -> None:
+def _send(subject: str, body: str, to_addrs: list[str], cc_addrs: list[str],
+          *, entity_type: str | None = None, entity_id: str | None = None,
+          event: str | None = None, status: str | None = None,
+          actor: str | None = None) -> None:
     settings = Settings()
     host = (settings.SMTP_HOST or "").strip()
     sender = (settings.SMTP_EMAIL or "").strip()
@@ -64,6 +68,13 @@ def _send(subject: str, body: str, to_addrs: list[str], cc_addrs: list[str]) -> 
         msg["Cc"] = ", ".join(cc_addrs)
     msg["Subject"] = subject
     msg.set_content(body)
+
+    # ANCHOR: these subjects already carry their own [RTV] / [Plan] event tags and
+    # some of them group in Gmail by subject alone. Prefixing only the constant
+    # module glyph adds the sender identity without disturbing any of that.
+    stamp(msg, module=Module.PRODUCTION, policy=SubjectPolicy.ANCHOR,
+          entity_type=entity_type, entity_id=entity_id, event=event,
+          status=status, actor=actor, sender=sender)
 
     recipients = list(dict.fromkeys([*to_addrs, *cc_addrs]))
 
