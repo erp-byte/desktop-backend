@@ -16,12 +16,16 @@ surfaced everywhere — there is no separate house number.
 """
 from __future__ import annotations
 
+import logging
+
 import asyncpg
 from fastapi import HTTPException
 
 from app.core.helpers import new_short_time_id
 from app.modules.sample.services import npd_auth
 from app.modules.sample.services import sample_inventory_service as inv
+
+logger = logging.getLogger(__name__)
 
 # Live BOMs minted on promotion carry the legal entity axis; the sample module
 # stays on 'cfpl' (the physical-warehouse axis lives only on sample tables).
@@ -402,6 +406,27 @@ async def get_dev_job_card(conn, dev_jc_id: int) -> dict:
     jc["base_bom_name"] = (
         await conn.fetchval("SELECT fg_sku_name FROM bom_header WHERE bom_id = $1", jc["base_bom_id"])
         if jc.get("base_bom_id") else None)
+    # Requestor (the business head this was raised for) + sales POC, read from the source
+    # requisition — no columns on the card itself. The sales-POC columns are selected
+    # defensively: samples/ migrations are hand-applied, so 085 may not be in yet and a
+    # bare SELECT of them would break the whole card view.
+    jc["source_requestor_name"] = None
+    jc["source_sales_poc_name"] = jc["source_sales_poc_email"] = None
+    if jc.get("source_requisition_id"):
+        has_poc = await conn.fetchval(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name = 'sample_requisitions' AND column_name = 'sales_poc_user_id'")
+        src = await conn.fetchrow(
+            f"""SELECT r.requestor_team, u.full_name AS requestor_full_name
+                       {', r.sales_poc_name, r.sales_poc_email' if has_poc else ''}
+                  FROM sample_requisitions r
+                  LEFT JOIN auth_user u ON u.user_id = r.requestor_user_id
+                 WHERE r.id = $1""", jc["source_requisition_id"])
+        if src:
+            jc["source_requestor_name"] = src["requestor_full_name"] or src["requestor_team"]
+            if has_poc:
+                jc["source_sales_poc_name"] = src["sales_poc_name"]
+                jc["source_sales_poc_email"] = src["sales_poc_email"]
     # Target articles (082) + each one's own trial recipe. Legacy cards (no article rows,
     # or 082 not applied) synthesize a single article from the card header + base recipe.
     jc["articles"] = await _dev_articles_for(conn, jc, all_lines)
@@ -1115,6 +1140,7 @@ async def dispatch_dev_sample(conn, dev_jc_id: int, *, recipient: str | None, qt
         # the same handle pattern as the phase/card ids. Retry on the rare collision.
         # Per-article rows carry article_id (083); the legacy INSERT omits the column so it
         # keeps working when 083 is unapplied.
+        dispatch_id = None
         for _attempt in range(5):
             cand = new_short_time_id()
             try:
@@ -1137,6 +1163,7 @@ async def dispatch_dev_sample(conn, dev_jc_id: int, *, recipient: str | None, qt
                                    (dispatch_id, dev_jc_id, seq, qty, recipient, mat_doc_id, dispatched_by)
                                VALUES ($1, $2, $3, $4, $5, $6, $7)""",
                             cand, dev_jc_id, seq, q, recipient, res["mat_doc_id"], user.user_id)
+                dispatch_id = cand
                 break
             except asyncpg.UniqueViolationError:
                 if _attempt == 4:
@@ -1151,6 +1178,19 @@ async def dispatch_dev_sample(conn, dev_jc_id: int, *, recipient: str | None, qt
                           dispatch_qty = $3, dispatch_mat_doc_id = $4, updated_at = NOW()
                     WHERE id = $5""",
                 user.user_id, recipient, q, res["mat_doc_id"], dev_jc_id)
+    # Close this dispatch out in the job card's mail trail, AFTER commit — the dispatch
+    # summary plus a link to THIS partial out's Delivery Challan + Gate Pass. Threads into
+    # the source requisition's trail when the card came from one. Best-effort: a mail
+    # failure must never undo a recorded goods issue.
+    try:
+        from app.modules.sample.services import sample_mail_service as mail
+        await mail.notify_dev_dispatch_email(
+            conn, dev_jc_id=dev_jc_id, dispatch_id=dispatch_id, seq=seq, qty=q,
+            uom=disp_uom, recipient=recipient,
+            actor_user_id=getattr(user, "user_id", None),
+            actor_name=getattr(user, "full_name", None))
+    except Exception:  # noqa: BLE001
+        logger.exception("Dispatch DC email failed for dev JC %s", dev_jc_id)
     return await get_dev_job_card(conn, dev_jc_id)
 
 

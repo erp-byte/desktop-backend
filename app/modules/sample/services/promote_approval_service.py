@@ -7,6 +7,7 @@ runs the real promote (npd_dev_service._finalize_promote) once both gates ACCEPT
 ids are app-supplied 8-digit BIGINTs (new_short_time_id) with a unique retry."""
 from __future__ import annotations
 import json
+import logging
 import types as _t
 
 import asyncpg
@@ -14,6 +15,8 @@ from fastapi import HTTPException
 
 from app.core.helpers import new_short_time_id
 from app.modules.sample.services import notification_service
+
+logger = logging.getLogger(__name__)
 
 
 async def _insert_8d(conn, sql: str, *params):
@@ -52,8 +55,14 @@ async def open_promote_request(conn, dev_jc_id: int, *, payload: dict, user) -> 
             "SELECT source_requisition_id FROM npd_dev_job_cards WHERE id = $1", dev_jc_id)
         requestor_uid = None
         if src_req:
+            # The REQUESTOR_BH gate belongs to the BUSINESS HEAD the request was raised
+            # for, never to whoever typed it in. business_head_user_id is the explicit
+            # binding; requestor_user_id is the fallback for requisitions raised before
+            # that binding existed (where it still holds the creator) — without the
+            # fallback those legacy cards would raise a gate bound to nobody and wedge.
             requestor_uid = await conn.fetchval(
-                "SELECT requestor_user_id FROM sample_requisitions WHERE id = $1", src_req)
+                "SELECT COALESCE(business_head_user_id, requestor_user_id) "
+                "FROM sample_requisitions WHERE id = $1", src_req)
         await _insert_8d(conn,
             """INSERT INTO npd_dev_promote_approval (id, promote_request_id, approver_kind, approver_user_id)
                VALUES ($1,$2,'INV_MGR',NULL) RETURNING id""", req_id)
@@ -141,12 +150,26 @@ async def act_promote_approval(conn, dev_jc_id: int, *, action: str, user,
             pr["id"], target, new_status, remarks, user.user_id)
         if act == "REJECT":
             await conn.execute("UPDATE npd_dev_promote_request SET status='VOID', decided_at=NOW() WHERE id=$1", pr["id"])
-            return {"ok": True, "status": "REJECTED"}
-        # Finalize INSIDE this transaction so a promote failure rolls the gate
-        # accept back (retryable). finalize_if_ready opens its own transaction,
-        # which nests as a savepoint here — if _finalize_promote raises, the whole
-        # outer transaction (including this gate flip) rolls back.
-        result = await finalize_if_ready(conn, dev_jc_id)
+            result = {"ok": True, "status": "REJECTED"}
+        else:
+            # Finalize INSIDE this transaction so a promote failure rolls the gate
+            # accept back (retryable). finalize_if_ready opens its own transaction,
+            # which nests as a savepoint here — if _finalize_promote raises, the whole
+            # outer transaction (including this gate flip) rolls back.
+            result = await finalize_if_ready(conn, dev_jc_id)
+    # Mail the decision into the job card's trail, AFTER commit so SMTP never rides the
+    # transaction. This is the one choke point every channel funnels through — WhatsApp
+    # (_apply_promote), the email button (POST /email/promote-action) and the in-app
+    # endpoint — so a WhatsApp approval reaches the mail trail by construction.
+    # Best-effort: a mail failure must not undo a recorded decision.
+    try:
+        from app.modules.sample.services import sample_mail_service as mail
+        await mail.notify_promote_status_email(
+            conn, dev_jc_id=dev_jc_id, gate=target, action=act,
+            actor_user_id=getattr(user, "user_id", None),
+            actor_name=getattr(user, "full_name", None), remarks=remarks, result=result)
+    except Exception:  # noqa: BLE001
+        logger.exception("Promote status email failed for dev JC %s", dev_jc_id)
     return result
 
 

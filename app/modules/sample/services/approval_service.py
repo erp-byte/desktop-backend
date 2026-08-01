@@ -109,6 +109,19 @@ async def act_bh_approval(conn, req_id: int, *, action: str, user,
                 "message": "Requisition is not awaiting business-head approval",
                 "details": {"status": locked["status"]}})
 
+        # 085: when the requisition names its business head, ONLY that BH (or an admin)
+        # may clear this gate — the create-time permission alone would let any BH in the
+        # pool approve a request raised for someone else. Requisitions created before 085
+        # carry no binding and keep the pool behaviour.
+        bound_bh = locked["business_head_user_id"]
+        if (bound_bh is not None
+                and user.user_id != bound_bh
+                and not getattr(user, "is_admin", False)):
+            raise HTTPException(403, detail={
+                "error": "not_the_approver",
+                "message": "This requisition is awaiting approval from its own business head",
+                "details": {"id": req_id}})
+
         await record_action(conn, req_id, approval_stage=BH_APPROVAL,
                             action=action, user=user, remarks=remarks)
 
@@ -139,7 +152,17 @@ async def act_bh_approval(conn, req_id: int, *, action: str, user,
                 message=f"Sample {locked['request_id']} rejected: {remarks}",
                 related_id=req_id)
 
-    return await req_svc.get_requisition(conn, req_id)
+    # Post the BH decision into the trail, after commit. Best-effort — a mail failure must
+    # never roll back a recorded approval.
+    fresh = await req_svc.get_requisition(conn, req_id)
+    try:
+        from app.modules.sample.services import sample_mail_service as mail
+        await mail.notify_requisition_event(
+            conn, fresh,
+            event=("approved" if action == "APPROVED" else "rejected"), reason=remarks)
+    except Exception:  # noqa: BLE001
+        logger.exception("BH approval email failed for req %s", req_id)
+    return fresh
 
 
 # ---------------------------------------------------------------------------
@@ -227,14 +250,16 @@ async def act_npd_review(conn, req_id: int, *, action: str, user,
             logger.exception("WhatsApp requestor notify failed for req %s", req_id)
         try:
             from app.modules.sample.services import sample_mail_service as mail
-            await mail.notify_requestor_email(conn, dict(locked), action=act, reason=reason)
-            await mail.notify_inventory_informative(
+            # ONE outcome mail into the trail — the detail card carries the reason, so
+            # there is no separate one-line "the request is updated" note behind it.
+            await mail.notify_requisition_event(
                 conn, dict(locked),
-                event=("accepted" if act in ("ACCEPT", "APPROVE") else "on hold"))
+                event=("accepted" if act in ("ACCEPT", "APPROVE") else "on hold"),
+                reason=reason)
             # Hold loop: re-offer the buttoned review card to npd_team as a reply into the
             # same thread, so a held request can be accepted (ends the loop) or held again.
             if act == "HOLD":
-                await mail.notify_npd_review_email(conn, dict(locked), threaded=True)
+                await mail.notify_npd_review_email(conn, dict(locked))
         except Exception:  # noqa: BLE001
             logger.exception("Sample outcome email failed for req %s", req_id)
 

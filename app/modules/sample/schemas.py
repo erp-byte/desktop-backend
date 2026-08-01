@@ -42,7 +42,17 @@ class NpdTargetIn(BaseModel):
 class RequisitionCreate(BaseModel):
     sample_type: SampleType
     warehouse: Warehouse
+    # The business head this request is raised FOR (085). Server-validated as an active
+    # business_head; it becomes requestor_user_id + business_head_user_id, and mirrors
+    # into requestor_team for display. Omitted -> the creator stays the requestor.
+    requestor_user_id: Optional[int] = None
     requestor_team: Optional[str] = None
+    # Sales point of contact (085). Defaults to the signed-in user when omitted; naming a
+    # user resolves their name+email from auth_user, or pass name/email directly for a POC
+    # without a login. Display + mail Cc only — drives no approval gate.
+    sales_poc_user_id: Optional[int] = None
+    sales_poc_name: Optional[str] = None
+    sales_poc_email: Optional[str] = None
     purpose_tag: Optional[PurposeTag] = None
     purpose_note: Optional[str] = None
     description: Optional[str] = None        # free-text request description
@@ -68,7 +78,14 @@ class RequisitionCreate(BaseModel):
 class RequisitionUpdate(BaseModel):
     warehouse: Optional[Warehouse] = None
     npd_target_name: Optional[str] = None
+    requestor_user_id: Optional[int] = None   # re-point the requestor BH (085)
     requestor_team: Optional[str] = None
+    # Sales point of contact (085). Defaults to the signed-in user when omitted; naming a
+    # user resolves their name+email from auth_user, or pass name/email directly for a POC
+    # without a login. Display + mail Cc only — drives no approval gate.
+    sales_poc_user_id: Optional[int] = None
+    sales_poc_name: Optional[str] = None
+    sales_poc_email: Optional[str] = None
     purpose_tag: Optional[PurposeTag] = None
     purpose_note: Optional[str] = None
     description: Optional[str] = None
@@ -133,7 +150,14 @@ class NpdRequisitionCreate(BaseModel):
     expected_dispatch_date: Optional[date] = None            # by BD team (nullable)
     description: Optional[str] = None                        # nullable
     purpose_tag: Optional[PurposeTag] = None                 # nullable
-    requestor_team: Optional[str] = None                     # nullable
+    requestor_user_id: Optional[int] = None                  # the BH this is raised for (085)
+    requestor_team: Optional[str] = None                     # nullable (mirrors the BH name)
+    # Sales point of contact (085). Defaults to the signed-in user when omitted; naming a
+    # user resolves their name+email from auth_user, or pass name/email directly for a POC
+    # without a login. Display + mail Cc only — drives no approval gate.
+    sales_poc_user_id: Optional[int] = None
+    sales_poc_name: Optional[str] = None
+    sales_poc_email: Optional[str] = None
     # Billing checklist: returnable XOR non_returnable (both optional); amount is
     # 0 unless paid, else mandatory > 0 with at most 2 decimals (Amount2 is strict).
     returnable: bool = False

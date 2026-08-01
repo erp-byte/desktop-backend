@@ -8,6 +8,7 @@ the house _gen_id pattern: GP-YYYYMMDD-NNNN via seq_gate_pass.
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
@@ -16,6 +17,16 @@ from app.modules.production.services.material_document_service import MVT_GI_SAM
 from app.modules.sample.services import audit_service, notification_service
 from app.modules.sample.services import approval_service as appr
 from app.modules.sample.services import requisition_service as req_svc
+
+logger = logging.getLogger(__name__)
+
+
+def _portal_link(req_id) -> str:
+    """Where the gate pass / outpass is printed. The PDF endpoint is a POST (it increments
+    print_count), so it cannot be linked from a mail — the requisition page carries the
+    Print button and is reachable by everyone on the trail."""
+    from app.config import Settings
+    return f"{Settings().WEB_APP_URL.rstrip('/')}/modules/sample/{req_id}"
 
 
 def _gen_gate_pass_number(seq_val: int) -> str:
@@ -56,7 +67,13 @@ async def inv_verify(conn, req_id: int, *, user, remarks: str | None = None) -> 
             target_team=notification_service.TEAM_BUSINESS,
             message=f"Sample {req['request_id']} verified by inventory manager.",
             related_id=req_id)
-    return await req_svc.get_requisition(conn, req_id)
+    fresh = await req_svc.get_requisition(conn, req_id)
+    try:
+        from app.modules.sample.services import sample_mail_service as mail
+        await mail.notify_requisition_event(conn, fresh, event="verified", reason=remarks)
+    except Exception:  # noqa: BLE001 — best-effort; a mail failure must not undo the check
+        logger.exception("Inventory verification email failed for req %s", req_id)
+    return fresh
 
 
 async def issue_gate_pass(conn, req_id: int, *, user, recipient_name: str | None = None,
@@ -91,6 +108,19 @@ async def issue_gate_pass(conn, req_id: int, *, user, recipient_name: str | None
             target_team=notification_service.TEAM_BUSINESS,
             message=f"Gate pass issued for sample {req['request_id']}.",
             related_id=gp_id, related_type=notification_service.REL_SAMPLE_GATE_PASS)
+    # Close the trail with the gate pass / delivery challan, linked to the portal page it
+    # prints from. Navigation only \u2014 no signed action URL \u2014 so it is safe on the
+    # broadcast copy.
+    try:
+        from app.modules.sample.services import sample_mail_service as mail
+        gp = await get_gate_pass(conn, gp_id)
+        await mail.notify_requisition_event(
+            conn, await req_svc.get_requisition(conn, req_id),
+            event="gate pass issued",
+            reason=f"Gate pass {gp.get('gate_pass_number') or gp_id}.",
+            link=_portal_link(req_id), link_label="Open gate pass")
+    except Exception:  # noqa: BLE001
+        logger.exception("Gate pass email failed for req %s", req_id)
     return await get_gate_pass(conn, gp_id)
 
 

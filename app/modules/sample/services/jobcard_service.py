@@ -8,6 +8,7 @@ the job-card lifecycle (IN_PRODUCTION -> PACKING -> READY_FOR_DISPATCH).
 """
 from __future__ import annotations
 
+import logging
 from datetime import date, timedelta
 
 from fastapi import HTTPException
@@ -15,6 +16,8 @@ from fastapi import HTTPException
 from app.modules.production.services.job_card_engine import create_job_cards
 from app.modules.sample.services import audit_service, notification_service
 from app.modules.sample.services import requisition_service as req_svc
+
+logger = logging.getLogger(__name__)
 
 JOBCARD_TYPE = {"BASIS_FG": "BASIS_FG_SAMPLE", "NPD": "NPD_SAMPLE", "TRIAL": "TRIAL_SAMPLE"}
 
@@ -103,7 +106,18 @@ async def start_production(conn, req_id: int, *, user) -> dict:
             target_team=notification_service.TEAM_PRODUCTION,
             message=f"Sample {req['request_id']} job cards issued ({po['prod_order_number']}).",
             related_id=req_id)
-    return await req_svc.get_requisition(conn, req_id)
+    # Mail production (they are on the Cc for job-card types) that a requisition has been
+    # raised for an item to be MADE for sampling — the in-app store_alert above reaches
+    # nobody's inbox on its own.
+    fresh = await req_svc.get_requisition(conn, req_id)
+    try:
+        from app.modules.sample.services import sample_mail_service as mail
+        await mail.notify_requisition_event(
+            conn, fresh, event="in production",
+            reason=f"Production order {po['prod_order_number']} \u2014 {len(jcs)} job card(s).")
+    except Exception:  # noqa: BLE001
+        logger.exception("Sample production email failed for req %s", req_id)
+    return fresh
 
 
 async def mark_packing(conn, req_id: int, *, user) -> dict:
@@ -115,9 +129,15 @@ async def mark_packing(conn, req_id: int, *, user) -> dict:
         await notification_service.emit_alert(
             conn, alert_type="sample_jobcard_completed",
             target_team=notification_service.TEAM_INVENTORY,
-            message=f"Sample {req['request_id']} production complete — packing.",
+            message=f"Sample {req['request_id']} production complete \u2014 packing.",
             related_id=req_id)
-    return await req_svc.get_requisition(conn, req_id)
+    fresh = await req_svc.get_requisition(conn, req_id)
+    try:
+        from app.modules.sample.services import sample_mail_service as mail
+        await mail.notify_requisition_event(conn, fresh, event="packing")
+    except Exception:  # noqa: BLE001
+        logger.exception("Sample packing email failed for req %s", req_id)
+    return fresh
 
 
 async def mark_ready(conn, req_id: int, *, user) -> dict:
@@ -126,4 +146,10 @@ async def mark_ready(conn, req_id: int, *, user) -> dict:
     async with conn.transaction():
         await req_svc.transition_status(conn, req_id, target="READY_FOR_DISPATCH",
                                         user=user, remarks="Packed, ready for dispatch")
-    return await req_svc.get_requisition(conn, req_id)
+    fresh = await req_svc.get_requisition(conn, req_id)
+    try:
+        from app.modules.sample.services import sample_mail_service as mail
+        await mail.notify_requisition_event(conn, fresh, event="ready")
+    except Exception:  # noqa: BLE001
+        logger.exception("Sample ready email failed for req %s", req_id)
+    return fresh

@@ -291,7 +291,7 @@ async def email_promote_action(
         return Response("<h3>This link is not authorised.</h3>", media_type="text/html", status_code=403)
 
     base = Settings().PUBLIC_BACKEND_URL.rstrip("/")
-    gate_label = "Inventory manager" if kind == "INV_MGR" else "Requestor (business head)"
+    gate_label = "Inventory manager" if kind == "INV_MGR" else "Business head"
     return _confirm_page(
         heading="Approve recipe promotion?",
         summary=f"Dev JC {dev_jc_id} · your gate: {gate_label}",
@@ -416,6 +416,18 @@ async def list_business_heads(
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
         return await requisition_service.list_business_heads(conn)
+
+
+# Sales-POC options for the requisition form. Same gate as /business-heads — the whole
+# requesting side populates it, and it exposes only name + work email of `sales` users.
+@router.get("/sales-pocs")
+async def list_sales_pocs(
+    request: Request,
+    user: AuthUser = Depends(require_permission("sample", "requisition", action="create")),
+):
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await requisition_service.list_sales_pocs(conn)
 
 
 @router.get("/requisitions")

@@ -21,6 +21,8 @@ from fastapi import HTTPException
 from app.core.helpers import new_short_time_id
 from app.modules.production.services.material_document_service import MVT_GI_SAMPLE
 from app.modules.sample.services import audit_service, notification_service
+import logging
+
 from app.modules.sample.services import approval_service as appr
 from app.modules.sample.services import gate_pass_service as gp_svc
 from app.modules.sample.services import requisition_service as req_svc
@@ -74,6 +76,13 @@ async def convert_full(conn, req_id: int, *, user, payload: dict | None = None) 
             target_team=notification_service.TEAM_INVENTORY,
             message=f"Sample {req['request_id']} converted to external gate pass.",
             related_id=gp_id, related_type=notification_service.REL_SAMPLE_GATE_PASS)
+    try:
+        from app.modules.sample.services import sample_mail_service as mail
+        await mail.notify_requisition_event(
+            conn, await req_svc.get_requisition(conn, req_id), event="converted")
+    except Exception:  # noqa: BLE001
+        logging.getLogger(__name__).exception(
+            "Conversion email failed for req %s", req_id)
     return await gp_svc.get_gate_pass(conn, gp_id)
 
 

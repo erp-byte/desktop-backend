@@ -121,6 +121,21 @@ async def create_requisition(conn, *, payload: dict, user) -> dict:
         if pcs is not None and wpp is not None:
             quantity = round(float(pcs) * float(wpp), 3)
 
+    # Requestor / POC split (085): the form may name the business head the request is
+    # raised FOR. When it does, that BH becomes requestor_user_id AND business_head_user_id
+    # (so the BASIS approval gate binds to them), requestor_team mirrors their name for
+    # display, and the creator is recorded as the POC. With no BH named, the creator stays
+    # the requestor — the pre-085 behaviour — and business_head_user_id is left NULL rather
+    # than guessed, since a wrong binding would gate approval on the wrong person.
+    bh_uid = payload.get("requestor_user_id")
+    requestor_uid = user.user_id
+    requestor_team = payload.get("requestor_team")
+    if bh_uid is not None:
+        bh_name = await _assert_business_head(conn, bh_uid)
+        requestor_uid = bh_uid
+        requestor_team = bh_name
+    poc_uid, poc_name, poc_email = await _resolve_sales_poc(conn, payload, user)
+
     async with conn.transaction():
         # request_id is an app-supplied 8-digit time-based BIGINT (new_short_time_id,
         # the same pattern as job_card_id / plan_id) and the surfaced identifier. It
@@ -135,6 +150,7 @@ async def create_requisition(conn, *, payload: dict, user) -> dict:
                         """
                         INSERT INTO sample_requisitions
                             (request_id, sample_type, status, requestor_user_id,
+                             business_head_user_id,
                              requestor_team, purpose_tag, purpose_note, base_bom_id,
                              internal_override, warehouse, transporter_name, vehicle_number,
                              npd_target_name, quantity, description,
@@ -143,12 +159,12 @@ async def create_requisition(conn, *, payload: dict, user) -> dict:
                              pcs, weight_per_piece,
                              returnable, non_returnable, paid, amount,
                              created_by, updated_by)
-                        VALUES ($1, $2, 'DRAFT', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                                $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $3, $3)
+                        VALUES ($1, $2, 'DRAFT', $3, $28, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                                $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $29, $29)
                         RETURNING id
                         """,
-                        request_id, sample_type, user.user_id,
-                        payload.get("requestor_team"), payload.get("purpose_tag"),
+                        request_id, sample_type, requestor_uid,
+                        requestor_team, payload.get("purpose_tag"),
                         payload.get("purpose_note"), payload.get("base_bom_id"),
                         bool(payload.get("internal_override", False)), warehouse,
                         payload.get("transporter_name"), payload.get("vehicle_number"),
@@ -165,11 +181,19 @@ async def create_requisition(conn, *, payload: dict, user) -> dict:
                         # nothing → (FALSE, FALSE, FALSE, 0).
                         bool(payload.get("returnable")), bool(payload.get("non_returnable")),
                         bool(payload.get("paid")), payload.get("amount") or 0,
+                        bh_uid, user.user_id,
                     )
                 break
             except asyncpg.UniqueViolationError:
                 if _attempt == 4:
                     raise
+        # Sales POC is written separately so the INSERT above stays valid on an environment
+        # where 085 has not been hand-applied yet (see has_sales_poc_columns).
+        if (poc_uid or poc_name or poc_email) and await has_sales_poc_columns(conn):
+            await conn.execute(
+                """UPDATE sample_requisitions
+                      SET sales_poc_user_id = $2, sales_poc_name = $3, sales_poc_email = $4
+                    WHERE id = $1""", req_id, poc_uid, poc_name, poc_email)
         await _insert_articles(conn, req_id, articles)
         await _insert_npd_targets(conn, req_id, targets)
         await audit_service.write_audit(
@@ -181,9 +205,11 @@ async def create_requisition(conn, *, payload: dict, user) -> dict:
     created = await get_requisition(conn, req_id)
     try:
         from app.modules.sample.services import sample_mail_service as mail
-        await mail.notify_inventory_informative(conn, created, event="created")
+        # Roots the transaction's mail trail — every later NPD mail (review, outcome,
+        # promote gates, promote decision, dispatch) replies into this one.
+        await mail.notify_requisition_event(conn, created, event="created")
     except Exception:  # noqa: BLE001
-        logger.exception("Inventory informative email failed for req %s", req_id)
+        logger.exception("Requisition created email failed for req %s", req_id)
     return created
 
 
@@ -379,12 +405,16 @@ async def list_requestors(conn, *, sample_types: list[str] | None = None) -> lis
     return [r["requestor_team"] for r in rows]
 
 
-async def list_business_heads(conn) -> list[str]:
-    """Names of active users holding the business_head role (primary or additional) —
-    feeds the requestor dropdown on the NPD request form, where a sales/admin user raises
-    a requisition ON BEHALF OF a business head."""
+async def list_business_heads(conn) -> list[dict]:
+    """Active users holding the business_head role (primary or additional) — feeds the
+    requestor dropdown on the NPD request form, where a sales/admin user raises a
+    requisition ON BEHALF OF a business head.
+
+    Returns {user_id, full_name}: the id is what create/update bind requestor_user_id and
+    business_head_user_id to, so the BH approval and the mail trail's To line route to that
+    specific person rather than being matched on a display string."""
     rows = await conn.fetch(
-        """SELECT DISTINCT u.full_name
+        """SELECT DISTINCT u.user_id, u.full_name
              FROM auth_user u
              LEFT JOIN auth_role pr ON u.role_id = pr.role_id
              LEFT JOIN auth_user_role ur ON ur.user_id = u.user_id
@@ -393,7 +423,86 @@ async def list_business_heads(conn) -> list[str]:
               AND u.full_name IS NOT NULL AND btrim(u.full_name) <> ''
               AND (pr.role_name = 'business_head' OR r.role_name = 'business_head')
             ORDER BY u.full_name""")
-    return [r["full_name"] for r in rows]
+    return [{"user_id": r["user_id"], "full_name": r["full_name"]} for r in rows]
+
+
+async def _assert_business_head(conn, uid: int) -> str:
+    """Full name of `uid`, or 422 if they are not an active business head. Guards the
+    requestor field at the boundary: the dropdown offers BHs only, so anything else
+    arriving here is a hand-crafted payload, and letting it through would bind the BASIS
+    approval gate to someone who can never clear it."""
+    row = await conn.fetchrow(
+        """SELECT u.full_name
+             FROM auth_user u
+             LEFT JOIN auth_role pr ON u.role_id = pr.role_id
+             LEFT JOIN auth_user_role ur ON ur.user_id = u.user_id
+             LEFT JOIN auth_role r ON ur.role_id = r.role_id
+            WHERE u.user_id = $1 AND COALESCE(u.is_active, TRUE)
+              AND (pr.role_name = 'business_head' OR r.role_name = 'business_head')
+            LIMIT 1""", uid)
+    if row is None:
+        raise HTTPException(422, detail={
+            "error": "invalid_requestor",
+            "message": "requestor_user_id must be an active business head",
+            "details": {"requestor_user_id": uid}})
+    return row["full_name"]
+
+
+async def has_sales_poc_columns(conn) -> bool:
+    """Whether migration 085 is applied. samples/ migrations are hand-applied (see the
+    header of 072), so every column they add has to be optional in code — mirrors the
+    information_schema guard npd_dev_service uses for the 084 `uom` column. Without this
+    an unmigrated environment would 500 on every requisition create."""
+    return bool(await conn.fetchval(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_name = 'sample_requisitions' AND column_name = 'sales_poc_user_id'"))
+
+
+async def list_sales_pocs(conn) -> list[dict]:
+    """Active users holding the `sales` role — feeds the Sales POC dropdown. Returns
+    {user_id, full_name, email}: the email is what the mail trail Ccs, so a POC with no
+    address on file is still selectable but simply never receives the trail."""
+    rows = await conn.fetch(
+        """SELECT DISTINCT u.user_id, u.full_name, COALESCE(u.email, '') AS email
+             FROM auth_user u
+             LEFT JOIN auth_role pr ON u.role_id = pr.role_id
+             LEFT JOIN auth_user_role ur ON ur.user_id = u.user_id
+             LEFT JOIN auth_role r ON ur.role_id = r.role_id
+            WHERE COALESCE(u.is_active, TRUE)
+              AND u.full_name IS NOT NULL AND btrim(u.full_name) <> ''
+              AND (pr.role_name = 'sales' OR r.role_name = 'sales')
+            ORDER BY u.full_name""")
+    return [{"user_id": r["user_id"], "full_name": r["full_name"], "email": r["email"]}
+            for r in rows]
+
+
+async def _resolve_sales_poc(conn, payload: dict, user) -> tuple[int | None, str | None, str | None]:
+    """(user_id, name, email) for the request's sales POC.
+
+    A named user wins and has their name/email read from auth_user, so the stored snapshot
+    can never disagree with the account. Free-text name/email is still accepted for a POC
+    without a login (same escape hatch Customer Returns has). With nothing supplied the
+    signed-in user becomes the POC — the common case, since `sales` is the role that
+    raises these requests. Any user may be named: unlike the requestor BH this drives no
+    approval gate, only display and a Cc, so restricting it would add friction for no
+    safety gain."""
+    uid = payload.get("sales_poc_user_id")
+    if uid is not None:
+        row = await conn.fetchrow(
+            "SELECT full_name, email FROM auth_user WHERE user_id = $1", uid)
+        if row is None:
+            raise HTTPException(422, detail={
+                "error": "invalid_sales_poc",
+                "message": "sales_poc_user_id does not match a user",
+                "details": {"sales_poc_user_id": uid}})
+        return uid, row["full_name"], (row["email"] or None)
+    name = (payload.get("sales_poc_name") or "").strip()
+    email = (payload.get("sales_poc_email") or "").strip()
+    if name or email:
+        return None, name or None, email or None
+    return (user.user_id,
+            (getattr(user, "full_name", None) or "").strip() or None,
+            (getattr(user, "email", None) or "").strip() or None)
 
 
 # ---------------------------------------------------------------------------
@@ -447,11 +556,27 @@ async def update_requisition(conn, req_id: int, *, payload: dict, user) -> dict:
     if not eff_paid and eff_amount and float(eff_amount) > 0:
         raise HTTPException(422, detail={"error": "invalid_billing",
                                          "message": "amount must be 0 unless paid"})
+    # Re-pointing the requestor moves BOTH the requestor and the BASIS approval binding to
+    # the new BH, and mirrors their name into requestor_team. Validated the same way as on
+    # create. The sales POC is independent of this and only moves when the patch names one
+    # (see below).
+    new_bh_uid = payload.get("requestor_user_id")
+    new_requestor_team = payload.get("requestor_team")
+    if new_bh_uid is not None:
+        new_requestor_team = await _assert_business_head(conn, new_bh_uid)
+    # Sales POC is editable. Only re-resolve when the patch actually names one — passing
+    # the signed-in user as a default here would silently steal the POC from whoever was
+    # set at creation every time an unrelated field is edited by someone else.
+    poc_touched = any(payload.get(k) is not None
+                      for k in ("sales_poc_user_id", "sales_poc_name", "sales_poc_email"))
+    new_poc = await _resolve_sales_poc(conn, payload, user) if poc_touched else (None, None, None)
     async with conn.transaction():
         await conn.execute(
             """
             UPDATE sample_requisitions
                SET requestor_team   = COALESCE($2, requestor_team),
+                   requestor_user_id     = COALESCE($26, requestor_user_id),
+                   business_head_user_id = COALESCE($26, business_head_user_id),
                    purpose_tag      = COALESCE($3, purpose_tag),
                    purpose_note     = COALESCE($4, purpose_note),
                    base_bom_id      = COALESCE($5, base_bom_id),
@@ -477,7 +602,7 @@ async def update_requisition(conn, req_id: int, *, payload: dict, user) -> dict:
                    updated_at = NOW(), updated_by = $6
              WHERE id = $1
             """,
-            req_id, payload.get("requestor_team"), payload.get("purpose_tag"),
+            req_id, new_requestor_team, payload.get("purpose_tag"),
             payload.get("purpose_note"), payload.get("base_bom_id"), user.user_id,
             payload.get("transporter_name"), payload.get("vehicle_number"),
             quantity, payload.get("npd_target_name"), new_warehouse,
@@ -490,7 +615,15 @@ async def update_requisition(conn, req_id: int, *, payload: dict, user) -> dict:
             payload.get("returnable"), payload.get("non_returnable"), payload.get("paid"),
             # paid explicitly unticked → force amount 0 (keeps the DB CHECK satisfied
             # even if the client omitted amount); else use the sent amount (or keep).
-            (0 if payload.get("paid") is False else payload.get("amount")))
+            (0 if payload.get("paid") is False else payload.get("amount")),
+            new_bh_uid)
+        # Separate + guarded, for the same reason as on create: 085 is hand-applied, so the
+        # statement above must stay valid on a database that has not seen it yet.
+        if poc_touched and await has_sales_poc_columns(conn):
+            await conn.execute(
+                """UPDATE sample_requisitions
+                      SET sales_poc_user_id = $2, sales_poc_name = $3, sales_poc_email = $4
+                    WHERE id = $1""", req_id, *new_poc)
         if payload.get("articles") is not None:
             await conn.execute(
                 "DELETE FROM sample_requisition_articles WHERE requisition_id = $1", req_id)
@@ -573,6 +706,17 @@ async def submit_requisition(conn, req_id: int, *, user) -> dict:
             await mail.notify_npd_review_email(conn, req)
         except Exception:  # noqa: BLE001
             logger.exception("Sample review email failed for req %s", req_id)
+    else:
+        # The general sample flow (BASIS_RM / BASIS_FG / INTERNAL) has no NPD review step —
+        # it goes straight to the business head. Post the submission into the trail so the
+        # BH and inventory see it coming; NPD types get the buttoned review mail above
+        # instead, which already announces the same thing.
+        try:
+            from app.modules.sample.services import sample_mail_service as mail
+            await mail.notify_requisition_event(conn, await get_requisition(conn, req_id),
+                                                event="submitted")
+        except Exception:  # noqa: BLE001
+            logger.exception("Sample submitted email failed for req %s", req_id)
 
     return await get_requisition(conn, req_id)
 

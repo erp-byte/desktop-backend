@@ -7,6 +7,8 @@ polluting 261 (GI-to-Production).
 """
 from __future__ import annotations
 
+import logging
+
 from fastapi import HTTPException
 
 from app.modules.production.services.material_document_service import (
@@ -14,6 +16,8 @@ from app.modules.production.services.material_document_service import (
 )
 from app.modules.sample.services import audit_service, notification_service
 from app.modules.sample.services import requisition_service as req_svc
+
+logger = logging.getLogger(__name__)
 
 
 async def issue_outward(conn, req_id: int, *, user,
@@ -95,7 +99,13 @@ async def issue_outward(conn, req_id: int, *, user,
             message=f"Sample {req['request_id']} material issued (265).",
             related_id=req_id)
 
-    return await req_svc.get_requisition(conn, req_id)
+    fresh = await req_svc.get_requisition(conn, req_id)
+    try:
+        from app.modules.sample.services import sample_mail_service as mail
+        await mail.notify_requisition_event(conn, fresh, event="issued")
+    except Exception:  # noqa: BLE001 — best-effort; a mail failure must not undo a 265
+        logger.exception("Sample outward email failed for req %s", req_id)
+    return fresh
 
 
 async def dispatch_internal(conn, req_id: int, *, user) -> dict:
@@ -115,4 +125,10 @@ async def dispatch_internal(conn, req_id: int, *, user) -> dict:
             target_team=notification_service.TEAM_INVENTORY,
             message=f"Sample {req['request_id']} dispatched internally.",
             related_id=req_id)
-    return await req_svc.get_requisition(conn, req_id)
+    fresh = await req_svc.get_requisition(conn, req_id)
+    try:
+        from app.modules.sample.services import sample_mail_service as mail
+        await mail.notify_requisition_event(conn, fresh, event="internally dispatched")
+    except Exception:  # noqa: BLE001
+        logger.exception("Internal dispatch email failed for req %s", req_id)
+    return fresh
