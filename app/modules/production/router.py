@@ -8819,7 +8819,7 @@ async def create_box_scan(
             scanned_by=user.full_name or user.phone,
         )
     if result.get("error") == "duplicate_box":
-        raise HTTPException(status_code=409, detail=f"Redundant box scanned — {result.get('box_id')} is already recorded.")
+        raise HTTPException(status_code=409, detail=f"Duplicate box scanned — {result.get('box_id')} is already recorded.")
     if result.get("error") == "job_card_not_found":
         raise HTTPException(status_code=404, detail="Job card not found")
     if result.get("error") == "article_required":
