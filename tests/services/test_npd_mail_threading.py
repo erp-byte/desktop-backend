@@ -310,3 +310,15 @@ def test_every_card_uses_the_shared_type_scale(sent):
         assert min(sizes) >= 11, f"{name} has {min(sizes)}px type — below the scale floor"
         # the request id / key figures must dominate
         assert max(sizes) >= m._T_KEY, f"{name} has no large focal type (max {max(sizes)}px)"
+
+
+# ── production request (general flow, no NPD) ────────────────────────────────
+def test_production_request_renders_on_the_general_trail(sent):
+    """A general sample whose article must be MADE says so on its own trail. The card must
+    talk about production, never about NPD — NPD runs a separate module."""
+    asyncio.run(m.notify_requisition_event(
+        _Conn(), {**BASIS, "sample_type": "BASIS_FG"}, event="production requested"))
+    assert len(sent) == 1
+    html = sent[0]["html"]
+    assert "ITEM TO BE MADE FOR SAMPLING" in html
+    assert "NPD" not in html, "the general production request must not mention NPD"

@@ -654,6 +654,50 @@ async def update_requisition(conn, req_id: int, *, payload: dict, user) -> dict:
     return await get_requisition(conn, req_id)
 
 
+async def request_production_item(conn, req_id: int, *, user, note: str | None = None) -> dict:
+    """Tell production that an item has to be MADE for this sample.
+
+    The general sample flow issues existing stock; when the requested article has to be
+    produced instead, production needs to know before the job cards land so they can plan
+    the run. This records the ask, alerts production, and posts it onto the request's mail
+    trail.
+
+    Scoped entirely to this module: no NPD team, no NPD authorisation, no development job
+    card. NPD runs its own requisition -> job card -> dispatch flow in its own module, and
+    a general sample never crosses into it. The recipe itself comes from the BOM master via
+    the requisition's Base BOM field.
+    """
+    req = _require(await _fetch_req(conn, req_id), req_id)
+    if req["status"] in ("CLOSED", "CANCELLED"):
+        raise HTTPException(409, detail={
+            "error": "not_actionable",
+            "message": "A closed or cancelled requisition cannot raise a production request",
+            "details": {"status": req["status"]}})
+
+    async with conn.transaction():
+        await audit_service.write_audit(
+            conn, req_id, audit_service.EV_JOBCARD,
+            new_value={"production_requested": True},
+            actor_user_id=user.user_id, actor_role=user.role_name,
+            remarks=note or "Item to be made for sampling")
+        tgt = req.get("npd_target_name") or "the requested article"
+        await notification_service.emit_alert(
+            conn, alert_type="sample_production_requested",
+            target_team=notification_service.TEAM_PRODUCTION,
+            message=(f"Sample {req['request_id']}: a requisition has been raised for {tgt} "
+                     f"to be created for sampling."),
+            related_id=req_id)
+
+    fresh = await get_requisition(conn, req_id)
+    try:
+        from app.modules.sample.services import sample_mail_service as mail
+        await mail.notify_requisition_event(
+            conn, fresh, event="production requested", reason=note)
+    except Exception:  # noqa: BLE001 — best-effort; mail must not block the request
+        logger.exception("Production request email failed for req %s", req_id)
+    return fresh
+
+
 async def submit_requisition(conn, req_id: int, *, user) -> dict:
     """DRAFT|BH_REJECTED -> SUBMITTED with validation guards (spec §8)."""
     req = _require(await _fetch_req(conn, req_id), req_id)

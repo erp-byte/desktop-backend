@@ -1010,10 +1010,19 @@ async def _finalize_promote(conn, dev_jc_id, *, promote_phase_id, close_payload:
             user.user_id, dev_jc_id)
         # Mirror the confirmed dispatch date onto the source requisition so its
         # view reflects the NPD-confirmed dispatch once the trial is closed.
+        #
+        # Also hand the freshly promoted BOM back to the requisition. Without this the
+        # development loop never closes: a sample that needed a recipe gets one developed
+        # and promoted, but base_bom_id stays NULL, so start_production keeps refusing to
+        # raise job cards. COALESCE so a requisition that already names a BOM keeps it —
+        # a promote must never silently repoint a deliberate choice.
         if jc.get("source_requisition_id"):
             await conn.execute(
-                "UPDATE sample_requisitions SET confirmed_dispatch_date = CURRENT_DATE, "
-                "updated_at = NOW() WHERE id = $1", jc["source_requisition_id"])
+                "UPDATE sample_requisitions "
+                "   SET confirmed_dispatch_date = CURRENT_DATE, "
+                "       base_bom_id = COALESCE(base_bom_id, $2), "
+                "       updated_at = NOW() "
+                " WHERE id = $1", jc["source_requisition_id"], new_bom_id)
     return await get_dev_job_card(conn, dev_jc_id)
 
 

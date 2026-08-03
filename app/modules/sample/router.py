@@ -494,6 +494,21 @@ async def update_requisition(
             conn, req_id, payload=body.model_dump(exclude_unset=True), user=user)
 
 
+@router.post("/requisitions/{req_id}/request-production")
+async def request_production_item(
+    request: Request,
+    req_id: int,
+    body: schemas.ProductionRequestBody | None = None,
+    user: AuthUser = Depends(require_permission("sample", "requisition", action="edit")),
+):
+    """Tell production an item has to be made for this sample. Gated on requisition-edit —
+    the requesting side raises it. No NPD involvement; NPD has its own module."""
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await requisition_service.request_production_item(
+            conn, req_id, user=user, note=(body.note if body else None))
+
+
 @router.post("/requisitions/{req_id}/submit")
 async def submit_requisition(
     request: Request,

@@ -75,6 +75,11 @@ class RequisitionCreate(BaseModel):
     articles: list[ArticleIn] = Field(default_factory=list)
 
 
+class ProductionRequestBody(BaseModel):
+    """Optional note on why this sample's article has to be produced."""
+    note: Optional[str] = None
+
+
 class RequisitionUpdate(BaseModel):
     warehouse: Optional[Warehouse] = None
     npd_target_name: Optional[str] = None

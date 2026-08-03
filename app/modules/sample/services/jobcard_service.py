@@ -72,10 +72,15 @@ async def start_production(conn, req_id: int, *, user) -> dict:
                                          "details": {"status": req["status"]}})
     bom_id = req["base_bom_id"]
     if not bom_id:
+        # The create form lets a BASIS_FG request defer its Base BOM ("set before
+        # production"), so arriving here without one is normal and recoverable: the BOM
+        # exists in the BOM master, it just has not been chosen. Say so plainly instead of
+        # failing with a bare field name.
         raise HTTPException(422, detail={
             "error": "bom_required",
-            "message": "base_bom_id is required to generate sample job cards",
-            "details": {"id": req_id}})
+            "message": ("Select a Base BOM on this requisition before starting production — "
+                        "job cards are generated from it."),
+            "details": {"id": req_id, "field": "base_bom_id", "next": "edit_requisition"}})
 
     # Batch size = sum of FG / NPD_OUTPUT article quantities; if a requisition
     # carries only input articles, fall back to 1.0 so a job card can still run.

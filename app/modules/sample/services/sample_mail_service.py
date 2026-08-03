@@ -452,7 +452,9 @@ def _detail_table(req: dict) -> str:
         ("Company", _fmt(req.get("company_name"))),
         ("Customer", _fmt(req.get("customer_name"))),
         ("Customer contact", _fmt(req.get("customer_contact"))),
-        ("Target NPD article", _fmt(req.get("npd_target_name"))),
+        # Column is npd_target_name for historical reasons, but the label must not say
+        # "NPD" on a general sample — that module is a separate flow entirely.
+        ("Target article", _fmt(req.get("npd_target_name"))),
         ("Pcs", _fmt(req.get("pcs")), "num"),
         ("Weight per piece", f"{_fmt(wpp)} kg" if wpp is not None else "—", "num"),
         ("Quantity", f"{_fmt(qty)} kg" if qty is not None else "—", "num"),
@@ -523,6 +525,7 @@ _REQ_EVENT = {
     "rejected":  ("#dc2626", "REJECTED BY BUSINESS HEAD", "The business head has rejected this sample request.", "Rejected", "#dc2626"),
     "accepted":  ("#16a34a", "SAMPLE REQUEST ACCEPTED",   "The NPD team has accepted this sample request.", "Accepted", "#16a34a"),
     "on hold":   ("#f59e0b", "SAMPLE REQUEST ON HOLD",    "The NPD team has placed this sample request on hold.", "On hold", "#b45309"),
+    "production requested": ("#7c3aed", "ITEM TO BE MADE FOR SAMPLING", "A requisition has been raised for this article to be created for sampling. Production — this is the reason for the run; job cards follow once the requisition starts production.", "To be produced", "#7c3aed"),
     "in production": ("#7c3aed", "SENT TO PRODUCTION",    "A production order and job cards have been raised to make this sample. Production — this requisition is the reason for the run.", "In production", "#7c3aed"),
     "packing":   ("#7c3aed", "PRODUCTION COMPLETE",       "Production of this sample is complete and it has moved to packing.", "Packing", "#7c3aed"),
     "ready":     ("#0f766e", "READY FOR DISPATCH",        "This sample is packed and ready for dispatch. Inventory can now verify it and issue the gate pass.", "Ready", "#0f766e"),
