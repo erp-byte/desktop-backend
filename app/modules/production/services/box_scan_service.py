@@ -102,6 +102,18 @@ async def scan_box(conn, *, job_card_id: int, code: str,
     code = (code or "").strip()
     if not code:
         return {"error": "box_not_found", "code": code}
+
+    # Redundant-box guard: a physical box id must not be recorded twice. Matched
+    # by the scanned id ALONE across EVERY job card (not the per-JC key), so the
+    # same box can't be stored again anywhere. Remove the existing row (the ✕ in
+    # the RM tab) to re-record it.
+    dup = await conn.fetchval(
+        "SELECT 1 FROM jc_box_scan WHERE box_id = $1 OR sfg_box_id = $1 LIMIT 1",
+        code,
+    )
+    if dup:
+        return {"error": "duplicate_box", "box_id": code}
+
     entered = (article or "").strip() or None
 
     # po_box / sfg_box first (fast, carries the SFG batch); then widen to the
