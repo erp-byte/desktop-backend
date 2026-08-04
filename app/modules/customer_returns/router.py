@@ -20,7 +20,7 @@ from app.modules.customer_returns import schemas
 from app.modules.customer_returns.approval_token import verify_action_token
 from app.modules.customer_returns.services import (
     create_service, query_service, box_service, export_xlsx,
-    mail_service, approval_service,
+    mail_service, approval_service, wa_notify,
 )
 
 
@@ -314,11 +314,15 @@ async def send_customer_return_for_approval(
         detail = await query_service.get_cr(conn, company, cr_id)
         detail["company"] = company
         rec = await mail_service.notify_cr_created(conn, detail)
+        # WhatsApp head-approval to the mapped BU Head (image header + Approve/Reject/
+        # Hold buttons). Best-effort — never raises; no-ops if WABA/phone unconfigured.
+        wa = await wa_notify.notify_cr_head_approval(conn, detail)
     return {
         "status": "sent",
         "approver": rec["approver"],
         "to": rec["to"],
         "cc_count": len(rec["cc"]),
+        "whatsapp": wa,
     }
 
 

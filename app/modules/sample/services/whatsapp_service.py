@@ -834,6 +834,15 @@ async def handle_inbound(conn, *, from_phone: str, text: str, context_id: str | 
     body = (text or "").strip()
     first = body.split(maxsplit=1)[0].upper() if body else ""
 
+    # ── CUSTOMER-RETURNS head approval (context.id → wa_return_message) — resolved FIRST,
+    #    since the BU-Head approver is neither an npd_team reviewer nor a promote approver.
+    #    Returns None when the tap isn't a customer-return message, so the flows below run. ──
+    if context_id:
+        from app.modules.customer_returns.services import wa_notify as _cr_wa  # lazy: avoid cycle
+        cr_res = await _cr_wa.handle_return_button_tap(conn, wa, body, context_id)
+        if cr_res is not None:
+            return cr_res
+
     # ── PROMOTE gate (job-card approval) — resolved BEFORE the NPD review flow, since
     #    its approvers (inventory_manager / requestor BH) are NOT npd_team reviewers. ──
     # (a) Approve / Reject button tap quoting a promote message (context.id → wa_promote_message).

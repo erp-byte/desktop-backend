@@ -380,6 +380,10 @@ SQL_FILES = [
     # 082 process_group — cross-product process merge tags every job card in a
     # merged run with a shared process_group_id (+ partial index). Idempotent.
     DB_DIR / "082_process_group.sql",
+    # 083 cr_wa_approval — wa_return_message maps a sent customer_returns_head_approval
+    # WhatsApp template's wamid to its CR so an inbound Approve/Reject/Hold tap resolves
+    # to the right return. Additive/idempotent.
+    DB_DIR / "083_cr_wa_approval.sql",
 ]
 
 # ── Optional: drop the v1 legacy job-card stack (TEST / Supabase DB ONLY) ──────
