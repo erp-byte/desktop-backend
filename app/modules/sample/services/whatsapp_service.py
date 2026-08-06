@@ -88,7 +88,7 @@ this order — keep the live template text aligned with the layouts below.
    and "Reject" (Reject → we ask for the reason in the next reply).
    HEADER (text): New promote approval — Dev JC {{1}}     [ {{1}} = dev JC id (8-digit) ]
    BODY ({{1}}..{{9}}):
-     Your gate: {{1}}                                      [ "Inventory manager" / "Requestor (business head)" ]
+     Your gate: {{1}}                                      [ "Inventory manager" / "Business head" ]
      Dev job card: {{2}}                                   [ dev JC id (8-digit) ]
      Target FG article: {{3}}   Target quantity: {{4}}
      Company: {{5}}   Customer: {{6}}
@@ -124,7 +124,7 @@ TPL_ACCEPTED = os.environ.get("WHATSAPP_TPL_NPD_ACCEPTED", "npd_request_accepted
 TPL_HOLD = os.environ.get("WHATSAPP_TPL_NPD_HOLD", "npd_request_on_hold")
 # Promote dual-approval gate (NPD dev job card): Approve / Reject quick replies.
 TPL_PROMOTE = os.environ.get("WHATSAPP_TPL_NPD_PROMOTE", "npd_promote_approval")
-_PROMOTE_GATE_LABEL = {"INV_MGR": "Inventory manager", "REQUESTOR_BH": "Requestor (business head)"}
+_PROMOTE_GATE_LABEL = {"INV_MGR": "Inventory manager", "REQUESTOR_BH": "Business head"}
 # Verify token for the webhook GET handshake (set the same value in Meta).
 VERIFY_TOKEN = os.environ.get("WHATSAPP_VERIFY_TOKEN", "")
 # This WABA is shared with the standalone Visitor Management system, which sends its own
