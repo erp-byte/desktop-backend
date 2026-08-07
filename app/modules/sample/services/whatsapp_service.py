@@ -843,6 +843,17 @@ async def handle_inbound(conn, *, from_phone: str, text: str, context_id: str | 
         if cr_res is not None:
             return cr_res
 
+    # ── PURCHASE no-PO intimation ("PO Created & Uploaded" / "Don't Accept the Material")
+    #    — the tapper is a purchase_manager, not an NPD reviewer or promote approver.
+    #    Handles BOTH the tap (context.id → wa_po_intimation_message) and the plain-text
+    #    PO number that answers it (no context.id, keyed on an armed capture for this
+    #    phone), so it must run for context-less messages too. Returns None when the
+    #    message isn't ours, leaving every flow below unchanged. ──
+    from app.modules.purchase.services import po_intimation as _po_wa  # lazy: avoid cycle
+    po_res = await _po_wa.handle_po_intimation_tap(conn, wa, body, context_id)
+    if po_res is not None:
+        return po_res
+
     # ── PROMOTE gate (job-card approval) — resolved BEFORE the NPD review flow, since
     #    its approvers (inventory_manager / requestor BH) are NOT npd_team reviewers. ──
     # (a) Approve / Reject button tap quoting a promote message (context.id → wa_promote_message).

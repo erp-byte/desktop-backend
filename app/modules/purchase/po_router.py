@@ -39,7 +39,7 @@ from app.modules.purchase.schemas.po_api import (
     PreviewResponse,
 )
 from app.modules.purchase.services import po_commit, po_delete, po_preview, po_query
-from app.modules.purchase.services import qc_intimation
+from app.modules.purchase.services import po_intimation, qc_intimation
 
 logger = logging.getLogger(__name__)
 
@@ -563,6 +563,10 @@ async def send_qc_intimation(
 class WalkInItem(BaseModel):
     sku_id: int | None = None
     sku_name: str = Field(min_length=1)
+    # Priced arrival — rate (₹/kg) and qty (kgs) drive the intimation's
+    # Base Value / GST Value columns. GST% comes from all_sku, not the client.
+    rate: float = 0.0
+    qty: float = 0.0
 
 
 class WalkInIntimationRequest(BaseModel):
@@ -570,6 +574,8 @@ class WalkInIntimationRequest(BaseModel):
     vendor_name: str | None = None
     vehicle_number: str | None = None
     invoice_no: str | None = None
+    warehouse: str | None = None
+    indentor: str | None = None
     items: list[WalkInItem] = Field(min_length=1)
 
 
@@ -579,13 +585,16 @@ async def send_walk_in_intimation(
     body: WalkInIntimationRequest,
     user: AuthUser = Depends(require_permission("purchase", "material_in", "qcint", action="create")),
 ):
-    """Record a QC arrival intimation for WALK-IN material that has NO purchase
-    order — articles are chosen from the global SKU master (/so/sku-lookup).
+    """Record an arrival for WALK-IN material that has NO purchase order, and
+    intimate the PURCHASE team so they raise the PO — articles are chosen from
+    the global SKU master (/so/sku-lookup).
 
-    Mirrors the PO-based intimation but with po_number=None and a generated
-    ``WI-YYYYMMDDHHMMSS`` transaction id so QC can see the arrival as its own
-    group (distinct from PO ``TR-*`` transactions). Notifies QC over WhatsApp
-    (best-effort); arrivals are persisted first so they survive a WA outage.
+    The arrival is stored like the PO-based intimation but with po_number=None
+    and a generated ``WI-YYYYMMDDHHMMSS`` transaction id, so QC still sees it as
+    its own group (distinct from PO ``TR-*`` transactions). The WhatsApp that
+    goes out is the ``purchase_without_po_intimation`` template addressed to the
+    purchase role — best-effort; the arrival is persisted first so it survives a
+    WA outage.
     """
     if body.entity:
         allowed = await _allowed_entities_for(request, user)
@@ -595,7 +604,8 @@ async def send_walk_in_intimation(
     vendor_name = (body.vendor_name or "").strip() or "Walk-in"
     vehicle = (body.vehicle_number or "").strip() or None
     invoice = (body.invoice_no or "").strip() or None
-    article_names = [it.sku_name for it in body.items]
+    warehouse = (body.warehouse or "").strip() or None
+    indentor = (body.indentor or "").strip() or (user.full_name or None)
     lines = [
         {"sku_id": it.sku_id, "sku_name": it.sku_name, "particulars": None}
         for it in body.items
@@ -614,12 +624,33 @@ async def send_walk_in_intimation(
         lines=lines,
     )
 
-    result = await qc_intimation.send_intimation(
+    # GST% is master data, never client input — pull the all_sku fraction for
+    # every picked article in one round-trip (0.05 → 5%).
+    sku_ids = [it.sku_id for it in body.items if it.sku_id is not None]
+    gst_by_sku: dict[int, float] = {}
+    if sku_ids:
+        rows = await pool.fetch(
+            "SELECT sku_id, COALESCE(gst, 0) AS gst FROM all_sku WHERE sku_id = ANY($1::int[])",
+            sku_ids,
+        )
+        gst_by_sku = {r["sku_id"]: float(r["gst"]) for r in rows}
+
+    result = await po_intimation.send_po_creation_intimation(
         pool,
-        po_number=walk_in_txn,
+        transaction_no=walk_in_txn,
+        invoice_no=invoice,
         vendor_name=vendor_name,
-        article_names=article_names,
-        vehicle_number=vehicle or "",
-        invoice_no=invoice or "",
+        vehicle_number=vehicle,
+        indentor=indentor,
+        warehouse=warehouse,
+        lines=[
+            {
+                "name": it.sku_name,
+                "rate": it.rate,
+                "qty": it.qty,
+                "gst": gst_by_sku.get(it.sku_id, 0.0) if it.sku_id is not None else 0.0,
+            }
+            for it in body.items
+        ],
     )
     return {**result, "transaction_no": walk_in_txn}
