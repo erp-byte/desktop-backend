@@ -909,8 +909,12 @@ async def save_accounting(conn, *, job_card_id: int,
     #            + total_return (RM sent back to stores / prev stage,
     #                            summed off consumption rows).
     # balance_difference = total_input - OUT.
+    # PM is packaging, counted in pcs — it is NOT kg mass and must never enter
+    # this kg return sum. Exclude input_kind='PM' (RM/SFG/WIP are all kg and
+    # still count). Mirrors the RM-only filter used for variance at :126-133.
     total_return = _f(await conn.fetchval(
-        "SELECT COALESCE(SUM(return_qty), 0) FROM job_card_material_consumption_v2 WHERE job_card_id=$1",
+        "SELECT COALESCE(SUM(return_qty), 0) FROM job_card_material_consumption_v2 "
+        "WHERE job_card_id=$1 AND input_kind <> 'PM'",
         job_card_id,
     ))
 

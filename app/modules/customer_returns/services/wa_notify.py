@@ -1,12 +1,18 @@
 """Customer-Returns WhatsApp head-approval notification.
 
-On "Send for Approval" the mapped Business Head gets the `customer_returns_head_approval`
+On "Send for Approval" the mapped Business Head AND every standing deputy approver
+(`deputy_approver` rows in cr_email_routing) get the `customer_returns_head_approval`
 template on the shared WABA: an IMAGE header (the articles table rendered as a PNG) +
 positional body variables ({{1}}..{{11}}) + the template's built-in Approve / Reject /
 Hold quick-reply buttons. A button tap is quoted back with `context.id` = the sent
 message's wamid; the shared webhook (sample/whatsapp_service.handle_inbound) resolves it
 via `wa_return_message` and calls `handle_return_button_tap` here, which applies the CR
 decision through the SAME approval_service the email magic-link uses.
+
+One message per approver means one wamid per approver, so a deputy's tap resolves
+through their own row — the inbound handler needed no change to accept it. Two people
+tapping is safe: apply_cr_action is idempotent and reports the second as already
+actioned.
 
 Self-contained WABA client (mirrors purchase/qc_intimation + sample/whatsapp_service —
 each tenant on this number has its own). Best-effort: a missing/unconfigured WABA or a
@@ -260,7 +266,11 @@ def _wamid(resp: dict) -> Optional[str]:
 
 # ── 3. recipient / actor resolution ───────────────────────────────────────────
 async def _resolve_bh_phone(conn, business_head: Optional[str]) -> Optional[str]:
-    """Phone of the CR's mapped Business Head (match auth_user.full_name, active)."""
+    """Phone of a person by auth_user.full_name (active, non-blank phone).
+
+    Used for the CR's mapped Business Head and, identically, for each standing
+    deputy — a deputy's `match_key` in cr_email_routing IS their full_name.
+    """
     if not business_head or not str(business_head).strip():
         return None
     phone = await conn.fetchval(
@@ -269,6 +279,41 @@ async def _resolve_bh_phone(conn, business_head: Optional[str]) -> Optional[str]
         business_head,
     )
     return _fmt_phone(phone) if phone else None
+
+
+async def _resolve_approver_phones(conn, detail: dict) -> list[tuple[str, str]]:
+    """[(name, phone)] for the BU Head and every standing deputy, deduped by number.
+
+    Deduped by PHONE, not by name: if a deputy happens to be the CR's own BU Head
+    they must not get the same template twice, which would also write two
+    wa_return_message rows and let one person's second tap look like a second
+    decision.
+
+    A deputy with no auth_user row (or no number on it) is simply absent from this
+    list — their mail still carries the buttons. WhatsApp is the faster channel,
+    never the only one.
+    """
+    names = [detail.get("business_head")]
+    try:
+        routing = await mail_service.fetch_routing(conn)
+        names += [d.get("name") for d in routing.get("deputy_approver", [])]
+    except Exception:  # noqa: BLE001 — a routing failure must not cost the BH send
+        logger.exception("[cr-wa] deputy routing lookup failed — BU Head only")
+
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for name in names:
+        if not name or not str(name).strip():
+            continue
+        phone = await _resolve_bh_phone(conn, name)
+        if not phone:
+            logger.info("[cr-wa] no phone on file for %r — skipping their WhatsApp", name)
+            continue
+        if phone in seen:
+            continue
+        seen.add(phone)
+        out.append((str(name).strip(), phone))
+    return out
 
 
 async def _resolve_actor(conn, wa: str) -> str:
@@ -330,39 +375,59 @@ def _body_params(detail: dict) -> list[str]:
 
 async def notify_cr_head_approval(conn, detail: dict) -> dict:
     """Send the head-approval WhatsApp (image header + body + buttons) to the CR's
-    Business Head. Best-effort — never raises. Returns a small status dict."""
+    Business Head AND every standing deputy. Best-effort — never raises.
+
+    Each recipient gets their own message, so each has its own wamid and its own
+    wa_return_message row; a tap resolves through the row it quotes, which is what
+    lets a deputy act on the same CR without any change to the inbound handler.
+    The decision itself is idempotent, so two people tapping is safe.
+
+    The articles PNG is rendered and uploaded ONCE and the media id reused — the
+    image is identical for every recipient, and re-uploading it per person would
+    triple the Graph round-trips on the send-for-approval request path.
+    """
     company = str(detail.get("company") or "").upper()
     cr_id = str(detail.get("rtv_id") or "")
     if not _wa_enabled():
         return {"status": "skipped", "reason": "wa_disabled"}
     png_path = None
     try:
-        phone = await _resolve_bh_phone(conn, detail.get("business_head"))
-        if not phone:
-            logger.info("[cr-wa] no BH phone for %s (business_head=%r) — skipping",
+        targets = await _resolve_approver_phones(conn, detail)
+        if not targets:
+            logger.info("[cr-wa] no approver phone for %s (business_head=%r) — skipping",
                         cr_id, detail.get("business_head"))
             return {"status": "skipped", "reason": "no_bh_phone"}
         png_path = render_articles_png(detail.get("customer") or "", detail.get("lines") or [])
         media_id = await _upload_media(png_path)
         if not media_id:
             return {"status": "error", "reason": "media_upload_failed"}
-        payload = {
-            "messaging_product": "whatsapp", "to": phone, "type": "template",
-            "template": {
-                "name": _tpl_name(), "language": {"code": _tpl_lang()},
-                "components": [
-                    {"type": "header", "parameters": [{"type": "image", "image": {"id": media_id}}]},
-                    {"type": "body", "parameters": [
-                        {"type": "text", "text": p} for p in _body_params(detail)]},
-                ],
-            },
-        }
-        resp = await _post_message(payload)
-        wamid = _wamid(resp)
-        if wamid:
-            await _store_return_message(conn, wamid, company, cr_id, phone)
-        logger.info("[cr-wa] head-approval sent cr=%s to=%s wamid=%s", cr_id, phone, wamid)
-        return {"status": "sent", "to": phone, "wamid": wamid}
+
+        sent: list[dict] = []
+        for name, phone in targets:
+            payload = {
+                "messaging_product": "whatsapp", "to": phone, "type": "template",
+                "template": {
+                    "name": _tpl_name(), "language": {"code": _tpl_lang()},
+                    "components": [
+                        {"type": "header", "parameters": [{"type": "image", "image": {"id": media_id}}]},
+                        {"type": "body", "parameters": [
+                            {"type": "text", "text": p} for p in _body_params(detail)]},
+                    ],
+                },
+            }
+            resp = await _post_message(payload)
+            wamid = _wamid(resp)
+            if wamid:
+                await _store_return_message(conn, wamid, company, cr_id, phone)
+            sent.append({"name": name, "to": phone, "wamid": wamid})
+            logger.info("[cr-wa] head-approval sent cr=%s to=%s (%s) wamid=%s",
+                        cr_id, phone, name, wamid)
+
+        first = sent[0]
+        # `to`/`wamid` stay top-level for the single-recipient shape callers and the
+        # existing logs already read.
+        return {"status": "sent", "to": first["to"], "wamid": first["wamid"],
+                "recipients": sent}
     except Exception:  # noqa: BLE001 — must not break send-for-approval
         logger.exception("[cr-wa] notify_cr_head_approval failed cr=%s", cr_id)
         return {"status": "error", "reason": "exception"}

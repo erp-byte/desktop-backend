@@ -5,10 +5,16 @@ async backend:
   * deterministic thread id ``RTV-<cr_id>@candorfoods.in`` — set as Message-ID on
     the "created" mail, as In-Reply-To + References on every later mail. No DB
     column (pure function of the id), so replies always resolve to the root.
-  * only the Business Head's copy of the "created" mail carries the
-    Approve / Reject / Hold buttons (signed magic links -> the public
-    /email-action endpoint); everyone else gets a button-less copy threaded under
-    the root.
+  * only an APPROVER's copy of the "created" mail carries the Approve / Reject /
+    Hold buttons (signed magic links -> the public /email-action endpoint);
+    everyone else gets a button-less copy threaded under the root.
+  * an approver is the CR's Business Head PLUS the standing deputies configured as
+    ``deputy_approver`` in cr_email_routing. A return must close the day it is
+    raised, and one named BU Head is a single point of failure. Each approver gets
+    their OWN copy carrying a token minted for their own address, so the audit
+    records who actually decided rather than crediting the BU Head for a deputy's
+    click. The decision itself is idempotent, so two approvers acting at once is
+    safe — the first wins, the second is told it is already actioned.
   * recipient routing comes from the DB (fetch_routing): BH/sales POC by role
     (auth_user), warehouse-owner / constant CC / notify-to from cr_email_routing.
   * best-effort: a missing SMTP config or a send failure is logged and swallowed
@@ -62,7 +68,8 @@ async def fetch_routing(conn) -> dict:
     try:
         cfg = await conn.fetch(
             "SELECT kind, match_key, match_type, email FROM cr_email_routing "
-            "WHERE active AND kind IN ('warehouse_cc', 'constant_cc', 'notify_to') "
+            "WHERE active AND kind IN ('warehouse_cc', 'constant_cc', 'notify_to', "
+            "'deputy_approver') "
             "ORDER BY kind, sort_order, match_key"
         )
     except Exception:
@@ -73,6 +80,13 @@ async def fetch_routing(conn) -> dict:
         "warehouse_cc": [{"match_key": r["match_key"], "match_type": r["match_type"], "email": r["email"]} for r in cfg if r["kind"] == "warehouse_cc"],
         "constant_cc": [r["email"] for r in cfg if r["kind"] == "constant_cc"],
         "notify_to": next((r["email"] for r in cfg if r["kind"] == "notify_to"), None),
+        # Standing deputies. Config rows rather than a role, because these two act
+        # for ANY CR's BU Head — holding the `business_head` role instead would put
+        # them in the create form's BU-Head dropdown as if a return could be
+        # assigned to them, which is not what a deputy is. `name` is their
+        # auth_user.full_name; the WhatsApp leg resolves a phone from it.
+        "deputy_approver": [{"name": r["match_key"], "email": r["email"]}
+                            for r in cfg if r["kind"] == "deputy_approver"],
     }
 
 
@@ -107,16 +121,26 @@ def _warehouse_cc_email(routing: dict, factory_unit) -> str | None:
 
 
 def resolve_recipients(routing: dict, header: dict) -> dict:
-    """{approver, to, cc} — port of the FE _approvalMatrix.resolveRecipients.
+    """{approver, approvers, to, cc} — port of the FE _approvalMatrix.resolveRecipients.
 
-    BH (if mapped) leads TO alongside notify_to and is the sole approver; CC =
-    sales POC (mapped + manual) + constants + creator + warehouse owner, deduped,
-    with the TO addresses removed.
+    The BH (if mapped) and the standing deputies are the approvers; they lead TO
+    alongside notify_to. CC = sales POC (mapped + manual) + constants + creator +
+    warehouse owner, deduped, with the TO addresses removed.
+
+    ``approver`` stays the PRIMARY alone — it is what the UI labels "Business Head"
+    and what the response payload has always meant. ``approvers`` is the full list
+    that actually receives buttons, primary first.
     """
     bh_email = lookup_business_head_email(routing, header.get("business_head"))
     approver = {"name": (header.get("business_head") or "").strip() or bh_email, "email": bh_email} if bh_email else None
 
-    to = [e for e in [bh_email, routing.get("notify_to")] if e]
+    approvers: list[dict] = [approver] if approver else []
+    for d in routing.get("deputy_approver", []):
+        email = (d.get("email") or "").strip()
+        if email and email.lower() not in {a["email"].strip().lower() for a in approvers}:
+            approvers.append({"name": (d.get("name") or "").strip() or email, "email": email})
+
+    to = [e for e in [*(a["email"] for a in approvers), routing.get("notify_to")] if e]
     to_lower = {a.strip().lower() for a in to}
 
     candidates: list[str] = []
@@ -140,7 +164,7 @@ def resolve_recipients(routing: dict, header: dict) -> dict:
             continue
         seen.add(n)
         cc.append(addr.strip())
-    return {"approver": approver, "to": to, "cc": cc}
+    return {"approver": approver, "approvers": approvers, "to": to, "cc": cc}
 
 
 # ── SMTP send (best-effort, off the event loop) ───────────────────────────────
@@ -287,6 +311,23 @@ def _plain_body(detail: dict, *, buttons: list[tuple[str, str, str]] | None, sta
     return "\n".join(lines)
 
 
+def _approver_note(approvers: list[dict], me: int) -> str:
+    """The line above the buttons on an approver's copy.
+
+    It has to say the other approvers exist, or the deputies read their copy as a
+    mistake and wait for the BU Head — which is the delay this whole change is
+    meant to remove. It also has to say the first decision wins, so nobody holds
+    off in case someone else is mid-click.
+    """
+    others = [a["name"] for i, a in enumerate(approvers) if i != me]
+    if not others:
+        return "Please Approve / Reject / Hold this customer return using the buttons below."
+    who = others[0] if len(others) == 1 else ", ".join(others[:-1]) + " and " + others[-1]
+    role = "You are the assigned Business Head." if me == 0 else "You are a standing deputy approver."
+    return (f"Please Approve / Reject / Hold this customer return today. {role} "
+            f"{who} can also action it — whoever decides first is the decision.")
+
+
 def _subject(cr_id: str, *, reply: bool) -> str:
     base = f"Customer Returns Created: {cr_id}"
     return f"Re: {base}" if reply else base
@@ -294,9 +335,9 @@ def _subject(cr_id: str, *, reply: bool) -> str:
 
 # ── public notifiers ──────────────────────────────────────────────────────────
 async def notify_cr_created(conn, detail: dict) -> dict:
-    """Send the approval mail: BH copy WITH Approve/Reject/Hold buttons (thread
-    root), plus a button-less copy to notify_to + CC threaded under it. Returns
-    the resolved recipients for the caller to surface. Best-effort send."""
+    """Send the approval mail: one copy per approver WITH Approve/Reject/Hold
+    buttons, plus a button-less copy to notify_to + CC. Returns the resolved
+    recipients for the caller to surface. Best-effort send."""
     routing = await fetch_routing(conn)
     rec = resolve_recipients(routing, detail)
     cr_id = str(detail.get("rtv_id"))
@@ -305,18 +346,26 @@ async def notify_cr_created(conn, detail: dict) -> dict:
     subject = _subject(cr_id, reply=False)
     base = (Settings().PUBLIC_BACKEND_URL or "").strip()
 
-    if rec["approver"]:
-        approver_email = rec["approver"]["email"]
-        buttons = [(label, _action_url(base, company, cr_id, action, approver_email), color)
-                   for action, label, color in ACTION_META]
-        # BH copy — the ONLY one with buttons; thread root.
-        await _send(subject,
-                    _plain_body(detail, buttons=buttons, status_note=None),
-                    _html_body(detail, buttons=buttons, status_note=None),
-                    [approver_email], [], message_id=thread)
-        # Everyone else — button-less, threaded under the root. Drop the BH addr.
-        others_cc = [c for c in rec["cc"] if c.lower() != approver_email.lower()]
-        others_to = [t for t in rec["to"] if t.lower() != approver_email.lower()]
+    if rec["approvers"]:
+        approver_emails = [a["email"] for a in rec["approvers"]]
+        # Threading is unchanged: the FIRST approver's copy still claims the thread
+        # root Message-ID and every later mail — deputy copies, the broadcast, the
+        # eventual status mail — replies into it. One conversation per CR, as before.
+        for i, email in enumerate(approver_emails):
+            buttons = [(label, _action_url(base, company, cr_id, action, email), color)
+                       for action, label, color in ACTION_META]
+            note = _approver_note(rec["approvers"], i)
+            await _send(subject,
+                        _plain_body(detail, buttons=buttons, status_note=note),
+                        _html_body(detail, buttons=buttons, status_note=note),
+                        [email], [],
+                        message_id=thread if i == 0 else None,
+                        in_reply_to=None if i == 0 else thread)
+        # Everyone else — button-less, threaded under the root. Approvers already
+        # have their own copy, so drop them here rather than mailing them twice.
+        actioners = {e.lower() for e in approver_emails}
+        others_cc = [c for c in rec["cc"] if c.lower() not in actioners]
+        others_to = [t for t in rec["to"] if t.lower() not in actioners]
         if others_to or others_cc:
             await _send(subject,
                         _plain_body(detail, buttons=None, status_note=None),
