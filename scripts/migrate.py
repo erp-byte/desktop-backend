@@ -384,6 +384,11 @@ SQL_FILES = [
     # WhatsApp template's wamid to its CR so an inbound Approve/Reject/Hold tap resolves
     # to the right return. Additive/idempotent.
     DB_DIR / "083_cr_wa_approval.sql",
+    # 086 cr_deputy_approver — R M Patil as a standing CC, plus Satyendra Garg and
+    # R M Patil as deputy approvers who hold the same mail buttons / WhatsApp
+    # template as the CR's BU Head, so a return still closes the same day when the
+    # primary is unavailable. Data rows only. Idempotent.
+    DB_DIR / "086_cr_deputy_approver.sql",
 ]
 
 # ── Optional: drop the v1 legacy job-card stack (TEST / Supabase DB ONLY) ──────
