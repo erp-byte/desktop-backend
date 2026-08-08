@@ -384,11 +384,29 @@ SQL_FILES = [
     # WhatsApp template's wamid to its CR so an inbound Approve/Reject/Hold tap resolves
     # to the right return. Additive/idempotent.
     DB_DIR / "083_cr_wa_approval.sql",
+    # 084 vendor_permissions — completes the 17-tuple vendor catalog every
+    # modules/vendor/router.py endpoint gates on, and grants the whole vendor
+    # module to purchase_manager so Vendor Management stops 403'ing. Guarded by
+    # NOT EXISTS + IS NOT DISTINCT FROM (plain ON CONFLICT can't dedupe rows whose
+    # sub_sub_module IS NULL — NULLS are DISTINCT). Idempotent.
+    DB_DIR / "084_vendor_permissions.sql",
+    # 085 wa_po_intimation — wa_po_intimation_message maps a sent
+    # purchase_without_po_intimation wamid back to its walk-in arrival, and
+    # wa_po_intimation_pending arms the follow-up PO-number capture keyed by the
+    # tapper's phone. Also creates the store_head role (referenced by the frontend
+    # + 075 but never inserted) with Material In. Additive/idempotent.
+    DB_DIR / "085_wa_po_intimation.sql",
     # 086 cr_deputy_approver — R M Patil as a standing CC, plus Satyendra Garg and
     # R M Patil as deputy approvers who hold the same mail buttons / WhatsApp
     # template as the CR's BU Head, so a return still closes the same day when the
     # primary is unavailable. Data rows only. Idempotent.
     DB_DIR / "086_cr_deputy_approver.sql",
+    # 087 store_head_po_read — Material In reads po_header via purchase.po.READ,
+    # so store_head (granted only material_in.* by 085) 403'd on the whole
+    # dashboard. Grants READ ONLY: no create/edit/delete, so stores can view the
+    # POs it receives against but not upload or commit one. MUST follow 085, which
+    # creates the role. Idempotent.
+    DB_DIR / "087_store_head_po_read.sql",
 ]
 
 # ── Optional: drop the v1 legacy job-card stack (TEST / Supabase DB ONLY) ──────
