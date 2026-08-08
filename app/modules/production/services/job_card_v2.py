@@ -137,6 +137,50 @@ PACKING_STAGES = frozenset({
 
 
 # ---------------------------------------------------------------------------
+# "Can this card handle PACKAGING MATERIAL?" — the canonical answer.
+# ---------------------------------------------------------------------------
+# Server mirror of web_replica/src/lib/processCatalog.ts::isPmBearingStage.
+# Both ends MUST agree: the client uses it to decide which PM inputs to render,
+# this uses it to decide which PM rows to accept. When they disagreed the
+# operator got a PM field that the server then rejected (119 live cards showed
+# PM consumption inputs but were refused an extra-giveaway row).
+#
+# This is NOT is_packing_stage above, and the two are deliberately separate:
+#   * is_pm_bearing_stage — a CAPABILITY. Answers "may this card record
+#     packaging material / extra-giveaway?". Widening it only ever unblocks
+#     work, never blocks it, so it is safe to keep broad.
+#   * is_packing_stage    — used for step ORDERING (plan_v2.sort_steps_packing_last)
+#     and batch-label requirements. Widening that would reorder live plans and
+#     newly demand a batch name, i.e. it would BLOCK operators. Left narrow.
+#
+# 'pack' rather than 'packing'/'packaging' also catches the archetype-C step
+# "Create WIP: (pack of existing SFG)". Underscores normalise to spaces so a
+# stage token ('master_carton') matches the same list as a process name
+# ('Master Carton'). Krugger / X-ray / Weighing are intentionally absent —
+# operator spec is packing + mono carton + master carton only.
+_PM_BEARING_TOKENS = (
+    "pack", "monocarton", "mono carton", "master carton", "flow wrap",
+)
+
+
+def is_pm_bearing_stage(*names: str | None, output_kind: str | None = None) -> bool:
+    """True when this job card may record packaging material.
+
+    Pass any name sources you have (stage, process_name) — live data has the
+    two disagreeing (stage='sorting' with process_name='Sorting + Packaging'),
+    so both are searched. `output_kind='FG'` always qualifies: a card that
+    produces finished goods packs them whatever its process is called, and no
+    other card in its chain can record that packaging.
+    """
+    if (output_kind or "").strip().upper() == "FG":
+        return True
+    hay = " ".join(n for n in names if n).lower().replace("_", " ")
+    if not hay.strip():
+        return False
+    return any(tok in hay for tok in _PM_BEARING_TOKENS)
+
+
+# ---------------------------------------------------------------------------
 # Serialisation
 # ---------------------------------------------------------------------------
 
@@ -1012,7 +1056,8 @@ async def create_job_cards_for_line(
     pkg_process: str = "Packaging",
 ) -> dict:
     """Create one chained job_card_v2 per WIP process → a terminating Packaging
-    JC for a SINGLE plan line, and dispatch each to its floor.
+    JC for a SINGLE plan line, and dispatch each to its floor. With NO WIP steps
+    the terminal alone is created — a single RM→FG card (one-process route).
 
     Driven by the wizard's per-article inputs (NOT the plan's snapshot steps):
       * wip_steps: [{process, floor, sfg_output}] in operator order;
@@ -1052,10 +1097,13 @@ async def create_job_cards_for_line(
         qk = 0.0
     if qk <= 0:
         return {"error": "invalid_qty", "message": "Quantity (kg) must be greater than 0"}
-    if not wip_steps:
-        return {"error": "no_wip_steps", "message": "At least one WIP process is required"}
+    # wip_steps MAY be empty: a single-process route creates ONE card — the
+    # terminal alone, a complete RM→FG stage (it is both first and last, so
+    # input_kind=RM + output_kind=FG, unlocked, RM/PM materialised on it). The
+    # terminal is always appended below, so ≥1 card is still guaranteed; only
+    # its floor is required.
     if not pkg_floor or not str(pkg_floor).strip():
-        return {"error": "missing_pkg_floor", "message": "A packaging floor is required"}
+        return {"error": "missing_pkg_floor", "message": "A process floor is required"}
 
     qu = None
     if qty_units not in (None, ""):
@@ -3626,7 +3674,7 @@ async def replace_balance_materials(conn, *, job_card_id: int,
     # qty > 0 — saving zero EGA is a no-op and shouldn't be blocked).
     if has_ega:
         jc_meta = await conn.fetchrow(
-            "SELECT bom_id, stage FROM job_card_v2 "
+            "SELECT bom_id, stage, process_name, output_kind FROM job_card_v2 "
             "WHERE  job_card_id=$1 AND deleted_at IS NULL "
             "FOR    UPDATE",
             job_card_id,
@@ -3634,7 +3682,18 @@ async def replace_balance_materials(conn, *, job_card_id: int,
         if jc_meta is None:
             return {"error": "job_card_not_found"}
         # B6 C2 fix: substring match (normalised) instead of exact-string.
-        if not is_packing_stage(jc_meta["stage"]):
+        #
+        # Now uses is_pm_bearing_stage — the SAME predicate the client uses to
+        # decide whether to render the EGA field, and reading process_name +
+        # output_kind rather than `stage` alone. The old stage-only check
+        # refused EGA on 119 live cards whose stage token lags their process
+        # name ('sorting' / 'Sorting + Packaging') and on every monocarton,
+        # master-carton and flow-wrap card. Strictly a SUPERSET of the previous
+        # gate: nothing that was accepted before is rejected now.
+        if not is_pm_bearing_stage(
+            jc_meta["stage"], jc_meta["process_name"],
+            output_kind=jc_meta["output_kind"],
+        ):
             return {
                 "error": "ega_non_packing_stage",
                 "stage": jc_meta["stage"],
