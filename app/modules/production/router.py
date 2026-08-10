@@ -5432,7 +5432,7 @@ async def list_job_cards_v2(
     machine_id: int | None = Query(None),
     customer:   str | None = Query(None),
     search:     str | None = Query(None),
-    date_field: Literal["created_at", "start_time", "end_time"] = Query("created_at"),
+    date_field: Literal["created_at", "start_time", "end_time", "plan_date"] = Query("created_at"),
     date_from:  date | None = Query(None),
     date_to:    date | None = Query(None),
     pendency:   Literal["overdue", "due_today", "due_this_week", "future", "pending_signoff"] | None = Query(
@@ -5459,12 +5459,15 @@ async def list_job_cards_v2(
       so_number (ILIKE), machine_id, customer (comma-sep), search
       (ILIKE on job_card_number / fg_sku_name / customer_name / batch_number).
     Date window:
-      date_field (created_at | start_time | end_time), date_from, date_to.
+      date_field (created_at | start_time | end_time | plan_date),
+      date_from, date_to. plan_date resolves through production_plan_v2 —
+      it matches the sort_by default, so a date window and the ordering
+      agree on what "plan date" means instead of silently diverging.
     Pendency chip:
       pendency (overdue | due_today | due_this_week | future).
     Sort:
       sort_by (created_at | start_time | end_time | plan_id | status |
-               step_number | job_card_id | planned_qty_kg),
+               step_number | job_card_id | planned_qty_kg | plan_date),
       sort_order (ASC | DESC).
     Returns:
       results, pagination, counters (total / locked / in_progress /

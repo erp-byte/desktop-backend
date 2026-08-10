@@ -2675,9 +2675,12 @@ _JC_SORTABLE_COLUMNS = frozenset({
     "plan_date",
 })
 
-# Map sortable column → SQL expression. Most are jc.<col>; plan_date
-# routes to the subquery so the operator can sort the JC list by the
-# planning date without us having to denormalise it onto job_card_v2.
+# Map a column name → SQL expression. Most are jc.<col>; plan_date
+# routes to the subquery so the operator can sort or filter the JC list by
+# the planning date without us having to denormalise it onto job_card_v2.
+# Used by BOTH the ORDER BY and the date-window WHERE, so the two can never
+# disagree about what "plan date" means. Every query in list_job_cards
+# aliases `job_card_v2 jc`, so the correlated reference resolves in each.
 def _jc_sort_expr(sort_col: str) -> str:
     if sort_col == "plan_date":
         return (
@@ -2685,7 +2688,11 @@ def _jc_sort_expr(sort_col: str) -> str:
             "WHERE ppv.plan_id = jc.plan_id)"
         )
     return f"jc.{sort_col}"
-_JC_DATE_FIELDS    = frozenset({"created_at", "start_time", "end_time"})
+# plan_date is included deliberately: sort_by both accepts it AND defaults to
+# it, so without it here a date window would silently filter on created_at
+# while the list was ordered — and read by the operator — as plan date. A JC
+# planned for July but created in June just vanished from a July window.
+_JC_DATE_FIELDS    = frozenset({"created_at", "start_time", "end_time", "plan_date"})
 _JC_PENDENCY_CHIPS = frozenset({"overdue", "due_today", "due_this_week", "future", "pending_signoff"})
 
 
@@ -2721,7 +2728,8 @@ async def list_job_cards(
         sort column is validated against an allow-list to keep the SQL
         injection surface zero.
       * date_field + date_from / date_to: choose which date column the
-        range filter applies to (created_at vs start_time vs end_time).
+        range filter applies to (created_at vs start_time vs end_time vs
+        plan_date, the last resolved from production_plan_v2).
       * pendency: chip filter (overdue / due_today / due_this_week / future)
         computed against end_time as the proxy for stage deadline.
       * so_number, machine_id, plan_id: drill-down filters.
@@ -2805,7 +2813,9 @@ async def list_job_cards(
                 f"Allowed: {sorted(_JC_DATE_FIELDS)}."
             ),
         }
-    date_col = date_field
+    # Route through the same expression map the ORDER BY uses, so plan_date
+    # filters on production_plan_v2.plan_date rather than being rejected.
+    date_col = _jc_sort_expr(date_field)
     if date_from:
         conditions.append(f"{date_col} >= ${idx}::date"); params.append(date_from); idx += 1
     if date_to:

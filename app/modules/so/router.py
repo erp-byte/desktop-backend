@@ -20,6 +20,7 @@ from app.modules.so.schemas import (
     GSTReconResponse,
     GSTReconLineOut,
     GSTReconSummary,
+    SKUBulkRow,
     SKUDetail,
     SKUDropdownOptions,
     SKULookupResponse,
@@ -966,6 +967,53 @@ async def sku_lookup(
                 )
 
     return SKULookupResponse(options=options, selected_item=selected_item)
+
+
+# NOTE: must stay ABOVE @router.get("/{so_id}") — FastAPI matches in
+# declaration order, so a later position would let "sku-lookup" be captured
+# as the so_id path param and 422 on int coercion.
+@router.get("/sku-lookup/bulk", response_model=list[SKUBulkRow])
+async def sku_lookup_bulk(
+    request: Request,
+    item_type: str | None = Query(None, description="rm | pm | fg | sfg — omit for all"),
+    user=Depends(require_permission("so", action="view")),
+):
+    """Flat all_sku projection: paired name / group / pack-weight rows.
+
+    /sku-lookup answers "what should the next dropdown offer?" — its
+    `options` are four independent distinct arrays, so which group a given
+    particulars belongs to, and what it weighs, cannot be recovered from
+    one call. This answers "what is every SKU and its attributes?" for
+    consumers doing client-side category grouping or net-kg conversion.
+
+    Two deliberate differences from /sku-lookup:
+
+      * SFG rows are INCLUDED. The picker hides item_type='sfg' because
+        intermediates are not sellable, but sfg_code is the only exact join
+        key back to a job card's input_code / output_code — SFG consumption
+        lines carry a synthesised material_sku_name that never matches
+        particulars, so dropping these rows would strand every one of them.
+      * No cost columns. gst is omitted along with everything else not
+        needed for grouping or weight.
+    """
+    pool = request.app.state.db_pool
+
+    where, params = "", []
+    if item_type:
+        where = "WHERE LOWER(TRIM(item_type)) = LOWER(TRIM($1))"
+        params.append(item_type)
+
+    rows = await pool.fetch(
+        f"""
+        SELECT particulars, item_type, item_group, sub_group,
+               uom, sale_group, sfg_code
+        FROM   all_sku
+        {where}
+        ORDER  BY particulars
+        """,
+        *params,
+    )
+    return [dict(r) for r in rows]
 
 
 @router.get("/{so_id}", response_model=SOHeaderOut)

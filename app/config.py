@@ -29,6 +29,20 @@ class Settings(BaseSettings):
     WS_TOKEN_SECRET: str = ""
     WS_TOKEN_EXPIRY_MINUTES: int = 5
 
+    # ── Database pool ─────────────────────────────────────────────────────
+    # Procfile / Dockerfile / render.yaml all start uvicorn WITHOUT --workers,
+    # so this is a single process and this pool serves the entire API. The
+    # previous hard-coded max_size=10 was the whole budget for every request
+    # in flight: any endpoint that issues several sequential queries (the job
+    # card accounting roll-up runs six) holds a connection for the duration,
+    # so a handful of concurrent readers could starve unrelated traffic.
+    # 25 stays well inside Postgres' default max_connections of 100.
+    DB_POOL_MIN: int = 2
+    DB_POOL_MAX: int = 25
+    # Without this, a connection stuck on a slow/hung query is never reclaimed
+    # and the pool leaks capacity until restart. Seconds; 0 disables.
+    DB_COMMAND_TIMEOUT: float = 30.0
+
     # ── Auth (JWT + lockout + rate limit) ─────────────────────────────────
     AUTH_ENCRYPTION_KEY: str = ""               # Fernet key for legacy password encryption; also dev fallback for JWT_SECRET
     JWT_SECRET: str = ""                        # required in non-dev; dev may derive from AUTH_ENCRYPTION_KEY
