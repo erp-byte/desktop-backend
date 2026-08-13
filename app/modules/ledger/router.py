@@ -11,6 +11,7 @@ Read-only by design. No POST/PATCH/DELETE on this router.
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import asyncpg
@@ -18,6 +19,8 @@ from fastapi import APIRouter, Depends, Query, Request
 
 from app.modules.auth.middleware import AuthUser, get_current_user
 from app.modules.ledger.services.leaves_service import ENTITIES, fetch_leaves
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/ledger", tags=["Ledger"])
 
@@ -39,8 +42,15 @@ async def list_leaves(
     async with pool.acquire() as conn:
         try:
             data = await fetch_leaves(conn, entity=entity)
-        except asyncpg.UndefinedTableError:
-            # A legacy inward table is absent in this environment. The frontend
-            # already renders an empty state; a 500 would just be noise.
+        except (asyncpg.UndefinedTableError, asyncpg.UndefinedColumnError) as exc:
+            # These legacy schemas are inferred from query code, not verified, so
+            # both a missing table and a missing column are expected environment
+            # states rather than bugs. fetch_leaves already degrades per-entity;
+            # this is the backstop for anything it does not cover. The frontend
+            # renders an empty state, so a 500 would just be noise.
+            log.warning(
+                "ledger: /leaves returning empty for entity=%s — legacy inward "
+                "schema is absent (%s: %s)", entity, type(exc).__name__, exc,
+            )
             return {"data": []}
     return {"data": data}

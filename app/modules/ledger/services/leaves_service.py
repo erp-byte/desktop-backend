@@ -23,6 +23,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import asyncpg
+
 from .godown_alias import AMBIGUOUS_ALIASES, ledger_godown, normalise
 
 log = logging.getLogger(__name__)
@@ -31,6 +33,15 @@ log = logging.getLogger(__name__)
 ENTITIES: tuple[str, ...] = ("cfpl", "cdpl")
 
 _PM = "pm"
+
+# Placeholder for a NULL/blank item_category or sub_category. The frontend types
+# these as non-nullable `string` and slugifies them (_tree.ts slug()), so a None
+# here is a client-side TypeError, not a blank cell.
+UNCATEGORISED = "Uncategorised"
+
+# The legacy inward tables predate schema-verified columns, so a missing table or
+# a missing column is a plausible per-entity failure rather than a bug.
+_MISSING_SCHEMA = (asyncpg.UndefinedTableError, asyncpg.UndefinedColumnError)
 
 # Only the columns the ledger actually consumes. Explicit casts so the UNION
 # survives the two families storing the same field with different types.
@@ -95,24 +106,53 @@ def build_leaves_sql(prefix: str) -> str:
            AND t._source        = a._source
          GROUP BY a.sku_id, a.item_description, a.item_category,
                   a.sub_category, lower(trim(a.material_type)), t.warehouse
+         ORDER BY a.sku_id, a.item_category, a.sub_category,
+                  lower(trim(a.material_type)), t.warehouse, a.item_description
     """
 
 
+def _text(value: Any) -> str:
+    """Never return None. Every field below is typed `string` on the client."""
+    return "" if value is None else str(value).strip()
+
+
+def _category(value: Any) -> str:
+    return _text(value) or UNCATEGORISED
+
+
+def _item_type(value: Any) -> str:
+    return _text(value).lower()
+
+
+def _label(value: Any, sku_id: Any) -> str:
+    """A blank label would render an unclickable empty row; identify it instead."""
+    return _text(value) or f"(unnamed SKU {sku_id})"
+
+
 def _leaf_key(r: dict[str, Any], godown: str, entity: str) -> tuple:
-    return (entity, r.get("sku_id"), r.get("item_description"),
-            r.get("material_type"), godown)
+    """Merge key. Must carry every field _to_leaf() emits as an identity column —
+    category included, or two rows differing only in category silently collapse
+    into one leaf that keeps whichever the (unordered) scan returned first.
+
+    Normalisation must match _to_leaf() exactly: a NULL material_type and an
+    empty-string one are the same leaf, so they must produce the same key.
+    """
+    return (entity, r.get("sku_id"), _label(r.get("item_description"), r.get("sku_id")),
+            _item_type(r.get("material_type")),
+            _category(r.get("item_category")), _category(r.get("sub_category")),
+            godown)
 
 
 def _to_leaf(r: dict[str, Any], godown: str, entity: str) -> dict[str, Any]:
-    material_type = (r.get("material_type") or "").strip().lower()
+    material_type = _item_type(r.get("material_type"))
     is_pm = material_type == _PM
     qty = r.get("qty_units") if is_pm else r.get("net_weight_kg")
     return {
         "sku_id": r.get("sku_id"),
-        "label": r.get("item_description"),
+        "label": _label(r.get("item_description"), r.get("sku_id")),
         "item_type": material_type,
-        "group": r.get("item_category"),
-        "subgroup": r.get("sub_category"),
+        "group": _category(r.get("item_category")),
+        "subgroup": _category(r.get("sub_category")),
         "uom_class": "nos" if is_pm else "kg",
         "godown": godown,
         "entity": entity,
@@ -130,7 +170,12 @@ def _to_leaf(r: dict[str, Any], godown: str, entity: str) -> dict[str, Any]:
 
 
 async def fetch_leaves(conn, entity: str = "both") -> list[dict[str, Any]]:
-    """Leaf rows for one entity or both, godowns canonicalised and merged."""
+    """Leaf rows for one entity or both, godowns canonicalised and merged.
+
+    Each entity is fetched independently: a missing legacy table or column for
+    one entity degrades that entity to zero rows and is logged, rather than
+    discarding rows already collected for the other.
+    """
     if entity == "both":
         prefixes = ENTITIES
     elif entity in ENTITIES:
@@ -140,9 +185,18 @@ async def fetch_leaves(conn, entity: str = "both") -> list[dict[str, Any]]:
 
     merged: dict[tuple, dict[str, Any]] = {}
     ambiguous_rows = 0
+    skipped: list[str] = []
 
     for prefix in prefixes:
-        rows = await conn.fetch(build_leaves_sql(prefix))
+        try:
+            rows = await conn.fetch(build_leaves_sql(prefix))
+        except _MISSING_SCHEMA as exc:
+            skipped.append(prefix)
+            log.warning(
+                "ledger: skipped entity %r — legacy inward schema is absent in "
+                "this environment (%s: %s)", prefix, type(exc).__name__, exc,
+            )
+            continue
         for raw in rows:
             r = dict(raw)
             raw_warehouse = r.get("warehouse_raw")
@@ -162,6 +216,12 @@ async def fetch_leaves(conn, entity: str = "both") -> list[dict[str, Any]]:
             "ledger: %d inward row(s) resolved through an ambiguous godown alias "
             "(%s) — mapping is inherited, not confirmed",
             ambiguous_rows, ", ".join(sorted(AMBIGUOUS_ALIASES)),
+        )
+    if skipped:
+        log.warning(
+            "ledger: returning %d leaf row(s) without entity %s — its legacy "
+            "inward tables could not be read",
+            len(merged), "/".join(skipped),
         )
 
     return list(merged.values())
