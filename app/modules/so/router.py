@@ -863,11 +863,16 @@ async def sku_lookup(
     sales_group: str = Query(None),
     search: str = Query(None),
     particulars: str = Query(None),
-    # `sku_lookup` sub-module, NOT the bare `so` view: the all_sku master is shared
-    # reference data behind the sample/NPD ArticlePicker, so roles that must never
-    # read a sales order still need it (090). check_permission falls back
-    # sub -> NULL, so existing bare-`so:view` holders are unaffected.
-    user=Depends(require_permission("so", sub_module="sku_lookup", action="view")),
+    # AUTHENTICATION ONLY — no permission gate, deliberately. all_sku is shared
+    # reference data (article name / group / uom / gst), not sales-order data,
+    # and it backs the ArticlePicker used by sample, NPD, purchase Material In,
+    # customer returns and SO creation. Living under /so meant it inherited the
+    # `so` module gate, which only admin / so_creator / viewer hold — so it 403'd
+    # for npd_team, business_head, sales, planner, purchase_manager and
+    # store_head, and the picker rendered that as "No matching articles."
+    # Gating it per-module re-breaks a different role every time a new screen
+    # reuses the picker; any logged-in user may read the article master.
+    user=Depends(get_current_user),
 ):
     """
     Cascading dropdown lookup against the all_sku master table.

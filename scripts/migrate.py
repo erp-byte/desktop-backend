@@ -407,15 +407,6 @@ SQL_FILES = [
     # POs it receives against but not upload or commit one. MUST follow 085, which
     # creates the role. Idempotent.
     DB_DIR / "087_store_head_po_read.sql",
-    # 090 sku_lookup_permission — /so/sku-lookup backs the shared ArticlePicker on
-    # the NPD dev job-card recipe, the NPD draft BOM and the sample requisition
-    # form, but gated on bare `so:view` (admin/so_creator/viewer only), so
-    # npd_team, business_head, sales and planner 403'd and the picker showed an
-    # empty dropdown. Splits the lookup onto its own `so/sku_lookup` sub-module
-    # row and grants only that — no sales-order read access. Existing `so:view`
-    # holders pass via check_permission's sub -> NULL fallback. Data rows only;
-    # NULL-safe idempotent (NOT EXISTS, see 084).
-    DB_DIR / "090_sku_lookup_permission.sql",
 ]
 
 # ── Optional: drop the v1 legacy job-card stack (TEST / Supabase DB ONLY) ──────
