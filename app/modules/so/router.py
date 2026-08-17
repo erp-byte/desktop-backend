@@ -863,7 +863,11 @@ async def sku_lookup(
     sales_group: str = Query(None),
     search: str = Query(None),
     particulars: str = Query(None),
-    user=Depends(require_permission("so", action="view")),
+    # `sku_lookup` sub-module, NOT the bare `so` view: the all_sku master is shared
+    # reference data behind the sample/NPD ArticlePicker, so roles that must never
+    # read a sales order still need it (090). check_permission falls back
+    # sub -> NULL, so existing bare-`so:view` holders are unaffected.
+    user=Depends(require_permission("so", sub_module="sku_lookup", action="view")),
 ):
     """
     Cascading dropdown lookup against the all_sku master table.
