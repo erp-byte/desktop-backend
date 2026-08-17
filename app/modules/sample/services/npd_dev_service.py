@@ -813,6 +813,20 @@ async def delete_phase(conn, dev_jc_id: int, phase_id: int, *, user) -> dict:
     return await get_dev_job_card(conn, dev_jc_id)
 
 
+# bom_header carries THREE unique indexes — bom_header_pkey (bom_id),
+# uq_bom_header_active_fg (fg_sku_name WHERE is_active) and uq_bom_header_fg_version
+# (fg_sku_name, version WHERE is_active). Only the last two are about the product
+# name, so the constraint has to be identified before blaming it on the operator.
+_FG_NAME_CONSTRAINTS = ("uq_bom_header_active_fg", "uq_bom_header_fg_version")
+
+
+async def _insert_bom_header(conn, fg_name: str, version: int, note: str) -> int:
+    return await conn.fetchval(
+        """INSERT INTO bom_header (fg_sku_name, version, is_active, entity, notes)
+           VALUES ($1, $2, TRUE, $3, $4) RETURNING bom_id""",
+        fg_name, version, _BOM_ENTITY, note)
+
+
 async def _mint_bom(conn, *, fg_name: str, lines, note: str) -> int:
     """Promote one recipe into a live bom_header + bom_line, returning the new bom_id.
     Only ONE active BOM is allowed per fg_sku_name (uq_bom_header_active_fg), so supersede
@@ -823,16 +837,13 @@ async def _mint_bom(conn, *, fg_name: str, lines, note: str) -> int:
     next_ver = await conn.fetchval(
         "SELECT COALESCE(MAX(version), 0) + 1 FROM bom_header WHERE fg_sku_name = $1", fg_name)
     try:
-        new_bom_id = await conn.fetchval(
-            """INSERT INTO bom_header (fg_sku_name, version, is_active, entity, notes)
-               VALUES ($1, $2, TRUE, $3, $4) RETURNING bom_id""",
-            fg_name, next_ver, _BOM_ENTITY, note)
+        # Nested transaction = SAVEPOINT. A failed INSERT aborts the transaction, so
+        # without this the sequence repair below could not run and the whole promote
+        # (including the already-minted sibling articles) would be unrecoverable.
+        async with conn.transaction():
+            new_bom_id = await _insert_bom_header(conn, fg_name, next_ver, note)
     except asyncpg.UniqueViolationError as e:
-        raise HTTPException(409, detail={
-            "error": "bom_conflict",
-            "message": f"Couldn't promote — a live BOM for '{fg_name}' already exists. "
-                       "Rename the target product or deactivate the existing BOM.",
-            "details": {"fg_sku_name": fg_name}}) from e
+        new_bom_id = await _mint_bom_recover(conn, e, fg_name, next_ver, note)
     for i, ln in enumerate(lines, 1):
         await conn.execute(
             """INSERT INTO bom_line
@@ -840,6 +851,60 @@ async def _mint_bom(conn, *, fg_name: str, lines, note: str) -> int:
                VALUES ($1, $2, $3, $4, $5, $6)""",
             new_bom_id, i, ln["sku_name"], ln["item_type"] or "rm", ln["qty"], ln["uom"])
     return new_bom_id
+
+
+async def _mint_bom_recover(conn, err: asyncpg.UniqueViolationError,
+                            fg_name: str, next_ver: int, note: str) -> int:
+    """Decide what a unique violation on the bom_header INSERT actually means.
+
+    This used to report EVERY unique violation as "a live BOM for '<name>' already
+    exists — rename the target product", which sent operators off to rename a product
+    that was never the problem. That advice is almost always wrong here: _mint_bom
+    deactivates the existing active BOM for this exact fg_sku_name and bumps to the
+    next version immediately before inserting, so the FG-name indexes cannot collide
+    on a single-threaded promote. The realistic cause is bom_header_pkey.
+    """
+    constraint = (err.constraint_name or "").lower()
+
+    if constraint == "bom_header_pkey":
+        # bom_id is a plain serial, and bom_header was bulk-loaded with explicit ids.
+        # An import that does not resync the sequence leaves nextval() handing out ids
+        # that are already taken, so EVERY promote fails until the sequence catches up.
+        # setval to MAX only ever moves the sequence FORWARD, and sequences are
+        # non-transactional, so the repair sticks even if this promote later rolls back.
+        logger.warning(
+            "bom_header id sequence is behind MAX(bom_id) — resyncing and retrying the "
+            "promote of %r (constraint %s)", fg_name, constraint)
+        await conn.execute(
+            """SELECT setval(pg_get_serial_sequence('bom_header', 'bom_id'),
+                             (SELECT COALESCE(MAX(bom_id), 1) FROM bom_header))""")
+        try:
+            async with conn.transaction():
+                return await _insert_bom_header(conn, fg_name, next_ver, note)
+        except asyncpg.UniqueViolationError as e2:
+            raise HTTPException(409, detail={
+                "error": "bom_id_sequence",
+                "message": "Couldn't promote — the bom_header id sequence is out of sync "
+                           "and did not recover automatically. A DBA needs to run: "
+                           "SELECT setval(pg_get_serial_sequence('bom_header','bom_id'), "
+                           "(SELECT MAX(bom_id) FROM bom_header));",
+                "details": {"fg_sku_name": fg_name,
+                            "constraint": (e2.constraint_name or "").lower()}}) from e2
+
+    if constraint in _FG_NAME_CONSTRAINTS:
+        raise HTTPException(409, detail={
+            "error": "bom_conflict",
+            "message": f"Couldn't promote — a live BOM for '{fg_name}' already exists. "
+                       "Rename the target product or deactivate the existing BOM.",
+            "details": {"fg_sku_name": fg_name, "constraint": constraint}}) from err
+
+    # Some other unique index. Name it rather than guessing — guessing is what made
+    # this bug take a rename-the-product detour in the first place.
+    raise HTTPException(409, detail={
+        "error": "bom_conflict",
+        "message": f"Couldn't promote '{fg_name}' — the BOM insert violated unique "
+                   f"constraint {constraint or 'unknown'}.",
+        "details": {"fg_sku_name": fg_name, "constraint": constraint}}) from err
 
 
 async def _finalize_promote(conn, dev_jc_id, *, promote_phase_id, close_payload: dict, user) -> dict:
