@@ -994,6 +994,24 @@ async def handle_inbound(conn, *, from_phone: str, text: str, context_id: str | 
     if cmd == "APPROVE":
         cmd = "ACCEPT"
     if cmd not in ("ACCEPT", "HOLD"):
+        # Being an NPD reviewer is a property of the PERSON, not of the message.
+        # _resolve_reviewer only asks "is this phone an npd_team/admin user?", so every
+        # unrelated thing a reviewer ever types landed here and got the ACCEPT/HOLD hint.
+        # Meanwhile the SAME webhook relays all non-ERP inbound to the maintenance bot
+        # (router.py → forward_maintenance, which is unconditional and fire-and-forget),
+        # so a reviewer who typed "hi" got BOTH the maintenance module menu AND this hint.
+        #
+        # That is the same two-systems-answer-one-message bug the unattributed branch
+        # above already fixed for non-reviewers (4e00810) — the principle just never got
+        # applied to recognised ones. Only answer when the message is addressed to US:
+        # it quotes an NPD review card. An ERP verb would have matched `cmd` already, and
+        # an armed hold prompt was consumed further up, so both still reply as before.
+        quotes_review = bool(context_id) and bool(await conn.fetchval(
+            "SELECT 1 FROM wa_review_message WHERE wamid = $1", context_id))
+        if not quotes_review and maintenance_forward_url():
+            logger.info("Non-NPD inbound from reviewer %s left to the maintenance bot "
+                        "(type=%s text=%r)", wa, (raw or {}).get("type"), body[:60])
+            return {"ok": True, "forwarded": "maintenance"}
         await _send_text(wa, "Reply  ACCEPT <request#>  or  HOLD <request#>  — "
                              "or tap the Accept / Hold button on the request.")
         return {"ok": False, "reason": "unparsed"}
