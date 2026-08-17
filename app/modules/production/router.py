@@ -4496,6 +4496,25 @@ async def create_plan_v2(
         async with pool.acquire() as conn:
             async with conn.transaction():
                 result = await create_plan(conn, payload)
+                if result.get("error") in ("no_lines", "no_bom"):
+                    # Raise INSIDE the transaction so create_plan's partial
+                    # writes roll back with it. create_plan inserts the plan
+                    # header before it resolves each line's bom_id, so a
+                    # missing BOM used to leave an orphan draft plan behind —
+                    # 0 lines (or just the lines that resolved first, plus
+                    # their so_fulfillment_v2 planned_qty bump) — while the
+                    # operator saw nothing but a 400. Such a plan approves
+                    # cleanly and generates no job cards, so the floor never
+                    # receives one. Regression:
+                    # tests/services/test_plan_create_rollback.py.
+                    #
+                    # Pass the full {error, message} envelope through so the
+                    # client gets an action-quality error ("create plan — one
+                    # or more selected SKUs have no BOM") instead of the bare
+                    # message text. Without this, FastAPI's HTTPException
+                    # would stringify detail and the frontend mapper falls
+                    # back to raw text.
+                    raise HTTPException(status_code=400, detail=result)
     except ValueError as exc:
         # Over-allocation against so_fulfillment_v2 pending_qty bounds.
         # Surface as a structured envelope so the frontend's friendlyApiError
@@ -4504,13 +4523,6 @@ async def create_plan_v2(
             status_code=400,
             detail={"error": "over_allocation", "message": str(exc)},
         )
-    if result.get("error") in ("no_lines", "no_bom"):
-        # Pass the full {error, message} envelope through so the client gets
-        # an action-quality error ("create plan — one or more selected SKUs
-        # have no BOM") instead of the bare message text. Without this,
-        # FastAPI's HTTPException would stringify detail and the frontend
-        # mapper falls back to raw text.
-        raise HTTPException(status_code=400, detail=result)
     return result
 
 
