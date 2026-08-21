@@ -407,6 +407,13 @@ SQL_FILES = [
     # POs it receives against but not upload or commit one. MUST follow 085, which
     # creates the role. Idempotent.
     DB_DIR / "087_store_head_po_read.sql",
+    # 092 backs the Accounting CRUD endpoints: soft-delete columns on the six
+    # tables the accounting payload writes, a per-batch key for job_card_qc_v2,
+    # and the collapse of job_card_output_v2's append-only history into one live
+    # row per batch (older rows are superseded, never deleted). See the file
+    # header for why the pre-existing unique indexes are deliberately left
+    # non-partial.
+    DB_DIR / "092_accounting_crud.sql",
 ]
 
 # ── Optional: drop the v1 legacy job-card stack (TEST / Supabase DB ONLY) ──────

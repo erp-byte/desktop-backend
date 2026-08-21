@@ -4496,6 +4496,25 @@ async def create_plan_v2(
         async with pool.acquire() as conn:
             async with conn.transaction():
                 result = await create_plan(conn, payload)
+                if result.get("error") in ("no_lines", "no_bom"):
+                    # Raise INSIDE the transaction so create_plan's partial
+                    # writes roll back with it. create_plan inserts the plan
+                    # header before it resolves each line's bom_id, so a
+                    # missing BOM used to leave an orphan draft plan behind —
+                    # 0 lines (or just the lines that resolved first, plus
+                    # their so_fulfillment_v2 planned_qty bump) — while the
+                    # operator saw nothing but a 400. Such a plan approves
+                    # cleanly and generates no job cards, so the floor never
+                    # receives one. Regression:
+                    # tests/services/test_plan_create_rollback.py.
+                    #
+                    # Pass the full {error, message} envelope through so the
+                    # client gets an action-quality error ("create plan — one
+                    # or more selected SKUs have no BOM") instead of the bare
+                    # message text. Without this, FastAPI's HTTPException
+                    # would stringify detail and the frontend mapper falls
+                    # back to raw text.
+                    raise HTTPException(status_code=400, detail=result)
     except ValueError as exc:
         # Over-allocation against so_fulfillment_v2 pending_qty bounds.
         # Surface as a structured envelope so the frontend's friendlyApiError
@@ -4504,13 +4523,6 @@ async def create_plan_v2(
             status_code=400,
             detail={"error": "over_allocation", "message": str(exc)},
         )
-    if result.get("error") in ("no_lines", "no_bom"):
-        # Pass the full {error, message} envelope through so the client gets
-        # an action-quality error ("create plan — one or more selected SKUs
-        # have no BOM") instead of the bare message text. Without this,
-        # FastAPI's HTTPException would stringify detail and the frontend
-        # mapper falls back to raw text.
-        raise HTTPException(status_code=400, detail=result)
     return result
 
 
@@ -8095,19 +8107,6 @@ class ScanSfgBoxesRequest(BaseModel):
     box_ids: list[str]              # box QR payloads are now "<8-digit>-<counter>" TEXT
 
 
-class FgCartonItem(BaseModel):
-    net_weight: float
-    units: int | None = None
-    gross_weight: float | None = None
-
-
-class CreateFgCartonsRequest(BaseModel):
-    cartons: list[FgCartonItem]
-    batch_id: int | None = None
-    batch_code: str | None = None
-    expected_net_kg: float | None = None
-
-
 @router.post("/job-cards-v2/{job_card_id}/wip-boxes")
 async def create_wip_boxes_endpoint(
     request: Request, job_card_id: int, body: CreateWipBoxesRequest,
@@ -8335,121 +8334,6 @@ async def sfg_canonical_search_endpoint(
     async with pool.acquire() as conn:
         results = await search_canonical_sfg(conn, q, entity, limit)
     return {"q": q, "results": results}
-
-
-# ── FG cartons (packing stage) — sibling of the wip-boxes routes ────────────
-
-@router.post("/job-cards-v2/{job_card_id}/fg-cartons")
-async def create_fg_cartons_endpoint(
-    request: Request, job_card_id: int, body: CreateFgCartonsRequest,
-    user=Depends(require_permission("production", "job_cards", "box_printing", action="create")),
-):
-    """Pack a terminal FG/packing JC's output into cartons; mint an 8-digit
-    carton_id (the QR payload) per carton. Print stickers via
-    …/fg-cartons/labels.pdf."""
-    from app.modules.production.services.sfg_box_service import create_fg_cartons
-    pool = request.app.state.db_pool
-    created_by = getattr(user, "full_name", None) or getattr(user, "phone", None)
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            result = await create_fg_cartons(
-                conn, job_card_id, [c.model_dump() for c in body.cartons],
-                batch_id=body.batch_id, batch_code=body.batch_code,
-                expected_net_kg=body.expected_net_kg, created_by=created_by,
-            )
-    if "error" in result:
-        code = 404 if result["error"] == "not_found" else 400
-        raise HTTPException(status_code=code, detail=result.get("message", result["error"]))
-    return strip_cost_fields(
-        result, getattr(user, "role_name", None),
-        is_admin=getattr(user, "is_admin", False),
-    )
-
-
-@router.get("/job-cards-v2/{job_card_id}/fg-cartons")
-async def list_fg_cartons_endpoint(
-    request: Request, job_card_id: int, user=Depends(require_permission("production", "job_cards", "box_printing", action="view")),
-):
-    """List the cartons packed by a terminal FG/packing JC (+ Σ net weight)."""
-    from app.modules.production.services.sfg_box_service import get_cartons_for_jc
-    pool = request.app.state.db_pool
-    async with pool.acquire() as conn:
-        result = await get_cartons_for_jc(conn, job_card_id)
-    return strip_cost_fields(
-        result, getattr(user, "role_name", None),
-        is_admin=getattr(user, "is_admin", False),
-    )
-
-
-@router.get("/job-cards-v2/{job_card_id}/fg-cartons/labels.pdf")
-async def fg_carton_labels_endpoint(
-    request: Request, job_card_id: int, user=Depends(require_permission("production", "job_cards", "box_printing", action="view")),
-):
-    """One QR sticker per carton for a packing JC (stickers carry no cost figures)."""
-    from app.modules.production.services.sfg_box_service import get_cartons_for_jc
-    from app.modules.production.services.label_service import fg_carton_labels_pdf
-    pool = request.app.state.db_pool
-    async with pool.acquire() as conn:
-        result = await get_cartons_for_jc(conn, job_card_id)
-    if not result.get("cartons"):
-        raise HTTPException(status_code=404, detail="No cartons to label for this job card")
-    pdf_bytes = fg_carton_labels_pdf(result.get("cartons", []))
-    return Response(
-        content=pdf_bytes,
-        media_type="application/pdf",
-        headers={"Content-Disposition": f'inline; filename="FG-cartons-{job_card_id}.pdf"'},
-    )
-
-
-@router.get("/fg-cartons/{carton_id}/label.pdf")
-async def fg_carton_single_label_endpoint(
-    request: Request, carton_id: str, user=Depends(require_permission("production", "job_cards", "box_printing", action="view")),
-):
-    """Single carton sticker. Entity-scoped for non-admins (mirror of the box reads)."""
-    from app.modules.production.services.sfg_box_service import get_box
-    from app.modules.production.services.label_service import fg_carton_label_pdf
-    pool = request.app.state.db_pool
-    async with pool.acquire() as conn:
-        carton = await get_box(conn, carton_id)
-    if not carton or carton.get("item_type") != "fg":
-        raise HTTPException(status_code=404, detail="Carton not found")
-    if not getattr(user, "is_admin", False):
-        allowed_ent = getattr(user, "allowed_entities", []) or []
-        if carton.get("entity") and allowed_ent and carton["entity"] not in allowed_ent:
-            raise HTTPException(status_code=403, detail="Entity outside your scope")
-    pdf_bytes = fg_carton_label_pdf(carton)
-    return Response(
-        content=pdf_bytes,
-        media_type="application/pdf",
-        headers={"Content-Disposition": f'inline; filename="FG-carton-{carton_id}.pdf"'},
-    )
-
-
-@router.get("/fg-cartons/{carton_id}/genealogy")
-async def fg_carton_genealogy_endpoint(
-    request: Request, carton_id: str, user=Depends(require_permission("production", "job_cards", action="view")),
-):
-    """Carton upstream trace: carton → SFG boxes consumed into the packing JC →
-    each box's box→lot lineage. ``level`` 0 = the carton; increases upstream."""
-    from app.modules.production.services.sfg_box_service import get_carton_genealogy
-    pool = request.app.state.db_pool
-    is_admin = getattr(user, "is_admin", False)
-    allowed_ent = [] if is_admin else (getattr(user, "allowed_entities", []) or [])
-    async with pool.acquire() as conn:
-        if not is_admin:
-            ent = await conn.fetchval(
-                "SELECT entity FROM sfg_box WHERE carton_id = $1 AND item_type = 'fg'",
-                carton_id,
-            )
-            if ent and allowed_ent and ent not in allowed_ent:
-                raise HTTPException(status_code=403, detail="Entity outside your scope")
-        result = await get_carton_genealogy(conn, carton_id, allowed_entities=allowed_ent or None)
-    if result is None:
-        raise HTTPException(status_code=404, detail="Carton not found")
-    return strip_cost_fields(
-        result, getattr(user, "role_name", None),
-        is_admin=getattr(user, "is_admin", False),
-    )
 
 
 @router.get("/job-cards-v2/{job_card_id}/allocations")

@@ -69,7 +69,7 @@ async def list_additives(conn, job_card_id: int) -> list[dict]:
             SELECT additive_id, batch_id, sku_name, material_name, qty_kg,
                    remarks, recorded_by, recorded_at
             FROM job_card_additive_consumption_v2
-            WHERE job_card_id = $1
+            WHERE job_card_id = $1 AND deleted_at IS NULL
             ORDER BY recorded_at ASC, additive_id ASC
             """,
             job_card_id,
@@ -91,7 +91,7 @@ async def list_additives(conn, job_card_id: int) -> list[dict]:
             SELECT additive_id, NULL::BIGINT AS batch_id, sku_name,
                    material_name, qty_kg, remarks, recorded_by, recorded_at
             FROM job_card_additive_consumption_v2
-            WHERE job_card_id = $1
+            WHERE job_card_id = $1 AND deleted_at IS NULL
             ORDER BY recorded_at ASC, additive_id ASC
             """,
             job_card_id,

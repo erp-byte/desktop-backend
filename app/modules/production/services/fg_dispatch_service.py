@@ -73,10 +73,12 @@ async def _batches_for_jc(conn, job_card_id: int) -> list[dict]:
                b.produced_qty_kg, b.fg_actual_kg, b.fg_actual_units,
                COALESCE((SELECT SUM(o.output_qty_kg) FROM job_card_output_v2 o
                           WHERE o.job_card_id = $1 AND o.batch_id = b.batch_id
-                            AND o.output_kind = 'FG'), 0) AS out_kg,
+                            AND o.output_kind = 'FG'
+                            AND o.deleted_at IS NULL), 0) AS out_kg,
                COALESCE((SELECT SUM(o.output_qty_units) FROM job_card_output_v2 o
                           WHERE o.job_card_id = $1 AND o.batch_id = b.batch_id
-                            AND o.output_kind = 'FG'), 0) AS out_units
+                            AND o.output_kind = 'FG'
+                            AND o.deleted_at IS NULL), 0) AS out_units
         FROM job_card_batch_v2 b
         WHERE b.job_card_id = $1
         ORDER BY b.batch_number

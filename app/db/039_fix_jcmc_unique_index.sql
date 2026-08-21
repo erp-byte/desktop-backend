@@ -48,6 +48,12 @@ BEGIN
       AND (
               a.recorded_at <  b.recorded_at
            OR (a.recorded_at = b.recorded_at AND a.consumption_id < b.consumption_id)
+      -- 092: never touch soft-deleted rows — this dedupe re-runs on every
+      -- deploy (scripts/migrate.py has no applied-migrations ledger), and
+      -- without this it would hard-purge the soft-delete audit trail that
+      -- the Accounting CRUD DELETE endpoint writes.
+      AND a.deleted_at IS NULL
+      AND b.deleted_at IS NULL
           );
 
     -- 2. Create the unique index ON CONFLICT relies on. Mirrors the

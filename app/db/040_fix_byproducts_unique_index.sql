@@ -60,6 +60,12 @@ BEGIN
       AND (
               a.recorded_at <  b.recorded_at
            OR (a.recorded_at = b.recorded_at AND a.byproduct_id < b.byproduct_id)
+      -- 092: never touch soft-deleted rows — this dedupe re-runs on every
+      -- deploy (scripts/migrate.py has no applied-migrations ledger), and
+      -- without this it would hard-purge the soft-delete audit trail that
+      -- the Accounting CRUD DELETE endpoint writes.
+      AND a.deleted_at IS NULL
+      AND b.deleted_at IS NULL
           );
 
     -- 2. Drop the stale single-key UNIQUE (job_card_id, category) from 018,

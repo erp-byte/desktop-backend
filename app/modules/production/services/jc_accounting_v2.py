@@ -14,10 +14,13 @@ equation below):
     in from the previous stage. The separate `carried_in_qty` column on
     job_card_accounting_v2 mirrors `job_card_v2.carried_qty_kg` and exists
     as an AUDIT field - it is NOT a separate addend to the balance.
-  * `output_qty` is mass still on the JC's floor (production retained).
-    `dispatched_out_qty` is the moved portion. They PARTITION the
-    production - never overlap. The balance equation sums both because
-    together they cover everything physically produced.
+  * `output_qty` is the COMPREHENSIVE production of the stage - every kg
+    made, whether it is still on the floor or has already moved
+    downstream. `dispatched_out_qty` mirrors
+    `job_card_v2.dispatched_to_next_kg` and is an AUDIT field recording
+    how much of that output has moved on. It is a SUBSET of `output_qty`,
+    NOT a disjoint bucket, so it is NOT a separate addend to the balance
+    - same treatment as `carried_in_qty` on the input side.
 
 Balance equation (per-JC, single UOM):
     total_input
@@ -29,7 +32,6 @@ Balance equation (per-JC, single UOM):
        + rejection
        + wastage
        + control_sample
-       + dispatched_out          (only relevant when output_kind=SFG)
        + Σ return_qty            (RM sent back to stores / prev stage)
 
 The tab supports a mixed-UoM JC by storing each piece with its UOM and
@@ -127,7 +129,7 @@ async def _record_consumption_variance(conn, job_card_id: int) -> dict:
         """
         SELECT material_sku_name, actual_consumed_qty, uom, input_kind
         FROM   job_card_material_consumption_v2
-        WHERE  job_card_id=$1 AND input_kind='RM'
+        WHERE  job_card_id=$1 AND input_kind='RM' AND deleted_at IS NULL
         """,
         job_card_id,
     )
@@ -139,7 +141,7 @@ async def _record_consumption_variance(conn, job_card_id: int) -> dict:
     excluded_non_rm = await conn.fetchval(
         """
         SELECT COUNT(*) FROM job_card_material_consumption_v2
-        WHERE  job_card_id=$1 AND input_kind <> 'RM'
+        WHERE  job_card_id=$1 AND input_kind <> 'RM' AND deleted_at IS NULL
         """,
         job_card_id,
     )
@@ -164,7 +166,7 @@ async def _record_consumption_variance(conn, job_card_id: int) -> dict:
         SELECT COALESCE(SUM(output_qty_kg),    0) AS actual_kg,
                COALESCE(SUM(output_qty_units), 0) AS actual_units
         FROM   job_card_output_v2
-        WHERE  job_card_id = $1
+        WHERE  job_card_id = $1 AND deleted_at IS NULL
         """,
         job_card_id,
     )
@@ -366,7 +368,7 @@ async def get_accounting(conn, job_card_id: int, *, batch_id: int | None = None)
         consumption = await conn.fetch(
             """
             SELECT * FROM job_card_material_consumption_v2
-            WHERE  job_card_id=$1
+            WHERE  job_card_id=$1 AND deleted_at IS NULL
             ORDER  BY consumption_id
             """,
             job_card_id,
@@ -378,6 +380,7 @@ async def get_accounting(conn, job_card_id: int, *, batch_id: int | None = None)
                 SELECT * FROM job_card_material_consumption_v2
                 WHERE  job_card_id=$1
                   AND  (batch_id = $2 OR batch_id IS NULL)
+                  AND  deleted_at IS NULL
                 ORDER  BY consumption_id
                 """,
                 job_card_id, batch_id,
@@ -390,7 +393,7 @@ async def get_accounting(conn, job_card_id: int, *, batch_id: int | None = None)
             consumption = await conn.fetch(
                 """
                 SELECT * FROM job_card_material_consumption_v2
-                WHERE  job_card_id=$1
+                WHERE  job_card_id=$1 AND deleted_at IS NULL
                 ORDER  BY consumption_id
                 """,
                 job_card_id,
@@ -416,7 +419,7 @@ async def get_accounting(conn, job_card_id: int, *, batch_id: int | None = None)
         byproducts = await conn.fetch(
             """
             SELECT * FROM job_card_byproducts_v2
-            WHERE  job_card_id=$1
+            WHERE  job_card_id=$1 AND deleted_at IS NULL
             ORDER  BY byproduct_id
             """,
             job_card_id,
@@ -428,6 +431,7 @@ async def get_accounting(conn, job_card_id: int, *, batch_id: int | None = None)
                 SELECT * FROM job_card_byproducts_v2
                 WHERE  job_card_id=$1
                   AND  (batch_id = $2 OR batch_id IS NULL)
+                  AND  deleted_at IS NULL
                 ORDER  BY byproduct_id
                 """,
                 job_card_id, batch_id,
@@ -440,7 +444,7 @@ async def get_accounting(conn, job_card_id: int, *, batch_id: int | None = None)
             byproducts = await conn.fetch(
                 """
                 SELECT * FROM job_card_byproducts_v2
-                WHERE  job_card_id=$1
+                WHERE  job_card_id=$1 AND deleted_at IS NULL
                 ORDER  BY byproduct_id
                 """,
                 job_card_id,
@@ -903,23 +907,46 @@ async def save_accounting(conn, *, job_card_id: int,
     # legacy code persisted it without using it in the balance for the
     # same reason.
     #
-    # OUT side = output (mass retained on floor) + dispatched_out (moved
-    #            to next JC) + process_loss + extra_give + control_sample
-    #            + rejection + offgrade + balance_material + wastage
+    # OUT side = output (EVERYTHING this stage produced) + process_loss
+    #            + extra_give + control_sample + rejection + offgrade
+    #            + balance_material + wastage
     #            + total_return (RM sent back to stores / prev stage,
     #                            summed off consumption rows).
     # balance_difference = total_input - OUT.
+    #
+    # `dispatched_out` is deliberately NOT an addend — it is an audit
+    # mirror, exactly like `carried_in` on the input side. The docstring
+    # used to claim output_qty and dispatched_out_qty PARTITION the
+    # production, which is what licensed summing both; no writer has ever
+    # honoured that. output_qty is the batch's full fg_actual_kg /
+    # produced_qty_kg, and job_card_v2.dispatched_to_next_kg — which
+    # dispatched_out mirrors — is incremented by close_batch's
+    # auto-dispatch with that SAME full produced qty (job_card_batch_v2
+    # :448, `if dispatch_qty_kg is None: effective_dispatch =
+    # produced_qty_kg`). Dispatch is therefore always a SUBSET of
+    # output_qty, and adding it double-counted every dispatching stage
+    # into balance_difference == -dispatched_out — a structurally
+    # unclosable JC. Symmetry to hold on to: the IN side excludes
+    # carried_in because total_input is comprehensive; the OUT side
+    # excludes dispatched_out because output_qty is comprehensive.
+    # A return_qty, by contrast, IS a real addend: returned RM never
+    # became output, so it is not already inside output_qty.
     # PM is packaging, counted in pcs — it is NOT kg mass and must never enter
     # this kg return sum. Exclude input_kind='PM' (RM/SFG/WIP are all kg and
     # still count). Mirrors the RM-only filter used for variance at :126-133.
+    # deleted_at filter (migration 092): soft-deleted consumption lines are no
+    # longer part of the record, so their return_qty must not keep inflating the
+    # OUT side. Without this, deleting a line with a return would push
+    # balance_difference negative and make the JC permanently unclosable —
+    # the same failure shape as the dispatched_out double-count above.
     total_return = _f(await conn.fetchval(
         "SELECT COALESCE(SUM(return_qty), 0) FROM job_card_material_consumption_v2 "
-        "WHERE job_card_id=$1 AND input_kind <> 'PM'",
+        "WHERE job_card_id=$1 AND input_kind <> 'PM' AND deleted_at IS NULL",
         job_card_id,
     ))
 
     total_accounted = (
-        output_qty + dispatched_out
+        output_qty
         + process_loss + extra_give + control_sample
         + rejection + offgrade + balance_mat + wastage
         + total_return
