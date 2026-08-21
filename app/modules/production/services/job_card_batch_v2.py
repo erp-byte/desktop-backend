@@ -411,6 +411,25 @@ async def close_batch(conn, *, batch_id: int,
     # (column is NOT NULL with no DB-side default) and retried on
     # collision via insert_with_pk_retry — same pattern record_output()
     # uses in services/job_card_v2.py.
+    #
+    # UPSERT, not plain INSERT (migration 092). close_batch is the SECOND
+    # writer of job_card_output_v2 — the Accounting record is the first — and
+    # this table used to be append-only, which is exactly why production
+    # accumulated 453 duplicate (job_card_id, batch_id) groups. 092 collapses
+    # those and pins one live row per batch with a partial unique index, so a
+    # bare INSERT here would raise UniqueViolationError the moment a batch that
+    # already has an accounting record is closed. insert_with_pk_retry only
+    # swallows *_pkey violations (core/helpers.py:103) and re-raises everything
+    # else, so that would abort the whole close transaction — batch close,
+    # auto-dispatch and downstream unlock all rolled back.
+    #
+    # The inference clause MUST repeat `WHERE deleted_at IS NULL`: Postgres will
+    # not match a partial index without its predicate.
+    #
+    # Who wins the numbers: close_batch is authoritative for produced_qty_kg,
+    # because closing the batch is the act that states what was made. `notes`
+    # is COALESCEd so a close that passes no note does not wipe one the
+    # accounting record already wrote.
     resolved_output_kind = output_kind or jc["output_kind"] or 'SFG'
 
     async def _insert_output_row():
@@ -422,6 +441,18 @@ async def close_batch(conn, *, batch_id: int,
                 output_qty_units, output_kind, uom, yield_pct,
                 notes, recorded_by, process_loss_kg
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            ON CONFLICT (job_card_id, COALESCE(batch_id, 0))
+                WHERE deleted_at IS NULL
+            DO UPDATE SET
+                rm_consumed_kg   = EXCLUDED.rm_consumed_kg,
+                output_qty_kg    = EXCLUDED.output_qty_kg,
+                output_qty_units = EXCLUDED.output_qty_units,
+                output_kind      = EXCLUDED.output_kind,
+                uom              = EXCLUDED.uom,
+                yield_pct        = EXCLUDED.yield_pct,
+                notes            = COALESCE(EXCLUDED.notes, job_card_output_v2.notes),
+                recorded_by      = EXCLUDED.recorded_by,
+                process_loss_kg  = EXCLUDED.process_loss_kg
             RETURNING *
             """,
             new_short_time_id(),
@@ -571,14 +602,9 @@ async def _lock_check_via_batch(conn, batch_id: int):
 # ---------------------------------------------------------------------------
 
 async def list_batches(conn, job_card_id: int) -> list[dict]:
-    # produced_qty_cartons = count of FG cartons (sfg_box item_type='fg') packed
-    # against each batch, so the Output tab's Cartons column + totals are real.
     rows = await conn.fetch(
         """
-        SELECT b.*,
-               (SELECT COUNT(*) FROM sfg_box c
-                 WHERE c.batch_id = b.batch_id AND c.item_type = 'fg')
-                 AS produced_qty_cartons
+        SELECT b.*
         FROM job_card_batch_v2 b
         WHERE  b.job_card_id=$1
         ORDER  BY b.batch_number
@@ -688,7 +714,7 @@ async def cancel_batch(conn, *, batch_id: int,
     # match rather than running all three branches.
     attached = await conn.fetchval(
         """
-        SELECT EXISTS (SELECT 1 FROM job_card_output_v2          WHERE batch_id=$1)
+        SELECT EXISTS (SELECT 1 FROM job_card_output_v2          WHERE batch_id=$1 AND deleted_at IS NULL)
             OR EXISTS (SELECT 1 FROM job_card_partial_dispatch_v2 WHERE batch_id=$1)
             OR EXISTS (SELECT 1 FROM job_card_shift_log_v2        WHERE batch_id=$1)
         """,
