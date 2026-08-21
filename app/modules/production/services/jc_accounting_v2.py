@@ -129,7 +129,7 @@ async def _record_consumption_variance(conn, job_card_id: int) -> dict:
         """
         SELECT material_sku_name, actual_consumed_qty, uom, input_kind
         FROM   job_card_material_consumption_v2
-        WHERE  job_card_id=$1 AND input_kind='RM'
+        WHERE  job_card_id=$1 AND input_kind='RM' AND deleted_at IS NULL
         """,
         job_card_id,
     )
@@ -141,7 +141,7 @@ async def _record_consumption_variance(conn, job_card_id: int) -> dict:
     excluded_non_rm = await conn.fetchval(
         """
         SELECT COUNT(*) FROM job_card_material_consumption_v2
-        WHERE  job_card_id=$1 AND input_kind <> 'RM'
+        WHERE  job_card_id=$1 AND input_kind <> 'RM' AND deleted_at IS NULL
         """,
         job_card_id,
     )
@@ -166,7 +166,7 @@ async def _record_consumption_variance(conn, job_card_id: int) -> dict:
         SELECT COALESCE(SUM(output_qty_kg),    0) AS actual_kg,
                COALESCE(SUM(output_qty_units), 0) AS actual_units
         FROM   job_card_output_v2
-        WHERE  job_card_id = $1
+        WHERE  job_card_id = $1 AND deleted_at IS NULL
         """,
         job_card_id,
     )
@@ -368,7 +368,7 @@ async def get_accounting(conn, job_card_id: int, *, batch_id: int | None = None)
         consumption = await conn.fetch(
             """
             SELECT * FROM job_card_material_consumption_v2
-            WHERE  job_card_id=$1
+            WHERE  job_card_id=$1 AND deleted_at IS NULL
             ORDER  BY consumption_id
             """,
             job_card_id,
@@ -380,6 +380,7 @@ async def get_accounting(conn, job_card_id: int, *, batch_id: int | None = None)
                 SELECT * FROM job_card_material_consumption_v2
                 WHERE  job_card_id=$1
                   AND  (batch_id = $2 OR batch_id IS NULL)
+                  AND  deleted_at IS NULL
                 ORDER  BY consumption_id
                 """,
                 job_card_id, batch_id,
@@ -392,7 +393,7 @@ async def get_accounting(conn, job_card_id: int, *, batch_id: int | None = None)
             consumption = await conn.fetch(
                 """
                 SELECT * FROM job_card_material_consumption_v2
-                WHERE  job_card_id=$1
+                WHERE  job_card_id=$1 AND deleted_at IS NULL
                 ORDER  BY consumption_id
                 """,
                 job_card_id,
@@ -418,7 +419,7 @@ async def get_accounting(conn, job_card_id: int, *, batch_id: int | None = None)
         byproducts = await conn.fetch(
             """
             SELECT * FROM job_card_byproducts_v2
-            WHERE  job_card_id=$1
+            WHERE  job_card_id=$1 AND deleted_at IS NULL
             ORDER  BY byproduct_id
             """,
             job_card_id,
@@ -430,6 +431,7 @@ async def get_accounting(conn, job_card_id: int, *, batch_id: int | None = None)
                 SELECT * FROM job_card_byproducts_v2
                 WHERE  job_card_id=$1
                   AND  (batch_id = $2 OR batch_id IS NULL)
+                  AND  deleted_at IS NULL
                 ORDER  BY byproduct_id
                 """,
                 job_card_id, batch_id,
@@ -442,7 +444,7 @@ async def get_accounting(conn, job_card_id: int, *, batch_id: int | None = None)
             byproducts = await conn.fetch(
                 """
                 SELECT * FROM job_card_byproducts_v2
-                WHERE  job_card_id=$1
+                WHERE  job_card_id=$1 AND deleted_at IS NULL
                 ORDER  BY byproduct_id
                 """,
                 job_card_id,
@@ -932,9 +934,14 @@ async def save_accounting(conn, *, job_card_id: int,
     # PM is packaging, counted in pcs — it is NOT kg mass and must never enter
     # this kg return sum. Exclude input_kind='PM' (RM/SFG/WIP are all kg and
     # still count). Mirrors the RM-only filter used for variance at :126-133.
+    # deleted_at filter (migration 092): soft-deleted consumption lines are no
+    # longer part of the record, so their return_qty must not keep inflating the
+    # OUT side. Without this, deleting a line with a return would push
+    # balance_difference negative and make the JC permanently unclosable —
+    # the same failure shape as the dispatched_out double-count above.
     total_return = _f(await conn.fetchval(
         "SELECT COALESCE(SUM(return_qty), 0) FROM job_card_material_consumption_v2 "
-        "WHERE job_card_id=$1 AND input_kind <> 'PM'",
+        "WHERE job_card_id=$1 AND input_kind <> 'PM' AND deleted_at IS NULL",
         job_card_id,
     ))
 

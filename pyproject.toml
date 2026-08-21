@@ -30,3 +30,18 @@ dependencies = [
     "reportlab==4.4.0",
     "pillow==12.2.0",
 ]
+
+# Test-only dependencies. Deliberately NOT in requirements.txt — the Dockerfile
+# pip-installs that file into the runtime image, and a test runner has no place
+# there. Install with `uv sync --group test`, or
+# `pip install "pytest>=9.1.1" "pytest-asyncio>=1.4.0" "pglast>=8.4"`.
+#
+# pglast is used by tests/services/test_ledger_leaves.py to parse the generated
+# ledger SQL. It is optional: those specific tests skip without it while the rest
+# of the file still runs.
+[dependency-groups]
+test = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "pglast>=8.4",
+]

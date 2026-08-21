@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 from app.config import Settings
 from app.core.middleware import request_context
+from app.core.openapi_tags import apply_module_feature_tags
 from app.db.connection import create_pool, close_pool
 from app.modules.auth.router import router as auth_router
 from app.modules.so.router import router as so_router
@@ -26,6 +27,7 @@ from app.modules.ncr.router import router as ncr_router
 from app.modules.production.router import router as production_router
 from app.modules.production.router_amendments import router as production_amendments_router
 from app.modules.production.router_audit import router as production_audit_router
+from app.modules.production.router_accounting_crud import router as production_accounting_crud_router
 from app.modules.amendment_router import router as amendment_router
 from app.modules.vendor.router import router as vendor_router
 from app.modules.sample.router import router as sample_router
@@ -162,6 +164,7 @@ app.include_router(ncr_router)
 app.include_router(production_router)
 app.include_router(production_amendments_router)
 app.include_router(production_audit_router)
+app.include_router(production_accounting_crud_router)
 app.include_router(amendment_router)
 app.include_router(vendor_router)
 app.include_router(sample_router)
@@ -220,6 +223,14 @@ async def receive_internal_event(body: InternalEventBody, request: Request):
         target_roles=body.target_roles,
     ))
     return {"accepted": True}
+
+
+# ── Swagger UI grouping ──
+# Retag every operation as "<Module> - <Feature>" and set the group order. Deliberately
+# the LAST thing in this file: it walks app.routes, so it must see every include_router
+# AND the @app.get/@app.post routes declared above (/health, /internal/events). It must
+# also run before the schema is first generated — FastAPI caches it on app.openapi_schema.
+app.openapi_tags = apply_module_feature_tags(app)
 
 
 # AWS Lambda entry point

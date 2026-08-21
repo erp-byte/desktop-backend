@@ -27,7 +27,7 @@ from app.modules.so.schemas.update import (
     SOManualUpdateRequest,
     SOManualUpdateResponse,
 )
-from app.modules.so.schemas.sku import SKUDetail, SKUDropdownOptions, SKULookupResponse
+from app.modules.so.schemas.sku import SKUBulkRow, SKUDetail, SKUDropdownOptions, SKULookupResponse
 
 __all__ = [
     "SOLineOut", "SOLineInput", "ManualUpdateLineInput",
@@ -37,5 +37,5 @@ __all__ = [
     "FieldChange", "LineChange", "HeaderChange", "SOUpdateDiff",
     "SOUpdatePreviewResponse", "SOUpdateConfirmRequest", "SOUpdateConfirmResponse",
     "SOManualUpdateRequest", "SOManualUpdateResponse",
-    "SKUDetail", "SKUDropdownOptions", "SKULookupResponse",
+    "SKUBulkRow", "SKUDetail", "SKUDropdownOptions", "SKULookupResponse",
 ]

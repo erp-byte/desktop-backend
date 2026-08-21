@@ -2675,9 +2675,12 @@ _JC_SORTABLE_COLUMNS = frozenset({
     "plan_date",
 })
 
-# Map sortable column → SQL expression. Most are jc.<col>; plan_date
-# routes to the subquery so the operator can sort the JC list by the
-# planning date without us having to denormalise it onto job_card_v2.
+# Map a column name → SQL expression. Most are jc.<col>; plan_date
+# routes to the subquery so the operator can sort or filter the JC list by
+# the planning date without us having to denormalise it onto job_card_v2.
+# Used by BOTH the ORDER BY and the date-window WHERE, so the two can never
+# disagree about what "plan date" means. Every query in list_job_cards
+# aliases `job_card_v2 jc`, so the correlated reference resolves in each.
 def _jc_sort_expr(sort_col: str) -> str:
     if sort_col == "plan_date":
         return (
@@ -2685,7 +2688,11 @@ def _jc_sort_expr(sort_col: str) -> str:
             "WHERE ppv.plan_id = jc.plan_id)"
         )
     return f"jc.{sort_col}"
-_JC_DATE_FIELDS    = frozenset({"created_at", "start_time", "end_time"})
+# plan_date is included deliberately: sort_by both accepts it AND defaults to
+# it, so without it here a date window would silently filter on created_at
+# while the list was ordered — and read by the operator — as plan date. A JC
+# planned for July but created in June just vanished from a July window.
+_JC_DATE_FIELDS    = frozenset({"created_at", "start_time", "end_time", "plan_date"})
 _JC_PENDENCY_CHIPS = frozenset({"overdue", "due_today", "due_this_week", "future", "pending_signoff"})
 
 
@@ -2721,7 +2728,8 @@ async def list_job_cards(
         sort column is validated against an allow-list to keep the SQL
         injection surface zero.
       * date_field + date_from / date_to: choose which date column the
-        range filter applies to (created_at vs start_time vs end_time).
+        range filter applies to (created_at vs start_time vs end_time vs
+        plan_date, the last resolved from production_plan_v2).
       * pendency: chip filter (overdue / due_today / due_this_week / future)
         computed against end_time as the proxy for stage deadline.
       * so_number, machine_id, plan_id: drill-down filters.
@@ -2805,7 +2813,9 @@ async def list_job_cards(
                 f"Allowed: {sorted(_JC_DATE_FIELDS)}."
             ),
         }
-    date_col = date_field
+    # Route through the same expression map the ORDER BY uses, so plan_date
+    # filters on production_plan_v2.plan_date rather than being rejected.
+    date_col = _jc_sort_expr(date_field)
     if date_from:
         conditions.append(f"{date_col} >= ${idx}::date"); params.append(date_from); idx += 1
     if date_to:
@@ -3332,7 +3342,8 @@ async def dispatch_to_next(conn, *, job_card_id: int, qty_kg: float,
         return {"error": "jc_terminal",
                 "message": f"Cannot dispatch from a {src['status']} job card"}
     produced = float(await conn.fetchval(
-        "SELECT COALESCE(SUM(output_qty_kg), 0) FROM job_card_output_v2 WHERE job_card_id=$1",
+        "SELECT COALESCE(SUM(output_qty_kg), 0) FROM job_card_output_v2 "
+        "WHERE job_card_id=$1 AND deleted_at IS NULL",
         job_card_id,
     ) or 0)
     already = float(src["dispatched_to_next_kg"] or 0)
@@ -3450,7 +3461,8 @@ async def dispatch_process_group(conn, *, process_job_card_id: int,
         return {"error": "jc_terminal", "message": "Process card is cancelled."}
 
     produced = float(await conn.fetchval(
-        "SELECT COALESCE(SUM(output_qty_kg),0) FROM job_card_output_v2 WHERE job_card_id=$1",
+        "SELECT COALESCE(SUM(output_qty_kg),0) FROM job_card_output_v2 "
+        "WHERE job_card_id=$1 AND deleted_at IS NULL",
         process_job_card_id,
     ) or 0)
     if produced <= 0:
@@ -3809,32 +3821,46 @@ async def upsert_qc(conn, *, job_card_id: int,
                     findings: str | None = None,
                     corrective_action: str | None = None,
                     inspector_user: str | None = None,
-                    recorded_by: str | None = None) -> dict:
-    """Persist a single-row QC summary. `passed` maps to result:
-    True → 'pass', False → 'fail', None → 'pending'. Re-saves UPDATE the
-    same row (UNIQUE on job_card_id); inspection_date is stamped to NOW
-    on every save so the timestamp reflects the latest call."""
+                    recorded_by: str | None = None,
+                    batch_id: int | None = None) -> dict:
+    """Persist a QC summary row. `passed` maps to result:
+    True → 'pass', False → 'fail', None → 'pending'. inspection_date is
+    stamped to NOW on every save so the timestamp reflects the latest call.
+
+    Migration 092 made the row per-(JC, batch): the unique key moved from
+    (job_card_id) to (job_card_id, COALESCE(batch_id, 0)), so the ON CONFLICT
+    target below MUST match that index. Callers that don't know about batches
+    pass batch_id=None and land on the COALESCE-0 sentinel — the same
+    one-row-per-JC behaviour they had before. The table was empty when the key
+    moved, so no existing row had to be reinterpreted.
+
+    deleted_at/deleted_by are cleared on conflict: a soft-deleted row still
+    occupies the unique key, so re-saving QC after a record delete has to
+    resurrect it rather than collide.
+    """
     result = 'pending' if passed is None else ('pass' if passed else 'fail')
 
     async def _upsert():
         return await conn.fetchrow(
             """
             INSERT INTO job_card_qc_v2 (
-                qc_id, job_card_id, result, findings, corrective_action,
+                qc_id, job_card_id, batch_id, result, findings, corrective_action,
                 inspector_user, inspection_date, recorded_by
             )
-            VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7)
-            ON CONFLICT (job_card_id) DO UPDATE SET
+            VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), $8)
+            ON CONFLICT (job_card_id, COALESCE(batch_id, 0)) DO UPDATE SET
                 result            = EXCLUDED.result,
                 findings          = EXCLUDED.findings,
                 corrective_action = EXCLUDED.corrective_action,
                 inspector_user    = EXCLUDED.inspector_user,
                 inspection_date   = NOW(),
-                recorded_by       = EXCLUDED.recorded_by
+                recorded_by       = EXCLUDED.recorded_by,
+                deleted_at        = NULL,
+                deleted_by        = NULL
             RETURNING *
             """,
             new_short_time_id(),
-            job_card_id, result, findings, corrective_action,
+            job_card_id, batch_id, result, findings, corrective_action,
             inspector_user, recorded_by,
         )
     row = await insert_with_pk_retry(conn, _upsert)
@@ -3962,7 +3988,7 @@ async def _derive_accounting_payload(conn, job_card_id: int) -> dict:
         """
         SELECT output_qty_kg, output_qty_units, process_loss_kg
         FROM   job_card_output_v2
-        WHERE  job_card_id = $1
+        WHERE  job_card_id = $1 AND deleted_at IS NULL
         ORDER  BY recorded_at DESC
         LIMIT  1
         """,
@@ -4002,6 +4028,7 @@ async def _derive_accounting_payload(conn, job_card_id: int) -> dict:
             FROM   job_card_material_consumption_v2
             WHERE  job_card_id = $1
               AND  COALESCE(input_kind, 'RM') <> 'PM'
+              AND  deleted_at IS NULL
             """,
             job_card_id,
         ) or 0)
@@ -4017,7 +4044,7 @@ async def _derive_accounting_payload(conn, job_card_id: int) -> dict:
         """
         SELECT category, COALESCE(SUM(quantity), 0) AS qty
         FROM   job_card_byproducts_v2
-        WHERE  job_card_id = $1
+        WHERE  job_card_id = $1 AND deleted_at IS NULL
         GROUP  BY category
         """,
         job_card_id,
@@ -4050,7 +4077,7 @@ async def _derive_accounting_payload(conn, job_card_id: int) -> dict:
         """
         SELECT balance_type, COALESCE(SUM(qty_kg), 0) AS qty
         FROM   job_card_balance_material_v2
-        WHERE  job_card_id = $1
+        WHERE  job_card_id = $1 AND deleted_at IS NULL
         GROUP  BY balance_type
         """,
         job_card_id,
@@ -4761,7 +4788,7 @@ async def get_job_card(conn, job_card_id: int) -> dict | None:
     h = _serialize(header)
 
     shifts   = await list_shifts(conn, job_card_id)
-    outputs  = await conn.fetch("SELECT * FROM job_card_output_v2  WHERE job_card_id=$1 ORDER BY recorded_at", job_card_id)
+    outputs  = await conn.fetch("SELECT * FROM job_card_output_v2  WHERE job_card_id=$1 AND deleted_at IS NULL ORDER BY recorded_at", job_card_id)
     rm       = await conn.fetch("SELECT * FROM job_card_rm_indent_v2 WHERE job_card_id=$1 ORDER BY rm_indent_id", job_card_id)
     pm       = await conn.fetch("SELECT * FROM job_card_pm_indent_v2 WHERE job_card_id=$1 ORDER BY pm_indent_id", job_card_id)
     signoffs = await conn.fetch("SELECT * FROM job_card_sign_off_v2 WHERE job_card_id=$1 ORDER BY signed_at", job_card_id)
@@ -4963,7 +4990,7 @@ async def get_job_card(conn, job_card_id: int) -> dict | None:
         SELECT qc_id, result, findings, corrective_action, inspector_user,
                inspection_date
         FROM   job_card_qc_v2
-        WHERE  job_card_id = $1
+        WHERE  job_card_id = $1 AND deleted_at IS NULL
         """,
         job_card_id,
     )
