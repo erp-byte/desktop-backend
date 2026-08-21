@@ -523,6 +523,7 @@ _REQ_EVENT = {
     "submitted": ("#0ea5e9", "SUBMITTED FOR APPROVAL",    "This sample request has been submitted and is awaiting business-head approval.", "Submitted", "#0284c7"),
     "approved":  ("#16a34a", "APPROVED BY BUSINESS HEAD", "The business head has approved this sample request. It now moves to issuing / production.", "Approved", "#16a34a"),
     "rejected":  ("#dc2626", "REJECTED BY BUSINESS HEAD", "The business head has rejected this sample request.", "Rejected", "#dc2626"),
+    "bh signed off": ("#16a34a", "APPROVED BY BUSINESS HEAD", "The business head has approved this request. It has now been handed to the NPD team for review.", "BH approved", "#16a34a"),
     "accepted":  ("#16a34a", "SAMPLE REQUEST ACCEPTED",   "The NPD team has accepted this sample request.", "Accepted", "#16a34a"),
     "on hold":   ("#f59e0b", "SAMPLE REQUEST ON HOLD",    "The NPD team has placed this sample request on hold.", "On hold", "#b45309"),
     "production requested": ("#7c3aed", "ITEM TO BE MADE FOR SAMPLING", "A requisition has been raised for this article to be created for sampling. Production — this is the reason for the run; job cards follow once the requisition starts production.", "To be produced", "#7c3aed"),
@@ -557,6 +558,60 @@ def _requisition_event_html(req: dict, event: str, reason=None,
              f'{_buttons([(link_label or "Open on the portal", link, hdr)] if link else [])}')
     return _shell(hdr=hdr, eyebrow=eyebrow, title=_fmt(req.get("request_id")),
                   inner=inner, footer=_TRAIL_FOOTER)
+
+
+# ── requisition-stage business-head sign-off (086) ───────────────────────────
+# The approval that used to sit on the dev job card's promote, moved to the request
+# itself. Approve hits the backend (GET confirm page → POST) carrying the BH's email
+# for the recipient-match auth; Reject links to the request page on the web app, which
+# pops a reason dialog — a rejection must always carry one.
+def _bh_signoff_approve_url(request_id, email: str) -> str:
+    from app.modules.sample.services.email_link_token import sign
+    base = Settings().PUBLIC_BACKEND_URL.rstrip("/")
+    t = sign("bh_signoff", request_id, email)
+    return (f"{base}/api/v1/sample/email/bh-signoff?request_id={request_id}"
+            f"&status=approve&email={quote(email)}&t={t}")
+
+
+def _bh_signoff_reject_url(pk_id, request_id, email: str) -> str:
+    # Carries the 8-digit request_id in the query, not just the path pk: the BH may not
+    # have a portal session, so the reason dialog has to be able to submit through the
+    # email-authenticated endpoint without first loading the requisition.
+    web = Settings().WEB_APP_URL.rstrip("/")
+    return f"{web}/modules/sample/{pk_id}?bh_reject={request_id}&email={quote(email)}"
+
+
+def _bh_signoff_html(req: dict, bh_email: str | None) -> str:
+    """The business-head approval card. With `bh_email` it carries Approve / Reject whose
+    Approve link embeds THAT address for the recipient-match auth — so this copy goes to
+    the bound BH alone. With None it is the identical card, buttons stripped, for the
+    button-less broadcast to the rest of the trail."""
+    rid = req.get("request_id")
+    type_label = "customer trial" if req.get("sample_type") == "TRIAL" else "NPD"
+    poc = _fmt(req.get("sales_poc_name") or req.get("sales_poc_email"), "the sales team")
+    if bh_email:
+        badge = ('<div style="margin:0 0 14px">'
+                 '<span style="display:inline-block;background:#eef2ff;color:#4338ca;font-size:11px;'
+                 'font-weight:700;letter-spacing:.04em;text-transform:uppercase;padding:4px 12px;'
+                 'border-radius:999px">Your approval</span></div>')
+        intro = (f"{poc} has raised this {type_label} sample request on your behalf and it needs "
+                 "your approval before the NPD team starts work on it. Tap <b>Approve</b> to "
+                 "release it to NPD, or <b>Reject</b> to open it on the portal and record a reason.")
+        pairs = [("&#10003;&nbsp; Approve", _bh_signoff_approve_url(rid, bh_email), "#16a34a"),
+                 ("&#10007;&nbsp; Reject", _bh_signoff_reject_url(req.get("id"), rid, bh_email), "#dc2626")]
+        footer = _ACTION_FOOTER
+    else:
+        badge = _pill("Awaiting BH approval", "#4f46e5")
+        intro = (f"This {type_label} sample request has been raised by {poc} and is awaiting its "
+                 "business head's approval. It reaches the NPD team once that approval is given "
+                 "— sharing the details for your visibility.")
+        pairs = []
+        footer = _TRAIL_FOOTER
+    inner = (f'<tr><td style="padding:26px 26px 6px">{badge}'
+             f'<p style="margin:0 0 18px;font-size:{_T_LEAD}px;color:{_INK};line-height:1.6">{intro}</p>'
+             f'{_detail_table(req)}</td></tr>{_buttons(pairs)}')
+    return _shell(hdr="#4f46e5", eyebrow="BUSINESS-HEAD APPROVAL NEEDED",
+                  title=_fmt(rid), inner=inner, footer=footer)
 
 
 # ── promote dual-approval gate ───────────────────────────────────────────────
@@ -620,18 +675,17 @@ def _promote_html(jc: dict, approver_label: str | None,
                  '<span style="display:inline-block;background:#eef2ff;color:#4338ca;font-size:11px;'
                  'font-weight:700;letter-spacing:.04em;text-transform:uppercase;padding:4px 12px;'
                  f'border-radius:999px">Your gate: {_fmt(approver_label)}</span></div>')
-        intro = ("A developed recipe is ready to be promoted into a live BOM. <b>Both</b> gates "
-                 "— Inventory manager and Business head — must approve before it "
-                 "goes live. Tap <b>Approve</b> to clear your gate, or <b>Reject</b> to open the "
-                 "job card on the portal and record a reason.")
+        intro = ("A developed recipe is ready to be promoted into a live BOM and needs your "
+                 "approval before it goes live. Tap <b>Approve</b> to clear your gate, or "
+                 "<b>Reject</b> to open the job card on the portal and record a reason.")
         pairs = [("&#10003;&nbsp; Approve", approve_url, "#16a34a"),
                  ("&#10007;&nbsp; Reject", reject_url, "#dc2626")]
         footer = _ACTION_FOOTER
     else:
         badge = _pill("Awaiting approval", "#4f46e5")
-        intro = ("A developed recipe is ready to be promoted into a live BOM and is awaiting its "
-                 "two approval gates — Inventory manager and Business head. Sharing "
-                 "the details for your visibility; the outcome will follow in this trail.")
+        intro = ("A developed recipe is ready to be promoted into a live BOM and is awaiting the "
+                 "inventory manager's approval. Sharing the details for your visibility; the "
+                 "outcome will follow in this trail.")
         pairs = []
         footer = _TRAIL_FOOTER
     inner = (f'<tr><td style="padding:26px 26px 6px">{badge}'
@@ -658,7 +712,7 @@ def _promote_status_html(jc: dict, *, gate: str, action: str, actor_name,
                  "The promote has been voided — the recipe was not promoted into a live BOM.")
     elif status == "PROMOTED":
         hdr, eyebrow, pill, pill_bg = "#16a34a", "PROMOTED", "Promoted", "#16a34a"
-        intro = (f"The <b>{gate_label}</b> gate was <b>approved</b> by {actor}. Both gates are "
+        intro = (f"The <b>{gate_label}</b> gate was <b>approved</b> by {actor}. Every gate is "
                  "now clear — the recipe has been promoted into a live BOM.")
     else:
         hdr, eyebrow, pill, pill_bg = "#4f46e5", "PROMOTE GATE APPROVED", "Awaiting approval", "#4f46e5"
@@ -746,6 +800,28 @@ async def notify_npd_review_email(conn, req: dict) -> None:
     _broadcast(subject, _review_html(req, None), rec, thread=thread, exclude=reviewers)
 
 
+async def notify_bh_signoff_email(conn, req: dict) -> None:
+    """086 — ask the bound business head to approve a held NPD/TRIAL request: a buttoned
+    Approve/Reject card addressed to them ALONE, plus the identical card with buttons
+    stripped to everyone else on the trail. Both reply into the requisition thread.
+
+    The NPD team is on that trail, so they SEE the request coming; what they do not get
+    until the BH approves is the buttoned review card that lets them act on it.
+    Best-effort, never raises."""
+    rid = req.get("request_id")
+    rec = await resolve_recipients(conn, req)
+    thread, subject = _thread_key(rid), _thread_subject(rid, req.get("sample_type"))
+    bh_email = await _email_for_user(conn, req.get("business_head_user_id"))
+    if not bh_email:
+        logger.warning("[sample-mail] business head %s has no email — the BH approval card for "
+                       "req %s reaches nobody who can act on it",
+                       req.get("business_head_user_id"), req.get("id"))
+    else:
+        _send(subject, _bh_signoff_html(req, bh_email), [bh_email], in_reply_to=thread)
+    _broadcast(subject, _bh_signoff_html(req, None), rec, thread=thread,
+               exclude=[bh_email] if bh_email else ())
+
+
 async def notify_promote_review_email(conn, *, dev_jc_id, requestor_uid=None) -> None:
     """On a dev-JC promote request — a buttoned Approve/Reject card to each gate holder
     addressed to them ALONE (their Approve link carries their own email + gate), plus the
@@ -822,6 +898,11 @@ async def send_due_reminders(conn) -> int:
     REMINDER_MAX and no sooner than REMINDER_MIN_HOURS apart. Returns # requests nudged.
     Meant to be run on a cron (the cadence guards make frequent calls safe no-ops).
 
+    Each request is nudged towards WHOEVER is actually blocking it (086): a request still
+    waiting on its business head goes to that BH, everything else to the npd_team. Sending
+    the NPD review card for a held request would offer reviewers an Accept the server
+    refuses — and would leave the BH, the one person who can move it, un-nudged.
+
     Only the buttoned copy goes out — a reminder is a nudge to the people who can act, so
     the rest of the trail is not re-mailed every 24h.
 
@@ -840,17 +921,38 @@ async def send_due_reminders(conn) -> int:
                   AND reminder_count < $1
                   AND (last_reminder_at IS NULL OR last_reminder_at < NOW() - make_interval(hours => $2))""",
             REMINDER_MAX, REMINDER_MIN_HOURS)
-        recips = _dedupe(await _emails_for_role(conn, "npd_team"))
-        if not recips:
+        if not rows:
             return 0
+        # 086 is hand-applied, so the column may not be there yet — treat its absence as
+        # "no request is ever held", which is exactly the pre-086 behaviour.
+        held = [r for r in rows if r.get("bh_signoff_state") == "PENDING"]
+        held_ids = {r["id"] for r in held}
+        ready = [r for r in rows if r["id"] not in held_ids]
+        recips = _dedupe(await _emails_for_role(conn, "npd_team"))
         sent = 0
-        for r in rows:
+
+        async def _bump(r):
+            await conn.execute(
+                "UPDATE sample_requisitions SET reminder_count = reminder_count + 1, "
+                "last_reminder_at = NOW() WHERE id = $1", r["id"])
+
+        for r in ready:
+            if not recips:
+                break
             rid = r["request_id"]
             subject, thread = _thread_subject(rid, r["sample_type"]), _thread_key(rid)
             for em in recips:
                 _send(subject, _review_html(dict(r), em), [em], in_reply_to=thread)
-            await conn.execute(
-                "UPDATE sample_requisitions SET reminder_count = reminder_count + 1, last_reminder_at = NOW() WHERE id = $1",
-                r["id"])
+            await _bump(r)
+            sent += 1
+
+        for r in held:
+            bh = await _email_for_user(conn, r["business_head_user_id"])
+            if not bh:
+                continue          # nobody to nudge; don't burn a reminder on a non-send
+            rid = r["request_id"]
+            subject, thread = _thread_subject(rid, r["sample_type"]), _thread_key(rid)
+            _send(subject, _bh_signoff_html(dict(r), bh), [bh], in_reply_to=thread)
+            await _bump(r)
             sent += 1
         return sent

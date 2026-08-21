@@ -187,6 +187,13 @@ class ApprovalAction(BaseModel):
     remarks: Optional[str] = None
 
 
+class BhSignoffBody(BaseModel):
+    """The bound business head's verdict on a held NPD/TRIAL request (086). A reason is
+    required to reject (enforced in the service)."""
+    action: Literal["APPROVED", "REJECTED", "APPROVE", "REJECT"]
+    remarks: Optional[str] = None
+
+
 class NpdReviewBody(BaseModel):
     # NPD team's verdict on a BH-sent request. Reason required for reject + hold
     # (enforced in the service). start_date is the date the hold takes effect —
@@ -366,6 +373,15 @@ class PromoteApprovalBody(BaseModel):
     # Only needed when one user holds BOTH gates (inventory_manager who is also the
     # requestor) — names which gate this action applies to so each is actioned once.
     approver_kind: Optional[Literal["INV_MGR", "REQUESTOR_BH"]] = None
+
+
+class BhSignoffEmailReject(BaseModel):
+    """Reject a requisition-stage BH approval from the email-driven reason dialog on the
+    web app (086). PUBLIC (no session) — authenticated by `email` being the bound business
+    head on that request; a reason is required."""
+    request_id: int
+    email: str
+    remarks: str
 
 
 class PromoteEmailReject(BaseModel):

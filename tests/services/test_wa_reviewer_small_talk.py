@@ -40,6 +40,12 @@ class _Conn:
     async def fetchval(self, query, *args):
         self.queries.append(" ".join(query.split()))
         if "wa_review_message" in query:
+            # These wamids are REVIEW cards, so the 086 business-head lookup — which
+            # is scoped to kind='BH_SIGNOFF' — misses them. Without this the stub
+            # answers every wa_review_message query alike and the tap is read as a
+            # business-head approval instead of review traffic.
+            if "BH_SIGNOFF" in query:
+                return None
             return 1 if args and args[0] in self.known else None
         return None
 

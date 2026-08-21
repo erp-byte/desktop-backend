@@ -489,7 +489,47 @@ async def list_dev_job_cards(conn, *, status: str | None = None,
              ORDER BY jc.created_at DESC
              LIMIT ${len(params) - 1} OFFSET ${len(params)}""",
         *params)
-    return [dict(r) for r in rows]
+    out = [dict(r) for r in rows]
+    await _attach_list_articles(conn, out)
+    return out
+
+
+async def _attach_list_articles(conn, rows: list[dict]) -> None:
+    """Hang each card's target articles (082) off `articles`, in ONE batched read.
+
+    The card header only mirrors article #1 (fg_sku_name / target_qty), so a queue built
+    from it shows a multi-product card as a single-product one. This is the LIST-shaped
+    counterpart of _dev_articles_for: names + quantities only, no recipe lines â€” the queue
+    never renders those and fetching them would multiply the row count.
+
+    Legacy cards (no article rows, or 082 not applied) fall back to the header synthesis,
+    exactly as the detail view does. Best-effort: a missing table degrades to that fallback
+    rather than failing the whole list.
+    """
+    if not rows:
+        return
+    by_jc: dict[int, list[dict]] = {}
+    try:
+        for a in await conn.fetch(
+                "SELECT dev_jc_id, article_id, name, pcs, weight_per_piece, quantity, uom, "
+                "       status, yield_pct, promoted_bom_id, line_order "
+                "  FROM npd_dev_job_card_articles "
+                " WHERE dev_jc_id = ANY($1::bigint[]) ORDER BY dev_jc_id, line_order, article_id",
+                [r["id"] for r in rows]):
+            by_jc.setdefault(a["dev_jc_id"], []).append(
+                {k: a[k] for k in ("article_id", "name", "pcs", "weight_per_piece",
+                                   "quantity", "uom", "status", "yield_pct", "promoted_bom_id")})
+    except Exception:  # noqa: BLE001 â€” 082 not applied â†’ header synthesis below
+        logger.exception("Failed to batch-read dev job-card articles for the queue")
+    for r in rows:
+        arts = by_jc.get(r["id"])
+        if not arts and (r.get("fg_sku_name") or r.get("base_bom_id")):
+            arts = [{"article_id": None, "name": r.get("fg_sku_name") or r.get("title"),
+                     "pcs": r.get("pcs"), "weight_per_piece": r.get("weight_per_piece"),
+                     "quantity": r.get("target_qty"), "uom": r.get("uom"),
+                     "status": r.get("status"), "yield_pct": r.get("yield_pct"),
+                     "promoted_bom_id": r.get("promoted_bom_id")}]
+        r["articles"] = arts or []
 
 
 async def search_boms(conn, *, search: str | None = None, limit: int = 30) -> list[dict]:
