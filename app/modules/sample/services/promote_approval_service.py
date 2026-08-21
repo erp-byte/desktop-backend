@@ -1,10 +1,16 @@
-"""Blocking dual-approval gate for an NPD dev-JC promote (spec: NPD email-approval epic).
+"""Blocking approval gate for an NPD dev-JC promote (spec: NPD email-approval epic).
 
-open_promote_request() stashes the close payload + raises two PENDING gates
-(INV_MGR -> any inventory_manager; REQUESTOR_BH -> the source requisition's
-requestor). act_promote_approval() flips one gate (role-checked). finalize_if_ready()
-runs the real promote (npd_dev_service._finalize_promote) once both gates ACCEPTED.
-ids are app-supplied 8-digit BIGINTs (new_short_time_id) with a unique retry."""
+open_promote_request() stashes the close payload + raises the INV_MGR PENDING gate
+(any inventory_manager). act_promote_approval() flips one gate (role-checked).
+finalize_if_ready() runs the real promote (npd_dev_service._finalize_promote) once
+every gate is ACCEPTED. ids are app-supplied 8-digit BIGINTs (new_short_time_id)
+with a unique retry.
+
+086 moved the BUSINESS-HEAD approval OFF this gate and onto the requisition, where it
+is now asked BEFORE the NPD team starts work (requisition_service.submit_requisition
+-> approval_service.act_bh_signoff). A promote therefore raises only INV_MGR. The
+REQUESTOR_BH branches below are retained deliberately: promotes opened before 086 still
+carry a live REQUESTOR_BH row, and dropping the handling would wedge them forever."""
 from __future__ import annotations
 import json
 import logging
@@ -51,41 +57,29 @@ async def open_promote_request(conn, dev_jc_id: int, *, payload: dict, user) -> 
             raise HTTPException(409, detail={"error": "promote_already_pending",
                 "message": "A promote is already awaiting approval for this job card",
                 "details": {"dev_jc_id": dev_jc_id}})
-        src_req = await conn.fetchval(
-            "SELECT source_requisition_id FROM npd_dev_job_cards WHERE id = $1", dev_jc_id)
-        requestor_uid = None
-        if src_req:
-            # The REQUESTOR_BH gate belongs to the BUSINESS HEAD the request was raised
-            # for, never to whoever typed it in. business_head_user_id is the explicit
-            # binding; requestor_user_id is the fallback for requisitions raised before
-            # that binding existed (where it still holds the creator) — without the
-            # fallback those legacy cards would raise a gate bound to nobody and wedge.
-            requestor_uid = await conn.fetchval(
-                "SELECT COALESCE(business_head_user_id, requestor_user_id) "
-                "FROM sample_requisitions WHERE id = $1", src_req)
+        # 086: the inventory manager is the ONLY gate on a promote. The business head
+        # signed off on the request at the requisition stage (or was auto-approved as
+        # its own sales POC) before NPD ever picked it up, so asking them again here —
+        # after the development work is finished — is the ask this change removed.
         await _insert_8d(conn,
             """INSERT INTO npd_dev_promote_approval (id, promote_request_id, approver_kind, approver_user_id)
                VALUES ($1,$2,'INV_MGR',NULL) RETURNING id""", req_id)
-        # A sourceless standalone dev JC (no requisition → no requestor) raises ONLY
-        # the INV_MGR gate; a REQUESTOR_BH gate with a NULL approver could never be
-        # accepted (no one is bound to it), wedging the promote in a dead-lock.
-        if requestor_uid is not None:
-            await _insert_8d(conn,
-                """INSERT INTO npd_dev_promote_approval (id, promote_request_id, approver_kind, approver_user_id)
-                   VALUES ($1,$2,'REQUESTOR_BH',$3) RETURNING id""", req_id, requestor_uid)
         await notification_service.emit_alert(
             conn, alert_type="npd_promote_requested",
             target_team=notification_service.TEAM_INVENTORY,
             message=f"Dev job card {dev_jc_id}: promote awaiting inventory-manager acceptance.",
             related_id=dev_jc_id)
+    # requestor_uid is deliberately NOT passed: with no REQUESTOR_BH gate to clear,
+    # a buttoned card to the BH would offer an approval that does not exist. They stay
+    # on the trail's broadcast copy (resolve_recipients puts the requestor on To).
     try:
         from app.modules.sample.services import sample_mail_service as mail
-        await mail.notify_promote_review_email(conn, dev_jc_id=dev_jc_id, requestor_uid=requestor_uid)
+        await mail.notify_promote_review_email(conn, dev_jc_id=dev_jc_id)
     except Exception:  # noqa: BLE001 — best-effort; a mail failure must not break the request
         pass
     try:
         from app.modules.sample.services import whatsapp_service as wa
-        await wa.notify_promote_review(conn, dev_jc_id=dev_jc_id, requestor_uid=requestor_uid)
+        await wa.notify_promote_review(conn, dev_jc_id=dev_jc_id)
     except Exception:  # noqa: BLE001 — best-effort; a WhatsApp failure must not break the request
         pass
     return {"ok": True, "promote_request_id": req_id, "status": "PENDING_APPROVAL"}

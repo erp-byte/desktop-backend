@@ -228,6 +228,117 @@ async def email_npd_action_confirm(
                         media_type="text/html")
 
 
+async def _resolve_bh_signoff(conn, request_id: int, email: str):
+    """Authenticate an email-link approver against the BH gate it claims (mandatory):
+    the address must belong to the ACTIVE user bound as that request's business head.
+    Returns (requisition row, auth_user row) or (None, None)."""
+    row = await conn.fetchrow(
+        "SELECT id, status, bh_signoff_state, business_head_user_id FROM sample_requisitions "
+        "WHERE request_id = $1 AND deleted_at IS NULL", request_id)
+    if row is None:
+        return None, None
+    urow = await conn.fetchrow(
+        """SELECT a.user_id, COALESCE(r.role_name, '') AS role_name
+             FROM auth_user a LEFT JOIN auth_role r ON a.role_id = r.role_id
+            WHERE a.user_id = $1 AND lower(a.email) = lower($2)
+              AND COALESCE(a.is_active, TRUE) LIMIT 1""",
+        row["business_head_user_id"], email)
+    return row, urow
+
+
+# ── Email approve/reject — requisition-stage business-head gate buttons (086) ──
+# PUBLIC (no auth dep). The mail buttons GET this.
+#   • status=approve → render a POST-confirm page (a link-scanner's GET can't auto-act);
+#     the POST below does the real approve.
+#   • Reject links straight to the web app's request page, which pops a reason dialog and
+#     submits through POST /email/bh-signoff-reject — a rejection must carry a reason.
+@router.get("/email/bh-signoff")
+async def email_bh_signoff(
+    request: Request,
+    request_id: int = Query(...),
+    status: str = Query(...),
+    email: str = Query(""),
+    t: str = Query(""),
+):
+    from app.config import Settings
+    st = (status or "").strip().lower()
+    if st != "approve":
+        return Response("<h3>Unknown action.</h3>", media_type="text/html", status_code=400)
+    if not (email or "").strip():  # never auth a blank identifier
+        return Response("<h3>This link is not authorised.</h3>", media_type="text/html", status_code=403)
+    from app.modules.sample.services.email_link_token import verify
+    if not verify(t, "bh_signoff", request_id, email):
+        return Response("<h3>This link is not authorised.</h3>", media_type="text/html", status_code=403)
+
+    base = Settings().PUBLIC_BACKEND_URL.rstrip("/")
+    return _confirm_page(
+        heading="Approve this sample request?",
+        summary=f"Request {request_id} · it goes to the NPD team once you approve",
+        action_url=f"{base}/api/v1/sample/email/bh-signoff",
+        hidden={"request_id": request_id, "email": email, "t": t},
+        button_label="✓ Confirm approve")
+
+
+@router.post("/email/bh-signoff")
+async def email_bh_signoff_confirm(
+    request: Request,
+    request_id: int = Form(...),
+    email: str = Form(""),
+    t: str = Form(""),
+):
+    """The real approve — POST-only, behind the confirm button. Verify `email` is the
+    request's bound business head, then approve. Auth fail / wrong state → no mutation."""
+    if not (email or "").strip():
+        return Response("<h3>This link is not authorised.</h3>", media_type="text/html", status_code=403)
+    from app.modules.sample.services.email_link_token import verify
+    if not verify(t, "bh_signoff", request_id, email):
+        return Response("<h3>This link is not authorised.</h3>", media_type="text/html", status_code=403)
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        row, urow = await _resolve_bh_signoff(conn, request_id, email)
+        if row is None:
+            return Response("<h3>Request not found.</h3>", media_type="text/html", status_code=404)
+        if urow is None:
+            return Response("<h3>This link is not authorised.</h3>", media_type="text/html", status_code=403)
+        if row["bh_signoff_state"] != "PENDING":
+            return Response("<h3>Already actioned.</h3>", media_type="text/html")
+        import types as _t
+        user = _t.SimpleNamespace(user_id=urow["user_id"], role_name=urow["role_name"],
+                                  is_admin=False, full_name="email")
+        try:
+            await approval_service.act_bh_signoff(conn, row["id"], action="APPROVED", user=user)
+        except HTTPException:
+            return Response("<h3>Could not approve — it may already have been actioned.</h3>",
+                            media_type="text/html")
+        return Response("<h3>&#10003; Approved. The request is now with the NPD team.</h3>"
+                        "<script>setTimeout(function(){try{window.close()}catch(e){}},400)</script>",
+                        media_type="text/html")
+
+
+@router.post("/email/bh-signoff-reject")
+async def email_bh_signoff_reject(request: Request, body: schemas.BhSignoffEmailReject):
+    """Reject a requisition-stage BH approval from the web app's email-driven reason
+    dialog. PUBLIC — the submit is authenticated by `email` being the bound business head
+    (mandatory), and a reason is required. Returns the refreshed requisition as JSON."""
+    email = (body.email or "").strip()
+    remarks = (body.remarks or "").strip()
+    if not email:
+        raise HTTPException(403, detail={"error": "unauthorised", "message": "This link is not authorised"})
+    if not remarks:
+        raise HTTPException(422, detail={"error": "reason_required", "message": "A reason is required to reject"})
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        row, urow = await _resolve_bh_signoff(conn, body.request_id, email)
+        if row is None or urow is None:
+            raise HTTPException(403, detail={"error": "not_an_approver",
+                                             "message": "This link is not authorised"})
+        import types as _t
+        user = _t.SimpleNamespace(user_id=urow["user_id"], role_name=urow["role_name"],
+                                  is_admin=False, full_name="email")
+        return await approval_service.act_bh_signoff(
+            conn, row["id"], action="REJECTED", user=user, remarks=remarks)
+
+
 async def _resolve_promote_approver(conn, dev_jc_id: int, kind: str, email: str):
     """Authenticate an email-link approver against the gate it claims (mandatory check):
     INV_MGR → an ACTIVE inventory_manager with that email; REQUESTOR_BH → the user bound
@@ -555,6 +666,22 @@ async def bh_approve(
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
         return await approval_service.act_bh_approval(
+            conn, req_id, action=body.action, user=user, remarks=body.remarks)
+
+
+@router.post("/requisitions/{req_id}/bh-signoff")
+async def bh_signoff(
+    request: Request,
+    req_id: int,
+    body: schemas.BhSignoffBody,
+    user: AuthUser = Depends(require_permission("sample", "approve", action="create")),
+):
+    """086 — the bound business head approves/rejects a held NPD/TRIAL request. Approving
+    releases it to the NPD team; rejecting moves it to BH_REJECTED and NPD never sees it.
+    The service enforces that the caller IS the bound BH (or an admin)."""
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await approval_service.act_bh_signoff(
             conn, req_id, action=body.action, user=user, remarks=body.remarks)
 
 

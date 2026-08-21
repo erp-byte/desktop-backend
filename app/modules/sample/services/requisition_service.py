@@ -358,6 +358,9 @@ async def list_requisitions(conn, *, status: str | None = None,
     target article, description and requestor. `date_from` / `date_to`
     bound created_at (inclusive, by calendar date). Each row carries `hold_reason`
     — the most recent HOLD remark — so the queue can surface it on the Hold pill.
+
+    The free-text search deliberately spans the CUSTOMER too (name + company): those are
+    columns on the queue, and a field you can see but not search reads as broken.
     """
     rows = await conn.fetch(
         """
@@ -380,6 +383,10 @@ async def list_requisitions(conn, *, status: str | None = None,
              OR COALESCE(sr.npd_target_name, '')   ILIKE '%' || $8 || '%'
              OR COALESCE(sr.description, '')        ILIKE '%' || $8 || '%'
              OR COALESCE(sr.requestor_team, '')     ILIKE '%' || $8 || '%'
+             -- The queue shows the customer, so the search box has to find one. Without
+             -- these, "who was that BigBasket sample for?" is unanswerable from the list.
+             OR COALESCE(sr.customer_name, '')      ILIKE '%' || $8 || '%'
+             OR COALESCE(sr.company_name, '')       ILIKE '%' || $8 || '%'
           ))
           AND ($9::text[] IS NULL OR sr.status = ANY($9))
          ORDER BY sr.created_at DESC
@@ -387,7 +394,42 @@ async def list_requisitions(conn, *, status: str | None = None,
         """,
         status, sample_type, warehouse, sample_types, requestor,
         date_from, date_to, q, statuses, limit, offset)
-    return [dict(r) for r in rows]
+    out = [dict(r) for r in rows]
+    await _attach_npd_targets(conn, out)
+    return out
+
+
+async def _attach_npd_targets(conn, rows: list[dict]) -> None:
+    """Hang each row's FULL target list (080) off `npd_targets`, in ONE batched read.
+
+    The header only mirrors target #1, so a queue built from it silently shows a
+    multi-article request as a single-article one. Rows that predate 080 have no child
+    rows — they fall back to the header mirror, exactly as the detail view does.
+
+    Best-effort and additive: 080 is hand-applied, so a missing table degrades to the
+    header synthesis rather than failing the whole list.
+    """
+    if not rows:
+        return
+    ids = [r["id"] for r in rows]
+    by_req: dict[int, list[dict]] = {}
+    try:
+        for t in await conn.fetch(
+                "SELECT requisition_id, id, name, pcs, weight_per_piece, quantity, line_order "
+                "  FROM sample_requisition_npd_targets "
+                " WHERE requisition_id = ANY($1::int[]) ORDER BY requisition_id, line_order, id",
+                ids):
+            by_req.setdefault(t["requisition_id"], []).append(
+                {k: t[k] for k in ("id", "name", "pcs", "weight_per_piece", "quantity")})
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to batch-read NPD targets for the queue (migration 080 applied?)")
+    for r in rows:
+        targets = by_req.get(r["id"])
+        if not targets and r.get("npd_target_name"):
+            targets = [{"name": r["npd_target_name"], "pcs": r.get("pcs"),
+                        "weight_per_piece": r.get("weight_per_piece"),
+                        "quantity": r.get("quantity")}]
+        r["npd_targets"] = targets or []
 
 
 async def list_requestors(conn, *, sample_types: list[str] | None = None) -> list[str]:
@@ -456,6 +498,16 @@ async def has_sales_poc_columns(conn) -> bool:
     return bool(await conn.fetchval(
         "SELECT 1 FROM information_schema.columns "
         "WHERE table_name = 'sample_requisitions' AND column_name = 'sales_poc_user_id'"))
+
+
+async def has_bh_signoff_columns(conn) -> bool:
+    """Whether migration 086 is applied. Same hand-applied-migration caveat as
+    has_sales_poc_columns: without this guard an unmigrated environment would 500 on
+    every submit. A False here means "no requisition-stage BH gate", which is exactly
+    the pre-086 behaviour."""
+    return bool(await conn.fetchval(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_name = 'sample_requisitions' AND column_name = 'bh_signoff_state'"))
 
 
 async def list_sales_pocs(conn) -> list[dict]:
@@ -638,12 +690,42 @@ async def update_requisition(conn, req_id: int, *, payload: dict, user) -> dict:
             actor_user_id=user.user_id, actor_role=user.role_name,
             remarks="Requisition edited")
 
+    # 086: re-pointing the business head on a request that is still WAITING on one moves
+    # the gate to a different person — who has been told nothing. Ask the new BH (and
+    # re-evaluate, since the new pairing may now be "the POC is the BH", which needs no
+    # approval at all). Only fires while the gate is actually PENDING, so a normal edit is
+    # untouched. Best-effort, after commit.
+    gate_moved = False
+    if (req["sample_type"] in ("NPD", "TRIAL")
+            and req.get("bh_signoff_state") == "PENDING"
+            and (new_bh_uid is not None or poc_touched)):
+        try:
+            from app.modules.sample.services import approval_service
+            after = await _fetch_req(conn, req_id)
+            state, _bh = approval_service.bh_signoff_decision(after or {})
+            if state != "PENDING":
+                # The edit removed the need for an approval — clear it the same way a
+                # submit would have, and hand the request on.
+                async with conn.transaction():
+                    await approval_service.arm_bh_signoff(conn, after, user=user)
+                await release_to_npd(conn, await get_requisition(conn, req_id))
+                gate_moved = True
+            elif new_bh_uid is not None and new_bh_uid != req.get("business_head_user_id"):
+                await approval_service.notify_bh_signoff(conn, await get_requisition(conn, req_id))
+                gate_moved = True
+        except Exception:  # noqa: BLE001
+            logger.exception("BH gate re-evaluation failed for req %s", req_id)
+
     # If the edited request is already in the NPD reviewers' queue (SUBMITTED /
     # ON_HOLD), re-notify them over WhatsApp with the updated details so they can
     # re-decide. Best-effort, after commit — never blocks the edit. Edits while
     # still DRAFT (not yet sent to NPD) don't notify. req["status"] is pre-update;
     # the PATCH never changes status, so it still reflects the review state.
-    if req["sample_type"] in ("NPD", "TRIAL") and req["status"] in ("SUBMITTED", "ON_HOLD"):
+    # A request still held for its business head was never handed to NPD, so there is
+    # nothing to re-notify them about — and gate_moved has already messaged the right
+    # party (the new BH, or NPD on a release).
+    if (req["sample_type"] in ("NPD", "TRIAL") and req["status"] in ("SUBMITTED", "ON_HOLD")
+            and req.get("bh_signoff_state") != "PENDING" and not gate_moved):
         try:
             from app.modules.sample.services import whatsapp_service as wa
             fresh = await _fetch_req(conn, req_id)
@@ -698,8 +780,50 @@ async def request_production_item(conn, req_id: int, *, user, note: str | None =
     return fresh
 
 
+async def release_to_npd(conn, req: dict) -> None:
+    """Hand an NPD / TRIAL request to the NPD team: the in-app alert plus the buttoned
+    Accept/Hold review card over WhatsApp and email.
+
+    Split out of submit_requisition by 086, because the handoff no longer always happens
+    AT submit — when the requisition-stage business-head gate is armed the request is
+    held back until that BH approves, and approval_service.act_bh_signoff calls this
+    then instead. Best-effort throughout: a transport failure must never block the
+    lifecycle move that preceded it.
+    """
+    req_id = req["id"]
+    tgt = req.get("npd_target_name")
+    try:
+        await notification_service.emit_alert(
+            conn, alert_type="sample_npd_requested",
+            target_team=notification_service.TEAM_NPD,
+            message=(f"New {req['sample_type']} request {req['request_id']} "
+                     f"raised for development" + (f": {tgt}." if tgt else ".")),
+            related_id=req_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("NPD handoff alert failed for req %s", req_id)
+    # WhatsApp the NPD reviewers so they can accept / hold straight from WhatsApp —
+    # the hold reason is captured from their reply.
+    try:
+        from app.modules.sample.services import whatsapp_service as wa
+        await wa.notify_npd_review(conn, req)
+    except Exception:  # noqa: BLE001
+        logger.exception("WhatsApp NPD review notify failed for req %s", req_id)
+    try:
+        from app.modules.sample.services import sample_mail_service as mail
+        await mail.notify_npd_review_email(conn, req)
+    except Exception:  # noqa: BLE001
+        logger.exception("Sample review email failed for req %s", req_id)
+
+
 async def submit_requisition(conn, req_id: int, *, user) -> dict:
-    """DRAFT|BH_REJECTED -> SUBMITTED with validation guards (spec §8)."""
+    """DRAFT|BH_REJECTED -> SUBMITTED with validation guards (spec §8).
+
+    086: an NPD / TRIAL submit runs the requisition-stage business-head gate first
+    (approval_service.arm_bh_signoff). When the gate is armed the request is HELD —
+    the NPD team is not told about it until the BH approves. When it auto-clears (the
+    sales POC IS the business head, or no BH was named) the handoff happens right here,
+    exactly as it did before.
+    """
     req = _require(await _fetch_req(conn, req_id), req_id)
     _assert_transition(req["status"], "SUBMITTED")
 
@@ -724,32 +848,24 @@ async def submit_requisition(conn, req_id: int, *, user) -> dict:
             old_value={"status": req["status"]}, new_value={"status": "SUBMITTED"},
             actor_user_id=user.user_id, actor_role=user.role_name,
             remarks="Submitted for BH approval")
-        # Path A handoff: a raised NPD / TRIAL request is the business team asking
-        # NPD to develop an article — alert the NPD team so they can pick it up
-        # (recipe authoring is allowed pre-approval; promotion still needs the BH
-        # gate). Other sample types route through the approval-stage alerts only.
+        # Path A handoff: a raised NPD / TRIAL request is the business team asking NPD
+        # to develop an article. Arm (or auto-clear) the BH gate INSIDE the same
+        # transaction as the status move, so a request can never end up SUBMITTED with
+        # no gate state — that state is what decides whether NPD hears about it at all.
+        gate = None
         if req["sample_type"] in ("NPD", "TRIAL"):
-            tgt = req.get("npd_target_name")
-            await notification_service.emit_alert(
-                conn, alert_type="sample_npd_requested",
-                target_team=notification_service.TEAM_NPD,
-                message=(f"New {req['sample_type']} request {req['request_id']} "
-                         f"raised for development" + (f": {tgt}." if tgt else ".")),
-                related_id=req_id)
+            from app.modules.sample.services import approval_service
+            gate = await approval_service.arm_bh_signoff(conn, req, user=user)
 
-    # WhatsApp the NPD reviewers (best-effort, after commit) so they can accept /
-    # hold straight from WhatsApp — the hold reason is captured from their reply.
+    # After commit, best-effort: either ask the business head, or hand to NPD — never
+    # both. A held request reaches NPD only once act_bh_signoff releases it.
     if req["sample_type"] in ("NPD", "TRIAL"):
-        try:
-            from app.modules.sample.services import whatsapp_service as wa
-            await wa.notify_npd_review(conn, req)
-        except Exception:  # noqa: BLE001
-            logger.exception("WhatsApp NPD review notify failed for req %s", req_id)
-        try:
-            from app.modules.sample.services import sample_mail_service as mail
-            await mail.notify_npd_review_email(conn, req)
-        except Exception:  # noqa: BLE001
-            logger.exception("Sample review email failed for req %s", req_id)
+        fresh = await get_requisition(conn, req_id)
+        if gate == "PENDING":
+            from app.modules.sample.services import approval_service
+            await approval_service.notify_bh_signoff(conn, fresh)
+        else:
+            await release_to_npd(conn, fresh)
     else:
         # The general sample flow (BASIS_RM / BASIS_FG / INTERNAL) has no NPD review step —
         # it goes straight to the business head. Post the submission into the trail so the

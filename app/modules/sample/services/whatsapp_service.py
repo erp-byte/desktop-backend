@@ -122,9 +122,17 @@ TPL_REVIEW = os.environ.get("WHATSAPP_TPL_NPD_REVIEW", "npd_request_review")
 TPL_UPDATED = os.environ.get("WHATSAPP_TPL_NPD_UPDATED", "npd_request_updated")
 TPL_ACCEPTED = os.environ.get("WHATSAPP_TPL_NPD_ACCEPTED", "npd_request_accepted")
 TPL_HOLD = os.environ.get("WHATSAPP_TPL_NPD_HOLD", "npd_request_on_hold")
-# Promote dual-approval gate (NPD dev job card): Approve / Reject quick replies.
+# Promote approval gate (NPD dev job card): Approve / Reject quick replies.
 TPL_PROMOTE = os.environ.get("WHATSAPP_TPL_NPD_PROMOTE", "npd_promote_approval")
 _PROMOTE_GATE_LABEL = {"INV_MGR": "Inventory manager", "REQUESTOR_BH": "Business head"}
+# Requisition-stage business-head approval (086): the SAME Approve / Reject quick replies,
+# now asked at the start of the flow instead of on the finished job card. It needs its own
+# Meta-approved template because the copy is about a REQUEST, not a recipe promotion —
+# create `npd_bh_approval` (1 header var + 9 body vars, Approve/Reject quick replies, same
+# shape as npd_promote_approval) in WhatsApp Manager. Until it is approved, point
+# WHATSAPP_TPL_BH_SIGNOFF at npd_promote_approval to fall back to the promote copy; the
+# send failure is logged loudly either way and the email card is unaffected.
+TPL_BH_SIGNOFF = os.environ.get("WHATSAPP_TPL_BH_SIGNOFF", "npd_bh_approval")
 # Verify token for the webhook GET handshake (set the same value in Meta).
 VERIFY_TOKEN = os.environ.get("WHATSAPP_VERIFY_TOKEN", "")
 # This WABA is shared with the standalone Visitor Management system, which sends its own
@@ -422,6 +430,52 @@ async def notify_requestor(conn, req: dict, *, action: str, reason: str | None =
         logger.warning("Requestor %s notify failed for req %s: %s — is template '%s' "
                        "registered + Approved (lang %s)?",
                        action, req.get("id"), resp.get("error"), tpl, TEMPLATE_LANG)
+
+
+# ── requisition-stage business-head approval (086) ───────────────────────────
+def _bh_signoff_params(req: dict) -> tuple[list[str], list[str]]:
+    """(header, body) for the BH approval template. HEADER {{1}} = request no; BODY
+    {{1}} = who raised it, {{2}} = request no, {{3}} = target article, {{4}} = qty,
+    {{5}} = company, {{6}} = customer, {{7}} = return type, {{8}} = paid, {{9}} = amount.
+    Deliberately the same 1+9 shape as _promote_params, so the promote template can stand
+    in as a fallback (see TPL_BH_SIGNOFF) without a parameter-count mismatch."""
+    number = _req_no(req)
+    qty = req.get("quantity")
+    qty_s = f"{_num(qty)} kg" if qty is not None else "—"
+    rtype = ("Returnable" if req.get("returnable")
+             else "Non-returnable" if req.get("non_returnable") else "—")
+    amt = req.get("amount")
+    amount = "—"
+    if req.get("paid") and amt is not None:
+        try:                                  # NUMERIC(12,2) → Decimal; defensive anyway
+            amount = f"{float(amt):,.2f}"
+        except (TypeError, ValueError):
+            amount = _txt(amt)
+    body = [_txt(req.get("sales_poc_name") or req.get("sales_poc_email") or "Sales"),
+            number, _txt(req.get("npd_target_name")), qty_s,
+            _txt(req.get("company_name")), _txt(req.get("customer_name")),
+            rtype, ("Yes" if req.get("paid") else "No"), amount]
+    return [number], body
+
+
+async def notify_bh_signoff(conn, req: dict) -> None:
+    """Message the bound business head that a request raised on their behalf needs their
+    Approve / Reject. One recipient — the gate binds to that one person. Best-effort."""
+    bh_uid = req.get("business_head_user_id")
+    phone = await _phone_for_user(conn, bh_uid)
+    if not phone:
+        logger.warning("Business head %s has no phone — skipping BH approval WhatsApp for "
+                       "req %s (the email card still went out)", bh_uid, req.get("id"))
+        return
+    header, body = _bh_signoff_params(req)
+    resp = await _send_template(phone, TPL_BH_SIGNOFF, body, header_params=header)
+    wamid = _wamid(resp)
+    if wamid and req.get("id") is not None:
+        await _store_review_message(conn, wamid, req["id"], "BH_SIGNOFF", phone)
+    elif isinstance(resp, dict) and resp.get("error"):
+        logger.warning("BH approval notify to %s failed for req %s: %s — is template '%s' "
+                       "registered + Approved (lang %s)?",
+                       phone, req.get("id"), resp.get("error"), TPL_BH_SIGNOFF, TEMPLATE_LANG)
 
 
 # ── promote dual-approval gate (job-card approval) ───────────────────────────
@@ -749,9 +803,60 @@ async def _set_pending_hold(conn, wa_phone: str, req_id: int) -> None:
 
 
 async def _pop_pending(conn, wa_phone: str) -> dict | None:
+    """Pop an armed NPD HOLD prompt. Scoped to action='HOLD' so a BH's armed reject
+    reason (086) can never be swallowed by the NPD review flow, and vice versa."""
     row = await conn.fetchrow(
-        "DELETE FROM wa_pending_action WHERE wa_phone = $1 RETURNING requisition_id, action", wa_phone)
+        "DELETE FROM wa_pending_action WHERE wa_phone = $1 AND action = 'HOLD' "
+        "RETURNING requisition_id, action", wa_phone)
     return dict(row) if row else None
+
+
+async def _set_pending_bh_reject(conn, wa_phone: str, req_id: int) -> None:
+    """Arm 'the next plain reply from this number is the BH's reject reason' — the same
+    arm-and-wait the NPD hold prompt uses, since a rejection must carry a reason."""
+    await conn.execute(
+        """INSERT INTO wa_pending_action (wa_phone, requisition_id, action)
+           VALUES ($1, $2, 'BH_REJECT')
+           ON CONFLICT (wa_phone) DO UPDATE
+             SET requisition_id = EXCLUDED.requisition_id, action = 'BH_REJECT', created_at = NOW()""",
+        wa_phone, req_id)
+
+
+async def _pop_pending_bh_reject(conn, wa_phone: str) -> int | None:
+    return await conn.fetchval(
+        "DELETE FROM wa_pending_action WHERE wa_phone = $1 AND action = 'BH_REJECT' "
+        "RETURNING requisition_id", wa_phone)
+
+
+async def _bh_signoff_req_for_wamid(conn, wamid: str | None) -> int | None:
+    """The requisition a tapped BH Approve/Reject refers to, via the quoted message id."""
+    if not wamid:
+        return None
+    return await conn.fetchval(
+        "SELECT requisition_id FROM wa_review_message WHERE wamid = $1 AND kind = 'BH_SIGNOFF'",
+        wamid)
+
+
+async def _apply_bh_signoff(conn, user, wa: str, req_id: int, action: str,
+                            reason: str | None) -> dict:
+    """Run act_bh_signoff and reply with the outcome. Translates the service's
+    HTTPException into a friendly reply (a stale re-tap just reports 'already actioned')."""
+    from fastapi import HTTPException
+    from app.modules.sample.services import approval_service
+    try:
+        await approval_service.act_bh_signoff(
+            conn, req_id, action=action, user=user, remarks=reason)
+    except HTTPException as e:
+        detail = e.detail if isinstance(e.detail, dict) else {"message": str(e.detail)}
+        await _send_text(wa, "Couldn't record that — "
+                             f"{detail.get('message', 'it may already have been actioned')}.")
+        return {"ok": False, "reason": detail.get("error", "error")}
+    if action == "REJECTED":
+        msg = "✗ Rejected — the request will not go to NPD." + (f" Reason: {reason}" if reason else "")
+    else:
+        msg = "✓ Approved — the request has been sent to the NPD team."
+    await _send_text(wa, msg)
+    return {"ok": True, "requisition_id": req_id, "action": action}
 
 
 async def _resolve_reviewer(conn, wa_phone: str) -> dict | None:
@@ -854,6 +959,44 @@ async def handle_inbound(conn, *, from_phone: str, text: str, context_id: str | 
     if po_res is not None:
         return po_res
 
+    # ── BUSINESS-HEAD approval on the REQUEST (086) — resolved before the promote and
+    #    NPD-review flows, since the BH is neither an npd_team reviewer nor a promote
+    #    approver, and a bare "Approve" tap must not be mistaken for either. ──
+    # (a) Approve / Reject quoting the BH approval card (context.id → wa_review_message).
+    bh_req_id = await _bh_signoff_req_for_wamid(conn, context_id) if context_id else None
+    if bh_req_id:
+        u = await _resolve_user(conn, wa)
+        if u is None:
+            await _send_text(wa, "Sorry, this number isn't recognised.")
+            return {"ok": False, "reason": "unauthorised"}
+        user = _WaUser(u["user_id"], u["role_name"])
+        if first in _PROMOTE_REJECT_WORDS or body.strip().upper() in _PROMOTE_REJECT_SYNONYMS:
+            await _set_pending_bh_reject(conn, wa, bh_req_id)
+            await _send_text(wa, "Rejecting the request — please reply with the reason.")
+            return {"ok": True, "awaiting": "bh_reject_reason", "requisition_id": bh_req_id}
+        # Only an explicit approve VERB approves. Free text quoting the card is a question,
+        # not a decision — answering it with "✓ Approved" would record one nobody made.
+        if not (first in _PROMOTE_APPROVE_WORDS
+                or body.strip().upper() in _PROMOTE_APPROVE_SYNONYMS):
+            await _send_text(wa, "Tap Approve or Reject on the request above — "
+                                 "or reply APPROVE / REJECT.")
+            return {"ok": False, "reason": "unparsed", "requisition_id": bh_req_id}
+        return await _apply_bh_signoff(conn, user, wa, bh_req_id, "APPROVED", None)
+    # (b) A reply with NO quoted button, while a BH reject is armed, IS the reason.
+    if not context_id:
+        pending_bh = await _pop_pending_bh_reject(conn, wa)
+        if pending_bh:
+            if not body:
+                await _set_pending_bh_reject(conn, wa, pending_bh)   # re-arm
+                await _send_text(wa, "Please send the reject reason as a text message.")
+                return {"ok": False, "reason": "empty_reason"}
+            u = await _resolve_user(conn, wa)
+            if u is None:
+                await _send_text(wa, "Sorry, this number isn't recognised.")
+                return {"ok": False, "reason": "unauthorised"}
+            return await _apply_bh_signoff(conn, _WaUser(u["user_id"], u["role_name"]),
+                                           wa, pending_bh, "REJECTED", body)
+
     # ── PROMOTE gate (job-card approval) — resolved BEFORE the NPD review flow, since
     #    its approvers (inventory_manager / requestor BH) are NOT npd_team reviewers. ──
     # (a) Approve / Reject button tap quoting a promote message (context.id → wa_promote_message).
@@ -899,7 +1042,9 @@ async def handle_inbound(conn, *, from_phone: str, text: str, context_id: str | 
     syn_approve = single in _PROMOTE_APPROVE_SYNONYMS
     syn_reject = single in _PROMOTE_REJECT_SYNONYMS
     if first in _PROMOTE_VERBS or syn_approve or syn_reject:
-        # A tap quoting a known NPD-REVIEW message is review traffic — leave it alone.
+        # A tap quoting a known NPD-REVIEW or BH-approval message is requisition traffic
+        # — leave it alone (a BH card was already handled above; this stops an unresolved
+        # one from being re-read as a promote).
         review_ctx = bool(context_id) and await conn.fetchval(
             "SELECT 1 FROM wa_review_message WHERE wamid = $1", context_id)
         # A bare yes/no synonym must NOT swallow a one-word NPD hold reason: if this phone

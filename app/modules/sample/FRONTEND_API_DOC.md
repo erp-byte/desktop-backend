@@ -24,7 +24,7 @@ INTERNALLY_DISPATCHED ─convert-partial→ PARTIALLY_CONVERTED (+ child → GAT
 |---|---|---|
 | view | `sample/view` | all (viewer+) |
 | create/edit requisition, submit | `sample/create`, `sample/edit` | planner, business_head, npd_team, admin |
-| BH approve/reject | `sample/approve/create` | business_head, admin |
+| BH approve/reject, BH sign-off (086) | `sample/approve/create` | business_head, admin |
 | production ack (start/packing) | `sample/production_ack/create` | floor_manager, admin |
 | outward, dispatch, inv-verify, mark-ready | `sample/inv_signoff/create` | inventory_manager, admin |
 | NPD draft author / promote | `sample/npd/create`, `sample/npd/promote/create` | npd_team, admin |
@@ -38,11 +38,35 @@ INTERNALLY_DISPATCHED ─convert-partial→ PARTIALLY_CONVERTED (+ child → GAT
 |---|---|---|---|
 | POST | `/requisitions` | `RequisitionCreate` | creates DRAFT + article lines |
 | GET | `/requisitions?status=&sample_type=&entity=&limit=&offset=` | — | list (newest first) |
-| GET | `/requisitions/{id}` | — | detail: `{...req, articles[], approvals[], audit[]}` |
+| GET | `/requisitions/{id}` | — | detail: `{...req, articles[], approvals[], audit[]}`. `bh_signoff_state` (086) is `PENDING\|APPROVED\|AUTO_APPROVED\|REJECTED\|NOT_REQUIRED`, or absent on pre-086 rows. |
 | PATCH | `/requisitions/{id}` | `RequisitionUpdate` | DRAFT / BH_REJECTED only |
 | POST | `/requisitions/{id}/submit` | — | guards: ≥1 article, valid sku_id, qty>0 |
 | POST | `/requisitions/{id}/cancel` | `{reason}` | any non-terminal status |
-| POST | `/requisitions/{id}/approve` | `{action: APPROVED\|REJECTED, remarks?}` | reject requires remarks |
+| POST | `/requisitions/{id}/approve` | `{action: APPROVED\|REJECTED, remarks?}` | reject requires remarks; non-NPD flow |
+| POST | `/requisitions/{id}/bh-signoff` | `{action: APPROVED\|REJECTED, remarks?}` | **086** — the NPD/TRIAL business-head gate. Only actionable while `bh_signoff_state = PENDING`, and only by the BOUND `business_head_user_id` (or an admin). Approve releases the request to the NPD team (status stays SUBMITTED); reject moves it to BH_REJECTED and requires a reason. |
+
+### Business-head approval on an NPD/TRIAL request (086)
+The BH approval used to sit on the dev job card's promote (a `REQUESTOR_BH` gate). It now
+sits on the REQUEST, and the promote raises only its `INV_MGR` gate.
+
+On submit of an NPD/TRIAL requisition:
+- `sales_poc_user_id != business_head_user_id` → `bh_signoff_state = PENDING`. The BH is
+  messaged (email card with Approve/Reject + the WhatsApp template); the NPD team is **not**
+  told about the request at all until that approval lands.
+- otherwise (the BH raised it themselves, or no BH was named) → `AUTO_APPROVED` /
+  `NOT_REQUIRED`, no message, straight to NPD. An `AUTO_APPROVED` gate still writes a
+  `REQUESTOR_BH_SIGNOFF` approval row so the audit distinguishes it from "never asked".
+
+`POST /requisitions/{id}/npd-review` returns 409 `awaiting_bh_signoff` while the gate is
+PENDING.
+
+Public, email-authenticated endpoints behind the mail buttons (no session):
+
+| Method | Path | Body / query | Notes |
+|---|---|---|---|
+| GET | `/email/bh-signoff` | `request_id, status=approve, email, t` | renders the POST-confirm page (a link-scanner's GET cannot approve) |
+| POST | `/email/bh-signoff` | `request_id, email, t` (form) | the real approve; `t` is the HMAC over `("bh_signoff", request_id, email)` |
+| POST | `/email/bh-signoff-reject` | `{request_id, email, remarks}` | reason required; the mail's Reject button routes via the web app's request page (`?bh_reject=<request_id>&email=`) |
 
 ### Outward & dispatch (Basis RM / Internal)
 | Method | Path | Body | Notes |
