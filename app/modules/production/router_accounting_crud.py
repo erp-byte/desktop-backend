@@ -55,6 +55,10 @@ class BalanceMaterialLine(BaseModel):
     material_name: str | None = None
     balance_type: str
     qty_kg: float = 0.0
+    # Unit for qty_kg (migration 094). Nullable on purpose: a missing unit
+    # reads as unknown, which is honest, where defaulting to KGS would
+    # relabel a PM line counted in pieces as a weight.
+    uom: str | None = None
     bom_line_id: int | None = None
     material_id: int | None = None
     remarks: str | None = None
@@ -72,6 +76,7 @@ class AdditiveLine(BaseModel):
     sku_name: str | None = None
     material_name: str | None = None
     qty_kg: float = 0.0
+    uom: str | None = None      # see BalanceMaterialLine.uom (migration 094)
     remarks: str | None = None
 
 

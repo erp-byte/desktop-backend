@@ -203,14 +203,14 @@ _BALANCE = {
     "table": "job_card_balance_material_v2",
     "pk": "balance_id",
     "key": ("bom_line_id", "balance_type"),
-    "values": ("material_name", "material_id", "qty_kg", "remarks"),
+    "values": ("material_name", "material_id", "qty_kg", "uom", "remarks"),
     "conflict": "(job_card_id, COALESCE(batch_id, 0), COALESCE(bom_line_id, 0), balance_type)",
 }
 _ADDITIVES = {
     "table": "job_card_additive_consumption_v2",
     "pk": "additive_id",
     "key": ("sku_name", "material_name"),
-    "values": ("qty_kg", "remarks"),
+    "values": ("qty_kg", "uom", "remarks"),
     # This one's index (created by migration 092) is PARTIAL, so the inference
     # clause MUST repeat the predicate or Postgres raises
     # "no unique or exclusion constraint matching the ON CONFLICT specification".
@@ -340,6 +340,10 @@ def _shape(output, sections: dict, qc, *, job_card_id: int, plan_id: int,
             "material_name": r.get("material_name"),
             "balance_type": r.get("balance_type"),
             "qty_kg": _f(r.get("qty_kg")),
+            # uom (094). Deliberately NOT defaulted to KGS: an unstated unit
+            # must read as unknown, or a PM line counted in pieces silently
+            # becomes a weight — the defect 094 exists to end.
+            "uom": _s(r.get("uom")),
             "bom_line_id": r.get("bom_line_id"),
             "material_id": r.get("material_id"),
             "remarks": r.get("remarks"),
@@ -348,6 +352,7 @@ def _shape(output, sections: dict, qc, *, job_card_id: int, plan_id: int,
             "sku_name": r.get("sku_name"),
             "material_name": r.get("material_name"),
             "qty_kg": _f(r.get("qty_kg")),
+            "uom": _s(r.get("uom")),        # see balance_materials.uom (094)
             "remarks": r.get("remarks"),
         } for r in sections["additives"]],
         "qc": ({
@@ -433,6 +438,7 @@ def _incoming_lines(payload: dict) -> dict:
             "material_name": _s(r.get("material_name")),
             "balance_type": _s(r.get("balance_type")),
             "qty_kg": _q(r.get("qty_kg")),
+            "uom": _s(r.get("uom")),        # 094; None = unit not stated
             "bom_line_id": r.get("bom_line_id"),
             "material_id": r.get("material_id"),
             "remarks": _s(r.get("remarks")),
@@ -441,6 +447,7 @@ def _incoming_lines(payload: dict) -> dict:
             "sku_name": _s(r.get("sku_name")),
             "material_name": _s(r.get("material_name")),
             "qty_kg": _q(r.get("qty_kg")),
+            "uom": _s(r.get("uom")),        # 094; None = unit not stated
             "remarks": _s(r.get("remarks")),
         } for r in payload.get("additives") or []],
     }

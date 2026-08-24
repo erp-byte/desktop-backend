@@ -3791,9 +3791,9 @@ async def replace_balance_materials(conn, *, job_card_id: int,
                 INSERT INTO job_card_balance_material_v2 (
                     balance_id, job_card_id, batch_id, bom_line_id,
                     material_id, material_name, balance_type, qty_kg,
-                    remarks, recorded_by
+                    uom, remarks, recorded_by
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 RETURNING *
                 """,
                 new_short_time_id(),
@@ -3804,6 +3804,10 @@ async def replace_balance_materials(conn, *, job_card_id: int,
                 _r.get("material_name") or _r.get("material_sku_name"),
                 _r["balance_type"],
                 float(_r.get("qty_kg") or 0),
+                # uom (094): whatever the caller states, else NULL = unknown.
+                # Never defaulted to KGS here — that would relabel a PM line
+                # counted in pieces as a weight.
+                _r.get("uom"),
                 _r.get("remarks"),
                 recorded_by,
             )
