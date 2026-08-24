@@ -586,3 +586,162 @@ async def test_batch_close_works_when_no_accounting_record_exists(ctx):
         "SELECT output_qty_kg FROM job_card_output_v2 WHERE job_card_id=$1 "
         "AND batch_id=$2 AND deleted_at IS NULL", fx["job_card_id"], fx["batch_id"])
     assert _num(row["output_qty_kg"]) == 150.0
+
+
+# ---------------------------------------------------------------------------
+# uom on balance materials / additives — migration 094.
+#
+# Both tables stored a bare qty_kg with no unit. That was invisible while every
+# line was a weight, and wrong as soon as the Accounting Summary began listing PM
+# rows: a zipper pouch is counted in pieces, so "0.00 kg of pouch" is a category
+# error, not a small number. 094 adds a NULLABLE uom; these tests pin the two
+# properties that make it safe — a non-kg unit survives the round trip, and an
+# absent unit is NOT silently relabelled as kilograms.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_balance_and_additive_uom_round_trip(ctx):
+    """A unit the caller states comes back unchanged, including a non-kg one."""
+    conn, fx = ctx
+    ids = {k: fx[k] for k in ("job_card_id", "plan_id", "batch_id")}
+    p = _full_payload(fx)
+    p["balance_materials"][0]["uom"] = "PCS"      # a counted packaging line
+    p["additives"][0]["uom"] = "GMS"
+    await svc.create_record(conn, **ids, payload=p, actor="test")
+
+    got = await svc.get_record(conn, **ids)
+    assert got["balance_materials"][0]["uom"] == "PCS", (
+        "a non-kg unit on a balance line did not survive the round trip — the "
+        "whole point of 094 is that a counted line stops reading as kilograms")
+    assert got["additives"][0]["uom"] == "GMS"
+
+    # And against the RAW table, not just the wire model.
+    row = await conn.fetchrow(
+        "SELECT uom, qty_kg FROM job_card_balance_material_v2 "
+        "WHERE job_card_id=$1 AND deleted_at IS NULL", fx["job_card_id"])
+    assert row["uom"] == "PCS"
+
+
+@pytest.mark.asyncio
+async def test_absent_uom_is_null_not_silently_kgs(ctx):
+    """An omitted unit must read as unknown.
+
+    Defaulting to KGS here would relabel a pieces quantity as a weight — the
+    exact defect 094 exists to end — so NULL is the correct stored value.
+    """
+    conn, fx = ctx
+    ids = {k: fx[k] for k in ("job_card_id", "plan_id", "batch_id")}
+    p = _full_payload(fx)
+    p["balance_materials"][0].pop("uom", None)
+    p["additives"][0].pop("uom", None)
+    await svc.create_record(conn, **ids, payload=p, actor="test")
+
+    row = await conn.fetchrow(
+        "SELECT uom FROM job_card_balance_material_v2 "
+        "WHERE job_card_id=$1 AND deleted_at IS NULL", fx["job_card_id"])
+    assert row["uom"] is None, (
+        "an unstated unit was defaulted to %r; it must stay NULL so the UI can "
+        "show 'unknown' instead of asserting kilograms" % (row["uom"],))
+
+
+@pytest.mark.asyncio
+async def test_uom_change_is_detected_by_the_per_line_diff(ctx):
+    """Changing only the unit must register as a change, not be swallowed.
+
+    uom is a text column added to the section's `values` tuple; if it were left
+    out, an operator correcting kg -> PCS would see "saved" and the row would not
+    move.
+    """
+    conn, fx = ctx
+    ids = {k: fx[k] for k in ("job_card_id", "plan_id", "batch_id")}
+    p = _full_payload(fx)
+    p["balance_materials"][0]["uom"] = "KGS"
+    await svc.create_record(conn, **ids, payload=p, actor="test")
+
+    p2 = _full_payload(fx)
+    p2["balance_materials"][0]["uom"] = "PCS"     # only the unit differs
+    res = await svc.update_record(conn, **ids, payload=p2, actor="test")
+    assert res["changes"]["balance_materials"]["updated"] == 1, (
+        "a uom-only edit was not detected: %r" % (res["changes"]["balance_materials"],))
+    got = await svc.get_record(conn, **ids)
+    assert got["balance_materials"][0]["uom"] == "PCS"
+
+
+@pytest.mark.asyncio
+async def test_pre_094_database_breaks_inserts_but_not_reads_or_plain_updates():
+    """Exactly which operations a missing `uom` column breaks.
+
+    092 shipped in the same commit as the code that read its columns, the deploy
+    pulled the code without running the migrator, and every GET /job-cards-v2/{id}
+    returned 500. 094 has the same shape, so the blast radius belongs in a test
+    rather than in prose — and the prose was wrong. "Writes fail" is too broad:
+
+      read                     -> fine. _fetch_sections uses SELECT *.
+      UPDATE, uom unchanged    -> fine. _upsert_section builds its SET list from
+                                  `diffs`, i.e. only the columns that changed, so
+                                  a qty-only edit never names uom.
+      INSERT (any new line)    -> FAILS. The insert names the whole
+                                  spec["values"] tuple, which now includes uom.
+
+    So the practical exposure is creating a record or adding a material, not
+    editing a quantity on one that already exists.
+
+    NOTE statement_cache_size=0: asyncpg caches prepared statements per
+    connection, so dropping a column mid-connection otherwise raises
+    InvalidCachedStatementError before the code under test is reached.
+    """
+    conn = await asyncpg.connect(DSN, timeout=30, statement_cache_size=0)
+    try:
+        has_uom = await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns "
+            "WHERE table_name='job_card_balance_material_v2' AND column_name='uom')")
+        if not has_uom:
+            pytest.skip("migration 094 not applied to this database")
+        fx = await _pick_fixture(conn)
+        if fx is None:
+            pytest.skip("no suitable job card / batch / bom_line fixture")
+        ids = {k: fx[k] for k in ("job_card_id", "plan_id", "batch_id")}
+
+        tx = conn.transaction()
+        await tx.start()
+        try:
+            for t in ("job_card_output_v2", "job_card_material_consumption_v2",
+                      "job_card_byproducts_v2", "job_card_balance_material_v2",
+                      "job_card_additive_consumption_v2", "job_card_qc_v2",
+                      "job_card_accounting_v2"):
+                await conn.execute(f"DELETE FROM {t} WHERE job_card_id=$1",
+                                   fx["job_card_id"])
+            # The record must EXIST first, or update_record returns {"error": ...}
+            # without issuing SQL and the test proves nothing.
+            created = await svc.create_record(conn, **ids, payload=_full_payload(fx),
+                                              actor="test")
+            assert not created.get("error"), created
+
+            await conn.execute("ALTER TABLE job_card_balance_material_v2     DROP COLUMN uom")
+            await conn.execute("ALTER TABLE job_card_additive_consumption_v2 DROP COLUMN uom")
+
+            # 1. reads survive
+            got = await svc.get_record(conn, **ids)
+            assert got.get("balance_materials"), "read path broke without uom"
+
+            # 2. an UPDATE that does not touch uom survives
+            p2 = _full_payload(fx)
+            p2["balance_materials"][0]["qty_kg"] = 7.77
+            res = await svc.update_record(conn, **ids, payload=p2, actor="test")
+            assert not res.get("error"), res
+            assert res["changes"]["balance_materials"]["updated"] == 1
+
+            # 3. an INSERT of a NEW line does not — it names the full values tuple
+            p3 = _full_payload(fx)
+            p3["balance_materials"].append({
+                "material_name": "A second balance line",
+                "balance_type": "wastage", "qty_kg": 1.0,
+                "bom_line_id": None, "material_id": None,
+            })
+            with pytest.raises(asyncpg.exceptions.UndefinedColumnError):
+                await svc.update_record(conn, **ids, payload=p3, actor="test")
+        finally:
+            await tx.rollback()
+    finally:
+        await conn.close()

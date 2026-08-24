@@ -206,8 +206,8 @@ async def save_additives(
                 """
                 INSERT INTO job_card_additive_consumption_v2
                     (additive_id, job_card_id, batch_id, sku_name, material_name,
-                     qty_kg, remarks, recorded_by)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                     qty_kg, uom, remarks, recorded_by)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 """,
                 new_short_time_id(),
                 job_card_id,
@@ -215,6 +215,7 @@ async def save_additives(
                 sku_name,
                 material_name,
                 qty,
+                (raw.get("uom") or None),   # 094; NULL = unit not stated
                 remarks,
                 recorded_by,
             )

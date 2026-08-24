@@ -414,6 +414,16 @@ SQL_FILES = [
     # header for why the pre-existing unique indexes are deliberately left
     # non-partial.
     DB_DIR / "092_accounting_crud.sql",
+    # 094 adds `uom` to the balance-material and additive lines. Both tables
+    # stored a bare qty_kg with no unit, which only became wrong once the
+    # Accounting Summary started listing PM rows — a pouch is counted in
+    # pieces, not kilograms. Their sibling tables (consumption, byproducts)
+    # have always had uom. Existing rows are stamped KGS, which is what a
+    # column named qty_kg has always meant; the column stays NULLABLE so a
+    # missing unit reads as unknown rather than being relabelled as kg.
+    # MUST run before the backend that writes uom is deployed — see the file
+    # header, and tests/services/test_accounting_crud.py for what breaks.
+    DB_DIR / "094_balance_additive_uom.sql",
 ]
 
 # ── Optional: drop the v1 legacy job-card stack (TEST / Supabase DB ONLY) ──────
