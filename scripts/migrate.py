@@ -424,6 +424,17 @@ SQL_FILES = [
     # MUST run before the backend that writes uom is deployed — see the file
     # header, and tests/services/test_accounting_crud.py for what breaks.
     DB_DIR / "094_balance_additive_uom.sql",
+    # 095 seeds the ('bom', NULL, NULL, 'view') and ('bom', NULL, NULL, 'create')
+    # catalog rows for the new top-level BOM module and grants them to ADMIN ONLY
+    # for now -- the rows exist so the permissions are grantable later without a
+    # new migration. Both /api/v1/bom/* endpoints are gated on them, and
+    # check_permission denies when no catalog row exists at ANY level, so this
+    # MUST run before the backend that depends on them is deployed.
+    # NULL-safe by NOT EXISTS, not by ON CONFLICT: two of each row's four key
+    # columns are NULL and the UNIQUE is NULLS DISTINCT, so a bare ON CONFLICT
+    # would re-insert duplicates on every deploy -- and 076_dedupe_permissions.sql
+    # runs earlier, so it could not clean up after them.
+    DB_DIR / "095_bom_module_rbac.sql",
 ]
 
 # ── Optional: drop the v1 legacy job-card stack (TEST / Supabase DB ONLY) ──────

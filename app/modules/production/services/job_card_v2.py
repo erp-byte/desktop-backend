@@ -27,6 +27,7 @@ Stage chain:
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -2966,7 +2967,33 @@ async def list_job_cards(
                   JOIN so_line  sl ON sl.so_line_id = sf.so_line_id
                   JOIN so_header sh ON sh.so_id      = sl.so_id
                  WHERE pl.plan_line_id = jc.plan_line_id
-                   AND sh.so_number IS NOT NULL) AS so_numbers
+                   AND sh.so_number IS NOT NULL) AS so_numbers,
+               -- Per-batch completion roll-up for the list page (Stage 4).
+               -- Save Output now completes a batch, so "how far along is this
+               -- JC" became a question about its BATCHES, not only its own
+               -- status column: a JC sits at in_progress with 3 of 4 batches
+               -- already closed, and the list could not show that.
+               --
+               -- A scalar subquery, NOT a join: joining job_card_batch_v2
+               -- multiplies the JC row once per batch and silently inflates
+               -- both the page and the COUNT(*) beside it. An aggregate
+               -- subquery with no GROUP BY always returns exactly one row --
+               -- including for a JC with NO batches, which is the normal
+               -- early state and must not drop the row from the list.
+               (SELECT jsonb_build_object(
+                         'total',     COUNT(*),
+                         'closed',    COUNT(*) FILTER (WHERE b.status = 'closed'),
+                         'open',      COUNT(*) FILTER (WHERE b.status = 'open'),
+                         'cancelled', COUNT(*) FILTER (WHERE b.status = 'cancelled'),
+                         -- Closed batches only: an open batch's
+                         -- produced_qty_kg is not yet a statement of what
+                         -- was made.
+                         'produced_qty_kg',
+                             COALESCE(SUM(b.produced_qty_kg)
+                                      FILTER (WHERE b.status = 'closed'), 0),
+                         'last_closed_at', MAX(b.closed_at))
+                  FROM job_card_batch_v2 b
+                 WHERE b.job_card_id = jc.job_card_id) AS batch_summary
         FROM job_card_v2 jc
         WHERE {where}
         ORDER BY {sort_expr} {sort_dir} {nulls}, jc.job_card_id {sort_dir}
@@ -2975,8 +3002,33 @@ async def list_job_cards(
         *params, page_size, offset,
     )
 
+    # asyncpg hands JSONB back as a TEXT STRING — no type codec is registered
+    # anywhere in this app (plan_v2.list_plans decodes lines_summary the same
+    # way for the same reason). Without this the client receives
+    # batch_summary as a stringified blob and every `.closed` read is
+    # undefined, which fails silently as "no batches" rather than loudly.
+    _EMPTY_BATCH_SUMMARY = {
+        "total": 0, "closed": 0, "open": 0, "cancelled": 0,
+        "produced_qty_kg": 0, "last_closed_at": None,
+    }
+    serialised: list[dict] = []
+    for r in rows:
+        d = _serialize(r)
+        raw = d.get("batch_summary")
+        if isinstance(raw, str):
+            try:
+                d["batch_summary"] = json.loads(raw)
+            except (TypeError, ValueError):
+                d["batch_summary"] = dict(_EMPTY_BATCH_SUMMARY)
+        elif raw is None:
+            # A JC with no batches: the aggregate still returns a row, but
+            # give the client the zero shape rather than null so it never
+            # has to null-check before reading a count.
+            d["batch_summary"] = dict(_EMPTY_BATCH_SUMMARY)
+        serialised.append(d)
+
     return {
-        "results": [_serialize(r) for r in rows],
+        "results": serialised,
         "pagination": {
             "page": page,
             "page_size": page_size,
@@ -3566,10 +3618,27 @@ async def record_output(conn, *, job_card_id: int,
                         process_loss_remark: str | None = None,
                         recorded_by: str | None = None,
                         batch_id: int | None = None) -> dict:
-    """Append an output row for this JC. The output_kind defaults to the
+    """Record this batch's output row. The output_kind defaults to the
     JC's declared output_kind (SFG / WIP / FG from the stage chain) unless
     overridden — e.g. when the floor reports a partial FG batch that's
     actually still WIP because QC failed.
+
+    UPSERT, not the append this used to be. Migration 092 added
+    `uq_jc_output_v2_live_per_batch` — UNIQUE (job_card_id,
+    COALESCE(batch_id, 0)) WHERE deleted_at IS NULL — after production
+    accumulated 453 duplicate groups, which makes appending impossible: the
+    SECOND save against a batch raised UniqueViolationError, and
+    insert_with_pk_retry only swallows *_pkey violations (core/helpers.py)
+    and re-raises everything else, so it surfaced as a 500. close_batch has
+    upserted against this same index since 092; this is the writer that was
+    left behind.
+
+    The inference clause MUST repeat `WHERE deleted_at IS NULL`: Postgres
+    will not match a partial index without its predicate.
+
+    `notes` and `process_loss_remark` are COALESCEd so a save that passes
+    neither does not wipe text an earlier save (or the accounting record)
+    already wrote.
 
     yield_pct is computed server-side as (output / rm_consumed) × 100 when
     rm_consumed > 0; NULL otherwise. The JC's status is NOT auto-flipped
@@ -3613,6 +3682,20 @@ async def record_output(conn, *, job_card_id: int,
                  output_qty_units, output_kind, uom, yield_pct, notes,
                  recorded_by, process_loss_kg, process_loss_remark)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            ON CONFLICT (job_card_id, COALESCE(batch_id, 0))
+                WHERE deleted_at IS NULL
+            DO UPDATE SET
+                rm_consumed_kg      = EXCLUDED.rm_consumed_kg,
+                output_qty_kg       = EXCLUDED.output_qty_kg,
+                output_qty_units    = EXCLUDED.output_qty_units,
+                output_kind         = EXCLUDED.output_kind,
+                uom                 = EXCLUDED.uom,
+                yield_pct           = EXCLUDED.yield_pct,
+                notes               = COALESCE(EXCLUDED.notes, job_card_output_v2.notes),
+                recorded_by         = EXCLUDED.recorded_by,
+                process_loss_kg     = EXCLUDED.process_loss_kg,
+                process_loss_remark = COALESCE(EXCLUDED.process_loss_remark,
+                                               job_card_output_v2.process_loss_remark)
             RETURNING *
             """,
             new_short_time_id(),

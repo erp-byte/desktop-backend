@@ -37,6 +37,7 @@ from app.modules.lookups_router import router as lookups_router
 from app.modules.qc.router import router as qc_router
 from app.modules.packing.router import router as packing_router
 from app.modules.customer_returns.router import router as customer_returns_router
+from app.modules.bom.router import router as bom_router
 from app.modules.so.services.item_matcher import load_master_items
 from app.modules.production.services.master_ingest import run_master_ingest
 
@@ -174,6 +175,7 @@ app.include_router(lookups_router)
 app.include_router(qc_router)
 app.include_router(packing_router)
 app.include_router(customer_returns_router)
+app.include_router(bom_router)
 app.include_router(webhook_router)
 app.include_router(ws_router)
 

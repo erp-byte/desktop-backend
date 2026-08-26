@@ -57,6 +57,20 @@ def _raise_if_locked(result: dict | None) -> None:
         raise HTTPException(status_code=409, detail=result)
 
 
+def _actor_name(user: AuthUser) -> str:
+    """Server-side identity for the maker / checker / acknowledger columns.
+
+    SECURITY: these used to arrive as client-supplied strings in the request
+    body, so any authenticated user could post anybody's name as both maker
+    AND checker - the maker-checker segregation was decorative. The actor is
+    now always derived from the validated access token instead. A session may
+    legitimately carry an empty full_name, so fall back to email, then phone,
+    then the numeric user id, and never return "".
+    """
+    return (user.full_name or user.email or user.phone
+            or f"user:{user.user_id}")
+
+
 # ---------------------------------------------------------------------------
 # Pydantic models
 # ---------------------------------------------------------------------------
@@ -1285,6 +1299,126 @@ async def get_indent(request: Request, indent_id: int, user: AuthUser = Depends(
             result["plan_line"] = dict(pl) if pl else None
 
     return result
+
+
+class IndentEdit(BaseModel):
+    required_qty_kg: float | None = None
+    required_by_date: date | None = None
+    priority: int | None = None
+
+
+def _indent_result(result: dict) -> dict:
+    """Normalise an indent_manager return into the {"updated": bool} contract.
+
+    indent_manager predates these routes and signals refusal as
+    {"error": "not_draft" | "invalid_status" | "no_fields", "message": ...},
+    while the production_indent_service family signals it as
+    {"updated": False}. Two shapes for one meaning is how a caller ends up
+    reporting a no-op as a success: a client testing only for `updated`
+    reads a refusal dict as truthy-by-absence and shows the green path.
+
+    So every one of these endpoints funnels through here and speaks ONE
+    contract. `reason` carries the machine-readable discriminator so a caller
+    can tell "someone else already acknowledged this" from "nothing to save".
+    not_found stays the caller's problem to raise as a 404 - it is a bad
+    reference, not a stale view.
+    """
+    err = result.get("error")
+    if err:
+        return {"updated": False, "reason": err,
+                "message": result.get("message") or err}
+    # Success shapes are themselves inconsistent (edit_indent already sets
+    # updated=True, link_indent_to_po sets nothing), so stamp it rather than
+    # trusting the service to have done it.
+    return {**result, "updated": True}
+
+
+@router.put("/indents/{indent_id}")
+async def edit_purchase_indent(
+    request: Request,
+    indent_id: int,
+    body: IndentEdit,
+    user: AuthUser = Depends(require_permission("production", "indents", action="edit")),
+):
+    """Edit a draft purchase indent (qty / required-by date / priority).
+
+    Wrong-state and empty-patch come back as 200 with
+    {"updated": False, "reason": "not_draft" | "no_fields"} - the caller's
+    view is stale, not the request malformed. See _indent_result.
+    """
+    from app.modules.production.services.indent_manager import edit_indent
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        result = await edit_indent(
+            conn, indent_id,
+            required_qty_kg=body.required_qty_kg,
+            required_by_date=body.required_by_date,
+            priority=body.priority,
+        )
+    if result.get("error") == "not_found":
+        raise HTTPException(status_code=404, detail="Indent not found")
+    return _indent_result(result)
+
+
+@router.put("/indents/{indent_id}/send")
+async def send_purchase_indent(
+    request: Request,
+    indent_id: int,
+    user: AuthUser = Depends(require_permission("production", "indents", "send", action="create")),
+):
+    """Send a draft indent -> raised. Writes the purchase + stores alerts and
+    emits indent.sent, so this one needs the transaction + deferred_events
+    wrapper: the event must not fan out unless the alerts committed."""
+    from app.modules.production.services.indent_manager import send_indent
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with deferred_events():
+            async with conn.transaction():
+                result = await send_indent(conn, indent_id)
+                if result.get("error") == "not_found":
+                    raise HTTPException(status_code=404, detail="Indent not found")
+    return _indent_result(result)
+
+
+@router.put("/indents/{indent_id}/acknowledge")
+async def acknowledge_purchase_indent(
+    request: Request,
+    indent_id: int,
+    user: AuthUser = Depends(require_permission("production", "indents", "acknowledge", action="create")),
+):
+    """Purchase team acknowledges a raised indent.
+
+    SECURITY: acknowledged_by is taken from the access token, never the body -
+    the endpoint deliberately accepts no body at all.
+    """
+    from app.modules.production.services.indent_manager import acknowledge_indent
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        result = await acknowledge_indent(conn, indent_id, _actor_name(user))
+    if result.get("error") == "not_found":
+        raise HTTPException(status_code=404, detail="Indent not found")
+    return _indent_result(result)
+
+
+class LinkPO(BaseModel):
+    po_reference: str
+
+
+@router.put("/indents/{indent_id}/link-po")
+async def link_purchase_indent_to_po(
+    request: Request,
+    indent_id: int,
+    body: LinkPO,
+    user: AuthUser = Depends(require_permission("production", "indents", "link_po", action="create")),
+):
+    """Link an acknowledged indent to a PO. acknowledged -> po_created."""
+    from app.modules.production.services.indent_manager import link_indent_to_po
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        result = await link_indent_to_po(conn, indent_id, body.po_reference)
+    if result.get("error") == "not_found":
+        raise HTTPException(status_code=404, detail="Indent not found")
+    return _indent_result(result)
 
 
 # ---------------------------------------------------------------------------
@@ -3635,9 +3769,10 @@ class ProductionIndentCreate(BaseModel):
     triggered_by_job_card: str | None = None
     triggered_by_so: str | None = None
     customer_name: str | None = None
-    maker_user: str
     status: str = "draft"
     entity: str = "cfpl"
+    # NOTE: no maker_user - see _actor_name(). An extra maker_user key in the
+    # body is ignored (pydantic v2 default), it can never reach the column.
 
 
 @router.post("/production-indents")
@@ -3646,7 +3781,7 @@ async def create_production_indent(request: Request, body: ProductionIndentCreat
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
         async with conn.transaction():
-            result = await _create(conn, **body.model_dump())
+            result = await _create(conn, **body.model_dump(), maker_user=_actor_name(user))
             if result.get("duplicate"):
                 raise HTTPException(status_code=409, detail=result["error"])
             return result
@@ -3661,8 +3796,9 @@ async def submit_production_indent(request: Request, indent_id: str, user: AuthU
 
 
 class CheckerAction(BaseModel):
-    checker_user: str
     checker_comment: str = ""
+    # NOTE: no checker_user - see _actor_name(). The checker is whoever holds
+    # the token that made this call, not whatever name the client typed.
 
 
 @router.put("/production-indents/{indent_id}/approve")
@@ -3670,7 +3806,7 @@ async def approve_production_indent(request: Request, indent_id: str, body: Chec
     from app.modules.production.services.production_indent_service import approve_indent
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
-        return await approve_indent(conn, indent_id, checker_user=body.checker_user,
+        return await approve_indent(conn, indent_id, checker_user=_actor_name(user),
                                      checker_comment=body.checker_comment)
 
 
@@ -3679,7 +3815,7 @@ async def return_production_indent(request: Request, indent_id: str, body: Check
     from app.modules.production.services.production_indent_service import return_indent
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
-        return await return_indent(conn, indent_id, checker_user=body.checker_user,
+        return await return_indent(conn, indent_id, checker_user=_actor_name(user),
                                     checker_comment=body.checker_comment)
 
 
@@ -3919,13 +4055,23 @@ async def list_rtv_dispositions(
 class RtvDispositionBody(BaseModel):
     rtv_id: str
     disposition_type: str
-    decided_by: str
     qc_remarks: str | None = None
     business_head: str | None = None  # key from BUSINESS_HEADS registry
 
 
 @router.post("/rtv/dispositions")
 async def assign_rtv_disposition(request: Request, body: RtvDispositionBody, user: AuthUser = Depends(require_permission("production", "rtv", action="create"))):
+    """SECURITY: decided_by is taken from the access token, never the body.
+
+    A 'reprocess' disposition creates a production_indent with
+    maker_user=decided_by and status='submitted' -- i.e. it lands directly in
+    the checker's approval queue. A client-supplied decided_by therefore let
+    any holder of production.rtv.create file an indent for approval under
+    someone else's name, which is the same impersonation the
+    POST /production-indents fix closed. Nothing calls this endpoint yet
+    (no web caller, absent from the Android contract), so dropping the field
+    breaks no client.
+    """
     from app.modules.production.services.rtv_disposition_service import assign_disposition
     from app.modules.production.services.mail_service import BUSINESS_HEADS
     if body.business_head and body.business_head not in BUSINESS_HEADS:
@@ -3936,7 +4082,8 @@ async def assign_rtv_disposition(request: Request, body: RtvDispositionBody, use
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
         async with conn.transaction():
-            return await assign_disposition(conn, **body.model_dump())
+            return await assign_disposition(
+                conn, decided_by=_actor_name(user), **body.model_dump())
 
 
 class DiscardBody(BaseModel):
@@ -6288,6 +6435,38 @@ class RecordOutputV2Request(BaseModel):
     # this flag gets a 403.
     admin_override:   bool       = False
 
+    # ── Stage 4: Save Output is the last step ────────────────────────
+    # Save Output now COMPLETES the batch, replacing the separate Close
+    # Batch button. Everything below is inert unless complete_batch is
+    # true, so the Android client (which posts the v1 twin of this body
+    # and has no Complete step) is unaffected by the default.
+    #
+    # The completion itself delegates to job_card_batch_v2.close_batch
+    # rather than reimplementing it here: that service holds the
+    # SELECT ... FOR UPDATE which stops two concurrent completes
+    # double-writing the downstream dispatch, and it is the authoritative
+    # writer of produced_qty_kg. Two implementations of this is how
+    # job_card_output_v2 accumulated 453 duplicate (job_card_id,
+    # batch_id) groups before migration 092.
+    complete_batch:   bool       = False
+    # Per-batch summary the UI computes from the live accounting form and
+    # posts alongside, so the batch row carries a self-contained record.
+    # Same fields BatchCloseRequest takes.
+    input_qty_kg:           float | None = None
+    control_sample_kg:      float | None = None
+    extra_give_away_qty:    float        = 0.0
+    yield_pct:              float | None = None
+    is_balanced:            bool  | None = None
+    balance_difference_qty: float | None = None
+    closure_remarks:        str   | None = None
+    # Admin-only: complete even though the accounting is unbalanced.
+    allow_unbalanced:       bool         = False
+    # Operator-chosen partial dispatch. Removing the Close Batch button
+    # must NOT remove this decision -- omitted means "the whole produced
+    # qty flows to the next JC", which is the legacy behaviour and not
+    # always what the operator wants.
+    dispatch_qty_kg:        float | None = Field(default=None, ge=0)
+
     @field_validator(
         "rm_consumed_kg", "output_qty_kg", "output_qty_units",
         "fg_actual_kg", "fg_actual_units", "fg_expected_kg", "process_loss_kg",
@@ -6679,6 +6858,77 @@ async def record_output_v2(
                     recorded_by=rec_by,
                 )
                 result["qc"] = qc_result.get("qc")
+
+            # ── Stage 4: complete the batch ──────────────────────────
+            # LAST, and inside the same transaction. Deliberately after
+            # byproducts / balance materials / additives / QC: closing is
+            # the act that states what was made, so everything the
+            # operator entered must already be persisted when it runs.
+            # Closing at the record_output call site instead would stamp
+            # the batch before its own accounting rows existed.
+            if body.complete_batch and "error" not in result:
+                from app.modules.production.services import (
+                    job_card_batch_v2 as _batch_svc,
+                )
+                # BALANCE GATE. An unbalanced batch does not complete --
+                # but the save still stands. Returning a 4xx here would
+                # roll back the whole transaction and throw away
+                # everything the operator just typed, which is a worse
+                # outcome than an open batch. So: saved, not completed,
+                # and the UI says which half happened.
+                unbalanced = body.is_balanced is False
+                if unbalanced and not (body.allow_unbalanced and user.is_admin):
+                    result["completed"] = False
+                    result["completion_blocked"] = {
+                        "error": "unbalanced",
+                        "balance_difference_qty": body.balance_difference_qty,
+                        "message": (
+                            "Output saved, but the batch was not completed: "
+                            "its accounting is unbalanced. Correct the "
+                            "figures, or ask an admin to override."
+                        ),
+                    }
+                else:
+                    close_res = await _batch_svc.close_batch(
+                        conn,
+                        batch_id=resolved_batch_id,
+                        job_card_id=job_card_id,
+                        # close_batch is authoritative for produced_qty_kg,
+                        # so it gets the same FG figure record_output just
+                        # wrote; its UPSERT reconciles the two.
+                        produced_qty_kg=body.output_qty_kg or 0.0,
+                        output_kind=body.output_kind,
+                        output_uom=body.uom,
+                        output_qty_units=body.output_qty_units,
+                        yield_pct=body.yield_pct,
+                        rm_consumed_kg=body.rm_consumed_kg or 0.0,
+                        extra_give_away_qty=body.extra_give_away_qty,
+                        input_qty_kg=body.input_qty_kg,
+                        process_loss_kg=body.process_loss_kg,
+                        control_sample_kg=body.control_sample_kg,
+                        is_balanced=body.is_balanced,
+                        balance_difference_qty=body.balance_difference_qty,
+                        closure_remarks=body.closure_remarks,
+                        dispatch_qty_kg=body.dispatch_qty_kg,
+                        notes=body.notes,
+                        allow_unbalanced=bool(body.allow_unbalanced and user.is_admin),
+                        closed_by=user.full_name or user.phone,
+                    )
+                    if close_res.get("error"):
+                        # A refused close must not silently look like a
+                        # successful save: raising rolls the whole thing
+                        # back, so the operator retries against a
+                        # consistent state rather than discovering later
+                        # that the batch stayed open.
+                        raise HTTPException(
+                            status_code=409 if close_res["error"] in (
+                                "batch_not_open", "batch_already_closed")
+                            else 400,
+                            detail=close_res,
+                        )
+                    result["completed"] = True
+                    result["batch_close"] = close_res
+
     # Structured envelopes so the frontend's friendlyApiError mapper can
     # decode the code and render a sentence ("Cannot save — an output qty
     # is required") instead of dumping raw JSON to the operator. Mirrors

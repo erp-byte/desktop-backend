@@ -38,7 +38,12 @@ async def list_production_indents(conn, *, entity=None, status=None,
         params.append(f"%{search}%")
         idx += 1
     if date_from:
-        conditions.append(f"created_at >= ${idx}")
+        # ::date is load-bearing, not decoration. created_at is TIMESTAMPTZ, so
+        # an uncast $N is resolved to timestamptz from the other operand and
+        # asyncpg then refuses to encode the plain 'YYYY-MM-DD' str the query
+        # param carries ("expected a datetime.date or datetime.datetime
+        # instance") - a 500, not a wrong result. date_to below already casts.
+        conditions.append(f"created_at >= ${idx}::date")
         params.append(date_from)
         idx += 1
     if date_to:
