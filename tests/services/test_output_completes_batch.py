@@ -359,6 +359,7 @@ def _output_insert_sql() -> str:
         async def fetchrow(self, sql, *args):
             if "INSERT INTO job_card_output_v2" in sql:
                 captured["sql"] = sql
+                captured["args"] = args
                 return {"output_id": 1, "job_card_id": JC, "batch_id": BATCH}
             # assert_not_locked's guard. Matched on the columns rather than the
             # FROM clause: the real statement spaces it "FROM   job_card_v2",
@@ -400,7 +401,19 @@ def _output_insert_sql() -> str:
 
     asyncio.run(_go())
     assert "sql" in captured, "record_output never issued its INSERT"
+    _LAST_INSERT.clear()
+    _LAST_INSERT.update(captured)
     return captured["sql"]
+
+
+# Same call, but the bound parameters rather than the statement. The SQL can be
+# right and the value still wrong: `or 0` mangled it before it ever reached PG.
+_LAST_INSERT: dict = {}
+
+
+def _output_insert_args() -> tuple:
+    _output_insert_sql()
+    return _LAST_INSERT["args"]
 
 
 def test_record_output_upserts_against_the_092_partial_index():
@@ -430,9 +443,100 @@ def test_record_output_upsert_preserves_free_text_it_was_not_given():
     for col in ("notes", "process_loss_remark"):
         assert f"COALESCE(EXCLUDED.{col}" in body, (
             f"{col} must be COALESCEd, or a second write nulls it")
-    # ...while the numbers ARE overwritten: the later save is the truth.
-    for col in ("output_qty_kg", "rm_consumed_kg", "process_loss_kg"):
+    # ...while the numbers the completion POST DOES send are overwritten: for
+    # those, and only those, the later save really is the truth. process_loss_kg
+    # was in this list and did not belong -- the completion POST omits it, which
+    # is precisely the situation the COALESCE above exists to handle. See
+    # test_record_output_upsert_preserves_process_loss_it_was_not_given.
+    for col in ("output_qty_kg", "rm_consumed_kg"):
         assert f"{col}       = EXCLUDED.{col}" in body or \
                f"{col}      = EXCLUDED.{col}" in body or \
                f"{col}     = EXCLUDED.{col}" in body or \
                f"{col} = EXCLUDED.{col}" in body, col
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  process_loss_kg survives the completion POST
+# ═══════════════════════════════════════════════════════════════════════════
+# The Process Loss blanking bug. One SAVE BATCH click fires three requests and
+# only the first carries the operator's figure:
+#
+#   1. POST /outputs                     process_loss_kg = 12.5   -> stored
+#   2. PUT  /accounting/summary          process_loss_qty = 12.5
+#   3. POST /outputs {complete_batch}    process_loss_kg ABSENT   -> None
+#
+# Request 3 does send output_qty_kg, so has_output_payload is true and
+# record_output runs a second time; close_batch then runs in the same
+# transaction. Both bound `process_loss_kg or 0` into an unguarded
+# `= EXCLUDED.process_loss_kg`, so the absent field arrived as 0 and overwrote
+# the 12.5 request 1 had stored seconds earlier. The operator's number was gone
+# before the page finished reloading.
+#
+# `notes` and `process_loss_remark`, sitting in the same DO UPDATE, are COALESCEd
+# for exactly this reason. process_loss_kg was left out of that fix.
+#
+# Why COALESCE on the PARAMETER and not on EXCLUDED: None means "the caller said
+# nothing, keep what is stored", but 0.0 means "the operator typed zero" and must
+# still be written. `or 0` could not tell those apart. The VALUES clause has to
+# coerce NULL -> 0 to satisfy the NOT NULL that migration 026 added, so
+# EXCLUDED.process_loss_kg is never NULL and cannot carry the distinction.
+def test_record_output_binds_none_rather_than_zero_when_unset():
+    """`or 0` turned "the caller said nothing" into a real 0 before the value
+    ever reached Postgres -- no SQL-side guard can recover it after that."""
+    args = _output_insert_args()
+    assert args[11] is None, (
+        f"record_output bound {args[11]!r} for $12 (process_loss_kg) when the "
+        "caller passed nothing; None has to survive into the statement for "
+        "COALESCE to keep the stored value")
+
+
+def test_record_output_upsert_preserves_process_loss_it_was_not_given():
+    sql = _output_insert_sql()
+    body = sql[sql.index("DO UPDATE"):]
+    assert "COALESCE($12, job_card_output_v2.process_loss_kg)" in body, (
+        "the completion POST carries no process_loss_kg, so a bare "
+        "= EXCLUDED.process_loss_kg zeroes what the operator's own save stored "
+        "seconds earlier -- this is the Process Loss blanking bug")
+
+
+def test_record_output_insert_still_satisfies_the_not_null_column():
+    """026 made the column NOT NULL DEFAULT 0. A genuine first INSERT with no
+    process_loss must still write 0, not NULL."""
+    sql = _output_insert_sql()
+    values = sql[sql.index("VALUES"):sql.index("ON CONFLICT")]
+    assert "COALESCE($12, 0)" in values, values
+
+
+def _close_batch_output_sql() -> str:
+    """close_batch's own job_card_output_v2 UPSERT -- the SECOND writer to run
+    on the completion POST, inside the same transaction."""
+    import inspect
+
+    from app.modules.production.services import job_card_batch_v2 as bsvc
+    src = inspect.getsource(bsvc.close_batch)
+    i = src.index("INSERT INTO job_card_output_v2")
+    return src[i:src.index("RETURNING *", i)]
+
+
+def test_close_batch_output_upsert_preserves_process_loss_it_was_not_given():
+    """Guarding only record_output would leave the value zeroed: close_batch
+    writes the same row afterwards, in the same transaction, and wins."""
+    sql = _close_batch_output_sql()
+    body = sql[sql.index("DO UPDATE"):]
+    assert "COALESCE($12, job_card_output_v2.process_loss_kg)" in body, body
+
+
+def test_close_batch_output_insert_still_satisfies_the_not_null_column():
+    sql = _close_batch_output_sql()
+    values = sql[sql.index("VALUES"):sql.index("ON CONFLICT")]
+    assert "COALESCE($12, 0)" in values, values
+
+
+def test_completion_post_really_does_omit_process_loss(client_with, spy):
+    """The premise the guards rest on. If this ever starts arriving populated the
+    client changed; the guards stay correct either way, but this records why
+    they exist."""
+    client = client_with(_Conn())
+    r = client.post(URL, json=_body(complete_batch=True, is_balanced=True))
+    assert r.status_code == 200, r.text
+    assert spy["close_kwargs"]["process_loss_kg"] is None

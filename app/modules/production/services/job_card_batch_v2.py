@@ -440,7 +440,8 @@ async def close_batch(conn, *, batch_id: int,
                 job_card_id, batch_id, rm_consumed_kg, output_qty_kg,
                 output_qty_units, output_kind, uom, yield_pct,
                 notes, recorded_by, process_loss_kg
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                      COALESCE($12, 0))
             ON CONFLICT (job_card_id, COALESCE(batch_id, 0))
                 WHERE deleted_at IS NULL
             DO UPDATE SET
@@ -452,7 +453,7 @@ async def close_batch(conn, *, batch_id: int,
                 yield_pct        = EXCLUDED.yield_pct,
                 notes            = COALESCE(EXCLUDED.notes, job_card_output_v2.notes),
                 recorded_by      = EXCLUDED.recorded_by,
-                process_loss_kg  = EXCLUDED.process_loss_kg
+                process_loss_kg  = COALESCE($12, job_card_output_v2.process_loss_kg)
             RETURNING *
             """,
             new_short_time_id(),
@@ -460,13 +461,18 @@ async def close_batch(conn, *, batch_id: int,
             output_qty_units, resolved_output_kind,
             output_uom or jc["uom"],
             yield_pct, notes, closed_by,
-            # Mirror the value we wrote into job_card_batch_v2 (line 322)
-            # so the sibling output detail row agrees with the batch row.
-            # Migration 026 added job_card_output_v2.process_loss_kg as
-            # NUMERIC(15,3) NOT NULL DEFAULT 0; `or 0` keeps the NOT NULL
-            # constraint happy when close_batch is called without a value
-            # (matches record_output's pattern in job_card_v2.py:1695).
-            process_loss_kg or 0,
+            # Mirror the value we wrote into job_card_batch_v2 above so the
+            # sibling output detail row agrees with the batch row.
+            #
+            # Passed RAW, not `or 0`. On the completion POST the client sends no
+            # process_loss_kg at all, so this is None -- and `or 0` turned that
+            # into a real 0 that overwrote the figure the operator's own save had
+            # stored moments earlier, blanking the Process Loss field. The
+            # statement COALESCEs instead: NULL keeps the stored value on a
+            # re-save and becomes 0 only on a genuine INSERT, where migration
+            # 026's NOT NULL requires it. A typed 0.0 still writes 0, which
+            # `or 0` could not distinguish from "unset".
+            process_loss_kg,
         )
     output_row = await insert_with_pk_retry(conn, _insert_output_row)
 

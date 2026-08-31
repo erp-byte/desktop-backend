@@ -3681,7 +3681,8 @@ async def record_output(conn, *, job_card_id: int,
                 (output_id, job_card_id, batch_id, rm_consumed_kg, output_qty_kg,
                  output_qty_units, output_kind, uom, yield_pct, notes,
                  recorded_by, process_loss_kg, process_loss_remark)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                    COALESCE($12, 0), $13)
             ON CONFLICT (job_card_id, COALESCE(batch_id, 0))
                 WHERE deleted_at IS NULL
             DO UPDATE SET
@@ -3693,7 +3694,7 @@ async def record_output(conn, *, job_card_id: int,
                 yield_pct           = EXCLUDED.yield_pct,
                 notes               = COALESCE(EXCLUDED.notes, job_card_output_v2.notes),
                 recorded_by         = EXCLUDED.recorded_by,
-                process_loss_kg     = EXCLUDED.process_loss_kg,
+                process_loss_kg     = COALESCE($12, job_card_output_v2.process_loss_kg),
                 process_loss_remark = COALESCE(EXCLUDED.process_loss_remark,
                                                job_card_output_v2.process_loss_remark)
             RETURNING *
@@ -3701,7 +3702,7 @@ async def record_output(conn, *, job_card_id: int,
             new_short_time_id(),
             job_card_id, batch_id, rm_consumed_kg, output_qty_kg,
             output_qty_units, kind, uom, yield_pct, notes,
-            recorded_by, process_loss_kg or 0, process_loss_remark,
+            recorded_by, process_loss_kg, process_loss_remark,
         )
     inserted = await insert_with_pk_retry(conn, _insert_output)
     return {"recorded": True, "output": _serialize(inserted), "yield_pct": yield_pct}
