@@ -8928,6 +8928,59 @@ class BoxScanRequest(BaseModel):
     count:        int | None = None
 
 
+class AssignBoxIdsRequest(BaseModel):
+    job_card_id: int | None = None   # attach the minted boxes to this JC
+    box_number:  int | None = None   # narrow to one carton, where box numbers exist
+    limit:       int | None = None   # cap how many rows to label; 1 = a single box
+
+
+@router.post("/inward/{company}/{transaction_no}/assign-box-ids")
+async def assign_box_ids_route(
+    request: Request,
+    company: str,
+    transaction_no: str,
+    body: AssignBoxIdsRequest,
+    user=Depends(require_permission("production", "job_cards", "material_scan", action="scan")),
+):
+    """Mint box ids for this transaction's unlabelled boxes, and optionally
+    attach them to a job card.
+
+    Inward does not write box_id — the approver's print does. Boxes whose labels
+    were never printed are therefore real stock that no scan can find, and that
+    every downstream read filters out (`COALESCE(box_id,'') <> ''`). This fills
+    them in, using the same format inward_tools.upsert_box mints.
+
+    On the pre-v2 {company}_boxes table the rows carry NO box_number and are
+    therefore indistinguishable, so `limit=1` labels a single arbitrary box —
+    arbitrary but deterministic (lowest row key first), never random.
+
+    NOTE the minted id exists in the database but not yet on the carton — the
+    response lists what was minted so the labels can be printed.
+
+    No surrounding transaction: the service opens its own for the mint, and the
+    job-card attach must run outside one (scan_box's contract).
+    """
+    from app.modules.production.services.box_id_assign_service import (
+        BoxIdAssignError, assign_box_ids,
+    )
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        try:
+            return await assign_box_ids(
+                conn,
+                company=company,
+                transaction_no=transaction_no,
+                job_card_id=body.job_card_id,
+                box_number=body.box_number,
+                limit=body.limit,
+                scanned_by=user.full_name or user.phone,
+            )
+        except BoxIdAssignError as exc:
+            # 422, not 500: the schema could not be verified or the input was
+            # rejected. Nothing was written either way.
+            raise HTTPException(status_code=422, detail=str(exc))
+
+
 @router.post("/job-cards-v2/{job_card_id}/box-scans")
 async def create_box_scan(
     request: Request,
@@ -8940,9 +8993,11 @@ async def create_box_scan(
     updates its weights in place."""
     from app.modules.production.services import box_scan_service as svc
     pool = request.app.state.db_pool
-    # No surrounding transaction: scan_box's widened resolve uses identify_box,
-    # which swallows missing-legacy-table errors that would poison a txn. The
-    # single upsert it runs is atomic on its own.
+    # No surrounding transaction: identify_box now PLANS around missing tables
+    # (it reads information_schema and builds only the branches that exist), so
+    # it no longer runs statements it expects to fail. It still narrowly catches
+    # schema drift under a cached plan, and a failed statement would poison a
+    # surrounding txn — so keep the autocommit. The single upsert is atomic anyway.
     async with pool.acquire() as conn:
         result = await svc.scan_box(
             conn,
@@ -8963,6 +9018,15 @@ async def create_box_scan(
         raise HTTPException(status_code=422, detail=f"'{body.code}' isn't in any catalogue — enter an article to store it.")
     if result.get("error") == "box_not_found":
         raise HTTPException(status_code=400, detail="No box code provided")
+    if result.get("error") == "ambiguous_box":
+        # Not a 404: the box WAS found, in more than one table. Attaching an
+        # arbitrary one could bind this job card to a different physical carton.
+        raise HTTPException(
+            status_code=409,
+            detail=(f"'{result.get('code')}' matches boxes in "
+                    f"{', '.join(t for t in result.get('tables') or [] if t)}. "
+                    "Scan the QR code so the transaction number can identify "
+                    "which box this is."))
     return result
 
 
