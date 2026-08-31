@@ -1,85 +1,397 @@
 """Universal box identify: scan a QR, tell which table the box lives in.
 
 Routing by QR structure (per the label formats in this ERP):
-  * JSON  {"tx":"TR-...","bi":"91483060-1"}  -> warehouse / cold tables by
-    (box_id, transaction_no).  bi = box id, tx = transaction number.
-  * bare  "91483060-1"                        -> sfg_box by carton_id.
-  * either primary misses                     -> exhaustive scan of every box
-    table by box id alone.
+  * JSON  {"tx":"TR-...","bi":"91483060-1"}  -> match (box_id, transaction_no)
+  * bare  "91483060-1"                       -> sfg_box by carton_id, then box id alone.
 
-The cfpl_*/cdpl_*/cold_transfer_inboxes tables are EXTERNALLY managed (no
-CREATE TABLE in this repo). Rather than introspect each one per request, we run
-the point-lookup directly and treat any DB-level failure (missing table/column
-on those tables — cold_transfer_inboxes' schema is unknown here — or a
-type/permission issue) as "box not in this table": one round-trip per table, no
-schema queries. box id / txn columns are `box_id` / `transaction_no` for the
-legacy family, `carton_id` / (none) for sfg_box.
+WHY THIS IS ONE QUERY, NOT A LOOP OF POINT LOOKUPS
+--------------------------------------------------
+`box_id` is in no unique key anywhere in this schema. Every module mints it from
+the last 8 digits of epoch-ms, so the base repeats about every 27.7 hours, and
+`delete_lot127024_2boxes.py` states it plainly: "box_id alone is NOT unique".
+A sequential per-table `LIMIT 1` therefore returns whichever table happened to be
+probed first — a *different physical box* than the one scanned, reported as
+`found: True`. So we UNION ALL the candidate branches, ORDER BY an explicit
+priority, and take LIMIT 2 so a genuine multi-match is detected and logged rather
+than silently resolved. One round trip instead of ten.
+
+WHY COLUMNS ARE VALIDATED BEFORE THE QUERY IS BUILT
+---------------------------------------------------
+A UNION couples every branch: one missing column fails the WHOLE statement at
+PREPARE. That has already happened here — selecting `batch_number` (absent on
+both tenants) made every box lookup 500. And the previous defence,
+`except asyncpg.PostgresError: return None`, was worse than the disease: a
+mistyped column became a permanent silent NOT FOUND in production.
+
+So `_plan()` builds only the branches whose columns actually exist, from one
+cached `information_schema` read per table. A table that is missing, or has
+drifted, is dropped from the plan and logged at WARNING — never guessed at, and
+never able to poison the other branches.
+
+NOT COVERED, DELIBERATELY
+-------------------------
+  * {cfpl|cdpl}_boxes (pre-v2) — of its columns only `lot_number` has any direct
+    evidence; the rest are inferred from its _v2 sibling. Adding it on that basis
+    would reintroduce exactly the silent-miss this module now prevents. It needs a
+    live `information_schema` check first. (It would then be *excluded by the
+    planner* rather than silently failing, but an unverified branch that never
+    matches is still a lie by omission, so it stays out until confirmed.)
+  * pending_transfer_stock — holds every In-Transit box. Today an in-transit box
+    resolves to its source table or to nothing, and never reports that it is
+    already committed to a challan. Adding it is a product decision, not a bug fix.
+
+PREFIX ROUTING IS NOT USED, ON PURPOSE
+--------------------------------------
+`TR-` is minted by seven independent generators in three formats and lands in
+nine-plus table families — a cold-destined inward writes the same `TR-` string
+into both `{p}_boxes_v2` and `{p}_cold_stocks` for the same physical box. So a
+transaction prefix cannot select a table. `TRANS`/`JB` label the transfer and
+job-work *challans* (header tables); the box rows under them carry the source
+`TR-` inward number. Prefix is used only to ORDER branches (see _PRIO_HINTS),
+never to include or exclude one.
 """
+from __future__ import annotations
+
 import json
+import logging
 
 import asyncpg
 
-# (table, company, box_id_col, txn_col)  -- user-specified order for the JSON path.
-_JSON_TABLES = [
-    ("cfpl_bulk_entry_boxes", "cfpl", "box_id", "transaction_no"),
-    ("cdpl_bulk_entry_boxes", "cdpl", "box_id", "transaction_no"),
-    ("cfpl_boxes_v2",         "cfpl", "box_id", "transaction_no"),
-    ("cdpl_boxes_v2",         "cdpl", "box_id", "transaction_no"),
-    ("cold_transfer_inboxes", "",     "box_id", "transaction_no"),
-    ("cfpl_cold_stocks",      "cfpl", "box_id", "transaction_no"),
-    ("cdpl_cold_stocks",      "cdpl", "box_id", "transaction_no"),
+logger = logging.getLogger(__name__)
+
+_ENTITIES = ("cfpl", "cdpl")
+
+
+# ── branch specs ─────────────────────────────────────────────────────────────
+# Each entry projects its own columns onto ONE common shape so the branches can
+# be UNIONed. Column names genuinely differ per table — `article` vs
+# `article_description` vs `item_description`, `lot_no` vs `lot_number`,
+# `weight_kg` vs `net_weight` — so the mapping is per branch, not per alias.
+#
+#   need    : columns that must exist for the branch to be built at all
+#   entity  : 'prefix' (read from the cfpl_/cdpl_ table name), a column, or None
+#             when the table carries no reliable signal (guessing is worse).
+#
+# `count` is projected ONLY where it is genuinely per-box. On bulk_entry_boxes and
+# cold_stocks it is a pile/article total replicated onto every row, so one carton
+# would read as e.g. 1403.
+_SPECS = [
+    {
+        "key": "boxes_v2", "split": True, "table": "{p}_boxes_v2",
+        "need": ("box_id", "transaction_no"),
+        "box": "box_id", "txn": "transaction_no",
+        "desc": "article_description", "lot": "lot_number",
+        "net": "net_weight", "gross": "gross_weight",
+        # No `status` column on this table (interunit_tools.py: "current target
+        # — no status col"). Status lives on {p}_transactions_v2.
+        "status": None, "count": None, "entity": "prefix",
+    },
+    {
+        "key": "bulk_entry_boxes", "split": True, "table": "{p}_bulk_entry_boxes",
+        "need": ("box_id", "transaction_no"),
+        "box": "box_id", "txn": "transaction_no",
+        "desc": "article_description", "lot": "lot_number",
+        "net": "net_weight", "gross": "gross_weight",
+        "status": "status", "count": None, "entity": "prefix",
+    },
+    {
+        "key": "cold_stocks", "split": True, "table": "{p}_cold_stocks",
+        "need": ("box_id", "transaction_no"),
+        "box": "box_id", "txn": "transaction_no",
+        "desc": "item_description", "lot": "lot_no",
+        "net": "weight_kg", "gross": None,
+        "status": None, "count": None, "entity": "prefix",
+    },
+    {
+        # The return id lives on the HEADER (rtv_id, "CR-…"); the box row has no
+        # transaction_no at all. This is the one branch that must join.
+        "key": "rtv_boxes", "split": True, "table": "{p}_rtv_boxes",
+        "join": "{p}_rtv_header", "join_on": "b.header_id = h.id",
+        "need": ("box_id", "header_id"),
+        "join_need": ("id", "rtv_id"),
+        "box": "box_id", "txn": "h.rtv_id",
+        "desc": "article_description", "lot": "lot_number",
+        "net": "net_weight", "gross": "gross_weight",
+        "status": None, "count": None, "entity": "prefix",
+    },
+    {
+        "key": "interunit_transfer_boxes", "split": False, "table": "interunit_transfer_boxes",
+        "need": ("box_id", "transaction_no"),
+        "box": "box_id", "txn": "transaction_no",
+        "desc": "article", "lot": "lot_number",
+        "net": "net_weight", "gross": "gross_weight",
+        # Entity comes from the header's sites, not the table name. Not worth a
+        # join for a field the caller treats as a hint.
+        "status": None, "count": None, "entity": None,
+    },
+    {
+        # Three box identities: a relabelled box keeps its pre-relabel id in
+        # original_box_id, and inward_box_id traces to the box it was received as.
+        # Matching box_id alone silently misses every relabelled box.
+        "key": "interunit_transfer_in_boxes", "split": False, "table": "interunit_transfer_in_boxes",
+        "need": ("box_id", "transaction_no"),
+        "alt_box": ("original_box_id", "inward_box_id"),
+        "box": "box_id", "txn": "transaction_no",
+        "desc": "article", "lot": "lot_number",
+        "net": "net_weight", "gross": "gross_weight",
+        "status": None, "count": None, "entity": None,
+    },
+    {
+        "key": "cold_transfer_inboxes", "split": False, "table": "cold_transfer_inboxes",
+        "need": ("box_id", "transaction_no"),
+        "box": "box_id", "txn": "transaction_no",
+        "desc": "item_description", "lot": "lot_no",
+        "net": "weight_kg", "gross": None,
+        "status": None, "count": None, "entity": None,
+    },
+    {
+        "key": "jb_inward_boxes", "split": False, "table": "jb_inward_boxes",
+        "need": ("box_id", "transaction_no"),
+        "box": "box_id", "txn": "transaction_no",
+        "desc": "item_description", "lot": "lot_no",
+        "net": "net_weight", "gross": "gross_weight",
+        "status": None, "count": None, "entity": None,
+    },
+    {
+        "key": "po_box", "split": False, "table": "po_box",
+        "need": ("box_id", "transaction_no"),
+        "box": "box_id", "txn": "transaction_no",
+        # Description is not on po_box; it lives on the PO line.
+        "desc": None, "lot": "lot_number",
+        "net": "net_weight", "gross": "gross_weight",
+        "status": None, "count": None, "entity": None,
+    },
+    {
+        # Keyed by carton_id and carries NO transaction number, so it can only ever
+        # join the box-id-only pass.
+        "key": "sfg_box", "split": False, "table": "sfg_box", "no_txn": True,
+        "need": ("carton_id",),
+        "box": "carton_id", "txn": None,
+        "desc": "fg_sku_name", "desc_fallback": "sfg_code", "lot": None,
+        "net": "net_weight", "gross": "gross_weight",
+        "status": "status", "count": None, "entity": "entity",
+        "job_card": "job_card_number",
+    },
 ]
-_SFG = ("sfg_box", "", "carton_id", None)
-# Everything scanned in the "search all tables" fallback (order = JSON set,
-# then sfg_box, then po_box). Re-scanning the primary here is cheap and lets a
-# mis-routed QR still resolve.
-_ALL_TABLES = _JSON_TABLES + [_SFG, ("po_box", "", "box_id", "transaction_no")]
 
-_ALIASES = {
-    "box_id":          ("carton_id", "box_id"),
-    "transaction_no":  ("transaction_no",),
-    "item_description": ("item_description", "article_description", "fg_sku_name", "sfg_code"),
-    "lot_number":      ("lot_number", "lot_no"),
-    "net_weight":      ("net_weight", "weight_kg"),
-    "gross_weight":    ("gross_weight",),
-    "count":           ("count", "no_of_cartons", "units"),
-    "status":          ("status",),
-    "job_card_number": ("job_card_number",),
-}
+# Ordering hints ONLY. A prefix can never include or exclude a branch (see the
+# module docstring) — it just floats the likeliest table to the top so that when
+# two tables legitimately hold the same (box_id, transaction_no), the scan
+# returns the more specific one. CR- and RTV- are ONE family: the rename was
+# forward-only and both are live on printed labels.
+_PRIO_HINTS = (
+    (("BE-",), "bulk_entry_boxes"),
+    (("CR-", "RTV-"), "rtv_boxes"),
+    (("PLAN-", "MPG-"), "sfg_box"),
+)
 
 
-async def _query(conn, table, box_col, box_id, txn_col=None, txn=None):
-    """First matching row as a dict, or None — one round-trip, no introspection.
-
-    Table/column names come from the hardcoded allowlists above (never user
-    input), so the f-string interpolation is injection-safe; only box_id/txn are
-    parameterized. Any PostgresError (undefined table/column on the external
-    tables, or a type/permission issue there) is swallowed as "not in this
-    table"; our own bugs (TypeError/KeyError) still surface. Safe under the
-    endpoint's autocommit — a failed statement is its own implicit txn and can't
-    poison the connection. (Inside a conn.transaction() you'd need a SAVEPOINT.)
-    """
-    preds, args = [f"{box_col} = $1"], [box_id]
-    if txn_col and txn is not None:
-        preds.append(f"{txn_col} = $2")
-        args.append(txn)
-    try:
-        row = await conn.fetchrow(
-            f"SELECT * FROM {table} WHERE {' AND '.join(preds)} LIMIT 1", *args
-        )
-    except asyncpg.PostgresError:
+def _hinted_first(txn: str | None) -> str | None:
+    if not txn:
         return None
-    return dict(row) if row else None
-
-
-def _pick(row, key):
-    for col in _ALIASES[key]:
-        v = row.get(col)
-        if v not in (None, ""):
-            return v
+    up = txn.strip().upper()
+    for prefixes, key in _PRIO_HINTS:
+        if any(up.startswith(p) for p in prefixes):
+            return key
     return None
 
 
+# ── column discovery ─────────────────────────────────────────────────────────
+# Process-lifetime cache. These tables don't gain or lose columns at runtime, and
+# the read is one catalog query per table.
+# ponytail: restart the process to pick up a schema change (rare; acceptable).
+_COLUMNS: dict[str, frozenset[str]] = {}
+
+
+async def _columns(conn, table: str) -> frozenset[str]:
+    """Column names for `table`, or an empty set if it does not exist.
+
+    An empty set makes a missing table and a drifted table take the same path —
+    the branch is dropped from the plan — which is what we want: neither may
+    break the other branches, and both get logged.
+    """
+    hit = _COLUMNS.get(table)
+    if hit is None:
+        rows = await conn.fetch(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = 'public' AND table_name = $1",
+            table,
+        )
+        hit = frozenset(r["column_name"] for r in rows)
+        _COLUMNS[table] = hit
+    return hit
+
+
+def _tables_for(spec: dict) -> list[tuple[str, str | None, str | None]]:
+    """(box_table, join_table, entity_literal) for a spec — twice if entity-split."""
+    if not spec.get("split"):
+        return [(spec["table"], spec.get("join"), None)]
+    out = []
+    for p in _ENTITIES:
+        out.append((
+            spec["table"].format(p=p),
+            spec["join"].format(p=p) if spec.get("join") else None,
+            p,
+        ))
+    return out
+
+
+# ── planning (pure — no DB, so it is directly unit-testable) ──────────────────
+def _qualify(name: str | None, cols: frozenset[str], alias: str) -> str:
+    """`b.col` when the column exists, a typed NULL placeholder when it does not.
+
+    Projecting NULL rather than dropping the branch keeps every arm of the UNION
+    the same width — the branch has already passed its `need` check, so what is
+    missing here is optional enrichment, not identity.
+    """
+    if not name:
+        return "NULL"
+    if "." in name:                # already qualified (e.g. h.rtv_id)
+        return name
+    return f"{alias}.{name}" if name in cols else "NULL"
+
+
+def _desc_expr(spec: dict, cols: frozenset[str], alias: str) -> str:
+    """Description column, with an optional fallback.
+
+    sfg_box stores the name in fg_sku_name but older rows carry only sfg_code —
+    the previous alias tuple covered both, and dropping that returned a null
+    article for those cartons, which the scan write path then rejects.
+    """
+    primary = _qualify(spec.get("desc"), cols, alias)
+    fb = _qualify(spec.get("desc_fallback"), cols, alias)
+    if fb == "NULL":
+        return primary
+    if primary == "NULL":
+        return fb
+    return f"COALESCE(NULLIF({primary}, ''), {fb})"
+
+
+def _plan(available: dict[str, frozenset[str]], *, with_txn: bool,
+          hint: str | None = None) -> tuple[str, list[str]]:
+    """Build the UNION ALL over every branch whose columns are all present.
+
+    `available` maps table name -> its column set. Returns (sql, sources) where
+    `sources` lists the tables actually included, in priority order. Returns
+    ("", []) when nothing qualifies.
+    """
+    ordered = sorted(
+        _SPECS,
+        key=lambda s: (0 if hint and s["key"] == hint else 1, _SPECS.index(s)),
+    )
+
+    branches: list[str] = []
+    sources: list[str] = []
+    prio = 0
+
+    for spec in ordered:
+        if with_txn and spec.get("no_txn"):
+            continue  # carries no transaction number; box-id pass only
+        for table, join, ent in _tables_for(spec):
+            cols = available.get(table) or frozenset()
+            if not cols:
+                continue
+            if not set(spec["need"]).issubset(cols):
+                continue
+            jcols = None
+            if join:
+                jcols = available.get(join) or frozenset()
+                if not set(spec.get("join_need") or ()).issubset(jcols):
+                    continue
+
+            prio += 1
+            b, j = "b", "h"
+
+            def col(name, _cols=cols, _b=b):
+                return _qualify(name, _cols, _b)
+
+            # box-id predicate: include the alternate identity columns that
+            # actually exist, so a relabelled box still resolves.
+            id_cols = [spec["box"]] + [c for c in (spec.get("alt_box") or ()) if c in cols]
+            id_pred = " OR ".join(f"{b}.{c}::text = $1" for c in id_cols)
+            where = f"({id_pred})"
+            if with_txn:
+                where += f" AND {col(spec['txn'])}::text = $2"
+
+            frm = f"{table} {b}"
+            if join:
+                frm += f" JOIN {join} {j} ON {spec['join_on']}"
+
+            ent_expr = "NULL"
+            if spec.get("entity") == "prefix" and ent:
+                ent_expr = f"'{ent}'"
+            elif spec.get("entity") and spec["entity"] != "prefix":
+                ent_expr = col(spec["entity"])
+
+            branches.append(
+                f"SELECT {col(spec['box'])}::text AS box_id, "
+                f"{col(spec['txn'])}::text AS transaction_no, "
+                f"{_desc_expr(spec, cols, b)}::text AS item_description, "
+                f"{col(spec.get('lot'))}::text AS lot_number, "
+                f"{col(spec.get('net'))}::numeric AS net_weight, "
+                f"{col(spec.get('gross'))}::numeric AS gross_weight, "
+                f"{col(spec.get('count'))}::bigint AS count, "
+                f"{col(spec.get('status'))}::text AS status, "
+                f"{col(spec.get('job_card'))}::text AS job_card_number, "
+                f"{ent_expr}::text AS company, "
+                f"'{table}'::text AS _src, {prio}::int AS _prio "
+                f"FROM {frm} WHERE {where}"
+            )
+            sources.append(table)
+
+    if not branches:
+        return "", []
+    sql = ("SELECT * FROM (" + " UNION ALL ".join(branches) +
+           ") u ORDER BY _prio, box_id LIMIT 2")
+    return sql, sources
+
+
+# Tables already reported as unusable. The column probe is cached, but the
+# WARNING must be rate-limited separately or a scan endpoint reprints the same
+# lines on every request and the signal is lost in its own noise.
+_WARNED: set[str] = set()
+
+
+async def _available(conn, *, with_txn: bool) -> dict[str, frozenset[str]]:
+    """Column sets for every table any branch might use, logging what is absent."""
+    out: dict[str, frozenset[str]] = {}
+    for spec in _SPECS:
+        if with_txn and spec.get("no_txn"):
+            continue
+        for table, join, _ in _tables_for(spec):
+            for t in (table, join):
+                if t and t not in out:
+                    out[t] = await _columns(conn, t)
+            if join:
+                jmissing = set(spec.get("join_need") or ()) - (out.get(join) or frozenset())
+                if jmissing and join not in _WARNED:
+                    _WARNED.add(join)
+                    logger.warning(
+                        "box-identify: join table %r is absent or missing %s — branch "
+                        "%r skipped. rtv_boxes is the ONLY source of a CR-/RTV- "
+                        "transaction number, so customer-return boxes will scan as "
+                        "NOT FOUND until this is corrected.",
+                        join, sorted(jmissing), spec["key"])
+            cols = out.get(table) or frozenset()
+            if not cols:
+                if table not in _WARNED:
+                    _WARNED.add(table)
+                    logger.warning(
+                        "box-identify: table %r absent — branch %r skipped. A box "
+                        "that lives only there will scan as NOT FOUND.",
+                        table, spec["key"])
+            else:
+                missing = set(spec["need"]) - cols
+                if missing and table not in _WARNED:
+                    _WARNED.add(table)
+                    logger.warning(
+                        "box-identify: table %r is missing %s — branch %r skipped. "
+                        "Boxes in that table will scan as NOT FOUND until the column "
+                        "map is corrected.", table, sorted(missing), spec["key"])
+    return out
+
+
+# ── result shaping ───────────────────────────────────────────────────────────
 def _num(v):
     if v is None:
         return None
@@ -89,47 +401,53 @@ def _num(v):
         return v
 
 
-def _company(table, row):
-    ent = row.get("entity")
-    if ent:
-        return ent
-    if table.startswith("cfpl"):
-        return "cfpl"
-    if table.startswith("cdpl"):
-        return "cdpl"
-    return None
-
-
-def _result(table, row, matched_by):
-    return {
+def _result(row: dict, matched_by: str, *, ambiguous_with=None) -> dict:
+    out = {
         "found": True,
-        "table": table,
-        "company": _company(table, row),
+        "table": row.get("_src"),
+        "company": row.get("company"),
         "matched_by": matched_by,
         "box": {
-            "box_id":          _pick(row, "box_id"),
-            "transaction_no":  _pick(row, "transaction_no"),
-            "item_description": _pick(row, "item_description"),
-            "lot_number":      _pick(row, "lot_number"),
-            "net_weight":      _num(_pick(row, "net_weight")),
-            "gross_weight":    _num(_pick(row, "gross_weight")),
-            "count":           _pick(row, "count"),
-            "status":          _pick(row, "status"),
-            "job_card_number": _pick(row, "job_card_number"),
+            "box_id":           row.get("box_id"),
+            "transaction_no":   row.get("transaction_no"),
+            "item_description": row.get("item_description"),
+            "lot_number":       row.get("lot_number"),
+            "net_weight":       _num(row.get("net_weight")),
+            "gross_weight":     _num(row.get("gross_weight")),
+            "count":            row.get("count"),
+            "status":           row.get("status"),
+            "job_card_number":  row.get("job_card_number"),
         },
-        # ponytail: no raw-row dump — cold_stocks carries cost cols
-        # (last_purchase_rate/value) and this endpoint is unauthenticated.
+        # ponytail: no raw-row dump — cold_stocks carries cost columns
+        # (last_purchase_rate/value) and this endpoint is scan-facing.
     }
+    if ambiguous_with:
+        # Surfaced, not swallowed: box_id is in no unique key, so a second hit
+        # means the caller may be looking at the wrong physical box.
+        out["ambiguous"] = True
+        out["also_in"] = ambiguous_with
+    return out
 
 
-async def _search_all(conn, box_id, skip=()):
-    for table, _company_hint, box_col, _txn_col in _ALL_TABLES:
-        if table in skip:
-            continue  # already tried with an identical box-id-only query
-        row = await _query(conn, table, box_col, box_id)  # box id only
-        if row:
-            return _result(table, row, "box_id_only")
-    return None
+async def _run(conn, sql: str, *args) -> list[dict]:
+    """Execute a planned query.
+
+    The catch is narrow ON PURPOSE. `_plan` has already proven every table and
+    column exists, so UndefinedTable/UndefinedColumn here means the schema moved
+    under a cached plan — recoverable, but it must be loud. Everything else
+    (DataError from a type mismatch, permissions) propagates: a scan that cannot
+    answer must not pretend the box is missing.
+    """
+    try:
+        return [dict(r) for r in await conn.fetch(sql, *args)]
+    except (asyncpg.UndefinedTableError, asyncpg.UndefinedColumnError):
+        logger.exception(
+            "box-identify: schema drifted under a cached column plan; clearing "
+            "the cache so the next scan re-plans.")
+        _COLUMNS.clear()
+        # Clear the warning suppressor too, or the re-plan drops branches silently.
+        _WARNED.clear()
+        return []
 
 
 async def identify_box(conn, value: str) -> dict:
@@ -144,105 +462,49 @@ async def identify_box(conn, value: str) -> dict:
 
     if tx and bi:
         bi, tx = str(bi).strip(), str(tx).strip()
-        for table, _c, box_col, txn_col in _JSON_TABLES:
-            row = await _query(conn, table, box_col, bi, txn_col, tx)
-            if row:
-                return _result(table, row, "tx+bi")
-        return await _search_all(conn, bi) or {"found": False, "box_id": bi}
+        avail = await _available(conn, with_txn=True)
+        sql, _ = _plan(avail, with_txn=True, hint=_hinted_first(tx))
+        rows = await _run(conn, sql, bi, tx) if sql else []
+        if rows:
+            extra = [r["_src"] for r in rows[1:]]
+            if extra:
+                logger.warning(
+                    "box-identify: (box_id=%r, transaction_no=%r) matched %d tables "
+                    "%s — returning %r. box_id is in no unique key, so this pair is "
+                    "not guaranteed to identify one physical box.",
+                    bi, tx, len(rows), [rows[0]["_src"]] + extra, rows[0]["_src"])
+            return _result(rows[0], "tx+bi", ambiguous_with=extra)
+        found = await _search_by_id(conn, bi, hint=_hinted_first(tx))
+        return found or {"found": False, "box_id": bi}
 
-    # bare id, or a JSON QR that only carried `bi` -> resolve by that id.
+    # bare id, or a JSON QR that only carried `bi`
     box_id = str(bi).strip() if bi else value
     if box_id:
-        row = await _query(conn, _SFG[0], _SFG[2], box_id)
-        if row:
-            return _result(_SFG[0], row, "carton_id")
-        # sfg_box already tried above with the same box-id-only query — skip it.
-        found = await _search_all(conn, box_id, skip={_SFG[0]})
+        found = await _search_by_id(conn, box_id)
         if found:
             return found
     return {"found": False, "box_id": box_id}
 
 
-if __name__ == "__main__":
-    import asyncio
+async def _search_by_id(conn, box_id: str, *, hint: str | None = None) -> dict | None:
+    """Box id alone, across every branch including sfg_box's carton_id.
 
-    class _FakeConn:
-        """Rows keyed by (table, box_id). Tables in `broken` raise like a missing
-        table/column would (they must be skipped, not fatal)."""
-        def __init__(self, rows, broken=()):
-            self.rows = rows
-            self.broken = set(broken)
-            self.seen = []  # table order actually queried
-
-        async def fetchrow(self, sql, box_id, txn=None):
-            table = sql.split("FROM ")[1].split(" WHERE")[0]
-            self.seen.append(table)
-            if table in self.broken:
-                raise asyncpg.UndefinedColumnError("no such column")
-            row = self.rows.get((table, box_id))
-            if row is None:
-                return None
-            if txn is not None and row.get("transaction_no") != txn:
-                return None
-            return dict(row)
-
-    async def _main():
-        # 1. JSON QR resolves in a warehouse table by (box_id, transaction_no).
-        c = _FakeConn({("cfpl_boxes_v2", "91-1"): {
-            "box_id": "91-1", "transaction_no": "TR-9", "net_weight": 10.5}})
-        r = await identify_box(c, '{"tx":"TR-9","bi":"91-1"}')
-        assert r["found"] and r["table"] == "cfpl_boxes_v2" and r["matched_by"] == "tx+bi"
-        assert r["box"]["net_weight"] == 10.5, r
-        # bulk_entry tables are tried before boxes_v2 (user order)
-        assert c.seen[:2] == ["cfpl_bulk_entry_boxes", "cdpl_bulk_entry_boxes"], c.seen
-
-        # 2. Bare id resolves in sfg_box via carton_id.
-        c = _FakeConn({("sfg_box", "48-2"): {
-            "carton_id": "48-2", "fg_sku_name": "FG-X", "entity": "cdpl",
-            "units": 5, "status": "PRINTED"}})
-        r = await identify_box(c, "48-2")
-        assert r["found"] and r["table"] == "sfg_box" and r["matched_by"] == "carton_id"
-        assert r["box"]["box_id"] == "48-2" and r["company"] == "cdpl", r
-        assert r["box"]["count"] == 5 and r["box"]["item_description"] == "FG-X", r
-
-        # 3. JSON QR whose box is actually an sfg_box -> both primaries miss,
-        #    exhaustive fallback finds it by box id alone.
-        c = _FakeConn({("sfg_box", "77-3"): {"carton_id": "77-3", "entity": "cfpl"}})
-        r = await identify_box(c, '{"tx":"TR-0","bi":"77-3"}')
-        assert r["found"] and r["table"] == "sfg_box" and r["matched_by"] == "box_id_only", r
-
-        # 4. Nothing anywhere -> found False, echoes the box id.
-        c = _FakeConn({})
-        r = await identify_box(c, "no-such")
-        assert r == {"found": False, "box_id": "no-such"}, r
-
-        # 4b. JSON with only `bi` (no tx) -> resolves by that id, not the raw JSON.
-        c = _FakeConn({("sfg_box", "88-1"): {"carton_id": "88-1", "entity": "cfpl"}})
-        r = await identify_box(c, '{"bi":"88-1"}')
-        assert r["found"] and r["table"] == "sfg_box", r
-
-        # 5. Wrong txn in JSON -> primary miss, fallback matches by box id only.
-        c = _FakeConn({("cfpl_cold_stocks", "5-1"): {
-            "box_id": "5-1", "transaction_no": "TR-REAL", "weight_kg": 3.2}})
-        r = await identify_box(c, '{"tx":"TR-WRONG","bi":"5-1"}')
-        assert r["found"] and r["matched_by"] == "box_id_only", r
-        assert r["box"]["net_weight"] == 3.2, r  # weight_kg alias
-
-        # 6. A table that errors (absent/unknown schema) is skipped, not fatal:
-        #    the scan continues and still resolves in a later table.
-        c = _FakeConn(
-            {("cdpl_boxes_v2", "9-9"): {"box_id": "9-9", "transaction_no": "TR-1"}},
-            broken={"cold_transfer_inboxes", "cfpl_boxes_v2"},
-        )
-        r = await identify_box(c, '{"tx":"TR-1","bi":"9-9"}')
-        assert r["found"] and r["table"] == "cdpl_boxes_v2", r
-
-        # 7. sfg_box isn't re-queried in the bare-path fallback (dedup).
-        c = _FakeConn({("po_box", "7-7"): {"box_id": "7-7"}})
-        r = await identify_box(c, "7-7")
-        assert r["found"] and r["table"] == "po_box", r
-        assert c.seen.count("sfg_box") == 1, c.seen  # primary only, not fallback
-
-        print("box_identify self-check OK")
-
-    asyncio.run(_main())
+    This pass is inherently weaker than tx+bi: without a transaction number,
+    a repeated box_id base (~27.7h) can match a different physical box. A
+    multi-table hit is therefore reported as ambiguous rather than resolved.
+    """
+    avail = await _available(conn, with_txn=False)
+    sql, _ = _plan(avail, with_txn=False, hint=hint)
+    if not sql:
+        return None
+    rows = await _run(conn, sql, box_id)
+    if not rows:
+        return None
+    extra = [r["_src"] for r in rows[1:]]
+    if extra:
+        logger.warning(
+            "box-identify: box_id=%r alone matched %d tables %s — returning %r. "
+            "Without a transaction number this may be a different physical box.",
+            box_id, len(rows), [rows[0]["_src"]] + extra, rows[0]["_src"])
+    matched = "carton_id" if rows[0].get("_src") == "sfg_box" else "box_id_only"
+    return _result(rows[0], matched, ambiguous_with=extra)

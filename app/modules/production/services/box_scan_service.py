@@ -88,9 +88,11 @@ async def scan_box(conn, *, job_card_id: int, code: str,
     NOWHERE, the box is still stored using the operator-entered ``article``
     (required) + weights/count, so any physical box can be recorded.
 
-    Resolution runs in AUTOCOMMIT on purpose: identify_box swallows
-    missing-legacy-table errors, which would poison a surrounding transaction —
-    so the caller must NOT wrap this in one (the single upsert is atomic anyway).
+    Resolution runs in AUTOCOMMIT on purpose. identify_box no longer swallows
+    errors — it plans its query from information_schema and includes only the
+    tables and columns that exist — but it still catches schema drift under a
+    cached plan, and any failed statement would poison a surrounding transaction.
+    So the caller must NOT wrap this in one (the single upsert is atomic anyway).
     """
     jc = await conn.fetchval(
         "SELECT 1 FROM job_card_v2 WHERE job_card_id = $1 AND deleted_at IS NULL",
@@ -121,6 +123,17 @@ async def scan_box(conn, *, job_card_id: int, code: str,
     box = await _resolve_box(conn, code, source_type)
     if box is None:
         ident = await identify_box(conn, code)
+        if ident.get("ambiguous"):
+            # The scan matched the same id in more than one table. box_id is in no
+            # unique key and its 8-digit base repeats about every 27.7 hours, so
+            # picking the top row would attach THIS job card to a box that may be
+            # a different physical carton. Refuse and tell the operator to scan the
+            # QR with its transaction number, which disambiguates.
+            return {
+                "error": "ambiguous_box",
+                "code": code,
+                "tables": [ident.get("table"), *(ident.get("also_in") or [])],
+            }
         if ident.get("found"):
             b = ident.get("box") or {}
             is_sfg = ident.get("table") == "sfg_box"
