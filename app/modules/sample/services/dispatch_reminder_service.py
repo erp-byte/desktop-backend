@@ -85,3 +85,32 @@ async def release_overdue(conn, req_id: int) -> None:
     await conn.execute(
         "DELETE FROM sample_dispatch_reminder_log "
         " WHERE requisition_id = $1 AND kind LIKE 'OVERDUE%'", req_id)
+
+
+async def due_buckets(conn, today: date) -> dict:
+    """Split the chaseable requisitions into the two buckets, against an IST `today`.
+
+    One query, bucketed in Python: the row set is small (open requisitions with a date),
+    and doing it here keeps the boundary rules in one readable place instead of two
+    near-identical SQL predicates.
+    """
+    placeholders = ", ".join(f"'{s}'" for s in OPEN_STATUSES)   # module constants, not input
+    rows = await conn.fetch(
+        f"""SELECT * FROM sample_requisitions
+             WHERE deleted_at IS NULL
+               AND expected_dispatch_date IS NOT NULL
+               AND status IN ({placeholders})
+               AND expected_dispatch_date <= $1 + 1
+             ORDER BY expected_dispatch_date, id""", today)
+    due, over = [], []
+    for r in rows:
+        d = dict(r)
+        exp = d["expected_dispatch_date"]
+        if exp == today + timedelta(days=1):
+            d["overdue_days"] = 0
+            due.append(d)
+        elif exp < today:
+            d["overdue_days"] = (today - exp).days
+            over.append(d)
+        # exp == today falls through: the warning is D-1, the chase D+1.
+    return {"due_tomorrow": due, "overdue": over}

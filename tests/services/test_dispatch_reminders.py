@@ -13,7 +13,7 @@ Run:  PYTHONPATH=. python -m pytest tests/services/test_dispatch_reminders.py
 from __future__ import annotations
 
 import asyncio
-from datetime import date
+from datetime import date, timedelta
 
 import asyncpg
 from asyncpg import exceptions as pg
@@ -121,3 +121,72 @@ def test_ist_today_is_ahead_of_utc_across_the_boundary():
     from datetime import datetime, timezone as _tz
     utc_evening = datetime(2026, 9, 4, 20, 0, tzinfo=_tz.utc)
     assert utc_evening.astimezone(svc.IST).date() == date(2026, 9, 5)
+
+
+# --- the scan ---------------------------------------------------------------
+
+class _ScanConn:
+    """Returns canned requisition rows and records the SQL + args it was given."""
+
+    def __init__(self, rows):
+        self.rows = [dict(r) for r in rows]
+        self.queries: list[str] = []
+        self.args: tuple = ()
+
+    async def fetch(self, query, *args):
+        self.queries.append(query)
+        self.args = args
+        return self.rows
+
+
+def _req(**kw):
+    base = {"id": REQ, "request_id": REQ, "status": "BH_APPROVED",
+            "expected_dispatch_date": DAY + timedelta(days=1), "sample_type": "NPD"}
+    base.update(kw)
+    return base
+
+
+def test_scan_asks_only_for_open_requisitions_with_a_date():
+    conn = _ScanConn([])
+    asyncio.run(svc.due_buckets(conn, DAY))
+    sql = conn.queries[0]
+    assert "expected_dispatch_date IS NOT NULL" in sql
+    assert "deleted_at IS NULL" in sql
+    for st in svc.OPEN_STATUSES:
+        assert st in sql
+    # The five non-chased statuses must not be selectable.
+    for st in ("INTERNALLY_DISPATCHED", "GATE_PASS_ISSUED", "CLOSED",
+               "BH_REJECTED", "CANCELLED"):
+        assert st not in sql
+
+
+def test_scan_passes_the_ist_day_as_the_comparison_date():
+    conn = _ScanConn([])
+    asyncio.run(svc.due_buckets(conn, DAY))
+    assert conn.args == (DAY,)
+
+
+def test_due_tomorrow_bucket():
+    conn = _ScanConn([_req(expected_dispatch_date=DAY + timedelta(days=1))])
+    out = asyncio.run(svc.due_buckets(conn, DAY))
+    assert [r["id"] for r in out["due_tomorrow"]] == [REQ]
+    assert out["overdue"] == []
+
+
+def test_due_today_is_in_neither_bucket():
+    """The warning is D-1 and the chase is D+1; the day itself is deliberately silent."""
+    conn = _ScanConn([_req(expected_dispatch_date=DAY)])
+    out = asyncio.run(svc.due_buckets(conn, DAY))
+    assert out["due_tomorrow"] == [] and out["overdue"] == []
+
+
+def test_overdue_bucket_carries_its_age():
+    conn = _ScanConn([_req(expected_dispatch_date=DAY - timedelta(days=3))])
+    out = asyncio.run(svc.due_buckets(conn, DAY))
+    assert [r["overdue_days"] for r in out["overdue"]] == [3]
+
+
+def test_far_future_is_in_neither_bucket():
+    conn = _ScanConn([_req(expected_dispatch_date=DAY + timedelta(days=9))])
+    out = asyncio.run(svc.due_buckets(conn, DAY))
+    assert out["due_tomorrow"] == [] and out["overdue"] == []
