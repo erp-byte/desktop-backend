@@ -126,6 +126,11 @@ async def scan_and_send(conn, *, today: date, dry_run: bool = False) -> dict:
 
     The claim comes before the send and is released if the send found no recipient: a row
     left behind for a mail nobody received would mark it sent for the rest of the day.
+
+    dry_run's count is the bucket size, not a count of addressable mails: it returns before
+    claiming or resolving recipients, so it can include a requisition an earlier tick already
+    sent today, or one whose business head has no address on file. That is the safe direction
+    for sizing a first batch — treat the number as an upper bound, not a promise.
     """
     if not await has_log_table(conn):
         logger.info("[dispatch-reminder] 087 not applied — nothing to do")
@@ -183,24 +188,30 @@ async def dispatch_reminder_loop(pool) -> None:
 
     Unlike promote_reminder_loop, several instances running at once is SAFE here: the
     guard's unique index decides which one sends.
+
+    Unlike promote_reminder_loop (and the other loops), this one ticks BEFORE its first
+    sleep. There, sleeping first only delays a resend if the process recycles early; here it
+    would silently disable the whole feature — a process that recycles faster than the tick
+    (deploy loops, health-check flapping, `uvicorn --reload`) would never reach a single
+    scan. An immediate first tick is safe: the send-once guard makes it idempotent, and the
+    hour gate still stops a 02:00 restart from mailing anyone.
     """
     tick_s = max(15 * 60, int(os.environ.get("SAMPLE_REMINDER_TICK_MIN", "60")) * 60)
     hour = int(os.environ.get("SAMPLE_REMINDER_HOUR", "7"))
     logger.info("Dispatch reminder loop started (tick=%ds, from %02d:00 IST)", tick_s, hour)
     try:
         while True:
-            await asyncio.sleep(tick_s)
             try:
-                if os.environ.get("SAMPLE_REMINDER_ENABLED", "1").strip() not in ("1", "true", "True"):
-                    continue
-                if datetime.now(IST).hour < hour:
-                    continue                          # too early to mail anyone
-                async with pool.acquire() as conn:
-                    counts = await scan_and_send(conn, today=ist_today())
-                if any(counts.values()):
-                    logger.info("Dispatch reminder: sent %s", counts)
+                enabled = os.environ.get("SAMPLE_REMINDER_ENABLED", "1").strip() in ("1", "true", "True")
+                if enabled and datetime.now(IST).hour >= hour:
+                    async with pool.acquire() as conn:
+                        counts = await scan_and_send(conn, today=ist_today())
+                    if any(counts.values()):
+                        logger.info("Dispatch reminder: sent %s", counts)
             except Exception:                         # noqa: BLE001 — a bad tick must never kill the loop
                 logger.exception("Dispatch reminder loop tick failed")
+            # Outside the inner try so a cancel here is never swallowed as "a bad tick".
+            await asyncio.sleep(tick_s)
     except asyncio.CancelledError:
         logger.info("Dispatch reminder loop stopped")
         raise

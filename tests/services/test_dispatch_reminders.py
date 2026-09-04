@@ -13,9 +13,10 @@ Run:  PYTHONPATH=. python -m pytest tests/services/test_dispatch_reminders.py
 from __future__ import annotations
 
 import asyncio
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import asyncpg
+import pytest
 from asyncpg import exceptions as pg
 
 from app.modules.sample.services import dispatch_reminder_service as svc
@@ -216,14 +217,20 @@ class _FullConn(_Conn):
         return await super().execute(query, *args)
 
 
-def _stub_mail(monkeypatch, *, ok=True):
+def _stub_mail(monkeypatch, *, ok=True, raises=False):
     calls: list[tuple] = []
 
     async def _due(conn, req, *, audience):
-        calls.append(("due", req["id"], audience)); return ok
+        calls.append(("due", req["id"], audience))
+        if raises:
+            raise RuntimeError("mailer exploded")
+        return ok
 
     async def _over(conn, req, *, days, audience):
-        calls.append(("over", req["id"], audience, days)); return ok
+        calls.append(("over", req["id"], audience, days))
+        if raises:
+            raise RuntimeError("mailer exploded")
+        return ok
 
     monkeypatch.setattr(svc, "notify_dispatch_due_tomorrow", _due)
     monkeypatch.setattr(svc, "notify_dispatch_overdue", _over)
@@ -264,6 +271,29 @@ def test_a_failed_send_does_not_consume_the_day(monkeypatch):
     assert conn.rows == []
 
 
+def test_a_release_touches_only_the_failed_kind(monkeypatch):
+    """The DELETE scan_and_send issues to undo a claim must target the exact
+    (requisition_id, kind, sent_on) triple, not just the requisition — otherwise a release
+    for one kind would also wipe out a sibling kind that legitimately sent."""
+    async def _over(conn, req, *, days, audience):
+        return audience == "npd"          # npd succeeds, owner fails
+    monkeypatch.setattr(svc, "notify_dispatch_overdue", _over)
+    conn = _FullConn([_req(expected_dispatch_date=DAY - timedelta(days=1))])
+    asyncio.run(svc.scan_and_send(conn, today=DAY))
+    assert [r["kind"] for r in conn.rows] == [svc.KIND_OVERDUE_NPD]
+
+
+def test_a_raising_send_does_not_consume_the_day(monkeypatch):
+    """A bug in the mailer must not permanently silence the chase: an exception out of
+    notify_* is treated exactly like a False return — the guard row is released."""
+    calls = _stub_mail(monkeypatch, raises=True)
+    conn = _FullConn([_req(expected_dispatch_date=DAY - timedelta(days=1))])
+    out = asyncio.run(svc.scan_and_send(conn, today=DAY))
+    assert calls          # the send was attempted
+    assert conn.rows == []
+    assert all(v == 0 for v in out.values())
+
+
 def test_dry_run_sends_nothing_and_claims_nothing(monkeypatch):
     calls = _stub_mail(monkeypatch)
     conn = _FullConn([_req(expected_dispatch_date=DAY - timedelta(days=1))])
@@ -277,3 +307,128 @@ def test_unmigrated_sends_nothing(monkeypatch):
     conn = _FullConn([_req(expected_dispatch_date=DAY - timedelta(days=1))], has_table=False)
     out = asyncio.run(svc.scan_and_send(conn, today=DAY))
     assert calls == [] and out == {}
+
+
+# --- the loop -----------------------------------------------------------------
+
+class _FrozenDateTime(datetime):
+    """A fixed IST clock (05:00) so the loop's hour gate is deterministic instead of
+    depending on the real time the suite happens to run at."""
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls(2026, 9, 4, 5, 0, tzinfo=tz)
+
+
+class _AcquireCtx:
+    async def __aenter__(self):
+        return None
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class _FakePool:
+    """dispatch_reminder_loop only ever does `async with pool.acquire() as conn`."""
+
+    def acquire(self):
+        return _AcquireCtx()
+
+
+def _stub_scan(monkeypatch):
+    """Replace scan_and_send itself: these tests are about the loop's own control flow
+    (gating, ticking, resilience), not the scan, which has its own tests above."""
+    calls: list[date] = []
+
+    async def _scan(conn, *, today):
+        calls.append(today)
+        return {}
+
+    monkeypatch.setattr(svc, "scan_and_send", _scan)
+    return calls
+
+
+def _sleep_raises_cancelled(monkeypatch):
+    """Make the loop's own sleep the exit: it records the duration it was asked to sleep
+    for, then raises CancelledError so the (otherwise infinite) loop stops after one pass —
+    exactly what a real task cancellation on shutdown looks like from inside the loop."""
+    sleeps: list[float] = []
+
+    async def _sleep(s):
+        sleeps.append(s)
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(svc.asyncio, "sleep", _sleep)
+    return sleeps
+
+
+def test_loop_does_not_scan_before_the_configured_hour(monkeypatch):
+    monkeypatch.setattr(svc, "datetime", _FrozenDateTime)   # frozen at 05:00 IST
+    monkeypatch.setenv("SAMPLE_REMINDER_HOUR", "23")
+    calls = _stub_scan(monkeypatch)
+    _sleep_raises_cancelled(monkeypatch)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(svc.dispatch_reminder_loop(_FakePool()))
+    assert calls == []
+
+
+def test_loop_scans_immediately_on_startup(monkeypatch):
+    """Regression for sleep-first: the loop must tick BEFORE its first sleep, or a process
+    that recycles faster than the tick interval would never scan at all."""
+    monkeypatch.setattr(svc, "datetime", _FrozenDateTime)   # frozen at 05:00 IST
+    monkeypatch.setenv("SAMPLE_REMINDER_HOUR", "5")          # already past the gate
+    calls = _stub_scan(monkeypatch)
+    sleeps = _sleep_raises_cancelled(monkeypatch)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(svc.dispatch_reminder_loop(_FakePool()))
+    assert len(calls) == 1        # scanned before the sleep that stopped the loop ran
+    assert sleeps                 # and still reached the sleep afterwards
+
+
+def test_loop_stops_cleanly_on_cancellation(monkeypatch):
+    """CancelledError out of asyncio.sleep must propagate out of the loop rather than being
+    swallowed by the per-tick except Exception, so task cancellation on shutdown works."""
+    monkeypatch.setattr(svc, "datetime", _FrozenDateTime)
+    monkeypatch.setenv("SAMPLE_REMINDER_HOUR", "0")
+    _stub_scan(monkeypatch)
+    _sleep_raises_cancelled(monkeypatch)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(svc.dispatch_reminder_loop(_FakePool()))
+
+
+def test_loop_honours_the_tick_floor(monkeypatch):
+    """A misconfigured tiny SAMPLE_REMINDER_TICK_MIN must not turn this into a tight poll
+    loop — the floor is 15 minutes regardless of what the env asks for."""
+    monkeypatch.setenv("SAMPLE_REMINDER_TICK_MIN", "1")
+    monkeypatch.setattr(svc, "datetime", _FrozenDateTime)
+    monkeypatch.setenv("SAMPLE_REMINDER_HOUR", "0")
+    _stub_scan(monkeypatch)
+    sleeps = _sleep_raises_cancelled(monkeypatch)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(svc.dispatch_reminder_loop(_FakePool()))
+    assert sleeps == [15 * 60]
+
+
+def test_loop_respects_the_kill_switch(monkeypatch):
+    monkeypatch.setenv("SAMPLE_REMINDER_ENABLED", "0")
+    monkeypatch.setattr(svc, "datetime", _FrozenDateTime)
+    monkeypatch.setenv("SAMPLE_REMINDER_HOUR", "0")   # would scan if it weren't disabled
+    calls = _stub_scan(monkeypatch)
+    _sleep_raises_cancelled(monkeypatch)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(svc.dispatch_reminder_loop(_FakePool()))
+    assert calls == []
+
+
+def test_loop_survives_an_exception_in_the_tick(monkeypatch):
+    """A bad tick (e.g. scan_and_send hitting a DB error) must be caught and logged, not
+    left to kill the loop — it should still reach its next sleep."""
+    async def _boom(conn, *, today):
+        raise RuntimeError("db exploded")
+    monkeypatch.setattr(svc, "scan_and_send", _boom)
+    monkeypatch.setattr(svc, "datetime", _FrozenDateTime)
+    monkeypatch.setenv("SAMPLE_REMINDER_HOUR", "0")
+    sleeps = _sleep_raises_cancelled(monkeypatch)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(svc.dispatch_reminder_loop(_FakePool()))
+    assert sleeps          # reached the sleep despite the exception
