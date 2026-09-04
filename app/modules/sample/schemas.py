@@ -368,6 +368,28 @@ class PromoteApprovalBody(BaseModel):
     approver_kind: Optional[Literal["INV_MGR", "REQUESTOR_BH"]] = None
 
 
+class RequisitionEmailCancel(BaseModel):
+    """Cancel a requisition from the overdue-dispatch reminder's Cancel button (087).
+    PUBLIC (no session) — authenticated by the signed token bound to
+    (req_cancel, request_id, email) plus `email` being that request's business head.
+    A reason is required; CANCELLED is terminal."""
+    request_id: int
+    email: str
+    t: str
+    reason: str
+
+
+class RequisitionEmailRedate(BaseModel):
+    """Move a requisition's expected dispatch date from the overdue reminder's
+    Change-date button (087). Same public-plus-token auth as the cancel above.
+    `expected_dispatch_date` is an ISO date (YYYY-MM-DD) — what the portal's native
+    <input type="date"> emits."""
+    request_id: int
+    email: str
+    t: str
+    expected_dispatch_date: date
+
+
 class PromoteEmailReject(BaseModel):
     """Reject a promote gate from the email-driven reason dialog on the web app. PUBLIC
     (no session) — authenticated by the recipient `email` owning the gate; a reason is
