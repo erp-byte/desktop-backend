@@ -8,11 +8,17 @@ the exact (action, id[, gate], email); the endpoint recomputes it with the
 server secret and constant-time compares before trusting the email.
 
 Bindings used by callers:
-    accept  -> sign("npd", request_id, email)
-    approve -> sign("promote", dev_jc_id, approver_kind, email)
+    accept      -> sign("npd", request_id, email)
+    approve     -> sign("promote", dev_jc_id, approver_kind, email)
+    req_cancel  -> sign("req_cancel", request_id, email)
+    req_redate  -> sign("req_redate", request_id, email)
 
 The reject link bounces through the web app (not backend-only), so it is not
 signed here; rejecting is non-escalating (blocks a promotion, requires a reason).
+
+The two dispatch-reminder links bounce through the web app like the reject link, but
+unlike it they ARE signed: cancelling is terminal and irreversible, so an unsigned link
+would let anyone who guessed an 8-digit request_id plus an address kill a live request.
 """
 
 import hashlib
