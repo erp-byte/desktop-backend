@@ -53,7 +53,9 @@ CREATE TABLE IF NOT EXISTS po_line (
     line_number             INT NOT NULL,
     sku_name                TEXT,
     uom                     TEXT,
-    pack_count              INT,
+    -- Tally's Quantity is a decimal measure (kg), not a count of packs.
+    -- See 097_po_line_pack_count_numeric.sql.
+    pack_count              NUMERIC(15,3),
     po_weight               NUMERIC(15,3),
     rate                    NUMERIC(15,3),
     amount                  NUMERIC(15,3),

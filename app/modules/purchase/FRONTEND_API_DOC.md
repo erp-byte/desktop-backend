@@ -131,7 +131,7 @@ Upload a Purchase Order Book Excel file. Backend parses header/line items, extra
 | Header | loading_unloading_charges | Col AQ (Loading/Unloading) | ~1% |
 | Line | sku_name | Col B (Particulars on line row) | 100% |
 | Line | pack_count | Col J (Quantity) | 100% |
-| Line | uom | Col K (Alt. Units) | ~1.5% |
+| Line | alt_units | Col K (Alt. Units) | ~1.5% |
 | Line | rate | Col L (Rate) | 100% |
 | Line | amount | Col M (Value) | 100% |
 
@@ -145,6 +145,7 @@ Upload a Purchase Order Book Excel file. Backend parses header/line items, extra
 | item_type | `all_sku.item_type` | `rm` (Raw Material), `pm` (Packing), `fg` (Finished Good) |
 | sales_group | `all_sku.sale_group` | e.g. "bulk", "retail" |
 | gst_rate | `all_sku.gst` | e.g. 0.05 (5%) |
+| uom | `all_sku.uom` | Unit weight in kg, as text. Always from all_sku — Col K "Alt. Units" is Tally's secondary *quantity* and is surfaced separately as `alt_units`. |
 | match_score | computed | 0.0 to 1.0 fuzzy match confidence |
 | match_source | computed | `"all_sku"` if matched, `null` if not |
 | po_weight | computed | `pack_count × all_sku.uom` |

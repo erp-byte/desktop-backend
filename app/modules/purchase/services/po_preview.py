@@ -27,6 +27,23 @@ logger = logging.getLogger(__name__)
 
 _FUZZY_THRESHOLD = 0.70
 _EXACT_THRESHOLD = 0.99
+# rapidfuzz (and therefore match_sku) scores on 0-100; the thresholds above are
+# the 0-1 scale match_sku returns. Passing the 0-1 value straight through as a
+# cut-off disables it -- every SKU then "matches" its nearest master row, however
+# unrelated, and that row's fields get grafted onto the line.
+_MATCH_CUTOFF = _FUZZY_THRESHOLD * 100
+
+# all_sku -> po_line field mapping. MasterItem mirrors the all_sku column names,
+# which differ from the po_line column names, so the mapping has to be explicit.
+# See FRONTEND_API_DOC.md, "What gets matched from all_sku".
+_MASTER_TO_LINE: tuple[tuple[str, str], ...] = (
+    ("particulars", "particulars"),
+    ("group",       "item_category"),
+    ("sub_group",   "sub_category"),
+    ("item_type",   "item_type"),
+    ("sale_group",  "sales_group"),
+    ("gst",         "gst_rate"),
+)
 
 
 # ── helpers ──────────────────────────────────────────────────────────────
@@ -65,17 +82,17 @@ def _classify_match_source(score: float) -> str:
 
 
 def _matched_item_payload(item: MasterItem | None) -> dict | None:
+    """The master row behind a match, in MatchedItem's field names.
+
+    `uom` stays numeric here: it is the unit weight in kg, and the frontend
+    multiplies it by pack_count when the user re-picks an item by hand.
+    """
     if item is None:
         return None
-    # MasterItem is a dataclass — be tolerant of field name variations
-    out = {}
-    for attr in ("sku_id", "sku_name", "item_category", "sub_category",
-                 "item_type", "sales_group", "gst_rate", "uom"):
-        if hasattr(item, attr):
-            v = getattr(item, attr)
-            if v is not None:
-                out[attr] = v
-    return out
+    out = {line_key: getattr(item, attr) for attr, line_key in _MASTER_TO_LINE}
+    out["sku_name"] = item.particulars      # canonical name from all_sku
+    out["uom"] = item.uom
+    return {k: v for k, v in out.items() if v is not None}
 
 
 def _enrich_line_from_master(line: dict, item: MasterItem | None, score: float) -> dict:
@@ -85,18 +102,31 @@ def _enrich_line_from_master(line: dict, item: MasterItem | None, score: float) 
     out["match_score"] = round(score, 4) if score else 0.0
     out["match_source"] = _classify_match_source(score)
     out["matched_item"] = _matched_item_payload(item)
-    if item is not None:
-        for attr, key in (
-            ("item_category", "item_category"),
-            ("sub_category", "sub_category"),
-            ("item_type", "item_type"),
-            ("sales_group", "sales_group"),
-            ("gst_rate", "gst_rate"),
-            ("uom", "uom"),
-            ("sku_name", "sku_name"),  # canonical SKU name
-        ):
-            if hasattr(item, attr) and out.get(key) in (None, ""):
-                out[key] = getattr(item, attr)
+    if item is None:
+        return out
+
+    for attr, key in _MASTER_TO_LINE:
+        v = getattr(item, attr)
+        if v is not None and out.get(key) in (None, ""):
+            out[key] = v
+    if out.get("sku_name") in (None, ""):
+        out["sku_name"] = item.particulars
+
+    # uom is an all_sku-sourced field, so the master value wins outright rather
+    # than only filling a gap -- anything the parser left here is Tally's
+    # "Alt. Units" secondary quantity (e.g. 20000.0), not a unit weight.
+    # po_line.uom is a text column but MasterItem.uom is a float, so stringify
+    # or the response fails PreviewLine validation.
+    if item.uom is not None:
+        out["uom"] = str(item.uom)
+
+    # po_weight = pack_count x all_sku.uom (FRONTEND_API_DOC). Without this the
+    # preview -> commit path stores NULL and MRP under-reports ordered weight.
+    pack_count = out.get("pack_count")
+    if (out.get("po_weight") is None and pack_count is not None
+            and item.uom is not None and item.uom > 0):
+        out["po_weight"] = round(pack_count * item.uom, 3)
+
     return out
 
 
@@ -200,7 +230,7 @@ async def preview(
         enriched_lines: list[dict] = []
         for line in po.get("lines", []):
             sku_name = line.get("sku_name") or ""
-            item, score = match_sku(sku_name, master_items, _FUZZY_THRESHOLD) \
+            item, score = match_sku(sku_name, master_items, _MATCH_CUTOFF) \
                 if sku_name else (None, 0.0)
             enriched = _enrich_line_from_master(line, item, score)
             if enriched.get("match_source") in ("exact", "fuzzy"):

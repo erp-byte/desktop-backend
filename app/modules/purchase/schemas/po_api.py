@@ -30,7 +30,10 @@ class PreviewLine(BaseModel):
     line_number: int
     sku_name: str | None = None
     uom: str | None = None
-    pack_count: int | None = None
+    # Tally's Quantity is a decimal measure (kg), not a count of packs --
+    # e.g. Rose Petals 20.8. An int here rejects the decimal outright
+    # (int_from_float) and 500s the whole preview.
+    pack_count: float | None = None
     po_weight: float | None = None
     rate: float | None = None
     amount: float | None = None
@@ -184,7 +187,10 @@ class PoLineOut(BaseModel):
     line_number: int
     sku_name: str | None = None
     uom: str | None = None
-    pack_count: int | None = None
+    # Tally's Quantity is a decimal measure (kg), not a count of packs --
+    # e.g. Rose Petals 20.8. An int here rejects the decimal outright
+    # (int_from_float) and 500s the whole preview.
+    pack_count: float | None = None
     po_weight: float | None = None
     rate: float | None = None
     amount: float | None = None
