@@ -136,10 +136,26 @@ def test_no_business_head_reports_false(monkeypatch):
         _MailConn(), REQ, days=2, audience="owner")) is False
 
 
-def test_overdue_owner_send_carries_the_buttons_and_broadcasts_without(monkeypatch):
+def test_overdue_owner_send_carries_the_buttons_and_the_poc_gets_a_button_less_copy(monkeypatch):
+    """Design §4: T4's Cc is the sales POC alone — the button-less copy must NOT fan out
+    to the full trail (that would be npd_team + inventory + production for an NPD/TRIAL
+    request, mailed daily). Only _send is used here, never _broadcast."""
     sent = _patch(monkeypatch, npd=["npd@x.in"], requestor="bh@x.in", poc="poc@x.in")
     asyncio.run(m.notify_dispatch_overdue(_MailConn(), REQ, days=2, audience="owner"))
-    direct = [s for s in sent if s["to"] != ["<broadcast>"]]
-    bcast = [s for s in sent if s["to"] == ["<broadcast>"]]
-    assert direct and "req_cancel" in direct[0]["html"]
-    assert bcast and "req_cancel" not in bcast[0]["html"]
+    assert not any(s["to"] == ["<broadcast>"] for s in sent), (
+        "the button-less T4 copy must not go through _broadcast")
+    bh_mail = [s for s in sent if s["to"] == ["bh@x.in"]]
+    poc_mail = [s for s in sent if s["to"] == ["poc@x.in"]]
+    assert bh_mail and "req_cancel" in bh_mail[0]["html"] and "req_redate" in bh_mail[0]["html"]
+    assert poc_mail and "req_cancel" not in poc_mail[0]["html"]
+    assert len(sent) == 2, "only the BH's buttoned copy and the POC's button-less copy"
+
+
+def test_overdue_owner_skips_the_poc_copy_when_there_is_no_poc(monkeypatch):
+    """No full-trail fallback when the POC is unresolved — the button-less copy is just
+    skipped, same policy as the guard on the buttoned BH copy above it."""
+    sent = _patch(monkeypatch, npd=["npd@x.in"], requestor="bh@x.in", poc=None)
+    ok = asyncio.run(m.notify_dispatch_overdue(_MailConn(), REQ, days=2, audience="owner"))
+    assert ok is True
+    assert len(sent) == 1
+    assert sent[0]["to"] == ["bh@x.in"]

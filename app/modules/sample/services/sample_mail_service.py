@@ -607,13 +607,16 @@ def _due_tomorrow_npd_html(req: dict) -> str:
 
 
 def _due_tomorrow_owner_html(req: dict) -> str:
-    """T2 — the same warning to the business head and the sales POC, who CAN move it."""
+    """T2 — the same warning to the business head and the sales POC. Informational only:
+    by this stage the portal's Edit button is gone for most open statuses (update_requisition
+    only allows DRAFT/SUBMITTED/BH_REJECTED), so the copy must not promise a portal edit —
+    it points at the overdue reminder's one-tap redate instead."""
     inner = (
         f'<tr><td style="padding:26px 26px 6px">{_pill("Due tomorrow", "#d97706")}'
         f'<p style="margin:0 0 18px;font-size:{_T_LEAD}px;color:{_INK};line-height:1.6">'
         f'The sample request you raised is due for dispatch tomorrow, <b>{_exp_day(req)}</b>. '
-        'The NPD team has been notified. If the date needs to move, change it on the '
-        'portal before it slips.</p>'
+        'The NPD team has been notified. If it is going to slip, reply to this thread — '
+        'the overdue reminder will offer a one-tap way to move the date or cancel.</p>'
         f'{_detail_table(req)}</td></tr>')
     return _shell(hdr="#d97706", eyebrow="DISPATCH DUE TOMORROW",
                   title=_fmt(req.get("request_id")), inner=inner, footer=_TRAIL_FOOTER)
@@ -962,8 +965,15 @@ async def notify_dispatch_overdue(conn, req: dict, *, days: int, audience: str) 
                        "card reaches nobody who can act on it", req.get("id"))
         return False
     _send(subject, _overdue_owner_html(req, days=days, bh_email=bh), [bh], in_reply_to=thread)
-    _broadcast(subject, _overdue_owner_html(req, days=days, bh_email=None), rec,
-               thread=thread, exclude=[bh])
+    # NOT _broadcast: this is the only mail in the file that repeats DAILY (every other
+    # _broadcast caller fires once, on an event). Fanning the button-less copy out to the
+    # whole trail (rec["to"] + rec["cc"] — npd_team, inventory, production for an NPD/TRIAL
+    # request) would mail the inventory/production pools daily for every stale requisition,
+    # and double NPD's overdue mail count against T3. Design §4 scopes T4's button-less
+    # copy to the sales POC alone, so send there directly and skip when there is none.
+    poc = rec.get("sales_poc")
+    if poc:
+        _send(subject, _overdue_owner_html(req, days=days, bh_email=None), [poc], in_reply_to=thread)
     return True
 
 

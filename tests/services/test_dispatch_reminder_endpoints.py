@@ -127,10 +127,21 @@ def _bh_user() -> SimpleNamespace:
     return SimpleNamespace(user_id=7, role_name="business_head")
 
 
+def test_the_two_open_status_lists_stay_in_step():
+    """The reminder mails a Change-date button for every status it chases, and the
+    endpoint behind that button accepts exactly OPEN_STATUSES_EDITABLE_DATE. The two
+    lists are deliberately duplicated (no cross-service import for one constant), so
+    nothing but this assertion stops them drifting — and drift means a mailed button
+    that 409s, which is a bug this branch already had to fix once."""
+    from app.modules.sample.services import dispatch_reminder_service as drs
+    assert tuple(drs.OPEN_STATUSES) == requisition_service.OPEN_STATUSES_EDITABLE_DATE
+
+
 @pytest.mark.parametrize("status", list(requisition_service.OPEN_STATUSES_EDITABLE_DATE))
 def test_set_expected_dispatch_date_accepts_every_open_status(status):
-    """Every status dispatch_reminder_service.OPEN_STATUSES chases must be redateable —
-    that constant and OPEN_STATUSES_EDITABLE_DATE are meant to be kept in step."""
+    """Every status in OPEN_STATUSES_EDITABLE_DATE must be redateable. That this is
+    also every status dispatch_reminder_service.OPEN_STATUSES chases is pinned
+    separately by test_the_two_open_status_lists_stay_in_step above."""
     conn = _ReqConn(_req_row(status=status))
     new_date = date(2026, 9, 20)
     out = asyncio.run(requisition_service.set_expected_dispatch_date(
