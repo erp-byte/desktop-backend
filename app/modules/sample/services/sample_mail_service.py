@@ -614,6 +614,106 @@ def _bh_signoff_html(req: dict, bh_email: str | None) -> str:
                   title=_fmt(rid), inner=inner, footer=footer)
 
 
+# ── dispatch-date reminders ──────────────────────────────────────────────────
+# Both links bounce through the WEB APP, not the backend: the business head needs a
+# reason box and a real date picker, and only the portal can offer those. Both are
+# HMAC-signed — unlike the BH *reject* link, which is deliberately unsigned because
+# rejecting is non-escalating. Cancel is terminal, so an unsigned link would let anyone
+# who guessed an 8-digit request_id and an address kill a live request.
+# Both take the requisition's PK *and* its 8-digit request_id, exactly like
+# _bh_signoff_reject_url above: the web route /modules/sample/<id> is keyed on the PK,
+# while the query carries the request_id the endpoint authenticates against. Using one
+# for both would open a different requisition — or none.
+def _req_cancel_url(pk_id, request_id, email: str) -> str:
+    from app.modules.sample.services.email_link_token import sign
+    web = Settings().WEB_APP_URL.rstrip("/")
+    t = sign("req_cancel", request_id, email)
+    return (f"{web}/modules/sample/{pk_id}?req_cancel={request_id}"
+            f"&email={quote(email)}&t={t}")
+
+
+def _req_redate_url(pk_id, request_id, email: str) -> str:
+    from app.modules.sample.services.email_link_token import sign
+    web = Settings().WEB_APP_URL.rstrip("/")
+    t = sign("req_redate", request_id, email)
+    return (f"{web}/modules/sample/{pk_id}?req_redate={request_id}"
+            f"&email={quote(email)}&t={t}")
+
+
+def _exp_day(req: dict) -> str:
+    v = req.get("expected_dispatch_date")
+    return str(v)[:10] if v else "—"
+
+
+def _overdue_label(days: int) -> str:
+    return f"{days} day{'' if days == 1 else 's'} overdue"
+
+
+def _due_tomorrow_npd_html(req: dict) -> str:
+    """T1 — the NPD team's day-before warning. Informational: NPD cannot move the date."""
+    inner = (
+        f'<tr><td style="padding:26px 26px 6px">{_pill("Due tomorrow", "#d97706")}'
+        f'<p style="margin:0 0 18px;font-size:{_T_LEAD}px;color:{_INK};line-height:1.6">'
+        f'This sample request is due for dispatch tomorrow, <b>{_exp_day(req)}</b>. '
+        'Sharing it so the trial and its output are ready in time.</p>'
+        f'{_detail_table(req)}</td></tr>')
+    return _shell(hdr="#d97706", eyebrow="DISPATCH DUE TOMORROW",
+                  title=_fmt(req.get("request_id")), inner=inner, footer=_TRAIL_FOOTER)
+
+
+def _due_tomorrow_owner_html(req: dict) -> str:
+    """T2 — the same warning to the business head and the sales POC, who CAN move it."""
+    inner = (
+        f'<tr><td style="padding:26px 26px 6px">{_pill("Due tomorrow", "#d97706")}'
+        f'<p style="margin:0 0 18px;font-size:{_T_LEAD}px;color:{_INK};line-height:1.6">'
+        f'The sample request you raised is due for dispatch tomorrow, <b>{_exp_day(req)}</b>. '
+        'The NPD team has been notified. If the date needs to move, change it on the '
+        'portal before it slips.</p>'
+        f'{_detail_table(req)}</td></tr>')
+    return _shell(hdr="#d97706", eyebrow="DISPATCH DUE TOMORROW",
+                  title=_fmt(req.get("request_id")), inner=inner, footer=_TRAIL_FOOTER)
+
+
+def _overdue_npd_html(req: dict, *, days: int) -> str:
+    """T3 — informatory, as specified: NPD is told, the business head is asked to act."""
+    inner = (
+        f'<tr><td style="padding:26px 26px 6px">{_pill(_overdue_label(days), "#dc2626")}'
+        f'<p style="margin:0 0 18px;font-size:{_T_LEAD}px;color:{_INK};line-height:1.6">'
+        f'This sample request has passed its expected dispatch date of '
+        f'<b>{_exp_day(req)}</b> — <b>{_overdue_label(days)}</b>. Its business head has '
+        'been asked to cancel it or set a new date.</p>'
+        f'{_detail_table(req)}</td></tr>')
+    return _shell(hdr="#dc2626", eyebrow="DISPATCH DATE PASSED",
+                  title=_fmt(req.get("request_id")), inner=inner, footer=_TRAIL_FOOTER)
+
+
+def _overdue_owner_html(req: dict, *, days: int, bh_email: str | None) -> str:
+    """T4 — the business head's actionable card. With `bh_email` it carries Cancel /
+    Change-date bound to THAT address; with None it is the identical card, buttons
+    stripped, for the button-less broadcast to the rest of the trail."""
+    rid, pk = req.get("request_id"), req.get("id")
+    if bh_email:
+        intro = (f'The sample request you raised has passed its expected dispatch date of '
+                 f'<b>{_exp_day(req)}</b> — <b>{_overdue_label(days)}</b>. Tap '
+                 '<b>Change expected date</b> to set a new one, or <b>Cancel request</b> '
+                 'to close it with a reason. It will keep reminding you daily until one '
+                 'of those happens.')
+        pairs = [("Change expected date", _req_redate_url(pk, rid, bh_email), "#2563eb"),
+                 ("Cancel request", _req_cancel_url(pk, rid, bh_email), "#dc2626")]
+        footer = _ACTION_FOOTER
+    else:
+        intro = (f'This sample request has passed its expected dispatch date of '
+                 f'<b>{_exp_day(req)}</b> — <b>{_overdue_label(days)}</b>. Its business '
+                 'head has been asked to cancel it or set a new date.')
+        pairs = []
+        footer = _TRAIL_FOOTER
+    inner = (f'<tr><td style="padding:26px 26px 6px">{_pill(_overdue_label(days), "#dc2626")}'
+             f'<p style="margin:0 0 18px;font-size:{_T_LEAD}px;color:{_INK};line-height:1.6">'
+             f'{intro}</p>{_detail_table(req)}</td></tr>{_buttons(pairs)}')
+    return _shell(hdr="#dc2626", eyebrow="DISPATCH DATE PASSED",
+                  title=_fmt(rid), inner=inner, footer=footer)
+
+
 # ── promote dual-approval gate ───────────────────────────────────────────────
 # Both buttons hit GET /email/promote-action?dev_jc_id&approver_kind&status&email.
 # Approve carries the recipient's email for the gate-match auth; Reject just needs
