@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Candor — Stock Take · Adjustment Ledger</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,300&family=Playfair+Display:wght@400;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/variables.css">
+  <link rel="stylesheet" href="css/reset.css">
+  <link rel="stylesheet" href="css/titlebar.css">
+  <link rel="stylesheet" href="css/sidebar.css">
+  <link rel="stylesheet" href="css/toast.css">
+  <link rel="stylesheet" href="css/animations.css">
+  <link rel="stylesheet" href="css/typography.css">
+  <link rel="stylesheet" href="css/layout.css">
+  <link rel="stylesheet" href="css/button.css">
+  <link rel="stylesheet" href="css/form.css">
+  <link rel="stylesheet" href="css/table.css">
+  <link rel="stylesheet" href="css/card.css">
+  <link rel="stylesheet" href="css/badge.css">
+  <link rel="stylesheet" href="css/state.css">
+  <link rel="stylesheet" href="css/page-skeleton.css">
+  <style>
+    /* Page-local only — everything structural comes from the shared toolkit. */
+    .filters { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
+    .filters .field { min-width: 180px; }
+    .filters .field.grow { flex: 1 1 240px; }
+    .cell-sub { font-size: 11px; opacity: .65; margin-top: 2px; }
+    .cell-reason { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+    td.mono { font-family: 'JetBrains Mono', monospace; font-size: 12px; opacity: .8; }
+    td.pos { color: #1d7324; }
+    td.neg { color: #a8500a; }
+    .pager { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; font-size: 12px; }
+    .note { font-size: 12px; padding: 10px 12px; border-radius: 3px; background: #fdf0e6; color: #a8500a; margin-bottom: 16px; }
+    .modal-backdrop {
+      position: fixed; inset: 0; background: rgba(0,0,0,.45);
+      display: flex; align-items: center; justify-content: center; z-index: 900; padding: 16px;
+    }
+    .modal-card { background: #fff; border-radius: 4px; max-width: 520px; width: 100%; padding: 20px; }
+    .modal-card h3 { margin: 0 0 10px; font-size: 16px; }
+    .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 16px; }
+    .modal-error { color: #d13212; font-size: 12px; margin-top: 8px; }
+    .final-note { font-size: 12px; opacity: .7; margin-top: 6px; }
+  </style>
+</head>
+<body>
+
+  <div class="titlebar">
+    <div class="titlebar-left">
+      <span class="titlebar-brand">Candor</span>
+      <span class="titlebar-sep"></span>
+      <div class="titlebar-crumbs">
+        <span class="crumb-link">Stock Take</span>
+        <span class="crumb-sep">/</span>
+        <span class="crumb-current">Adjustment Ledger</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="layout">
+    <aside class="sidebar">
+      <nav class="sidebar-nav">
+        <div class="nav-section-label">Stock Take</div>
+        <button class="nav-item active">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M4 4h13a2 2 0 0 1 2 2v13a1 1 0 0 1-1 1H6a2 2 0 0 1-2-2z"/><path d="M4 7h15M4 11h15M4 15h9"/></svg>
+          Adjustment Ledger
+        </button>
+      </nav>
+    </aside>
+
+    <main class="main-content">
+      <header class="page-header">
+        <p class="page-greeting">Stock Take</p>
+        <h1 class="page-title page-title--canonical">Adjustment ledger</h1>
+        <p class="page-subtitle">
+          Every stock addition and subtraction recorded between physical counts.
+          Entries are final — a mistake is corrected by posting a balancing entry that points at the original,
+          and both rows stay on the record.
+        </p>
+      </header>
+
+      <p class="note" id="scopeNote" hidden></p>
+
+      <section class="card">
+        <div class="filters">
+          <div class="field">
+            <label class="field-label" for="filterWarehouse">Warehouse</label>
+            <select id="filterWarehouse" class="field-input"><option value="">All warehouses</option></select>
+          </div>
+          <div class="field">
+            <label class="field-label" for="filterLocation">Location (floor)</label>
+            <select id="filterLocation" class="field-input"><option value="">All floors</option></select>
+          </div>
+          <div class="field grow">
+            <label class="field-label" for="filterItem">Article</label>
+            <input id="filterItem" class="field-input" type="search" placeholder="Exact article name">
+          </div>
+          <div class="field">
+            <button id="refresh" class="btn btn-ghost">Refresh</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="card" style="margin-top:16px">
+        <div class="table-wrap" style="overflow-x:auto">
+          <table class="table">
+            <thead>
+              <tr>
+                <th>Txn</th>
+                <th>Article</th>
+                <th>Stock type</th>
+                <th class="num">Units</th>
+                <th class="num">Qty (kg)</th>
+                <th>Where</th>
+                <th>Reason</th>
+                <th>By</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="tableBody">
+              <tr><td colspan="9" class="state-empty">Loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="pager" id="pager" hidden>
+          <span id="pagerInfo"></span>
+          <span>
+            <button id="prevPage" class="btn btn-ghost btn-sm">Previous</button>
+            <button id="nextPage" class="btn btn-ghost btn-sm">Next</button>
+          </span>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Reversal. The only write this screen performs, and it adds a row rather
+       than changing one — the table blocks UPDATE and DELETE by trigger. -->
+  <div class="modal-backdrop" id="reversalModal" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="reversalTitle">
+      <h3 id="reversalTitle">Post a balancing entry</h3>
+      <p id="reversalSummary" style="font-size:13px"></p>
+      <div class="field" style="margin-top:14px">
+        <label class="field-label" for="reversalReason">Reason for the correction (required)</label>
+        <textarea id="reversalReason" class="field-input" rows="3"
+                  placeholder="Why is the original entry being reversed?"></textarea>
+      </div>
+      <p class="modal-error" id="reversalError" hidden></p>
+      <p class="final-note">The new entry is also final. Nothing is edited or removed.</p>
+      <div class="modal-actions">
+        <button id="cancelReversal" class="btn btn-ghost">Cancel</button>
+        <button id="confirmReversal" class="btn btn-primary">Post reversal</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="js/web-shims.js"></script>
+  <script src="js/titlebar.js"></script>
+  <script src="js/toast.js"></script>
+  <script src="js/navigation.js"></script>
+  <script src="js/auth.js"></script>
+  <script src="js/stock-take-api.js"></script>
+  <script src="js/stock-take-transactions.js"></script>
+</body>
+</html>

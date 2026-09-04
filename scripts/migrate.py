@@ -414,6 +414,29 @@ SQL_FILES = [
     # header for why the pre-existing unique indexes are deliberately left
     # non-partial.
     DB_DIR / "092_accounting_crud.sql",
+    # 098 adds stocktake_transactions, the append-only stock adjustment ledger
+    # behind POST /api/v1/stock-take/transactions. Must run BEFORE that code is
+    # deployed — the endpoint INSERTs into a table that otherwise does not exist.
+    # The file is fully idempotent (CREATE ... IF NOT EXISTS, guarded ALTERs and
+    # trigger creation), so re-running it on every deploy is a no-op.
+    DB_DIR / "098_stocktake_transactions.sql",
+    # 099 adds stocktake_transactions.txn_code, the 8-digit YYMMDD+NN reference
+    # the UI displays. Must run AFTER 098 (it alters that table and temporarily
+    # disables 098's UPDATE trigger to backfill rows that predate the column).
+    # Idempotent: the backfill is skipped once no row has a NULL code.
+    DB_DIR / "099_stocktake_txn_code.sql",
+    # 100 supersedes 099's txn_code format: still 8 digits, but YYDDD+NNN cut in
+    # Asia/Kolkata rather than YYMMDD+NN cut in the server's UTC. Widens the
+    # daily ceiling from 99 to 999 and stops the code's date disagreeing with the
+    # date operators see on screen. Renumbers any row still in the old format.
+    DB_DIR / "100_stocktake_txn_code_format.sql",
+    # 101 lets a console adjustment write a row into stocktake_entries that is
+    # NOT mistaken for a physical count: it widens chk_entries_source to accept
+    # source_kind='ADJUSTMENT' and adds the partial unique index that makes
+    # "one adjustment row per article/place/IST day" a database guarantee.
+    # Must run BEFORE the write-back code deploys — without the widened CHECK
+    # every adjustment INSERT fails.
+    DB_DIR / "101_stocktake_entries_adjustment_rows.sql",
 ]
 
 # ── Optional: drop the v1 legacy job-card stack (TEST / Supabase DB ONLY) ──────
