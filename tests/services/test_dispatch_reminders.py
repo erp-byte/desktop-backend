@@ -190,3 +190,90 @@ def test_far_future_is_in_neither_bucket():
     conn = _ScanConn([_req(expected_dispatch_date=DAY + timedelta(days=9))])
     out = asyncio.run(svc.due_buckets(conn, DAY))
     assert out["due_tomorrow"] == [] and out["overdue"] == []
+
+
+# --- orchestration ----------------------------------------------------------
+
+class _FullConn(_Conn):
+    """Guard behaviour from _Conn, plus the scan's fetch and the per-kind row release
+    scan_and_send uses to undo a claim whose mail reached nobody. _Conn.execute only
+    knows the OVERDUE-prefix delete, so that second form is handled here."""
+
+    def __init__(self, rows, **kw):
+        super().__init__(**kw)
+        self.scan_rows = [dict(r) for r in rows]
+
+    async def fetch(self, query, *args):
+        return self.scan_rows
+
+    async def execute(self, query, *args):
+        if "kind = $2 AND sent_on = $3" in query:
+            req_id, kind, day = args
+            self.rows = [r for r in self.rows
+                         if not (r["requisition_id"] == req_id and r["kind"] == kind
+                                 and r["sent_on"] == day)]
+            return "DELETE"
+        return await super().execute(query, *args)
+
+
+def _stub_mail(monkeypatch, *, ok=True):
+    calls: list[tuple] = []
+
+    async def _due(conn, req, *, audience):
+        calls.append(("due", req["id"], audience)); return ok
+
+    async def _over(conn, req, *, days, audience):
+        calls.append(("over", req["id"], audience, days)); return ok
+
+    monkeypatch.setattr(svc, "notify_dispatch_due_tomorrow", _due)
+    monkeypatch.setattr(svc, "notify_dispatch_overdue", _over)
+    return calls
+
+
+def test_a_due_request_mails_both_audiences_once(monkeypatch):
+    calls = _stub_mail(monkeypatch)
+    conn = _FullConn([_req(expected_dispatch_date=DAY + timedelta(days=1))])
+    out = asyncio.run(svc.scan_and_send(conn, today=DAY))
+    assert sorted(c[2] for c in calls) == ["npd", "owner"]
+    assert out[svc.KIND_DUE_NPD] == 1 and out[svc.KIND_DUE_OWNER] == 1
+
+
+def test_running_twice_in_a_day_sends_once(monkeypatch):
+    """The hourly tick must not re-mail. This is the whole point of the guard."""
+    calls = _stub_mail(monkeypatch)
+    conn = _FullConn([_req(expected_dispatch_date=DAY - timedelta(days=1))])
+    asyncio.run(svc.scan_and_send(conn, today=DAY))
+    asyncio.run(svc.scan_and_send(conn, today=DAY))
+    assert len(calls) == 2          # npd + owner, not four
+
+
+def test_the_next_day_chases_again(monkeypatch):
+    calls = _stub_mail(monkeypatch)
+    conn = _FullConn([_req(expected_dispatch_date=DAY - timedelta(days=1))])
+    asyncio.run(svc.scan_and_send(conn, today=DAY))
+    asyncio.run(svc.scan_and_send(conn, today=DAY + timedelta(days=1)))
+    assert len(calls) == 4
+
+
+def test_a_failed_send_does_not_consume_the_day(monkeypatch):
+    """notify_* returning False means nobody was addressed — it must be retried, so the
+    guard row must not survive."""
+    _stub_mail(monkeypatch, ok=False)
+    conn = _FullConn([_req(expected_dispatch_date=DAY - timedelta(days=1))])
+    asyncio.run(svc.scan_and_send(conn, today=DAY))
+    assert conn.rows == []
+
+
+def test_dry_run_sends_nothing_and_claims_nothing(monkeypatch):
+    calls = _stub_mail(monkeypatch)
+    conn = _FullConn([_req(expected_dispatch_date=DAY - timedelta(days=1))])
+    out = asyncio.run(svc.scan_and_send(conn, today=DAY, dry_run=True))
+    assert calls == [] and conn.rows == []
+    assert out[svc.KIND_OVERDUE_NPD] == 1      # still reports what it WOULD send
+
+
+def test_unmigrated_sends_nothing(monkeypatch):
+    calls = _stub_mail(monkeypatch)
+    conn = _FullConn([_req(expected_dispatch_date=DAY - timedelta(days=1))], has_table=False)
+    out = asyncio.run(svc.scan_and_send(conn, today=DAY))
+    assert calls == [] and out == {}
