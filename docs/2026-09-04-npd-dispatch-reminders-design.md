@@ -104,9 +104,11 @@ Two new public endpoints on the sample router, mirroring `POST /email/bh-signoff
 | Endpoint | Body | Behaviour |
 |---|---|---|
 | `POST /email/requisition-cancel` | `request_id`, `email`, `t`, `reason` | verify token → resolve requisition → assert `email` is the bound BH → `cancel_requisition(reason=...)` |
-| `POST /email/requisition-redate` | `request_id`, `email`, `t`, `expected_dispatch_date` | verify token → same auth → `update_requisition(expected_dispatch_date=...)` |
+| `POST /email/requisition-redate` | `request_id`, `email`, `t`, `expected_dispatch_date` | verify token → same auth → `requisition_service.set_expected_dispatch_date(...)` |
 
-Both reuse the existing services, so the status guard (`_assert_transition`), the mandatory-reason check and the audit write all come for free. `cancel_requisition` already rejects a blank reason with 422; the dialog disables submit on empty input so that is a backstop, not the UX.
+The redate endpoint calls `set_expected_dispatch_date`, not `update_requisition`: `update_requisition` refuses anything past SUBMITTED/BH_REJECTED, which is 6 of the 8 statuses the reminder chases, so it would 409 on exactly the requisitions this button exists to fix. `set_expected_dispatch_date` is a narrow, date-only mutator that accepts all eight open statuses (`requisition_service.OPEN_STATUSES_EDITABLE_DATE`) and touches nothing else.
+
+Both reuse the existing services, so the status guard (`_assert_transition` / the open-status check), the mandatory-reason check and the audit write all come for free. `cancel_requisition` already rejects a blank reason with 422; the dialog disables submit on empty input so that is a backstop, not the UX.
 
 A logged-in BH clicking from mail on a machine with a session should use the ordinary session endpoints. The portal picks between the two exactly as `submitReject` already does on the job-card page.
 
@@ -220,6 +222,7 @@ Frontend: `buildDispatchHistory`-style pure coverage is not applicable here; the
 - `app/modules/sample/services/sample_mail_service.py` — four builders, four senders, two signed URL helpers
 - `app/modules/sample/router.py` — two email endpoints
 - `app/modules/sample/schemas.py` — two request bodies
+- `app/modules/sample/services/requisition_service.py` — `OPEN_STATUSES_EDITABLE_DATE` + `set_expected_dispatch_date`, the narrow date-only mutator the redate endpoint calls
 - `app/modules/sample/services/email_link_token.py` — document the two new bindings
 - `app/main.py` — start the loop
 - `web_replica/src/app/modules/sample/[id]/page.tsx` — `?req_cancel` / `?req_redate` handling

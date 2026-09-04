@@ -42,6 +42,29 @@ def ist_today() -> date:
     return datetime.now(IST).date()
 
 
+def _is_truthy(s: str | None) -> bool:
+    """Mirrors whatsapp_service._is_truthy — the house precedent for a config gate, so
+    TRUE / yes / on read as ON here too, not just the narrower "1"/"true"/"True"."""
+    return (s or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    """Parse an int env var, logging and falling back to `default` on anything that does
+    not parse. Deliberately never raises: this used to sit as a bare int(os.environ[...])
+    outside the loop's try, so a malformed value (e.g. "60m") raised before the loop's
+    first iteration — the task then just sits in bg_tasks and the exception is swallowed
+    at shutdown by asyncio.gather(..., return_exceptions=True), with nothing ever logged."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.error("[dispatch-reminder] %s=%r is not an integer — falling back to %d",
+                     name, raw, default)
+        return default
+
+
 async def has_log_table(conn) -> bool:
     """Whether migration 087 is applied. samples/ migrations are hand-applied, so an
     unmigrated environment must no-op rather than raise on every tick."""
@@ -196,13 +219,19 @@ async def dispatch_reminder_loop(pool) -> None:
     scan. An immediate first tick is safe: the send-once guard makes it idempotent, and the
     hour gate still stops a 02:00 restart from mailing anyone.
     """
-    tick_s = max(15 * 60, int(os.environ.get("SAMPLE_REMINDER_TICK_MIN", "60")) * 60)
-    hour = int(os.environ.get("SAMPLE_REMINDER_HOUR", "7"))
-    logger.info("Dispatch reminder loop started (tick=%ds, from %02d:00 IST)", tick_s, hour)
+    tick_min = _env_int("SAMPLE_REMINDER_TICK_MIN", 60)
+    tick_s = max(15 * 60, tick_min * 60)
+    hour = _env_int("SAMPLE_REMINDER_HOUR", 7)
+    if not 0 <= hour <= 23:
+        logger.error("[dispatch-reminder] SAMPLE_REMINDER_HOUR=%r out of range 0-23 — "
+                     "falling back to default 7", hour)
+        hour = 7
+    enabled = _is_truthy(os.environ.get("SAMPLE_REMINDER_ENABLED", "1"))
+    logger.info("Dispatch reminder loop started (enabled=%s, tick=%ds, from %02d:00 IST)",
+                enabled, tick_s, hour)
     try:
         while True:
             try:
-                enabled = os.environ.get("SAMPLE_REMINDER_ENABLED", "1").strip() in ("1", "true", "True")
                 if enabled and datetime.now(IST).hour >= hour:
                     async with pool.acquire() as conn:
                         counts = await scan_and_send(conn, today=ist_today())
