@@ -85,3 +85,61 @@ def test_every_card_renders_without_a_date():
     m._due_tomorrow_owner_html(bare)
     m._overdue_npd_html(bare, days=1)
     m._overdue_owner_html(bare, days=1, bh_email=BH)
+
+
+# --- senders ----------------------------------------------------------------
+import asyncio
+
+
+class _MailConn:
+    pass
+
+
+def _patch(monkeypatch, *, npd, requestor, poc):
+    async def _rec(conn, req):
+        return {"to": [requestor] if requestor else list(npd), "cc": [poc] if poc else [],
+                "npd": list(npd), "inventory": [], "production": [],
+                "requestor": requestor, "sales_poc": poc}
+    sent: list[dict] = []
+    monkeypatch.setattr(m, "resolve_recipients", _rec)
+    monkeypatch.setattr(m, "_send", lambda subj, html, to, **kw: sent.append(
+        {"to": list(to), "cc": list(kw.get("cc") or []), "html": html}) or "mid")
+    monkeypatch.setattr(m, "_broadcast", lambda subj, html, rec, **kw: sent.append(
+        {"to": ["<broadcast>"], "cc": [], "html": html}))
+    return sent
+
+
+def test_npd_audience_goes_to_the_team_pool(monkeypatch):
+    sent = _patch(monkeypatch, npd=["npd@x.in"], requestor="bh@x.in", poc="poc@x.in")
+    ok = asyncio.run(m.notify_dispatch_due_tomorrow(_MailConn(), REQ, audience="npd"))
+    assert ok is True
+    assert sent[0]["to"] == ["npd@x.in"]
+
+
+def test_owner_audience_addresses_bh_and_poc_together(monkeypatch):
+    sent = _patch(monkeypatch, npd=["npd@x.in"], requestor="bh@x.in", poc="poc@x.in")
+    ok = asyncio.run(m.notify_dispatch_due_tomorrow(_MailConn(), REQ, audience="owner"))
+    assert ok is True
+    assert sorted(sent[0]["to"]) == ["bh@x.in", "poc@x.in"]
+
+
+def test_no_npd_recipient_reports_false_so_the_guard_is_not_claimed(monkeypatch):
+    """Claiming the row on a mail that reached nobody would mark it sent forever."""
+    sent = _patch(monkeypatch, npd=[], requestor="bh@x.in", poc=None)
+    assert asyncio.run(m.notify_dispatch_due_tomorrow(_MailConn(), REQ, audience="npd")) is False
+    assert sent == []
+
+
+def test_no_business_head_reports_false(monkeypatch):
+    sent = _patch(monkeypatch, npd=["npd@x.in"], requestor=None, poc=None)
+    assert asyncio.run(m.notify_dispatch_overdue(
+        _MailConn(), REQ, days=2, audience="owner")) is False
+
+
+def test_overdue_owner_send_carries_the_buttons_and_broadcasts_without(monkeypatch):
+    sent = _patch(monkeypatch, npd=["npd@x.in"], requestor="bh@x.in", poc="poc@x.in")
+    asyncio.run(m.notify_dispatch_overdue(_MailConn(), REQ, days=2, audience="owner"))
+    direct = [s for s in sent if s["to"] != ["<broadcast>"]]
+    bcast = [s for s in sent if s["to"] == ["<broadcast>"]]
+    assert direct and "req_cancel" in direct[0]["html"]
+    assert bcast and "req_cancel" not in bcast[0]["html"]

@@ -993,6 +993,56 @@ async def notify_dev_dispatch_email(conn, *, dev_jc_id, dispatch_id=None, seq=No
     _broadcast(subject, html, rec, thread=thread)
 
 
+async def notify_dispatch_due_tomorrow(conn, req: dict, *, audience: str) -> bool:
+    """Day-before warning. `audience` is "npd" (the team pool) or "owner" (the business
+    head + the sales POC, who are the two who can actually move the date).
+
+    Returns True only when the mail was addressed to somebody — the caller uses that to
+    decide whether to claim the send-once row, so a mail that reached nobody is retried
+    on the next tick instead of being recorded as sent. Best-effort, never raises."""
+    rid = req.get("request_id")
+    rec = await resolve_recipients(conn, req)
+    thread, subject = _thread_key(rid), _thread_subject(rid, req.get("sample_type"))
+    if audience == "npd":
+        to = list(rec["npd"])
+        html = _due_tomorrow_npd_html(req)
+    else:
+        to = _dedupe([rec.get("requestor"), rec.get("sales_poc")])
+        html = _due_tomorrow_owner_html(req)
+    if not to:
+        logger.warning("[sample-mail] no %s recipient for the due-tomorrow warning on "
+                       "req %s — nothing sent", audience, req.get("id"))
+        return False
+    _send(subject, html, to, in_reply_to=thread)
+    return True
+
+
+async def notify_dispatch_overdue(conn, req: dict, *, days: int, audience: str) -> bool:
+    """Daily chase once the date has passed. "npd" is informatory; "owner" carries the
+    business head's Cancel / Change-date buttons, with the identical card broadcast
+    button-less to the rest of the trail. Same True/False contract as above."""
+    rid = req.get("request_id")
+    rec = await resolve_recipients(conn, req)
+    thread, subject = _thread_key(rid), _thread_subject(rid, req.get("sample_type"))
+    if audience == "npd":
+        to = list(rec["npd"])
+        if not to:
+            logger.warning("[sample-mail] no npd recipient for the overdue chase on req %s",
+                           req.get("id"))
+            return False
+        _send(subject, _overdue_npd_html(req, days=days), to, in_reply_to=thread)
+        return True
+    bh = rec.get("requestor")
+    if not bh:
+        logger.warning("[sample-mail] req %s has no business-head address — the overdue "
+                       "card reaches nobody who can act on it", req.get("id"))
+        return False
+    _send(subject, _overdue_owner_html(req, days=days, bh_email=bh), [bh], in_reply_to=thread)
+    _broadcast(subject, _overdue_owner_html(req, days=days, bh_email=None), rec,
+               thread=thread, exclude=[bh])
+    return True
+
+
 async def send_due_reminders(conn) -> int:
     """Reminder reply on the trail for NPD/TRIAL requests still SUBMITTED/ON_HOLD, capped at
     REMINDER_MAX and no sooner than REMINDER_MIN_HOURS apart. Returns # requests nudged.
