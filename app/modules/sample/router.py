@@ -339,6 +339,81 @@ async def email_bh_signoff_reject(request: Request, body: schemas.BhSignoffEmail
             conn, row["id"], action="REJECTED", user=user, remarks=remarks)
 
 
+def _assert_req_action_token(action: str, request_id: int, email: str, t: str) -> None:
+    """403 unless `t` is this exact (action, request_id, email) signature. Shared by the
+    two dispatch-reminder actions. Unlike the BH reject link these ARE signed — cancel is
+    terminal, so an unsigned link would let a guessed request_id plus an address kill a
+    live request."""
+    from app.modules.sample.services.email_link_token import verify
+    if not (email or "").strip() or not verify(t, action, request_id, email):
+        raise HTTPException(403, detail={"error": "unauthorised",
+                                         "message": "This link is not authorised"})
+
+
+async def _resolve_req_bh(conn, request_id: int, email: str):
+    """The auth_user row for this requisition's bound business head, when their address
+    matches `email`. None when it does not — the token proves the link was ours, this
+    proves the clicker is the person it was issued to."""
+    return await conn.fetchrow(
+        """SELECT a.user_id, COALESCE(r.role_name, '') AS role_name, sr.id AS req_pk
+             FROM sample_requisitions sr
+             JOIN auth_user a ON a.user_id = COALESCE(sr.business_head_user_id,
+                                                      sr.requestor_user_id)
+             LEFT JOIN auth_role r ON a.role_id = r.role_id
+            WHERE sr.request_id = $1 AND sr.deleted_at IS NULL
+              AND lower(a.email) = lower($2) AND COALESCE(a.is_active, TRUE)
+            LIMIT 1""", request_id, email)
+
+
+@router.post("/email/requisition-cancel")
+async def email_requisition_cancel(request: Request, body: schemas.RequisitionEmailCancel):
+    """Cancel a requisition from the overdue-dispatch reminder. PUBLIC — signed token +
+    the caller being that request's business head. A reason is mandatory."""
+    email = (body.email or "").strip()
+    reason = (body.reason or "").strip()
+    _assert_req_action_token("req_cancel", body.request_id, email, body.t)
+    if not reason:
+        raise HTTPException(422, detail={"error": "reason_required",
+                                         "message": "A reason is required to cancel"})
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        row = await _resolve_req_bh(conn, body.request_id, email)
+        if row is None:
+            raise HTTPException(403, detail={"error": "not_an_approver",
+                                             "message": "This link is not authorised"})
+        import types as _t
+        user = _t.SimpleNamespace(user_id=row["user_id"], role_name=row["role_name"],
+                                  is_admin=False, full_name="email")
+        return await requisition_service.cancel_requisition(
+            conn, row["req_pk"], reason=reason, user=user)
+
+
+@router.post("/email/requisition-redate")
+async def email_requisition_redate(request: Request, body: schemas.RequisitionEmailRedate):
+    """Move a requisition's expected dispatch date from the overdue reminder. Clears the
+    overdue reminder rows so the NEW date earns a fresh warning instead of being silenced
+    by yesterday's chase."""
+    email = (body.email or "").strip()
+    _assert_req_action_token("req_redate", body.request_id, email, body.t)
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        row = await _resolve_req_bh(conn, body.request_id, email)
+        if row is None:
+            raise HTTPException(403, detail={"error": "not_an_approver",
+                                             "message": "This link is not authorised"})
+        import types as _t
+        user = _t.SimpleNamespace(user_id=row["user_id"], role_name=row["role_name"],
+                                  is_admin=False, full_name="email")
+        out = await requisition_service.update_requisition(
+            conn, row["req_pk"],
+            payload={"expected_dispatch_date": body.expected_dispatch_date}, user=user)
+        from app.modules.sample.services import dispatch_reminder_service as drs
+        if await drs.has_log_table(conn):
+            await drs.release_overdue(conn, row["req_pk"])
+        return out
+
+
+
 async def _resolve_promote_approver(conn, dev_jc_id: int, kind: str, email: str):
     """Authenticate an email-link approver against the gate it claims (mandatory check):
     INV_MGR → an ACTIVE inventory_manager with that email; REQUESTOR_BH → the user bound
