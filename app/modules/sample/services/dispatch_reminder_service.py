@@ -114,3 +114,93 @@ async def due_buckets(conn, today: date) -> dict:
             over.append(d)
         # exp == today falls through: the warning is D-1, the chase D+1.
     return {"due_tomorrow": due, "overdue": over}
+
+
+from app.modules.sample.services.sample_mail_service import (      # noqa: E402
+    notify_dispatch_due_tomorrow, notify_dispatch_overdue)
+
+
+async def scan_and_send(conn, *, today: date, dry_run: bool = False) -> dict:
+    """Resolve both buckets and send whatever has not gone out today. Returns per-kind
+    counts of what was sent (or, under dry_run, what WOULD be).
+
+    The claim comes before the send and is released if the send found no recipient: a row
+    left behind for a mail nobody received would mark it sent for the rest of the day.
+    """
+    if not await has_log_table(conn):
+        logger.info("[dispatch-reminder] 087 not applied — nothing to do")
+        return {}
+    buckets = await due_buckets(conn, today)
+    counts = {KIND_DUE_NPD: 0, KIND_DUE_OWNER: 0, KIND_OVERDUE_NPD: 0, KIND_OVERDUE_OWNER: 0}
+
+    async def _one(req, kind, audience, send) -> None:
+        if dry_run:
+            counts[kind] += 1
+            return
+        if not await claim(conn, req["id"], kind, today):
+            return                                   # already sent today, or lost the race
+        try:
+            ok = await send()
+        except Exception:                            # noqa: BLE001
+            logger.exception("[dispatch-reminder] send failed for req %s kind %s",
+                             req["id"], kind)
+            ok = False
+        if ok:
+            counts[kind] += 1
+        else:
+            # Undo the claim so the next tick retries rather than recording a phantom send.
+            await conn.execute(
+                "DELETE FROM sample_dispatch_reminder_log "
+                " WHERE requisition_id = $1 AND kind = $2 AND sent_on = $3",
+                req["id"], kind, today)
+
+    for req in buckets["due_tomorrow"]:
+        await _one(req, KIND_DUE_NPD, "npd",
+                   lambda r=req: notify_dispatch_due_tomorrow(conn, r, audience="npd"))
+        await _one(req, KIND_DUE_OWNER, "owner",
+                   lambda r=req: notify_dispatch_due_tomorrow(conn, r, audience="owner"))
+    for req in buckets["overdue"]:
+        d = req["overdue_days"]
+        await _one(req, KIND_OVERDUE_NPD, "npd",
+                   lambda r=req, d=d: notify_dispatch_overdue(conn, r, days=d, audience="npd"))
+        await _one(req, KIND_OVERDUE_OWNER, "owner",
+                   lambda r=req, d=d: notify_dispatch_overdue(conn, r, days=d, audience="owner"))
+    return counts
+
+
+async def dispatch_reminder_loop(pool) -> None:
+    """In-process background loop: hourly, send the day's dispatch reminders.
+
+    Hourly rather than a single daily alarm because this loop lives and dies with the web
+    process — a fixed alarm would be missed outright by a restart at the wrong minute.
+    With the send-once guard, ticking often just means "the first tick after the app is up
+    on a given day sends, the rest no-op", which turns a restart into a delay instead of a
+    silent miss.
+
+    NOTE: like dispatcher_loop / broadcaster_loop / promote_reminder_loop, this only ticks
+    under a persistent server (uvicorn/ECS) — NOT on the Lambda/Mangum path. scan_and_send
+    is deliberately callable on its own so that deployment can drive it externally.
+
+    Unlike promote_reminder_loop, several instances running at once is SAFE here: the
+    guard's unique index decides which one sends.
+    """
+    tick_s = max(15 * 60, int(os.environ.get("SAMPLE_REMINDER_TICK_MIN", "60")) * 60)
+    hour = int(os.environ.get("SAMPLE_REMINDER_HOUR", "7"))
+    logger.info("Dispatch reminder loop started (tick=%ds, from %02d:00 IST)", tick_s, hour)
+    try:
+        while True:
+            await asyncio.sleep(tick_s)
+            try:
+                if os.environ.get("SAMPLE_REMINDER_ENABLED", "1").strip() not in ("1", "true", "True"):
+                    continue
+                if datetime.now(IST).hour < hour:
+                    continue                          # too early to mail anyone
+                async with pool.acquire() as conn:
+                    counts = await scan_and_send(conn, today=ist_today())
+                if any(counts.values()):
+                    logger.info("Dispatch reminder: sent %s", counts)
+            except Exception:                         # noqa: BLE001 — a bad tick must never kill the loop
+                logger.exception("Dispatch reminder loop tick failed")
+    except asyncio.CancelledError:
+        logger.info("Dispatch reminder loop stopped")
+        raise
