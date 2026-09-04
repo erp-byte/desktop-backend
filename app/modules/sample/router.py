@@ -293,12 +293,17 @@ async def email_requisition_redate(request: Request, body: schemas.RequisitionEm
         import types as _t
         user = _t.SimpleNamespace(user_id=row["user_id"], role_name=row["role_name"],
                                   is_admin=False, full_name="email")
-        out = await requisition_service.update_requisition(
-            conn, row["req_pk"],
-            payload={"expected_dispatch_date": body.expected_dispatch_date}, user=user)
-        from app.modules.sample.services import dispatch_reminder_service as drs
-        if await drs.has_log_table(conn):
-            await drs.release_overdue(conn, row["req_pk"])
+        out = await requisition_service.set_expected_dispatch_date(
+            conn, row["req_pk"], new_date=body.expected_dispatch_date, user=user)
+        # Best-effort: the date change above already committed. A failure clearing the
+        # overdue-chase rows must not turn an applied edit into a 500 the BH would retry
+        # forever against — mirrors the WhatsApp-notify wrap in update_requisition.
+        try:
+            from app.modules.sample.services import dispatch_reminder_service as drs
+            if await drs.has_log_table(conn):
+                await drs.release_overdue(conn, row["req_pk"])
+        except Exception:  # noqa: BLE001
+            logger.exception("release_overdue failed for req %s", row["req_pk"])
         return out
 
 
