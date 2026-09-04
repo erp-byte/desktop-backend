@@ -43,6 +43,17 @@ TRANSITIONS: dict[str, set[str]] = {
 }
 
 
+# Statuses whose expected dispatch date may be moved via set_expected_dispatch_date —
+# the overdue-dispatch reminder's "Change expected date" button reaches these. Deliberately
+# the SAME eight statuses as dispatch_reminder_service.OPEN_STATUSES (not imported from
+# there, to avoid a cross-service import for one constant) — keep the two lists in step: a
+# status the reminder starts chasing must be added here too, or the button it mails 409s.
+OPEN_STATUSES_EDITABLE_DATE = (
+    "DRAFT", "SUBMITTED", "BH_APPROVED", "ON_HOLD",
+    "IN_PRODUCTION", "PACKING", "READY_FOR_DISPATCH", "PARTIALLY_CONVERTED",
+)
+
+
 def _assert_transition(current: str, target: str) -> None:
     """Raise 409 if current -> target is not an allowed status transition."""
     if target not in TRANSITIONS.get(current, set()):
@@ -733,6 +744,36 @@ async def update_requisition(conn, req_id: int, *, payload: dict, user) -> dict:
         except Exception:  # noqa: BLE001
             logger.exception("WhatsApp NPD updated notify failed for req %s", req_id)
 
+    return await get_requisition(conn, req_id)
+
+
+async def set_expected_dispatch_date(conn, req_id: int, *, new_date, user) -> dict:
+    """Move ONLY the expected dispatch date, on any requisition that is still open.
+
+    Deliberately not part of update_requisition: that one refuses anything past SUBMITTED
+    because the article lines and warehouse must not churn once production has started.
+    A slipping DATE is the opposite case — it is precisely the in-production and
+    ready-for-dispatch requisitions whose date needs moving, and the overdue reminder's
+    "Change expected date" button exists to do it. So this touches one column, and nothing
+    else, across every open status.
+    """
+    req = _require(await _fetch_req(conn, req_id), req_id)
+    if req["status"] not in OPEN_STATUSES_EDITABLE_DATE:
+        raise HTTPException(409, detail={
+            "error": "not_editable",
+            "message": "Only an open requisition's expected dispatch date can be changed",
+            "details": {"status": req["status"]}})
+    async with conn.transaction():
+        await conn.execute(
+            "UPDATE sample_requisitions "
+            "   SET expected_dispatch_date = $2, updated_at = NOW(), updated_by = $3 "
+            " WHERE id = $1", req_id, new_date, user.user_id)
+        await audit_service.write_audit(
+            conn, req_id, audit_service.EV_ARTICLE_EDIT,
+            old_value={"expected_dispatch_date": str(req["expected_dispatch_date"] or "")},
+            new_value={"expected_dispatch_date": str(new_date)},
+            actor_user_id=user.user_id, actor_role=user.role_name,
+            remarks="Expected dispatch date changed from the overdue-dispatch reminder")
     return await get_requisition(conn, req_id)
 
 
