@@ -29,6 +29,16 @@ KIND_DUE_NPD = "DUE_TOMORROW_NPD"
 KIND_DUE_OWNER = "DUE_TOMORROW_OWNER"
 KIND_OVERDUE_NPD = "OVERDUE_NPD"
 KIND_OVERDUE_OWNER = "OVERDUE_OWNER"
+# The D-1 warning also goes to the NPD team over WhatsApp. It claims under its OWN kind
+# rather than sharing DUE_TOMORROW_NPD: the claim is per (requisition, kind, day), so a
+# shared kind would let a successful email consume the day and leave a failed WhatsApp
+# with nothing to retry against.
+KIND_DUE_NPD_WA = "DUE_TOMORROW_NPD_WA"
+KIND_DUE_OWNER_WA = "DUE_TOMORROW_OWNER_WA"
+# The overdue chase reaches the BH on WhatsApp too — the only copy that carries the
+# Change-date / Cancel buttons on that channel.
+KIND_OVERDUE_NPD_WA = "OVERDUE_NPD_WA"
+KIND_OVERDUE_OWNER_WA = "OVERDUE_OWNER_WA"
 
 # A requisition past these has shipped (INTERNALLY_DISPATCHED / GATE_PASS_ISSUED /
 # CLOSED) or is dead (BH_REJECTED / CANCELLED). Mirrors OPEN_STATUSES in the web app's
@@ -141,6 +151,9 @@ async def due_buckets(conn, today: date) -> dict:
 
 from app.modules.sample.services.sample_mail_service import (      # noqa: E402
     notify_dispatch_due_tomorrow, notify_dispatch_overdue)
+from app.modules.sample.services.whatsapp_service import (        # noqa: E402
+    notify_dispatch_due_tomorrow as wa_notify_dispatch_due_tomorrow,
+    notify_dispatch_overdue as wa_notify_dispatch_overdue)
 
 
 async def scan_and_send(conn, *, today: date, dry_run: bool = False) -> dict:
@@ -159,7 +172,10 @@ async def scan_and_send(conn, *, today: date, dry_run: bool = False) -> dict:
         logger.info("[dispatch-reminder] 087 not applied — nothing to do")
         return {}
     buckets = await due_buckets(conn, today)
-    counts = {KIND_DUE_NPD: 0, KIND_DUE_OWNER: 0, KIND_OVERDUE_NPD: 0, KIND_OVERDUE_OWNER: 0}
+    counts = {KIND_DUE_NPD: 0, KIND_DUE_OWNER: 0,
+              KIND_DUE_NPD_WA: 0, KIND_DUE_OWNER_WA: 0,
+              KIND_OVERDUE_NPD: 0, KIND_OVERDUE_OWNER: 0,
+              KIND_OVERDUE_NPD_WA: 0, KIND_OVERDUE_OWNER_WA: 0}
 
     async def _one(req, kind, audience, send) -> None:
         if dry_run:
@@ -187,12 +203,22 @@ async def scan_and_send(conn, *, today: date, dry_run: bool = False) -> dict:
                    lambda r=req: notify_dispatch_due_tomorrow(conn, r, audience="npd"))
         await _one(req, KIND_DUE_OWNER, "owner",
                    lambda r=req: notify_dispatch_due_tomorrow(conn, r, audience="owner"))
+        await _one(req, KIND_DUE_NPD_WA, "npd",
+                   lambda r=req: wa_notify_dispatch_due_tomorrow(conn, r, audience="npd"))
+        await _one(req, KIND_DUE_OWNER_WA, "owner",
+                   lambda r=req: wa_notify_dispatch_due_tomorrow(conn, r, audience="owner"))
     for req in buckets["overdue"]:
         d = req["overdue_days"]
         await _one(req, KIND_OVERDUE_NPD, "npd",
                    lambda r=req, d=d: notify_dispatch_overdue(conn, r, days=d, audience="npd"))
         await _one(req, KIND_OVERDUE_OWNER, "owner",
                    lambda r=req, d=d: notify_dispatch_overdue(conn, r, days=d, audience="owner"))
+        await _one(req, KIND_OVERDUE_NPD_WA, "npd",
+                   lambda r=req, d=d: wa_notify_dispatch_overdue(conn, r, days=d,
+                                                                 audience="npd"))
+        await _one(req, KIND_OVERDUE_OWNER_WA, "owner",
+                   lambda r=req, d=d: wa_notify_dispatch_overdue(conn, r, days=d,
+                                                                 audience="owner"))
     return counts
 
 

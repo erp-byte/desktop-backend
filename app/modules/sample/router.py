@@ -418,6 +418,76 @@ async def email_requisition_redate(request: Request, body: schemas.RequisitionEm
         return out
 
 
+async def _release_overdue_best_effort(conn, req_pk: int) -> None:
+    """Forget the overdue chase so the NEW date earns a fresh warning instead of being
+    silenced by yesterday's rows. Best-effort: the date change has already committed, and a
+    failure clearing the log must not turn an applied edit into a 500 the caller retries."""
+    try:
+        from app.modules.sample.services import dispatch_reminder_service as drs
+        if await drs.has_log_table(conn):
+            await drs.release_overdue(conn, req_pk)
+    except Exception:  # noqa: BLE001
+        logger.exception("release_overdue failed for req %s", req_pk)
+
+
+def _parse_action_date(raw: str | None):
+    """ISO first, then dd-mm-yyyy (also / and .). None when it is neither, or is not in
+    the future — a date already gone would re-arm the overdue chase on the next scan."""
+    from datetime import date as _date
+    from app.modules.sample.services.whatsapp_service import _dispatch_today, _parse_ddmmyyyy
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    today = _dispatch_today()
+    try:
+        iso = _date.fromisoformat(raw)
+    except ValueError:
+        return _parse_ddmmyyyy(raw, today=today)
+    return iso if iso > today else None
+
+
+@router.post("/requisitions/{req_id}/dispatch-action")
+async def requisition_dispatch_action(
+    request: Request,
+    req_id: int,
+    body: schemas.DispatchActionBody,
+    user: AuthUser = Depends(require_permission("sample", "requisition", action="edit")),
+):
+    """Move a requisition's expected dispatch date, or cancel it — the same two actions the
+    overdue reminder offers on WhatsApp and by email, as an authenticated call.
+
+    A reason is mandatory on BOTH legs. Cancel is terminal, and a date that moved with no
+    recorded why is exactly what the chase exists to surface.
+    """
+    reason = (body.reason or "").strip()
+    if not reason:
+        raise HTTPException(422, detail={
+            "error": "reason_required",
+            "message": "A reason is required to change the date or cancel"})
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        if body.action == "CANCEL":
+            # No release_overdue here: CANCELLED leaves OPEN_STATUSES, so the scan stops
+            # selecting the requisition anyway, and deleting the rows would only lose the
+            # record that it was chased.
+            return await requisition_service.cancel_requisition(
+                conn, req_id, reason=reason, user=user)
+        if not (body.expected_dispatch_date or "").strip():
+            raise HTTPException(422, detail={
+                "error": "date_required",
+                "message": "expected_dispatch_date is required to change the date"})
+        new_date = _parse_action_date(body.expected_dispatch_date)
+        if new_date is None:
+            raise HTTPException(422, detail={
+                "error": "bad_date",
+                "message": "expected_dispatch_date must be a future date, "
+                           "as dd-mm-yyyy or yyyy-mm-dd",
+                "details": {"expected_dispatch_date": body.expected_dispatch_date}})
+        out = await requisition_service.set_expected_dispatch_date(
+            conn, req_id, new_date=new_date, user=user, reason=reason)
+        await _release_overdue_best_effort(conn, req_id)
+        return out
+
 
 async def _resolve_promote_approver(conn, dev_jc_id: int, kind: str, email: str):
     """Authenticate an email-link approver against the gate it claims (mandatory check):

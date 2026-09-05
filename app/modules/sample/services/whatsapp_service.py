@@ -95,6 +95,63 @@ this order — keep the live template text aligned with the layouts below.
      Return type: {{7}}   Paid: {{8}}   Amount: {{9}}
      <a closing "Tap *Approve* … or *Reject* …" line — body must not END on a variable>
 
+6. npd_dispatch_due_tomorrow_team  (to the NPD team, D-1)  — env WHATSAPP_TPL_DISPATCH_DUE_TEAM
+   Fired by dispatch_reminder_service's daily 09:00 IST scan for every open requisition
+   whose expected_dispatch_date is tomorrow. No buttons — purely informational.
+   HEADER (text): Dispatch due tomorrow — {{1}}          [ header {{1}} = request no ]
+   BODY ({{1}}..{{6}}):
+     This sample request is due for dispatch tomorrow.
+     ⏎
+     Request: {{1}}                                      [ body {{1}} = request no ]
+     Expected dispatch: {{2}}                            [ YYYY-MM-DD, or TBC ]
+     Target article: {{3}}
+     Quantity: {{4}} kg                                  [ the "kg" is literal template
+                                                           text; requisition quantity is
+                                                           pcs × weight_per_piece in kg ]
+     Customer: {{5}}
+     Warehouse: {{6}}
+     ⏎
+     Please make sure the trial and its output are ready in time.
+
+7. npd_dispatch_due_tomorrow_owner (to the business head, D-1) — env WHATSAPP_TPL_DISPATCH_DUE_OWNER
+   The same D-1 scan, addressed to the requisition's bound business_head_user_id. No
+   buttons — the ACTIONS live on the overdue chase, which this copy points forward to.
+   HEADER (text): Dispatch due tomorrow — {{1}}          [ header {{1}} = request no ]
+   BODY ({{1}}..{{4}}) — FOUR vars, not the team template's six:
+     The sample request you raised is due for dispatch tomorrow.
+     ⏎
+     Request: {{1}}                                      [ body {{1}} = request no ]
+     Expected dispatch: {{2}}                            [ YYYY-MM-DD, or TBC ]
+     Target article: {{3}}
+     Customer: {{4}}
+     ⏎
+     The NPD team has been notified. If it is going to slip, the overdue reminder will
+     offer a one-tap way to move the date or cancel.
+
+8. npd_dispatch_overdue_team    (to the business head, daily) — env WHATSAPP_TPL_DISPATCH_OVERDUE
+   The chase once expected_dispatch_date is in the PAST. Registered with a "_team" suffix
+   but addressed to the bound business_head_user_id — they are the only one who can act.
+   Repeats every day until the date moves or the request is cancelled.
+   HEADER (text): Dispatch date passed — {{1}}            [ header {{1}} = request no ]
+   BODY ({{1}}..{{5}}):
+     The sample request you raised has passed its expected dispatch date.
+     ⏎
+     Request: {{1}}                                      [ body {{1}} = request no ]
+     Expected dispatch: {{2}}                            [ the date it MISSED ]
+     Days overdue: {{3}}
+     Target article: {{4}}
+     Customer: {{5}}
+     ⏎
+     Use a button below to set a new date or cancel the request. …
+   BUTTONS: two QUICK REPLY buttons — "Change expected date" and "Cancel request".
+   Both are two messages deep: the tap asks for a reason, and Change expected date then
+   asks for the date itself. State lives in wa_dispatch_pending (088).
+
+9. npd_dispatch_overdue_team_notifier (to the NPD team, daily) — env WHATSAPP_TPL_DISPATCH_OVERDUE_TEAM
+   The same chase as #8, informational, to the npd_team pool. Identical HEADER + five BODY
+   vars; NO buttons — the actions belong to the business head alone. Closing line differs:
+     Its business head has been asked to cancel it or set a new date.
+
 The reviewer-facing prompts/confirmations ("Please reply with the reason", "✓ Accepted")
 are sent as plain session text (no template — the reviewer just messaged us, so the
 24-hour customer-service window is open).
@@ -106,7 +163,7 @@ import asyncio
 import logging
 import os
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -133,6 +190,25 @@ _PROMOTE_GATE_LABEL = {"INV_MGR": "Inventory manager", "REQUESTOR_BH": "Business
 # WHATSAPP_TPL_BH_SIGNOFF at npd_promote_approval to fall back to the promote copy; the
 # send failure is logged loudly either way and the email card is unaffected.
 TPL_BH_SIGNOFF = os.environ.get("WHATSAPP_TPL_BH_SIGNOFF", "npd_bh_approval")
+# Dispatch-date reminder (D-1) fired by dispatch_reminder_service's daily scan. No
+# buttons: purely informational, so there is no wa_review_message mapping to keep.
+TPL_DISPATCH_DUE_TEAM = os.environ.get("WHATSAPP_TPL_DISPATCH_DUE_TEAM",
+                                       "npd_dispatch_due_tomorrow_team")
+# Same D-1 warning, addressed to the requisition's bound business head — the one person
+# who can move the date or cancel. Shorter copy, so a SEPARATE template with four body
+# vars instead of the team template's six.
+TPL_DISPATCH_DUE_OWNER = os.environ.get("WHATSAPP_TPL_DISPATCH_DUE_OWNER",
+                                        "npd_dispatch_due_tomorrow_owner")
+# The daily chase once the date has PASSED. Two quick-reply buttons whose inbound payload
+# is the button text — "Change expected date" / "Cancel request" — handled in handle_inbound.
+# Registered as npd_dispatch_overdue_team but addressed to the business head: they are the
+# only one who can move the date or cancel, and the buttons are theirs.
+TPL_DISPATCH_OVERDUE = os.environ.get("WHATSAPP_TPL_DISPATCH_OVERDUE",
+                                      "npd_dispatch_overdue_team")
+# The same chase, informational, to the NPD team pool. Same five body vars as the business
+# head's copy but NO buttons — the actions belong to the one person who can take them.
+TPL_DISPATCH_OVERDUE_TEAM = os.environ.get("WHATSAPP_TPL_DISPATCH_OVERDUE_TEAM",
+                                           "npd_dispatch_overdue_team_notifier")
 # Verify token for the webhook GET handshake (set the same value in Meta).
 VERIFY_TOKEN = os.environ.get("WHATSAPP_VERIFY_TOKEN", "")
 # This WABA is shared with the standalone Visitor Management system, which sends its own
@@ -391,6 +467,415 @@ async def notify_npd_updated(conn, req: dict) -> None:
     await _augment_requestor(conn, req)
     await _notify_reviewers(conn, req, template=TPL_UPDATED, kind="UPDATED",
                             params=_updated_params(req))
+
+
+def _dispatch_due_team_params(req: dict) -> tuple[list[str], list[str]]:
+    """(header, body) for npd_dispatch_due_tomorrow_team — SIX body vars. HEADER and BODY number
+    INDEPENDENTLY — header {{1}} and body {{1}} are two separate parameters that happen
+    to carry the same request no."""
+    exp = req.get("expected_dispatch_date")
+    no = _req_no(req)
+    return [no], [
+        no,                                        # {{1}} Request
+        str(exp)[:10] if exp else "TBC",           # {{2}} Expected dispatch
+        _txt(req.get("npd_target_name")),          # {{3}} Target article
+        _num(req.get("quantity")),                 # {{4}} Quantity (template supplies "kg")
+        _txt(req.get("customer_name")),            # {{5}} Customer
+        _txt(req.get("warehouse")),                # {{6}} Warehouse
+    ]
+
+
+def _dispatch_due_owner_params(req: dict) -> tuple[list[str], list[str]]:
+    """(header, body) for npd_dispatch_due_tomorrow_owner — FOUR body vars, not the team
+    template's six. The business head is not making the batch, so the quantity and the
+    warehouse are noise; they only need enough to recognise which request this is."""
+    exp = req.get("expected_dispatch_date")
+    no = _req_no(req)
+    return [no], [
+        no,                                        # {{1}} Request
+        str(exp)[:10] if exp else "TBC",           # {{2}} Expected dispatch
+        _txt(req.get("npd_target_name")),          # {{3}} Target article
+        _txt(req.get("customer_name")),            # {{4}} Customer
+    ]
+
+
+def _dispatch_overdue_params(req: dict, *, days: int) -> tuple[list[str], list[str]]:
+    """(header, body) for npd_dispatch_overdue_team — FIVE body vars.
+
+    `days` comes from the scan, which computed it against the IST day; recomputing it here
+    off the server clock would disagree with the reminder that decided to send.
+    """
+    exp = req.get("expected_dispatch_date")
+    no = _req_no(req)
+    return [no], [
+        no,                                        # {{1}} Request
+        str(exp)[:10] if exp else "TBC",           # {{2}} Expected dispatch
+        _num(days),                                # {{3}} Days overdue
+        _txt(req.get("npd_target_name")),          # {{4}} Target article
+        _txt(req.get("customer_name")),            # {{5}} Customer
+    ]
+
+
+async def notify_dispatch_overdue(conn, req: dict, *, days: int, audience: str) -> bool:
+    """The daily chase once the expected dispatch date has passed.
+
+    `audience` is "npd" (the team pool — informational, so they know the request they are
+    making has slipped) or "owner" (the bound business head — the copy that carries the
+    Change-date / Cancel buttons). Two registered templates with the SAME five parameters;
+    only the owner's has buttons, and sending that one to the pool would let any team
+    member cancel a live request.
+
+    Same True/False contract as the D-1 warning: False releases the day's claim so the next
+    tick retries.
+    """
+    if audience == "npd":
+        nums = await _resolve_recipients(conn)
+        if not nums:
+            logger.warning("No NPD reviewers with a phone (roles=%s) — skipping the overdue "
+                           "notice for req %s; assign the role + a phone on auth_user, or "
+                           "set WHATSAPP_NPD_REVIEW_NUMBERS", _REVIEW_ROLES, req.get("id"))
+            return False
+        header, body = _dispatch_overdue_params(req, days=days)
+        sent_any = False
+        for n in nums:
+            resp = await _send_template(n, TPL_DISPATCH_OVERDUE_TEAM, body,
+                                        header_params=header)
+            if isinstance(resp, dict) and resp.get("error"):
+                logger.warning("Overdue notice to %s failed for req %s: %s (template %s)",
+                               n, req.get("id"), resp.get("error"), TPL_DISPATCH_OVERDUE_TEAM)
+            else:
+                sent_any = True
+        # Deliberately NO wa_review_message row: this copy has no buttons, and a mapping
+        # would create a way for a stray reply from the pool to resolve as the BH's answer.
+        return sent_any
+
+    # ── the business head's copy: the only one with the two actions on it ──
+    # Its wamid IS mapped, because the quick-reply tap that answers it carries no request
+    # number — only context.id. Without that row the tap is unattributable.
+    bh_uid = req.get("business_head_user_id")
+    if not bh_uid:
+        logger.warning("Req %s has no business head bound — no overdue chase on WhatsApp "
+                       "(requisitions raised before 086 carry no business_head_user_id)",
+                       req.get("id"))
+        return False
+    phone = await _phone_for_user(conn, bh_uid)
+    if not phone:
+        logger.warning("Business head %s has no phone — skipping the overdue WhatsApp chase "
+                       "for req %s (the email card, with the same two actions, still went "
+                       "out)", bh_uid, req.get("id"))
+        return False
+    header, body = _dispatch_overdue_params(req, days=days)
+    resp = await _send_template(phone, TPL_DISPATCH_OVERDUE, body, header_params=header)
+    if isinstance(resp, dict) and resp.get("error"):
+        logger.warning("Overdue chase to %s failed for req %s: %s (template %s — check it "
+                       "is Approved in WhatsApp Manager)",
+                       phone, req.get("id"), resp.get("error"), TPL_DISPATCH_OVERDUE)
+        return False
+    wamid = _wamid(resp)
+    if wamid and req.get("id") is not None:
+        await _store_review_message(conn, wamid, req["id"], "DISPATCH_OVERDUE", phone)
+    return True
+
+
+# ── the date the business head types back ────────────────────────────────────
+# dd-mm-yyyy, with / and . allowed too: the prompt asks for dashes but a phone keyboard
+# makes the other two just as likely, and day-month-year order is unambiguous either way.
+_DDMMYYYY_RE = re.compile(r"^\s*(\d{1,2})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(\d{4})\s*$")
+
+
+def _parse_ddmmyyyy(s: Any, *, today: date) -> date | None:
+    """Parse the new expected dispatch date, or None when it is not usable.
+
+    Strict on purpose, because both loose readings are silent disasters: a two-digit year
+    is ambiguous by a century, and a date at or before today would re-arm the overdue chase
+    on the very next scan — the BH would answer the prompt and be chased again in the
+    morning. Asking again costs one message; guessing costs the whole point of the button.
+    """
+    m = _DDMMYYYY_RE.match(str(s or ""))
+    if not m:
+        return None
+    d, mo, y = (int(g) for g in m.groups())
+    try:
+        out = date(y, mo, d)
+    except ValueError:                     # 31-02, month 13, day 0 …
+        return None
+    return out if out > today else None
+
+
+# ── overdue chase: the two buttons and the replies that answer them ──────────
+# The quick-reply payload is the button TEXT (Meta sends no separate payload for these),
+# so these are matched case-insensitively against the registered labels.
+_BTN_REDATE = "change expected date"
+_BTN_CANCEL = "cancel request"
+
+_ASK_REDATE_REASON = ("Changing the expected dispatch date for request {no}.\n"
+                      "Please reply with the reason for the change.")
+_ASK_CANCEL_REASON = ("Cancelling request {no}.\n"
+                      "Please reply with the reason for the cancellation.")
+_ASK_DATE = ("Reason noted. Now reply with the new expected dispatch date in "
+             "dd-mm-yyyy format — for example 15-09-2026.")
+_BAD_DATE = ("Sorry, I could not read that as a date. Please reply in dd-mm-yyyy format "
+             "— for example 15-09-2026. It has to be a date after today.")
+
+
+def _dispatch_today() -> date:
+    """Today in IST — seam for the tests, and the same +05:30 the reminder scan uses."""
+    return datetime.now(timezone(timedelta(hours=5, minutes=30))).date()
+
+
+async def _apply_dispatch_redate(conn, req_id: int, *, new_date, user, reason=None):
+    """Lazy wrapper around the requisition service (import cycle: requisition_service
+    imports this module for its own notify calls). Also the seam the inbound tests patch."""
+    from app.modules.sample.services import requisition_service
+    return await requisition_service.set_expected_dispatch_date(
+        conn, req_id, new_date=new_date, user=user, reason=reason)
+
+
+async def _apply_dispatch_cancel(conn, req_id: int, *, reason: str, user):
+    from app.modules.sample.services import requisition_service
+    return await requisition_service.cancel_requisition(
+        conn, req_id, reason=reason, user=user)
+
+
+async def _release_overdue_rows(conn, req_id: int) -> None:
+    """Forget the chase so the NEW date earns a fresh warning. Best-effort: the date move
+    has already committed, and a failure here must not read back as a failed redate."""
+    try:
+        from app.modules.sample.services import dispatch_reminder_service as drs
+        if await drs.has_log_table(conn):
+            await drs.release_overdue(conn, req_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("release_overdue failed for req %s", req_id)
+
+
+async def _wamid_kind(conn, wamid: str) -> str | None:
+    """What flow a quoted message belongs to, or None when we never sent it."""
+    row = await conn.fetchrow(
+        "SELECT kind, requisition_id FROM wa_review_message WHERE wamid = $1", wamid)
+    return row["kind"] if row else None
+
+
+# Latched False the first time wa_dispatch_pending turns out to be missing. Every inbound
+# WhatsApp message reaches this handler, so without the latch an unmigrated deploy logs a
+# failure per message and buries anything real in the same log.
+_DISPATCH_PENDING_READY = True
+
+
+async def _peek_dispatch_pending(conn, wa_phone: str) -> dict | None:
+    """The armed prompt for this number, or None. 088 is hand-applied like every other
+    samples/ migration, so a deploy can land before the table does — and this runs on the
+    path of EVERY inbound message, where raising would break the whole webhook."""
+    global _DISPATCH_PENDING_READY
+    if not _DISPATCH_PENDING_READY:
+        return None
+    try:
+        row = await conn.fetchrow(
+            "SELECT requisition_id, action, stage, reason FROM wa_dispatch_pending "
+            " WHERE wa_phone = $1", wa_phone)
+    except Exception as e:  # noqa: BLE001
+        _DISPATCH_PENDING_READY = False
+        logger.warning("wa_dispatch_pending unavailable — the overdue chase's buttons are "
+                       "inert until migration 088 is applied (%s)", e)
+        return None
+    return dict(row) if row else None
+
+
+async def _arm_dispatch_pending(conn, wa_phone: str, req_id: int, action: str) -> None:
+    await conn.execute(
+        """INSERT INTO wa_dispatch_pending (wa_phone, requisition_id, action, stage)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (wa_phone) DO UPDATE
+             SET requisition_id = EXCLUDED.requisition_id, action = EXCLUDED.action,
+                 stage = EXCLUDED.stage, reason = NULL, created_at = NOW()""",
+        wa_phone, req_id, action, "REASON")
+
+
+async def _advance_dispatch_pending(conn, wa_phone: str, *, stage: str, reason) -> None:
+    await conn.execute(
+        "UPDATE wa_dispatch_pending SET stage = $1, reason = $2 WHERE wa_phone = $3",
+        stage, reason, wa_phone)
+
+
+async def _clear_dispatch_pending(conn, wa_phone: str) -> None:
+    await conn.execute("DELETE FROM wa_dispatch_pending WHERE wa_phone = $1", wa_phone)
+
+
+async def _dispatch_actor(conn, wa_phone: str, req_id: int):
+    """(user, request_no) when this number belongs to the requisition's bound business
+    head, else (None, request_no). The chase is ADDRESSED to the BH, but a number is not
+    a signature — cancelling is terminal, so the acting user is checked against the row."""
+    req = await conn.fetchrow(
+        "SELECT id, request_id, status, business_head_user_id FROM sample_requisitions "
+        " WHERE id = $1 AND deleted_at IS NULL", req_id)
+    if req is None:
+        return None, req_id
+    u = await _resolve_user(conn, wa_phone)
+    if u is None or u["user_id"] != req["business_head_user_id"]:
+        return None, req["request_id"]
+    return _WaUser(u["user_id"], u["role_name"]), req["request_id"]
+
+
+async def handle_dispatch_action(conn, wa_phone: str, text: str,
+                                 context_id: str | None) -> dict | None:
+    """The overdue chase's buttons and their follow-up replies.
+
+    Returns None when the message belongs to some other flow, so handle_inbound falls
+    through unchanged — the same contract as handle_return_button_tap / the PO intimation
+    handler. Never raises: a failure replies to the business head instead.
+    """
+    body = (text or "").strip()
+    wa = _fmt_phone(wa_phone)
+    if context_id:
+        kind = await _wamid_kind(conn, context_id)
+        if kind == "DISPATCH_OVERDUE":
+            req_id = await conn.fetchval(
+                "SELECT requisition_id FROM wa_review_message "
+                " WHERE wamid = $1 AND kind = 'DISPATCH_OVERDUE'", context_id)
+            return await _handle_dispatch_tap(conn, wa, req_id, body)
+        if kind is not None:
+            return None                  # another flow's card — leave the tap alone
+        # An unmapped quote (our own text prompt, quoted back) falls through to the
+        # pending below: otherwise the reply-quote UI would silently drop the answer.
+    pend = await _peek_dispatch_pending(conn, wa)
+    if pend is None:
+        return None
+    return await _handle_dispatch_reply(conn, wa, pend, body)
+
+
+async def _handle_dispatch_tap(conn, wa: str, req_id, body: str) -> dict:
+    low = body.lower()
+    if low == _BTN_REDATE:
+        action, awaiting, prompt = "REDATE", "redate_reason", _ASK_REDATE_REASON
+    elif low == _BTN_CANCEL:
+        action, awaiting, prompt = "CANCEL", "cancel_reason", _ASK_CANCEL_REASON
+    else:
+        # Free text quoting the card is a question, not a decision. Arming a cancellation
+        # off it would let an idle reply start killing a live request.
+        await _send_text(wa, "Tap *Change expected date* or *Cancel request* on the "
+                             "reminder above.")
+        return {"ok": False, "reason": "unparsed", "requisition_id": req_id}
+    user, req_no = await _dispatch_actor(conn, wa, req_id)
+    if user is None:
+        await _send_text(wa, "Sorry, only this request's business head can action it.")
+        return {"ok": False, "reason": "unauthorised", "requisition_id": req_id}
+    await _arm_dispatch_pending(conn, wa, req_id, action)
+    await _send_text(wa, prompt.format(no=req_no))
+    return {"ok": True, "awaiting": awaiting, "requisition_id": req_id}
+
+
+async def _handle_dispatch_reply(conn, wa: str, pend: dict, body: str) -> dict:
+    req_id = pend["requisition_id"]
+    user, req_no = await _dispatch_actor(conn, wa, req_id)
+    if user is None:
+        await _clear_dispatch_pending(conn, wa)
+        await _send_text(wa, "Sorry, only this request's business head can action it.")
+        return {"ok": False, "reason": "unauthorised", "requisition_id": req_id}
+
+    if pend["stage"] == "REASON":
+        if not body:
+            await _send_text(wa, "Please reply with the reason — it is recorded against "
+                                 "the request.")
+            return {"ok": False, "reason": "reason_required", "requisition_id": req_id}
+        if pend["action"] == "REDATE":
+            await _advance_dispatch_pending(conn, wa, stage="DATE", reason=body)
+            await _send_text(wa, _ASK_DATE)
+            return {"ok": True, "awaiting": "redate_date", "requisition_id": req_id}
+        try:
+            await _apply_dispatch_cancel(conn, req_id, reason=body, user=user)
+        except Exception as e:  # noqa: BLE001 — reply with the reason, never 500 the webhook
+            return await _dispatch_failed(conn, wa, req_id, e, "cancel")
+        await _clear_dispatch_pending(conn, wa)
+        await _send_text(wa, f"✓ Request {req_no} has been cancelled. Reason recorded.")
+        return {"ok": True, "action": "CANCELLED", "requisition_id": req_id}
+
+    new_date = _parse_ddmmyyyy(body, today=_dispatch_today())
+    if new_date is None:
+        # Deliberately does NOT clear the pending: losing the reason would make the BH
+        # type it again over a typo in the date.
+        await _send_text(wa, _BAD_DATE)
+        return {"ok": False, "reason": "bad_date", "requisition_id": req_id}
+    try:
+        await _apply_dispatch_redate(conn, req_id, new_date=new_date, user=user,
+                                     reason=pend.get("reason"))
+    except Exception as e:  # noqa: BLE001
+        return await _dispatch_failed(conn, wa, req_id, e, "redate")
+    await _release_overdue_rows(conn, req_id)
+    await _clear_dispatch_pending(conn, wa)
+    await _send_text(wa, f"✓ Expected dispatch for request {req_no} moved to "
+                         f"{new_date.strftime('%d-%m-%Y')}. Reason recorded.")
+    return {"ok": True, "action": "REDATED", "requisition_id": req_id,
+            "expected_dispatch_date": new_date.isoformat()}
+
+
+async def _dispatch_failed(conn, wa: str, req_id, exc: Exception, what: str) -> dict:
+    """One place to turn a service refusal into a reply. The pending row is cleared so the
+    business head is not stuck answering a prompt that can never succeed (a request already
+    cancelled elsewhere, say)."""
+    detail = getattr(exc, "detail", None)
+    msg = (detail or {}).get("message") if isinstance(detail, dict) else None
+    logger.warning("Dispatch %s failed for req %s: %s", what, req_id, exc)
+    await _clear_dispatch_pending(conn, wa)
+    await _send_text(wa, msg or "Sorry, that could not be applied. Please use the portal.")
+    return {"ok": False, "reason": what + "_failed", "requisition_id": req_id}
+
+
+async def _resolve_due_audience(conn, req: dict, audience: str):
+    """(numbers, template, params) for one audience, or None when nobody is reachable.
+
+    Mirrors sample_mail_service.notify_dispatch_due_tomorrow's split: "npd" is the team
+    pool (everyone who has to make it), "owner" is the requisition's bound business head
+    — the single person who can move the date or cancel it.
+    """
+    if audience == "owner":
+        bh_uid = req.get("business_head_user_id")
+        if not bh_uid:
+            logger.warning("Req %s has no business head bound — no owner dispatch reminder "
+                           "on WhatsApp (requisitions raised before 086 carry no "
+                           "business_head_user_id)", req.get("id"))
+            return None
+        phone = await _phone_for_user(conn, bh_uid)
+        if not phone:
+            logger.warning("Business head %s has no phone — skipping the owner dispatch "
+                           "reminder for req %s (the email card still went out)",
+                           bh_uid, req.get("id"))
+            return None
+        return [phone], TPL_DISPATCH_DUE_OWNER, _dispatch_due_owner_params(req)
+    nums = await _resolve_recipients(conn)
+    if not nums:
+        # WARNING (not INFO): a silent "0 delivered" almost always traces here —
+        # no user in these roles has a phone on file.
+        logger.warning("No NPD reviewers with a phone (roles=%s) — skipping the dispatch "
+                       "reminder for req %s; assign the role + a phone on auth_user, or "
+                       "set WHATSAPP_NPD_REVIEW_NUMBERS", _REVIEW_ROLES, req.get("id"))
+        return None
+    return nums, TPL_DISPATCH_DUE_TEAM, _dispatch_due_team_params(req)
+
+
+async def notify_dispatch_due_tomorrow(conn, req: dict, *, audience: str) -> bool:
+    """Warn that a sample requisition is due for dispatch tomorrow. `audience` is "npd"
+    (the team pool) or "owner" (the bound business head) — two audiences, two registered
+    Meta templates, two different parameter counts.
+
+    Returns True only if at least one number was actually messaged. The caller's
+    send-once guard releases the day's claim on False, so an unconfigured recipient list
+    or a Meta rejection is retried on the next tick instead of silently consuming the day.
+    A disabled/unconfigured WhatsApp counts as sent: _post's dev fallback carries no
+    error, and retrying a channel that is switched off every hour would be noise.
+    """
+    resolved = await _resolve_due_audience(conn, req, audience)
+    if resolved is None:
+        return False
+    nums, template, (header, body) = resolved
+    sent_any = False
+    for n in nums:
+        resp = await _send_template(n, template, body, header_params=header)
+        if isinstance(resp, dict) and resp.get("error"):
+            logger.warning("Dispatch reminder (%s) to %s failed: %s (template %s — check "
+                           "it is Approved in WhatsApp Manager)",
+                           audience, n, resp.get("error"), template)
+        else:
+            sent_any = True
+    return sent_any
 
 
 async def _requestor_phone(conn, req: dict) -> str | None:
@@ -958,6 +1443,14 @@ async def handle_inbound(conn, *, from_phone: str, text: str, context_id: str | 
     po_res = await _po_wa.handle_po_intimation_tap(conn, wa, body, context_id)
     if po_res is not None:
         return po_res
+
+    # ── OVERDUE-DISPATCH chase (088): "Change expected date" / "Cancel request".
+    #    MUST run before the NPD-review flow below: _req_for_wamid resolves a quoted wamid
+    #    WITHOUT filtering on kind, so a dispatch tap reaching it first would be answered
+    #    as an Accept/Hold on the request. Returns None for anything that isn't ours. ──
+    disp_res = await handle_dispatch_action(conn, wa, body, context_id)
+    if disp_res is not None:
+        return disp_res
 
     # ── BUSINESS-HEAD approval on the REQUEST (086) — resolved before the promote and
     #    NPD-review flows, since the BH is neither an npd_team reviewer nor a promote

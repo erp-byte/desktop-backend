@@ -406,7 +406,6 @@ class RequisitionEmailRedate(BaseModel):
     expected_dispatch_date: date
 
 
-
 class PromoteEmailReject(BaseModel):
     """Reject a promote gate from the email-driven reason dialog on the web app. PUBLIC
     (no session) — authenticated by the recipient `email` owning the gate; a reason is
@@ -506,3 +505,16 @@ class ConvertFullBody(GatePassIssueBody):
 class ConvertPartialBody(GatePassIssueBody):
     qty: float = Field(gt=0)
     remarks: Optional[str] = None
+
+
+class DispatchActionBody(BaseModel):
+    """The overdue reminder's two actions, as an authenticated API call.
+
+    `expected_dispatch_date` is a STRING, not a date: the WhatsApp prompt asks a human for
+    dd-mm-yyyy while an API caller will send ISO, and both reach the same service. The
+    router parses and validates it, so a garbled value is a 422 with a message rather than
+    a pydantic type error nobody can act on.
+    """
+    action: Literal["CHANGE_DATE", "CANCEL"]
+    reason: str
+    expected_dispatch_date: str | None = None

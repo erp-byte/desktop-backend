@@ -17,8 +17,13 @@
 CREATE TABLE IF NOT EXISTS sample_dispatch_reminder_log (
     id              BIGINT PRIMARY KEY,
     requisition_id  BIGINT NOT NULL REFERENCES sample_requisitions(id) ON DELETE CASCADE,
-    kind            TEXT   NOT NULL,   -- DUE_TOMORROW_NPD | DUE_TOMORROW_OWNER
-                                       -- OVERDUE_NPD      | OVERDUE_OWNER
+    kind            TEXT   NOT NULL,   -- one row per audience PER CHANNEL, so a failed
+                                       -- WhatsApp retries without re-sending the email:
+                                       --   DUE_TOMORROW_NPD | DUE_TOMORROW_OWNER
+                                       --   OVERDUE_NPD      | OVERDUE_OWNER
+                                       --   …and the _WA suffix of each.
+                                       -- Deliberately unconstrained TEXT: adding a channel
+                                       -- must not need a migration on a live table.
     sent_on         DATE   NOT NULL,   -- the IST day it was sent
     sent_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (requisition_id, kind, sent_on)

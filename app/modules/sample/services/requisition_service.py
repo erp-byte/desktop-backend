@@ -747,7 +747,17 @@ async def update_requisition(conn, req_id: int, *, payload: dict, user) -> dict:
     return await get_requisition(conn, req_id)
 
 
-async def set_expected_dispatch_date(conn, req_id: int, *, new_date, user) -> dict:
+def _redate_remark(reason: str | None) -> str:
+    """The audit remark for a date move. `reason` is optional because the emailed link has
+    no reason field; the API and the WhatsApp flow both insist on one, and when there is one
+    it is the only thing that answers "why did this slip?" a month later."""
+    base = "Expected dispatch date changed from the overdue-dispatch reminder"
+    r = (reason or "").strip()
+    return f"{base}: {r}" if r else base
+
+
+async def set_expected_dispatch_date(conn, req_id: int, *, new_date, user,
+                                    reason: str | None = None) -> dict:
     """Move ONLY the expected dispatch date, on any requisition that is still open.
 
     Deliberately not part of update_requisition: that one refuses anything past SUBMITTED
@@ -773,7 +783,7 @@ async def set_expected_dispatch_date(conn, req_id: int, *, new_date, user) -> di
             old_value={"expected_dispatch_date": str(req["expected_dispatch_date"] or "")},
             new_value={"expected_dispatch_date": str(new_date)},
             actor_user_id=user.user_id, actor_role=user.role_name,
-            remarks="Expected dispatch date changed from the overdue-dispatch reminder")
+            remarks=_redate_remark(reason))
     return await get_requisition(conn, req_id)
 
 

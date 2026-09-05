@@ -232,8 +232,18 @@ def _stub_mail(monkeypatch, *, ok=True, raises=False):
             raise RuntimeError("mailer exploded")
         return ok
 
+    async def _wa(conn, req):
+        calls.append(("wa", req["id"], "npd"))
+        if raises:
+            raise RuntimeError("mailer exploded")
+        return ok
+
     monkeypatch.setattr(svc, "notify_dispatch_due_tomorrow", _due)
     monkeypatch.setattr(svc, "notify_dispatch_overdue", _over)
+    # The WhatsApp leg shares scan_and_send; stub it too so these mail tests neither
+    # reach the Graph API nor resolve phones out of a connection that only knows
+    # requisitions. Its own behaviour is covered in test_dispatch_reminder_whatsapp.py.
+    monkeypatch.setattr(svc, "wa_notify_dispatch_due_tomorrow", _wa)
     return calls
 
 
@@ -241,7 +251,7 @@ def test_a_due_request_mails_both_audiences_once(monkeypatch):
     calls = _stub_mail(monkeypatch)
     conn = _FullConn([_req(expected_dispatch_date=DAY + timedelta(days=1))])
     out = asyncio.run(svc.scan_and_send(conn, today=DAY))
-    assert sorted(c[2] for c in calls) == ["npd", "owner"]
+    assert sorted(c[2] for c in calls if c[0] == "due") == ["npd", "owner"]
     assert out[svc.KIND_DUE_NPD] == 1 and out[svc.KIND_DUE_OWNER] == 1
 
 
