@@ -699,6 +699,8 @@ async def list_requisitions(
     warehouse: str | None = Query(None),
     sample_types: str | None = Query(None, description="CSV of sample_type values (e.g. NPD,TRIAL)"),
     statuses: str | None = Query(None, description="CSV of status values (e.g. DRAFT,SUBMITTED)"),
+    display_statuses: str | None = Query(
+        None, description="CSV of display buckets (PENDING,HOLD,IN_PROCESS,PARTIAL,DISPATCHED,CANCELLED)"),
     requestor: str | None = Query(None),
     q: str | None = Query(None, description="Free-text search: number / request_id / target / description / requestor"),
     date_from: date | None = Query(None),
@@ -709,12 +711,15 @@ async def list_requisitions(
 ):
     types = [t for t in (sample_types.split(",") if sample_types else []) if t] or None
     status_set = [s for s in (statuses.split(",") if statuses else []) if s] or None
+    display_set = [s.strip().upper() for s in (display_statuses.split(",") if display_statuses else [])
+                   if s.strip()] or None
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
         return await requisition_service.list_requisitions(
             conn, status=status, sample_type=sample_type, warehouse=warehouse,
             sample_types=types, statuses=status_set, requestor=requestor, q=q,
-            date_from=date_from, date_to=date_to, limit=limit, offset=offset)
+            date_from=date_from, date_to=date_to, limit=limit, offset=offset,
+            display_statuses=display_set)
 
 
 # NB: declared BEFORE /requisitions/{req_id} so "requestors" isn't parsed as an id.

@@ -351,6 +351,70 @@ async def get_requisition(conn, req_id: int) -> dict:
     return req
 
 
+# The six buckets the queue and the dashboard show, in resolution order. Kept as SQL
+# rather than derived in Python because the filter has to be a WHERE: filtering after the
+# fetch would page against the unfiltered row set, so page 2 of "Partial" would skip rows
+# page 1 never showed.
+DISPLAY_STATUSES = ("PENDING", "HOLD", "IN_PROCESS", "PARTIAL", "DISPATCHED", "CANCELLED")
+
+_DISPLAY_STATUS_CASE = """
+        CASE
+          WHEN sr.status = 'ON_HOLD'                        THEN 'HOLD'
+          WHEN sr.status IN ('CANCELLED', 'BH_REJECTED')    THEN 'CANCELLED'
+          WHEN sr.status IN ('DRAFT', 'SUBMITTED')          THEN 'PENDING'
+          -- The gate pass closes a request whatever the ledger says, and it is the ONLY
+          -- route to Dispatched for the types that never raise a dev job card.
+          WHEN sr.status IN ('GATE_PASS_ISSUED', 'CLOSED')  THEN 'DISPATCHED'
+          -- Complete only when every part shipped in ONE unit that matches the header's
+          -- kg. uom_kinds > 1 means the sum is meaningless, so it can only ever be
+          -- Partial — a wrong "Dispatched" closes a request that is still owed stock.
+          -- The 1g tolerance stops a rounding remainder pinning it at Partial forever.
+          WHEN COALESCE(disp.qty_any, 0) > 0
+           AND COALESCE(disp.uom_kinds, 0) <= 1
+           AND sr.quantity IS NOT NULL AND sr.quantity > 0
+           AND COALESCE(disp.qty_kg, 0) >= sr.quantity - 0.001
+                                                            THEN 'DISPATCHED'
+          WHEN COALESCE(disp.qty_any, 0) > 0                THEN 'PARTIAL'
+          ELSE 'IN_PROCESS'
+        END AS display_status"""
+
+# No ledger to read (078 unapplied): a shape-compatible empty CTE, so the CASE above
+# still compiles and every row falls through to its lifecycle status.
+_DISP_CTE_ABSENT = """
+        SELECT NULL::bigint AS req_id, NULL::numeric AS qty_any,
+               NULL::numeric AS qty_kg, NULL::bigint AS uom_kinds
+         WHERE FALSE"""
+
+
+def _disp_cte(cols: set[str]) -> str:
+    """The per-requisition dispatch totals, or an empty stand-in when 078 is unapplied.
+
+    `uom` is 084, added nullable with no backfill, so parts dispatched before it have
+    none — the card's own unit is then the only answer available. Reading a column that
+    does not exist would 500 the entire queue, NPD or not, so it is substituted instead.
+    """
+    if not cols:
+        return _DISP_CTE_ABSENT
+    unit = ("COALESCE(d.uom, jc.output_uom, jc.uom, 'kg')" if "uom" in cols
+            else "COALESCE(jc.output_uom, jc.uom, 'kg')")
+    return f"""
+        SELECT jc.source_requisition_id AS req_id,
+               SUM(d.qty)                                        AS qty_any,
+               SUM(CASE WHEN lower({unit}) = 'kg' THEN d.qty ELSE 0 END) AS qty_kg,
+               COUNT(DISTINCT lower({unit}))                     AS uom_kinds
+          FROM npd_dev_dispatch d
+          JOIN npd_dev_job_cards jc ON jc.id = d.dev_jc_id
+         WHERE jc.source_requisition_id IS NOT NULL
+         GROUP BY 1"""
+
+
+async def _dispatch_ledger_cols(conn) -> set[str]:
+    """Which npd_dev_dispatch columns exist. Empty when 078 has not been applied."""
+    return {r["column_name"] for r in await conn.fetch(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_name = 'npd_dev_dispatch'")}
+
+
 async def list_requisitions(conn, *, status: str | None = None,
                             sample_type: str | None = None,
                             warehouse: str | None = None,
@@ -359,6 +423,7 @@ async def list_requisitions(conn, *, status: str | None = None,
                             requestor: str | None = None,
                             q: str | None = None,
                             date_from=None, date_to=None,
+                            display_statuses: list[str] | None = None,
                             limit: int = 50, offset: int = 0) -> list[dict]:
     """List requisitions with the queue filters.
 
@@ -372,15 +437,24 @@ async def list_requisitions(conn, *, status: str | None = None,
 
     The free-text search deliberately spans the CUSTOMER too (name + company): those are
     columns on the queue, and a field you can see but not search reads as broken.
+
+    Every row also carries `display_status` — the six buckets the queue and the dashboard
+    show (see DISPLAY_STATUSES) — and `display_statuses` filters on it. Both live in SQL so
+    the filter is a WHERE and LIMIT/OFFSET still page over the rows the caller asked for.
     """
+    disp_cte = _disp_cte(await _dispatch_ledger_cols(conn))
     rows = await conn.fetch(
-        """
+        f"""
+        WITH disp AS ({disp_cte}
+        ), base AS (
         SELECT sr.*,
                (SELECT a.remarks FROM sample_approvals a
                  WHERE a.requisition_id = sr.id AND a.action = 'HOLD'
                  ORDER BY a.actioned_at DESC NULLS LAST, a.sequence_no DESC
-                 LIMIT 1) AS hold_reason
+                 LIMIT 1) AS hold_reason,
+               {_DISPLAY_STATUS_CASE}
           FROM sample_requisitions sr
+          LEFT JOIN disp ON disp.req_id = sr.id
          WHERE sr.deleted_at IS NULL
           AND ($1::text   IS NULL OR sr.status = $1)
           AND ($2::text   IS NULL OR sr.sample_type = $2)
@@ -400,11 +474,14 @@ async def list_requisitions(conn, *, status: str | None = None,
              OR COALESCE(sr.company_name, '')       ILIKE '%' || $8 || '%'
           ))
           AND ($9::text[] IS NULL OR sr.status = ANY($9))
-         ORDER BY sr.created_at DESC
+        )
+        SELECT * FROM base
+         WHERE ($12::text[] IS NULL OR display_status = ANY($12))
+         ORDER BY created_at DESC
          LIMIT $10 OFFSET $11
         """,
         status, sample_type, warehouse, sample_types, requestor,
-        date_from, date_to, q, statuses, limit, offset)
+        date_from, date_to, q, statuses, limit, offset, display_statuses)
     out = [dict(r) for r in rows]
     await _attach_npd_targets(conn, out)
     return out
