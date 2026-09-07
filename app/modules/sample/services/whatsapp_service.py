@@ -819,6 +819,72 @@ async def _dispatch_failed(conn, wa: str, req_id, exc: Exception, what: str) -> 
     return {"ok": False, "reason": what + "_failed", "requisition_id": req_id}
 
 
+# ── the business head's manual trigger ───────────────────────────────────────
+# The 9 AM loop sends inside a one-hour window only (SAMPLE_REMINDER_WINDOW_HOURS), so a
+# server that was down or being deployed across 09:00-09:59 sends nothing that day. This
+# is the recovery, and it is deliberately the SAME scan rather than an overdue-only one:
+# a missed morning also missed the D-1 warnings, and the send-once guard means running it
+# twice costs nothing.
+_REMINDER_COMMANDS = {"EXPIRED"}
+# Only the two roles that own the outcome. This is the one inbound path that can push a
+# template to a whole team, so an npd_team member who happens to type the word must be
+# refused BEFORE the scan, not merely told afterwards.
+_REMINDER_ROLES = {"business_head", "admin"}
+
+
+async def handle_reminder_command(conn, wa_phone: str, text: str) -> dict | None:
+    """"Expired" from a business head — run today's dispatch scan now.
+
+    Returns None for anything that is not the bare command, so handle_inbound falls through
+    unchanged. Never raises: a failure replies instead.
+
+    Must be wired AFTER handle_dispatch_action. A business head who has been asked "why are
+    you cancelling?" and answers "Expired" means it as the reason; running the command there
+    would both swallow the answer and message the whole NPD team.
+    """
+    if (text or "").strip().upper() not in _REMINDER_COMMANDS:
+        return None
+    wa = _fmt_phone(wa_phone)
+    u = await _resolve_user(conn, wa)
+    if u is None:
+        await _send_text(wa, "Sorry, this number isn't recognised.")
+        return {"ok": False, "reason": "unauthorised"}
+    if (u.get("role_name") or "") not in _REMINDER_ROLES:
+        await _send_text(wa, "Sorry, only a business head can run the dispatch check.")
+        return {"ok": False, "reason": "forbidden"}
+
+    # Lazy: dispatch_reminder_service imports THIS module at its own module level, so a
+    # top-level import back would cycle.
+    from app.modules.sample.services import dispatch_reminder_service as drs
+    try:
+        today = drs.ist_today()
+        # Checked before the scan because scan_and_send returns {} on an unmigrated server —
+        # indistinguishable from "the guard held" unless it is asked separately.
+        if not await drs.has_log_table(conn):
+            await _send_text(wa, "Dispatch reminders aren't set up on this server yet.")
+            return {"ok": False, "reason": "unmigrated"}
+        buckets = await drs.due_buckets(conn, today)
+        counts = await drs.scan_and_send(conn, today=today)
+    except Exception as exc:                          # noqa: BLE001
+        logger.exception("Manual dispatch scan failed for %s", wa)
+        await _send_text(wa, "Couldn't run the dispatch check — please try again.")
+        return {"ok": False, "reason": "failed", "error": str(exc)}
+
+    over, due = len(buckets["overdue"]), len(buckets["due_tomorrow"])
+    sent = sum(counts.values())
+    if not (over or due):
+        msg = "Nothing pending — no requisition is overdue or due tomorrow."
+    elif sent:
+        msg = f"Dispatch reminders sent — {over} overdue, {due} due tomorrow."
+    else:
+        # The 9 AM run already claimed the day. Saying "sent" would have the business head
+        # believe a second round went out; saying nothing would read as a broken command.
+        msg = f"Already sent today. Still open: {over} overdue, {due} due tomorrow."
+    await _send_text(wa, msg)
+    logger.info("Manual dispatch scan by %s: overdue=%d due=%d sent=%d", wa, over, due, sent)
+    return {"ok": True, "sent": sent, "overdue": over, "due_tomorrow": due, "counts": counts}
+
+
 async def _resolve_due_audience(conn, req: dict, audience: str):
     """(numbers, template, params) for one audience, or None when nobody is reachable.
 
@@ -1451,6 +1517,15 @@ async def handle_inbound(conn, *, from_phone: str, text: str, context_id: str | 
     disp_res = await handle_dispatch_action(conn, wa, body, context_id)
     if disp_res is not None:
         return disp_res
+
+    # ── "Expired": the business head asking for the 9 AM scan to be run now, after a
+    #    deploy or an outage crossed the 09:00-09:59 window. AFTER the flow above, whose
+    #    pending capture owns any free text from this number — there "Expired" is the
+    #    reason that was asked for. BEFORE the flows below, which would answer a bare word
+    #    as an Approve/Reject decision. Returns None for anything that isn't the word. ──
+    cmd_res = await handle_reminder_command(conn, wa, body)
+    if cmd_res is not None:
+        return cmd_res
 
     # ── BUSINESS-HEAD approval on the REQUEST (086) — resolved before the promote and
     #    NPD-review flows, since the BH is neither an npd_team reviewer nor a promote
