@@ -442,3 +442,24 @@ def test_loop_survives_an_exception_in_the_tick(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(svc.dispatch_reminder_loop(_FakePool()))
     assert sleeps          # reached the sleep despite the exception
+
+
+def test_the_comparison_date_is_cast_so_postgres_can_type_the_arithmetic():
+    """asyncpg sends the parameter untyped, so Postgres resolves `$1 + 1` BEFORE it looks
+    at the left-hand side: it picks integer + integer, the predicate becomes
+    `date <= integer`, and there is no such operator. Every tick then raises
+
+        UndefinedFunctionError: operator does not exist: date <= integer
+
+    and the whole scan sends nothing — mail or WhatsApp.
+
+    The stand-in connections in this file never parse SQL, so no other test here can catch
+    it. This shipped and failed on every tick in production until the cast was added; the
+    assertion is deliberately about the query TEXT because that is the only signal
+    available without a live Postgres.
+    """
+    conn = _ScanConn([])
+    asyncio.run(svc.due_buckets(conn, DAY))
+    sql = conn.queries[0]
+    assert "$1::date + 1" in sql
+    assert "$1 + 1" not in sql

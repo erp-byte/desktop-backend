@@ -133,7 +133,10 @@ async def due_buckets(conn, today: date) -> dict:
              WHERE deleted_at IS NULL
                AND expected_dispatch_date IS NOT NULL
                AND status IN ({placeholders})
-               AND expected_dispatch_date <= $1 + 1
+               -- $1::date, not $1: asyncpg sends the parameter untyped, so Postgres
+               -- resolves the addition first, picks integer + integer, and the predicate
+               -- becomes `date <= integer` — no such operator, and every tick raises.
+               AND expected_dispatch_date <= $1::date + 1
              ORDER BY expected_dispatch_date, id""", today)
     due, over = [], []
     for r in rows:
