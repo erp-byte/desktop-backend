@@ -422,7 +422,7 @@ def test_loop_honours_the_tick_floor(monkeypatch):
 def test_loop_respects_the_kill_switch(monkeypatch):
     monkeypatch.setenv("SAMPLE_REMINDER_ENABLED", "0")
     monkeypatch.setattr(svc, "datetime", _FrozenDateTime)
-    monkeypatch.setenv("SAMPLE_REMINDER_HOUR", "0")   # would scan if it weren't disabled
+    monkeypatch.setenv("SAMPLE_REMINDER_HOUR", "5")   # would scan if it weren't disabled
     calls = _stub_scan(monkeypatch)
     _sleep_raises_cancelled(monkeypatch)
     with pytest.raises(asyncio.CancelledError):
@@ -437,11 +437,109 @@ def test_loop_survives_an_exception_in_the_tick(monkeypatch):
         raise RuntimeError("db exploded")
     monkeypatch.setattr(svc, "scan_and_send", _boom)
     monkeypatch.setattr(svc, "datetime", _FrozenDateTime)
-    monkeypatch.setenv("SAMPLE_REMINDER_HOUR", "0")
+    monkeypatch.setenv("SAMPLE_REMINDER_HOUR", "5")   # inside the window, so _boom runs
     sleeps = _sleep_raises_cancelled(monkeypatch)
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(svc.dispatch_reminder_loop(_FakePool()))
     assert sleeps          # reached the sleep despite the exception
+
+
+# --- the send window ----------------------------------------------------------
+#
+# The gate used to be `hour >= SAMPLE_REMINDER_HOUR`, which is true for the whole rest of
+# the day. Because the loop ticks before its first sleep, EVERY deploy after 09:00 opened
+# with a full scan — and on a day whose claims had been cleared, or for a requisition that
+# became overdue during the day, that meant real WhatsApp messages going out at 17:00
+# because someone shipped a build. The gate is now a window: 09:00-09:59 and nothing else.
+# Outside it the send is manual, via the business head's "Expired" command.
+
+
+def _freeze(monkeypatch, hh, mm=0):
+    """Freeze the loop's clock at a given IST time."""
+    class _Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 9, 4, hh, mm, tzinfo=tz)
+    monkeypatch.setattr(svc, "datetime", _Clock)
+
+
+def _ticked(monkeypatch, hh, mm=0, **env):
+    """Run one pass of the loop at that IST time and report whether it scanned."""
+    _freeze(monkeypatch, hh, mm)
+    monkeypatch.setenv("SAMPLE_REMINDER_HOUR", "9")
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    calls = _stub_scan(monkeypatch)
+    _sleep_raises_cancelled(monkeypatch)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(svc.dispatch_reminder_loop(_FakePool()))
+    return bool(calls)
+
+
+def test_a_deploy_in_the_afternoon_does_not_send(monkeypatch):
+    """The regression this window exists for: restarting the server at 17:51 must not
+    re-run the morning's scan."""
+    assert _ticked(monkeypatch, 17, 51) is False
+
+
+def test_the_window_opens_on_the_hour(monkeypatch):
+    assert _ticked(monkeypatch, 9, 0) is True
+
+
+def test_the_window_covers_the_rest_of_that_hour(monkeypatch):
+    """A restart at 09:40 is still the morning run, not a stray afternoon send."""
+    assert _ticked(monkeypatch, 9, 59) is True
+
+
+def test_the_window_closes_at_the_next_hour(monkeypatch):
+    assert _ticked(monkeypatch, 10, 0) is False
+
+
+def test_the_window_is_still_shut_before_the_hour(monkeypatch):
+    assert _ticked(monkeypatch, 8, 59) is False
+
+
+def test_a_night_restart_sends_nothing(monkeypatch):
+    assert _ticked(monkeypatch, 2, 0) is False
+
+
+def test_a_slower_tick_widens_the_window_so_it_cannot_be_jumped(monkeypatch):
+    """The window must never be narrower than the gap between ticks. With a 2-hour tick a
+    one-hour window could be stepped straight over — 08:30 then 10:30 — and the day's
+    reminders would silently never go out."""
+    assert _ticked(monkeypatch, 10, 30, SAMPLE_REMINDER_TICK_MIN="120") is True
+    assert _ticked(monkeypatch, 11, 30, SAMPLE_REMINDER_TICK_MIN="120") is False
+
+
+def test_the_window_can_be_widened_by_env(monkeypatch):
+    assert _ticked(monkeypatch, 11, 30, SAMPLE_REMINDER_WINDOW_HOURS="3") is True
+    assert _ticked(monkeypatch, 12, 0, SAMPLE_REMINDER_WINDOW_HOURS="3") is False
+
+
+def test_the_window_never_wraps_past_midnight(monkeypatch):
+    """`ist_today()` is a different day on the far side of midnight, so a window that
+    wrapped would scan 01:00 against the wrong date and re-send yesterday's chase under
+    today's claim. It is clamped to the end of the day instead."""
+    _freeze(monkeypatch, 1, 0)
+    monkeypatch.setenv("SAMPLE_REMINDER_HOUR", "23")
+    monkeypatch.setenv("SAMPLE_REMINDER_WINDOW_HOURS", "4")
+    calls = _stub_scan(monkeypatch)
+    _sleep_raises_cancelled(monkeypatch)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(svc.dispatch_reminder_loop(_FakePool()))
+    assert calls == []
+
+
+def test_a_junk_window_falls_back_rather_than_raising(monkeypatch):
+    """Same contract as the other env ints: a malformed value must not stop the loop
+    before its first tick, where the exception would be swallowed at shutdown."""
+    assert _ticked(monkeypatch, 9, 15, SAMPLE_REMINDER_WINDOW_HOURS="1h") is True
+
+
+def test_a_zero_window_still_covers_its_own_hour(monkeypatch):
+    """A 0 would otherwise disable the feature outright while reading like a valid
+    setting. The floor is one hour."""
+    assert _ticked(monkeypatch, 9, 30, SAMPLE_REMINDER_WINDOW_HOURS="0") is True
 
 
 def test_the_comparison_date_is_cast_so_postgres_can_type_the_arithmetic():

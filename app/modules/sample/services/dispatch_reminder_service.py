@@ -246,7 +246,14 @@ async def dispatch_reminder_loop(pool) -> None:
     would silently disable the whole feature — a process that recycles faster than the tick
     (deploy loops, health-check flapping, `uvicorn --reload`) would never reach a single
     scan. An immediate first tick is safe: the send-once guard makes it idempotent, and the
-    hour gate still stops a 02:00 restart from mailing anyone.
+    window gate stops a restart at any other hour from messaging anyone.
+
+    That gate is a WINDOW (09:00-09:59 by default), not "at or after 09:00". Open-ended, it
+    made every afternoon deploy open with a full scan: harmless on a day already claimed,
+    but a requisition that fell overdue during the day, or a day whose claims had been
+    cleared, meant real WhatsApp messages going out at 17:00 because someone shipped a
+    build. Outside the window the send is manual — the business head replies "Expired"
+    (whatsapp_service.handle_reminder_command), which runs this same scan on demand.
     """
     tick_min = _env_int("SAMPLE_REMINDER_TICK_MIN", 60)
     tick_s = max(15 * 60, tick_min * 60)
@@ -255,13 +262,21 @@ async def dispatch_reminder_loop(pool) -> None:
         logger.error("[dispatch-reminder] SAMPLE_REMINDER_HOUR=%r out of range 0-23 — "
                      "falling back to default 7", hour)
         hour = 7
+    # The window can never be narrower than the gap between ticks, or a slow tick would
+    # step straight over it (08:30 then 10:30 on a 2-hour tick) and the day would silently
+    # send nothing. Floor of 1 so a stray 0 does not disable the feature while reading like
+    # a valid setting, and clamped to the end of the day so it never wraps past midnight —
+    # ist_today() is a different date on the far side, so a wrapped window would scan
+    # 01:00 against tomorrow and re-send yesterday's chase under today's claim.
+    window = max(1, _env_int("SAMPLE_REMINDER_WINDOW_HOURS", -(-tick_s // 3600)))
+    window = min(window, 24 - hour)
     enabled = _is_truthy(os.environ.get("SAMPLE_REMINDER_ENABLED", "1"))
-    logger.info("Dispatch reminder loop started (enabled=%s, tick=%ds, from %02d:00 IST)",
-                enabled, tick_s, hour)
+    logger.info("Dispatch reminder loop started (enabled=%s, tick=%ds, "
+                "sends %02d:00-%02d:59 IST)", enabled, tick_s, hour, hour + window - 1)
     try:
         while True:
             try:
-                if enabled and datetime.now(IST).hour >= hour:
+                if enabled and hour <= datetime.now(IST).hour < hour + window:
                     async with pool.acquire() as conn:
                         counts = await scan_and_send(conn, today=ist_today())
                     if any(counts.values()):
