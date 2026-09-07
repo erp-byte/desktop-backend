@@ -355,10 +355,19 @@ async def get_requisition(conn, req_id: int) -> dict:
 # rather than derived in Python because the filter has to be a WHERE: filtering after the
 # fetch would page against the unfiltered row set, so page 2 of "Partial" would skip rows
 # page 1 never showed.
-DISPLAY_STATUSES = ("PENDING", "HOLD", "IN_PROCESS", "PARTIAL", "DISPATCHED", "CANCELLED")
+DISPLAY_STATUSES = ("PENDING", "BH_PENDING", "HOLD", "IN_PROCESS", "PARTIAL",
+                    "DISPATCHED", "CANCELLED")
 
-_DISPLAY_STATUS_CASE = """
-        CASE
+def _display_status_case(has_bh: bool) -> str:
+    """The bucket expression. `has_bh` adds 086's business-head gate as the FIRST branch:
+    a SUBMITTED request whose business head has not signed off was never handed to NPD, and
+    showing it as plain Pending invites a reviewer to act on something the server refuses.
+    Omitted when 086 is unapplied — selecting a column that does not exist would 500 every
+    queue read."""
+    bh = ("\n          WHEN sr.bh_signoff_state = 'PENDING'              THEN 'BH_PENDING'"
+          if has_bh else "")
+    return f"""
+        CASE{bh}
           WHEN sr.status = 'ON_HOLD'                        THEN 'HOLD'
           WHEN sr.status IN ('CANCELLED', 'BH_REJECTED')    THEN 'CANCELLED'
           WHEN sr.status IN ('DRAFT', 'SUBMITTED')          THEN 'PENDING'
@@ -377,6 +386,7 @@ _DISPLAY_STATUS_CASE = """
           WHEN COALESCE(disp.qty_any, 0) > 0                THEN 'PARTIAL'
           ELSE 'IN_PROCESS'
         END AS display_status"""
+
 
 # No ledger to read (078 unapplied): a shape-compatible empty CTE, so the CASE above
 # still compiles and every row falls through to its lifecycle status.
@@ -408,11 +418,19 @@ def _disp_cte(cols: set[str]) -> str:
          GROUP BY 1"""
 
 
-async def _dispatch_ledger_cols(conn) -> set[str]:
-    """Which npd_dev_dispatch columns exist. Empty when 078 has not been applied."""
-    return {r["column_name"] for r in await conn.fetch(
-        "SELECT column_name FROM information_schema.columns "
-        "WHERE table_name = 'npd_dev_dispatch'")}
+async def _schema_probe(conn) -> tuple[set[str], bool]:
+    """(npd_dev_dispatch columns, whether 086's bh_signoff_state exists).
+
+    ONE round trip for both. The queue is paged and re-fetched on every filter change, so
+    a second probe here is a second probe per keystroke.
+    """
+    rows = await conn.fetch(
+        "SELECT table_name, column_name FROM information_schema.columns "
+        " WHERE table_name = 'npd_dev_dispatch' "
+        "    OR (table_name = 'sample_requisitions' AND column_name = 'bh_signoff_state')")
+    disp = {r["column_name"] for r in rows if r["table_name"] == "npd_dev_dispatch"}
+    has_bh = any(r["table_name"] == "sample_requisitions" for r in rows)
+    return disp, has_bh
 
 
 async def list_requisitions(conn, *, status: str | None = None,
@@ -442,7 +460,9 @@ async def list_requisitions(conn, *, status: str | None = None,
     show (see DISPLAY_STATUSES) — and `display_statuses` filters on it. Both live in SQL so
     the filter is a WHERE and LIMIT/OFFSET still page over the rows the caller asked for.
     """
-    disp_cte = _disp_cte(await _dispatch_ledger_cols(conn))
+    ledger_cols, has_bh = await _schema_probe(conn)
+    disp_cte = _disp_cte(ledger_cols)
+    status_case = _display_status_case(has_bh)
     rows = await conn.fetch(
         f"""
         WITH disp AS ({disp_cte}
@@ -452,7 +472,7 @@ async def list_requisitions(conn, *, status: str | None = None,
                  WHERE a.requisition_id = sr.id AND a.action = 'HOLD'
                  ORDER BY a.actioned_at DESC NULLS LAST, a.sequence_no DESC
                  LIMIT 1) AS hold_reason,
-               {_DISPLAY_STATUS_CASE}
+               {status_case}
           FROM sample_requisitions sr
           LEFT JOIN disp ON disp.req_id = sr.id
          WHERE sr.deleted_at IS NULL

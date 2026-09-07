@@ -33,8 +33,10 @@ from app.modules.sample.services import requisition_service as rs
 class _Conn:
     """Records the SQL and args; answers the migration probe and the nested reads."""
 
-    def __init__(self, *, cols=("dispatch_id", "dev_jc_id", "qty", "uom", "article_id")):
+    def __init__(self, *, cols=("dispatch_id", "dev_jc_id", "qty", "uom", "article_id"),
+                 bh=True):
         self.cols = list(cols)
+        self.bh = bh
         self.queries: list[str] = []
         self.args: list[tuple] = []
 
@@ -42,7 +44,11 @@ class _Conn:
         self.queries.append(query)
         self.args.append(args)
         if "information_schema.columns" in query:
-            return [{"column_name": c} for c in self.cols]
+            out = [{"table_name": "npd_dev_dispatch", "column_name": c} for c in self.cols]
+            if self.bh:
+                out.append({"table_name": "sample_requisitions",
+                            "column_name": "bh_signoff_state"})
+            return out
         return []
 
 
@@ -70,13 +76,13 @@ def test_hold_is_resolved_before_anything_else():
     """A held request that already part-shipped is still on hold — that is the state the
     reviewer has to act on, and Partial would hide it."""
     _, sql = _list()
-    assert sql.index("'HOLD'") < sql.index("'PARTIAL'")
+    assert sql.index("THEN 'HOLD'") < sql.index("THEN 'PARTIAL'")
 
 
 def test_cancelled_outranks_the_quantity_check():
     """A cancelled request whose stock had already gone must not read as Dispatched."""
     _, sql = _list()
-    assert sql.index("'CANCELLED'") < sql.index("'PARTIAL'")
+    assert sql.index("THEN 'CANCELLED'") < sql.index("THEN 'PARTIAL'")
 
 
 def test_the_gate_pass_statuses_reach_dispatched_without_the_ledger():
@@ -142,3 +148,37 @@ def test_a_ledger_without_the_uom_column_falls_back_to_the_card():
 def test_the_probe_runs_once_per_list_call():
     conn, _ = _list()
     assert sum("information_schema.columns" in q for q in conn.queries) == 1
+
+
+# --- the business-head gate -------------------------------------------------
+#
+# 086 added bh_signoff_state, and it outranks everything: a SUBMITTED request whose
+# business head has not signed off was never handed to NPD at all. Showing it as plain
+# Pending invites a reviewer to act on something the server will refuse.
+
+def test_the_bh_gate_outranks_every_other_bucket():
+    _, sql = _list(conn_kw={"cols": ("dispatch_id", "qty", "uom"), "bh": True})
+    assert "'BH_PENDING'" in sql
+    assert sql.index("THEN 'BH_PENDING'") < sql.index("THEN 'HOLD'")
+
+
+def test_the_gate_reads_the_086_column():
+    _, sql = _list(conn_kw={"bh": True})
+    assert "bh_signoff_state" in sql
+
+
+def test_an_unmigrated_086_omits_the_gate_rather_than_failing():
+    """086 is hand-applied like the rest. Selecting a column that does not exist would
+    500 every queue read, so a missing gate degrades to the six buckets."""
+    _, sql = _list(conn_kw={"bh": False})
+    assert "bh_signoff_state" not in sql
+    assert "AS display_status" in sql
+
+
+def test_the_gate_is_filterable_like_any_other_bucket():
+    _, sql = _list(display_statuses=["BH_PENDING"], conn_kw={"bh": True})
+    assert "display_status = ANY" in sql
+
+
+def test_bh_pending_is_a_declared_bucket():
+    assert "BH_PENDING" in rs.DISPLAY_STATUSES
