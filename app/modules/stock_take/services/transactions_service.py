@@ -1,4 +1,4 @@
-"""Append-only stock adjustment ledger over `stocktake_entries`.
+"""Append-only stock adjustment ledger over `new_stock_entries`.
 
 One row per physical movement recorded between counts. A posted row is FINAL —
 `stocktake_transactions` blocks UPDATE and DELETE at the database level
@@ -10,7 +10,7 @@ from the caller's `allowed_warehouses` / `allowed_floors`; a request body cannot
 name a floor the user was not granted. That is the actual access control here —
 the endpoint itself is open to any authenticated user, matching the read side.
 
-ARTICLE IDENTITY IS A STRING. `stocktake_entries.item_name` is free text with no
+ARTICLE IDENTITY IS A STRING. `new_stock_entries.item_name` is free text with no
 FK, and the Stock Take floor UI deliberately allows custom items, so a
 transaction joins counted stock on UPPER(BTRIM(item_name)) plus stock_type — the
 same identity both latest-stock implementations use. `sku_id` is recorded when
@@ -23,7 +23,8 @@ from typing import Any, Optional, Sequence
 
 import asyncpg
 
-from .business_day import ENTRY_DAY, TXN_DAY
+from .. import floors as _floors
+from .business_day import ENTRIES_TABLE, ENTRY_DAY, TXN_DAY
 
 log = logging.getLogger(__name__)
 
@@ -66,7 +67,7 @@ def _normalise_warehouse(code: Optional[str]) -> str:
     """'W-202' -> 'W202'.
 
     auth_user.allowed_warehouses carries BOTH spellings (a single row can hold
-    {W202,A185,W-202,A-185}) while stocktake_entries only ever uses the
+    {W202,A185,W-202,A-185}) while the entries table only ever uses the
     unhyphenated form, so the ledger stores the unhyphenated one or nothing joins.
     Mirrors normaliseWarehouseCode in web_replica/src/lib/warehouseScope.ts.
     """
@@ -78,34 +79,61 @@ def effective_scope(
     *,
     available_warehouses: Optional[Sequence[str]] = None,
     available_floors: Optional[Sequence[str]] = None,
+    places: Optional[dict[str, list[str]]] = None,
 ) -> dict[str, Any]:
     """The warehouses and floors this user may post against.
 
     CRITICAL SEMANTIC: an EMPTY `allowed_floors` / `allowed_warehouses` means
     "no restriction", NOT "no access" — auth_schema.sql:35 says so, the auth
     middleware only enforces scope `if user.allowed_floors`, and the profile
-    screen renders an empty list as "All". Admins bypass scope entirely
-    (middleware.py:160). Treating empty as a denial locked out every
-    unrestricted user, including admins.
+    screen renders an empty list as "All". Treating empty as a denial locked out
+    every unrestricted user, including admins.
 
-    So an unrestricted user is offered everything stock actually exists at
-    (the distinct values in stocktake_entries) and picks one; a scoped user is
-    offered only their grants.
+    BEING ADMIN MEANS NOT BEING BLOCKED, NOT BEING UNASSIGNED. This used to read
+    `is_admin or not granted_floors`, which threw away an admin's actual profile
+    and offered them every warehouse and every floor_name in the table. An admin
+    assigned W202 was still shown A185 and F53. Admins already bypass the
+    enforcement check (middleware.py:160), so nothing here needs to widen them a
+    second time — and a dropdown is a suggestion, not a permission.
+
+    WHAT "UNRESTRICTED" IS OFFERED. The admin screen labels its floor control
+    "filtered by warehouses; empty = all in those warehouses", so that is what an
+    empty grant means: every floor the SCOPED WAREHOUSES declare, not every
+    string the table happens to contain. Offering the latter put TEESTTTT,
+    TEST FLOOR, 1ST : FIRST LINE and REJECTION COLD & RACK (a stock type, not a
+    place) in front of people as though they were locations. Warehouses that
+    declare no floors at all fall back to their own data — see floors.floors_for.
     """
     granted_floors = [f for f in (user.allowed_floors or []) if str(f).strip()]
     granted_whs = [w for w in (user.allowed_warehouses or []) if str(w).strip()]
-    is_admin = bool(getattr(user, "is_admin", False))
 
-    floors_unrestricted = is_admin or not granted_floors
-    whs_unrestricted = is_admin or not granted_whs
+    floors_unrestricted = not granted_floors
+    whs_unrestricted = not granted_whs
 
-    floors = list(available_floors or []) if floors_unrestricted else granted_floors
     whs_raw = list(available_warehouses or []) if whs_unrestricted else granted_whs
     whs = sorted({_normalise_warehouse(w) for w in whs_raw if str(w).strip()})
+
+    # Per warehouse, so the form can narrow the floor list once a warehouse is
+    # chosen instead of listing another building's floors.
+    places = places or {}
+    by_wh: dict[str, list[str]] = {}
+    for wh in whs:
+        offered = _floors.FLOORS_BY_WAREHOUSE.get(wh) or places.get(wh) or []
+        if not floors_unrestricted:
+            keep = {_norm(f) for f in granted_floors}
+            offered = [f for f in offered if _norm(f) in keep]
+        by_wh[wh] = list(offered)
+
+    floors: list[str] = []
+    for wh in whs:
+        for f in by_wh[wh]:
+            if f not in floors:
+                floors.append(f)
 
     return {
         "warehouses": whs,
         "floors": floors,
+        "floors_by_warehouse": by_wh,
         "warehouses_unrestricted": whs_unrestricted,
         "floors_unrestricted": floors_unrestricted,
     }
@@ -115,6 +143,7 @@ def resolve_scope(
     user: Any, *, warehouse: Optional[str], location: Optional[str],
     available_warehouses: Optional[Sequence[str]] = None,
     available_floors: Optional[Sequence[str]] = None,
+    places: Optional[dict[str, list[str]]] = None,
 ) -> tuple[str, str]:
     """The (warehouse, floor) this transaction is attributed to, or ScopeError.
 
@@ -124,8 +153,23 @@ def resolve_scope(
     — see effective_scope for why empty grants are not a denial.
     """
     scope = effective_scope(
-        user, available_warehouses=available_warehouses, available_floors=available_floors)
-    floors = scope["floors"]
+        user, available_warehouses=available_warehouses,
+        available_floors=available_floors, places=places)
+    # Narrow to the requested warehouse before checking the floor, so "is this
+    # floor allowed" is asked about the building the caller actually named.
+    floors = (scope["floors_by_warehouse"].get(_normalise_warehouse(warehouse))
+              if warehouse else None) or scope["floors"]
+
+    # WAREHOUSE FIRST. Floors are now derived FROM the warehouses, so a caller
+    # with no warehouse also has no floors — and reporting that as "you have no
+    # floor assigned" sends them to fix the wrong half of their profile.
+    if not scope["warehouses"]:
+        raise ScopeError(
+            "no_warehouse_access",
+            "There is no warehouse available to attribute this transaction to. "
+            "Ask an administrator to set your warehouse access.",
+            {"allowed_warehouses": list(user.allowed_warehouses or [])},
+        )
     if not floors:
         # Distinguish the two very different causes. An UNRESTRICTED user with
         # nothing available is not a permissions problem at all — it means this
@@ -137,7 +181,7 @@ def resolve_scope(
             raise ScopeError(
                 "no_stock_data",
                 "No stock-take locations are available on this server. Its database has no "
-                "stocktake_entries data — check which database DATABASE_URL points at.",
+                "entries data — check which database DATABASE_URL points at.",
                 {"unrestricted": True},
             )
         raise ScopeError(
@@ -209,7 +253,7 @@ async def current_balance(
     row = await conn.fetchrow(
         f"""
         WITH scoped AS (
-            SELECT * FROM stocktake_entries
+            SELECT * FROM {ENTRIES_TABLE}
              WHERE (status IS NULL OR status != 'draft')
                -- Physical counts only. The adjustment write-back puts an
                -- ADJUSTMENT row in this table too; counting it here would both
@@ -331,11 +375,11 @@ async def create_transaction(
     delta = qty if operation == "ADDITION" else -qty
     sign = 1.0 if operation == "ADDITION" else -1.0
 
-    # Mirror the movement into stocktake_entries. Same transaction as the ledger
+    # Mirror the movement into the entries table. Same transaction as the ledger
     # INSERT above, deliberately: the caller owns the transaction, so either both
     # rows land or neither does. A ledger row without its entries row (or the
     # reverse) could never be reconciled afterwards, because the ledger blocks
-    # UPDATE and DELETE while stocktake_entries does not.
+    # UPDATE and DELETE while the entries table does not.
     entry = await write_back_entry(
         conn,
         item_name=item_name, stock_type=stock_type,
@@ -434,31 +478,37 @@ async def write_back_entry(
     actor: str, material_type: str = "", item_category: str = "",
     item_subcategory: str = "",
 ) -> dict[str, Any]:
-    """Fold one adjustment into TODAY's stocktake_entries row for this article.
+    """Fold one adjustment into TODAY's `new_stock_entries` row for this article.
 
     "Today" is the Asia/Kolkata day (business_day.ENTRY_DAY), so an adjustment
     posted at 1am IST lands on the day the operator thinks it is rather than on
     the previous UTC day.
 
-    One statement, not read-then-write: uq_entries_adjustment_day makes
+    One statement, not read-then-write: uq_nse_adjustment_day makes
     (IST day, item, warehouse, floor, stock_type) unique among ADJUSTMENT rows,
     so ON CONFLICT does "update today's row if it exists, else create it"
     atomically. Two operators adjusting the same article at the same moment
     therefore accumulate instead of racing to insert duplicates.
 
+    THE INFERENCE CLAUSE MUST MATCH THAT INDEX CHARACTER FOR CHARACTER. It is not
+    the shape the old uq_entries_adjustment_day had: warehouse and floor_name are
+    wrapped in COALESCE(..., '') and the day is the one-step IST form. Postgres
+    matches ON CONFLICT to an index by comparing parsed expressions, so a
+    near-miss is not a silent fallback -- it raises "no unique or exclusion
+    constraint matching the ON CONFLICT specification" on every adjustment.
+
     Deltas are SIGNED and accumulate. The row holds the net movement for the
     day, not a stock level — a subtraction leaves it negative, which is correct
     for a delta row and is why nothing here clamps at zero.
 
-    created_at is written as NAIVE UTC to match how backend_st writes it
-    (routes/items.ts passes the SQL literal CURRENT_TIMESTAMP into a
-    `timestamp WITHOUT time zone` column on a UTC server). Writing naive IST
-    would put the row 5.5 hours in the future for every other reader of this
-    table.
+    created_at is written as a plain now(). The column is timestamptz here,
+    unlike the naive-UTC column the floor app writes, so the old
+    `now() AT TIME ZONE 'UTC'` would strip the zone off an already-absolute
+    instant and land the row 5.5 hours in the past.
     """
     row = await conn.fetchrow(
-        """
-        INSERT INTO stocktake_entries
+        f"""
+        INSERT INTO {ENTRIES_TABLE}
             (item_name, item_type, item_category, item_subcategory,
              floor_name, warehouse, total_quantity, unit_uom, total_weight,
              entered_by, authority, stock_type, status, source_kind,
@@ -474,16 +524,17 @@ async def write_back_entry(
                 -- reason and a named actor — so leaving it unverified would put
                 -- work in that queue that no floor manager can meaningfully
                 -- verify, and would grow every time anyone adjusts stock.
-                TRUE, $9, (now() AT TIME ZONE 'UTC'), TRUE,
-                (now() AT TIME ZONE 'UTC'), (now() AT TIME ZONE 'UTC'))
-        ON CONFLICT ((((created_at AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Kolkata')::date),
-                     UPPER(BTRIM(item_name)), UPPER(BTRIM(warehouse)),
-                     UPPER(BTRIM(floor_name)), stock_type)
+                TRUE, $9, now(), TRUE,
+                now(), now())
+        ON CONFLICT (((created_at AT TIME ZONE 'Asia/Kolkata')::date),
+                     UPPER(BTRIM(item_name)),
+                     UPPER(BTRIM(COALESCE(warehouse, ''))),
+                     UPPER(BTRIM(COALESCE(floor_name, ''))), stock_type)
                 WHERE source_kind = 'ADJUSTMENT'
         DO UPDATE SET
-            total_quantity = stocktake_entries.total_quantity + EXCLUDED.total_quantity,
-            total_weight   = stocktake_entries.total_weight   + EXCLUDED.total_weight,
-            updated_at     = (now() AT TIME ZONE 'UTC')
+            total_quantity = {ENTRIES_TABLE}.total_quantity + EXCLUDED.total_quantity,
+            total_weight   = {ENTRIES_TABLE}.total_weight   + EXCLUDED.total_weight,
+            updated_at     = now()
         RETURNING id, total_quantity, total_weight,
                   (xmax = 0) AS created_new
         """,
@@ -547,7 +598,7 @@ async def export_transactions(conn: asyncpg.Connection, **filters: Any) -> tuple
 
     Deliberately no LIMIT: a truncated export is worse than a slow one, because
     the recipient cannot tell it is partial. The ledger is append-only and small
-    relative to stocktake_entries, and idx_stk_txn_created_at covers the sort.
+    relative to the entries table, and idx_stk_txn_created_at covers the sort.
     """
     where, params, applied = _ledger_filters(**filters)
     rows = await conn.fetch(

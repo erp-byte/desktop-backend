@@ -1,9 +1,18 @@
-"""Latest-date stock read over `stocktake_entries`.
+"""Latest-date stock read over `new_stock_entries`.
 
-`stocktake_entries` is written by the SEPARATE Stock Take app (an Express/Lambda
-backend under Stock_Take/backend_st) into the same AWS RDS `warehouse_db` this
-service connects to. Nothing here writes: the console is a reader of that app's
-data, and the counting flow stays where it is.
+The table name comes from business_day.ENTRIES_TABLE, which also owns the
+matching IST day expression — the two cannot be chosen independently without
+being silently wrong. See that module's header.
+
+`new_stock_entries` holds the same rows under the same ids as the
+`stocktake_entries` the SEPARATE Stock Take app (an Express/Lambda backend under
+Stock_Take/backend_st) writes into this same AWS RDS `warehouse_db`, but with
+timestamptz timestamps and canonicalised floor names. Nothing here writes to it
+except the console's own adjustment rows; the counting flow stays where it is.
+
+BECAUSE THE FLOOR APP STILL WRITES THE OLD TABLE, rows counted after the
+2026-09-08 backfill do not appear here until they are copied across. That is a
+deliberate, visible consequence of the switch, not a bug in this reader.
 
 The table is NOT part of this app's schema management — production_schema.sql
 does not declare it — so a missing table is a plausible environment state rather
@@ -26,7 +35,7 @@ from typing import Any, Optional, Sequence
 
 import asyncpg
 
-from .business_day import ENTRY_DAY, TXN_DAY
+from .business_day import ENTRIES_TABLE, ENTRY_DAY, TXN_DAY
 
 log = logging.getLogger(__name__)
 
@@ -127,7 +136,7 @@ def _build_filters(
     # inside the include_drafts branch, because it is a correctness rule rather
     # than a user-facing filter.
     #
-    # A console adjustment now also writes a row into stocktake_entries
+    # A console adjustment now also writes a row into this same table
     # (source_kind='ADJUSTMENT', see 101_stocktake_entries_adjustment_rows.sql).
     # Without this predicate two things break at once:
     #   1. The baseline is MAX(day) over this same WHERE, so an adjustment posted
@@ -141,9 +150,11 @@ def _build_filters(
     # table directly.
     conds.append("(source_kind IS NULL OR source_kind = 'COUNT')")
 
-    # Floor names in this dataset carry trailing spaces ("UPPER BASEMENT "), so
-    # both sides are trimmed before comparison — same rule the Express backend's
-    # buildEntryFilters uses, so the two agree on what a floor is.
+    # Both sides are trimmed and upper-cased before comparison. The canonical
+    # table no longer carries the trailing spaces the floor app writes
+    # ("UPPER BASEMENT "), but the rule stays: it is what the Express backend's
+    # buildEntryFilters does, so the two agree on what a floor is, and it keeps a
+    # filter value typed against either table selecting the same rows.
     for value, tmpl, key in (
         (_as_list(warehouse), "UPPER(TRIM(warehouse)) = ANY(${n}::text[])", "warehouse"),
         (_as_list(floor_name), "UPPER(TRIM(floor_name)) = ANY(${n}::text[])", "floorName"),
@@ -318,19 +329,19 @@ async def fetch_latest_stock(
         as_of_date = await conn.fetchval(
             f"""
             SELECT MAX({ENTRY_DAY})
-            FROM stocktake_entries
+            FROM {ENTRIES_TABLE}
             {where}
             {date_clause}
             """,
             *date_params,
         )
     except _MISSING_SCHEMA as exc:
-        # stocktake_entries belongs to the Stock Take app, not this one. Pointed
-        # at a database without it (the Supabase config carries no stocktake
-        # tables), an empty result is the honest answer and the console renders
-        # its empty state; a 500 would just be noise.
+        # The entries table is not part of this app's schema. Pointed at a
+        # database without it (the Supabase config carries no stocktake tables),
+        # an empty result is the honest answer and the console renders its empty
+        # state; a 500 would just be noise.
         log.warning(
-            "stock_take: stocktake_entries unavailable — returning empty (%s: %s)",
+            "stock_take: %s unavailable — returning empty (%s: %s)", ENTRIES_TABLE,
             type(exc).__name__, exc,
         )
         return _empty(page, page_size, applied, sort)
@@ -368,10 +379,10 @@ async def fetch_latest_stock(
 
     # Both halves key on the SAME identity the rest of the system uses:
     # UPPER(BTRIM(item_name)) plus stock_type. That is a string join, not a key --
-    # stocktake_entries.item_name is free text with no FK -- so an article renamed
+    # item_name is free text with no FK -- so an article renamed
     # between the count and the adjustment will not net. See 098's header.
     ctes = """
-        WITH scoped AS (SELECT * FROM stocktake_entries %(where)s %(daycap)s),
+        WITH scoped AS (SELECT * FROM %(entries)s %(where)s %(daycap)s),
              -- Sum duplicates FIRST, then pick the latest day. Order matters: a
              -- naive DISTINCT ON over raw rows returns the right 3292
              -- article/place combinations but only 577,465 kg of 895,396 —
@@ -478,7 +489,7 @@ async def fetch_latest_stock(
                      ON c.k_item = t.k_item AND c.k_stock = t.k_stock
              )
     """ % {"where": where, "daycap": date_clause, "txnwhere": txn_where,
-           "entry_day": ENTRY_DAY, "refday": ref_day}
+           "entries": ENTRIES_TABLE, "entry_day": ENTRY_DAY, "refday": ref_day}
 
     totals = await conn.fetchrow(
         ctes + """
@@ -584,13 +595,18 @@ async def fetch_filter_options(conn: asyncpg.Connection) -> dict[str, list[str]]
     """
     try:
         rows = await conn.fetch(
-            """
+            # floor_name is returned AS SPELLED, not upper-cased. In this table it
+            # is already canonical ("First Floor", not "1 ST FLOOR "), and that
+            # spelling is the whole point of the dropdown. Matching is unaffected:
+            # _build_filters compares UPPER(TRIM(floor_name)) against values this
+            # module upper-cases in Python, so either casing selects the same rows.
+            f"""
             SELECT DISTINCT
                 UPPER(TRIM(warehouse))                        AS warehouse,
-                UPPER(TRIM(floor_name))                       AS floor_name,
+                BTRIM(floor_name)                             AS floor_name,
                 UPPER(TRIM(COALESCE(item_type, '')))          AS item_type,
                 COALESCE(stock_type, 'Fresh Stock')           AS stock_type
-            FROM stocktake_entries
+            FROM {ENTRIES_TABLE}
             WHERE (status IS NULL OR status != 'draft')
             """
         )
@@ -610,3 +626,36 @@ async def fetch_filter_options(conn: asyncpg.Connection) -> dict[str, list[str]]
         "item_types": uniq("item_type"),
         "stock_types": uniq("stock_type"),
     }
+
+
+async def fetch_places(conn: asyncpg.Connection) -> dict[str, list[str]]:
+    """Which floors each warehouse actually holds stock on, {W202: [...], ...}.
+
+    fetch_filter_options flattens floors across every warehouse, which is right
+    for a filter bar — you may want "everything on a First Floor" — but wrong for
+    a form that posts to one place: it offers A185's floors to someone who picked
+    W202. This keeps them apart.
+
+    Only consulted for warehouses that declare no floors of their own (F53, A68).
+    A declared warehouse is offered what the ERP profile says it has, never what
+    somebody once typed — see app/modules/stock_take/floors.py.
+    """
+    try:
+        rows = await conn.fetch(
+            f"""
+            SELECT DISTINCT UPPER(TRIM(warehouse)) AS wh, BTRIM(floor_name) AS fl
+              FROM {ENTRIES_TABLE}
+             WHERE (status IS NULL OR status != 'draft')
+               AND warehouse IS NOT NULL AND BTRIM(COALESCE(floor_name, '')) <> ''
+             ORDER BY 1, 2
+            """
+        )
+    except _MISSING_SCHEMA as exc:
+        log.warning("stock_take: places unavailable — returning empty (%s: %s)",
+                    type(exc).__name__, exc)
+        return {}
+
+    out: dict[str, list[str]] = {}
+    for r in rows:
+        out.setdefault(r["wh"], []).append(r["fl"])
+    return out

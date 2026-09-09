@@ -1,12 +1,12 @@
 """LIVE-SQL test for the stock-take latest-stock service.
 
-`stocktake_entries` is owned by the separate Stock Take app and lives in the AWS
+`new_stock_entries` is owned by the separate Stock Take app and lives in the AWS
 RDS `warehouse_db`. It is NOT in this app's production_schema.sql, and it does
 not exist in the Supabase database `.env` can be pointed at -- so the statements
 here cannot be validated by a FakeConn that only records SQL. This file executes
 them against the real database.
 
-If the configured database has no `stocktake_entries`, the run reports SKIP with
+If the configured database has no `new_stock_entries`, the run reports SKIP with
 an explanation rather than failing: that is a configuration state, not a bug.
 Point it at RDS to actually exercise the SQL:
 
@@ -28,15 +28,25 @@ import asyncpg
 
 from app.config import Settings
 from app.modules.stock_take.services import latest_stock_service as svc
+from app.modules.stock_take.services import business_day
 
 _passed = 0
 _failed = 0
 
 
-# The IST business day of a stocktake_entries row. Mirrors
-# app/modules/stock_take/services/business_day.ENTRY_DAY -- the two-step form is
-# required because created_at is a NAIVE column holding UTC.
-ED = "((created_at AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Kolkata')::date"
+# The IST business day of a new_stock_entries row. Written out rather than
+# imported, so that changing business_day breaks this file loudly instead of
+# silently moving the expected values with it. The assertions below are what keep
+# the copy honest.
+#
+# ONE step, not two: new_stock_entries.created_at is timestamptz. The two-step
+# form belongs to the floor app's stocktake_entries, whose column is NAIVE and
+# holds UTC; using it here would shift every business day by -5:30 while still
+# parsing and still returning dates.
+ED = "(created_at AT TIME ZONE 'Asia/Kolkata')::date"
+TBL = "new_stock_entries"
+assert ED == business_day.ENTRY_DAY,     "business_day.ENTRY_DAY is now %r -- update ED and re-check every expected value"     % (business_day.ENTRY_DAY,)
+assert TBL == business_day.ENTRIES_TABLE,     "business_day.ENTRIES_TABLE is now %r -- this test is reading the wrong table"     % (business_day.ENTRIES_TABLE,)
 
 
 def check(label, cond, extra=""):
@@ -58,10 +68,10 @@ async def main():
     url = os.getenv("STOCKTAKE_TEST_DATABASE_URL") or Settings().DATABASE_URL
     conn = await asyncpg.connect(url)
     try:
-        exists = await conn.fetchval("SELECT to_regclass('stocktake_entries')")
+        exists = await conn.fetchval("SELECT to_regclass('new_stock_entries')")
         if not exists:
             print(
-                "\n  SKIP  stocktake_entries is not in the configured database.\n"
+                "\n  SKIP  new_stock_entries is not in the configured database.\n"
                 "        This app's DATABASE_URL points somewhere without the Stock Take\n"
                 "        tables (the Supabase config has none). Set STOCKTAKE_TEST_DATABASE_URL\n"
                 "        to the RDS warehouse_db to exercise these statements.\n"
@@ -71,14 +81,14 @@ async def main():
         non_draft = ("(status IS NULL OR status != 'draft')"
                      " AND (source_kind IS NULL OR source_kind = 'COUNT')")
         latest = await conn.fetchval(
-            f"SELECT MAX(((created_at AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Kolkata')::date) FROM stocktake_entries WHERE {non_draft}"
+            f"SELECT MAX((created_at AT TIME ZONE 'Asia/Kolkata')::date) FROM new_stock_entries WHERE {non_draft}"
         )
         latest_s = latest.isoformat()
         # GROUND TRUTH IS REBUILT THE WAY THE SERVICE DEFINES THE FIGURE.
         #
         # Two corrections are baked in here, both learned the hard way:
         #
-        # 1. It must include the LEDGER. Summing stocktake_entries alone was
+        # 1. It must include the LEDGER. Summing new_stock_entries alone was
         #    right only while stocktake_transactions was empty -- "netting is a
         #    no-op" was an accident of there being no data. When adjustments
         #    landed it reported failures that were just the netting working, and
@@ -97,7 +107,7 @@ async def main():
         # days, so a single date per article both drops and double-counts.
         day = await conn.fetchrow(
             f"""
-            WITH scoped AS (SELECT * FROM stocktake_entries WHERE {non_draft}),
+            WITH scoped AS (SELECT * FROM new_stock_entries WHERE {non_draft}),
             place_day AS (
                 SELECT UPPER(BTRIM(item_name)) AS k,
                        COALESCE(stock_type, 'Fresh Stock') AS st,
@@ -170,8 +180,8 @@ async def main():
         wh = await conn.fetchrow(
             f"""
             SELECT UPPER(TRIM(warehouse)) AS w,
-                   MAX(((created_at AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Kolkata')::date) AS d
-            FROM stocktake_entries WHERE {non_draft}
+                   MAX((created_at AT TIME ZONE 'Asia/Kolkata')::date) AS d
+            FROM new_stock_entries WHERE {non_draft}
             GROUP BY 1 ORDER BY MAX(created_at) ASC LIMIT 1
             """
         )
@@ -185,7 +195,7 @@ async def main():
         wt = await conn.fetchval(
             f"""
             WITH scoped AS (
-                SELECT * FROM stocktake_entries
+                SELECT * FROM new_stock_entries
                  WHERE {non_draft} AND UPPER(TRIM(warehouse)) = $1
             ),
             place_day AS (
@@ -234,8 +244,8 @@ async def main():
         # -- [3] asOf --------------------------------------------------------
         print("\n[3] asOf")
         prev = await conn.fetchval(
-            f"""SELECT MAX(((created_at AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Kolkata')::date) FROM stocktake_entries
-                WHERE {non_draft} AND ((created_at AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Kolkata')::date < $1::date""",
+            f"""SELECT MAX((created_at AT TIME ZONE 'Asia/Kolkata')::date) FROM new_stock_entries
+                WHERE {non_draft} AND (created_at AT TIME ZONE 'Asia/Kolkata')::date < $1::date""",
             latest,
         )
         prev = prev.isoformat() if prev else None
@@ -264,8 +274,16 @@ async def main():
 
         # -- [5] Drafts -------------------------------------------------------
         print("\n[5] Drafts")
+        # COUNT rows only, mirroring the service. include_drafts widens the
+        # STATUS filter; it does not widen source_kind, which _build_filters
+        # applies unconditionally as a correctness rule. Without this the truth
+        # query drifts the moment a console adjustment is posted on a day nobody
+        # counted -- which is exactly what that rule is designed to keep out of
+        # the baseline.
         all_status = await conn.fetchval(
-            "SELECT MAX(((created_at AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Kolkata')::date) FROM stocktake_entries"
+            "SELECT MAX((created_at AT TIME ZONE 'Asia/Kolkata')::date)"
+            " FROM new_stock_entries"
+            " WHERE (source_kind IS NULL OR source_kind = 'COUNT')"
         )
         all_status = all_status.isoformat() if all_status else None
         check("default view excludes drafts", r["as_of_date"] == latest_s)
@@ -295,10 +313,10 @@ async def main():
 
         # -- [7] Injection ----------------------------------------------------
         print("\n[7] Robustness")
-        ri = await svc.fetch_latest_stock(conn, search="'; DROP TABLE stocktake_entries;--", page_size=5)
+        ri = await svc.fetch_latest_stock(conn, search="'; DROP TABLE new_stock_entries;--", page_size=5)
         check("injection attempt is parameterised harmlessly", ri["items"] == [])
         check("table survived",
-              await conn.fetchval("SELECT COUNT(*) FROM stocktake_entries") > 0)
+              await conn.fetchval("SELECT COUNT(*) FROM new_stock_entries") > 0)
 
         # -- [8] Filter options ------------------------------------------------
         print("\n[8] Filter options")

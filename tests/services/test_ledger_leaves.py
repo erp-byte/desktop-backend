@@ -15,6 +15,8 @@ Run:  PYTHONPATH=. python -m pytest tests/services/test_ledger_leaves.py -v
 """
 from __future__ import annotations
 
+from datetime import date
+
 import asyncpg
 import pytest
 
@@ -62,7 +64,10 @@ class PerEntityConn:
     async def fetch(self, sql, *args):
         self.queries.append((sql, args))
         for prefix, outcome in self.outcomes.items():
-            if f"{prefix}_articles_v2" in sql:
+            # Matched on the TRANSACTIONS table, which both the leaves query and
+            # the activity query reference. The articles table appears only in
+            # the former, so keying on it silently returned [] for activity.
+            if f"{prefix}_transactions_v2" in sql:
                 if isinstance(outcome, Exception):
                     raise outcome
                 return list(outcome)
@@ -341,15 +346,60 @@ async def test_a_null_row_still_carries_a_usable_quantity():
 async def test_rows_differing_only_by_category_do_not_merge():
     """The key must carry category. Otherwise these two collapse into one leaf
     that keeps whichever the unordered scan happened to return first, and the
-    item jumps between tree groups across reloads."""
+    item jumps between tree groups across reloads.
+
+    Two genuinely DIFFERENT categories. Case variants of one category are a
+    different case and merge — see the test below."""
     conn = FakeConn([
         row(item_category="Cashew Kernal", net_weight_kg=100.0),
-        row(item_category="CASHEW KERNAL", net_weight_kg=40.0),
+        row(item_category="Cashew Whole", net_weight_kg=40.0),
     ])
     out = await S.fetch_leaves(conn, entity="cfpl")
     assert len(out) == 2
-    assert {leaf["group"] for leaf in out} == {"Cashew Kernal", "CASHEW KERNAL"}
+    assert {leaf["group"] for leaf in out} == {"Cashew Kernal", "Cashew Whole"}
     assert sorted(leaf["inward_qty"] for leaf in out) == [40.0, 100.0]
+
+
+@pytest.mark.asyncio
+async def test_case_variant_categories_are_one_leaf():
+    """One category spelled two ways is ONE leaf, and its quantity adds up.
+
+    The legacy tables carry 21 such pairs live — "Packaging"/"packaging",
+    "PISTA"/"pista". Kept apart, sku 3837 in A68 appeared as two identical rows
+    each holding half of its real inward quantity. This is the same rule as
+    test_null_and_blank_material_type_merge_into_one_leaf: two leaves that look
+    identical on screen are one leaf."""
+    conn = FakeConn([
+        row(item_category="Cashew Kernal", net_weight_kg=100.0, value_indicative=1000.0),
+        row(item_category="CASHEW KERNAL", net_weight_kg=40.0, value_indicative=400.0),
+    ])
+    out = await S.fetch_leaves(conn, entity="cfpl")
+    assert len(out) == 1
+    assert out[0]["inward_qty"] == 140.0
+    assert out[0]["value_indicative"] == 1400.0
+
+
+@pytest.mark.asyncio
+async def test_the_surviving_spelling_does_not_depend_on_scan_order():
+    """The merge must not let row order decide the label — that was the whole
+    objection to merging. Smallest spelling wins, whichever order they arrive."""
+    a = row(item_category="Cashew Kernal", net_weight_kg=100.0)
+    b = row(item_category="CASHEW KERNAL", net_weight_kg=40.0)
+    forward = await S.fetch_leaves(FakeConn([a, b]), entity="cfpl")
+    reverse = await S.fetch_leaves(FakeConn([b, a]), entity="cfpl")
+    assert forward[0]["group"] == reverse[0]["group"] == "CASHEW KERNAL"
+    assert forward[0]["inward_qty"] == reverse[0]["inward_qty"] == 140.0
+
+
+@pytest.mark.asyncio
+async def test_case_variant_subcategories_are_one_leaf():
+    conn = FakeConn([
+        row(sub_category="Pouch Roll", net_weight_kg=10.0),
+        row(sub_category="POUCH ROLL", net_weight_kg=5.0),
+    ])
+    out = await S.fetch_leaves(conn, entity="cfpl")
+    assert len(out) == 1
+    assert out[0]["inward_qty"] == 15.0
 
 
 @pytest.mark.asyncio
@@ -428,3 +478,140 @@ async def test_an_unexpected_database_error_still_propagates():
 
     with pytest.raises(asyncpg.PostgresSyntaxError):
         await S.fetch_leaves(Boom(), entity="cfpl")
+
+
+# ── Entry-date window / day set / shift ────────────────────────────
+
+@pytest.mark.asyncio
+async def test_no_window_emits_no_date_predicate():
+    """The default has to stay exactly what every caller got before the window
+    existed — an all-time aggregate with no bound parameters."""
+    conn = FakeConn([row()])
+    await S.fetch_leaves(conn, entity="cfpl")
+    sql, args = conn.queries[0]
+    assert args == ()
+    assert "entry_date BETWEEN" not in sql
+    assert "entry_date = ANY" not in sql
+
+
+@pytest.mark.asyncio
+async def test_a_range_binds_both_bounds():
+    conn = FakeConn([row()])
+    await S.fetch_leaves(conn, entity="cfpl",
+                         date_from=date(2026, 3, 1), date_to=date(2026, 3, 31))
+    sql, args = conn.queries[0]
+    assert "t.entry_date BETWEEN $1::date AND $2::date" in sql
+    assert args == (date(2026, 3, 1), date(2026, 3, 31))
+
+
+@pytest.mark.asyncio
+async def test_a_day_set_binds_an_array_not_a_span():
+    """Ticking three days must not become the range that contains them.
+
+    On live data the span of the three busiest days covers 174 days nobody
+    selected: 109,290 kg of inward becomes 3,121,931 kg."""
+    days = [date(2026, 3, 6), date(2026, 3, 19), date(2026, 8, 29)]
+    conn = FakeConn([row()])
+    await S.fetch_leaves(conn, entity="cfpl", days=days)
+    sql, args = conn.queries[0]
+    assert "t.entry_date = ANY($1::date[])" in sql
+    assert "BETWEEN" not in sql
+    assert args == (days,)
+
+
+@pytest.mark.asyncio
+async def test_a_range_and_a_day_set_are_mutually_exclusive():
+    with pytest.raises(ValueError):
+        await S.fetch_leaves(FakeConn(), entity="cfpl", days=[date(2026, 3, 6)],
+                             date_from=date(2026, 3, 1), date_to=date(2026, 3, 31))
+
+
+@pytest.mark.asyncio
+async def test_an_empty_day_set_is_rejected_not_treated_as_everything():
+    """Deselecting the last day must not invert into "the whole warehouse"."""
+    with pytest.raises(ValueError):
+        await S.fetch_leaves(FakeConn(), entity="cfpl", days=[])
+
+
+@pytest.mark.asyncio
+async def test_half_a_range_is_rejected():
+    with pytest.raises(ValueError):
+        await S.fetch_leaves(FakeConn(), entity="cfpl", date_from=date(2026, 3, 1))
+    with pytest.raises(ValueError):
+        await S.fetch_leaves(FakeConn(), entity="cfpl", date_to=date(2026, 3, 1))
+
+
+@pytest.mark.asyncio
+async def test_a_reversed_range_is_rejected():
+    with pytest.raises(ValueError):
+        await S.fetch_leaves(FakeConn(), entity="cfpl",
+                             date_from=date(2026, 3, 31), date_to=date(2026, 3, 1))
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_shift_is_rejected():
+    with pytest.raises(ValueError):
+        await S.fetch_leaves(FakeConn(), entity="cfpl", shift="afternoon")
+
+
+def test_the_shift_cutoff_converts_utc_to_ist():
+    """created_at is a NAIVE column holding UTC, so it must be told what it is
+    before being converted. The one-step form means the opposite and would shift
+    the cutoff by -5:30: measured on live data, 1,570 of 1,599 documents land
+    before 14:00 read raw, against 584 read correctly."""
+    for key in ("am", "pm"):
+        frag = S.SHIFTS[key]
+        assert "AT TIME ZONE 'UTC'" in frag
+        assert "AT TIME ZONE 'Asia/Kolkata'" in frag
+        assert frag.index("'UTC'") < frag.index("'Asia/Kolkata'")
+    assert S.SHIFTS["all"] == ""
+    assert str(S.SHIFT_CUTOFF_HOUR) in S.SHIFTS["am"]
+
+
+@pytest.mark.asyncio
+async def test_shift_narrows_without_disturbing_the_date_bindings():
+    conn = FakeConn([row()])
+    await S.fetch_leaves(conn, entity="cfpl", date_from=date(2026, 3, 1),
+                         date_to=date(2026, 3, 31), shift="pm")
+    sql, args = conn.queries[0]
+    # The shift is a module literal, so it never consumes a bind slot — the two
+    # date bounds must still be $1 and $2.
+    assert args == (date(2026, 3, 1), date(2026, 3, 31))
+    assert "$1::date AND $2::date" in sql
+    assert f">= {S.SHIFT_CUTOFF_HOUR}" in sql
+
+
+def test_an_unknown_window_mode_is_rejected():
+    with pytest.raises(ValueError):
+        S.build_leaves_sql("cfpl", window="fortnight")
+
+
+@pytest.mark.asyncio
+async def test_activity_merges_entities_and_splits_by_shift():
+    class TwoEntities:
+        def __init__(self):
+            self.queries = []
+
+        async def fetch(self, sql, *args):
+            self.queries.append((sql, args))
+            # Same day from both entities must merge, not appear twice.
+            return [{"d": date(2026, 3, 6), "docs": 3, "am": 2, "pm": 1}]
+
+    conn = TwoEntities()
+    out = await S.fetch_activity(conn, entity="both")
+    assert len(conn.queries) == 2, "one query per entity"
+    assert out["days"] == [{"date": "2026-03-06", "docs": 6, "am": 4, "pm": 2}]
+    assert out["min_date"] == out["max_date"] == "2026-03-06"
+    assert out["shift_cutoff_hour"] == S.SHIFT_CUTOFF_HOUR
+
+
+@pytest.mark.asyncio
+async def test_activity_degrades_when_a_legacy_table_is_absent():
+    """Same posture as fetch_leaves: one entity's missing schema must not
+    discard the other entity's days."""
+    conn = PerEntityConn({
+        "cfpl": [{"d": date(2026, 3, 6), "docs": 2, "am": 2, "pm": 0}],
+        "cdpl": asyncpg.UndefinedTableError("no such table"),
+    })
+    out = await S.fetch_activity(conn, entity="both")
+    assert out["days"] == [{"date": "2026-03-06", "docs": 2, "am": 2, "pm": 0}]

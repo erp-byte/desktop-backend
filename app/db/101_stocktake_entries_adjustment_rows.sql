@@ -61,7 +61,13 @@ END$$;
 -- (created_at AT TIME ZONE 'Asia/Kolkata')::date is rejected outright with
 -- "functions in index expression must be marked IMMUTABLE" — so the correct
 -- conversion and the indexable one are the same expression. It matches
--- business_day.ENTRY_DAY exactly; if one changes, so must the other.
+-- business_day.LEGACY_ENTRY_DAY exactly; if one changes, so must the other.
+--
+-- SUPERSEDED for the console. Since the 2026-09-08 backfill the console reads
+-- and writes new_stock_entries, whose created_at is timestamptz and whose
+-- equivalent index (uq_nse_adjustment_day) therefore uses the ONE-step day and
+-- wraps warehouse/floor_name in COALESCE. This index still serves the floor
+-- app's table and must keep the two-step form.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_entries_adjustment_day
     ON stocktake_entries (
         (((created_at AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Kolkata')::date),

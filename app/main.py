@@ -32,11 +32,14 @@ from app.modules.amendment_router import router as amendment_router
 from app.modules.vendor.router import router as vendor_router
 from app.modules.sample.router import router as sample_router
 from app.modules.transfer.router import router as transfer_router
+from app.modules.job_work.router import router as job_work_router
 from app.modules.cold_storage.router import router as cold_storage_router
 from app.modules.lookups_router import router as lookups_router
 from app.modules.qc.router import router as qc_router
 from app.modules.packing.router import router as packing_router
 from app.modules.customer_returns.router import router as customer_returns_router
+from app.modules.bom.router import router as bom_router
+from app.modules.ledger.router import router as ledger_router
 from app.modules.stock_take.router import router as stock_take_router
 from app.modules.so.services.item_matcher import load_master_items
 from app.modules.production.services.master_ingest import run_master_ingest
@@ -157,7 +160,18 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["X-Request-ID"],
+    # Anything a browser fetch() needs to READ must be listed here — an
+    # unlisted response header is not merely hidden cross-origin, it is
+    # silently absent, so `headers.get(...)` returns null with no error.
+    # Content-Disposition carries the .xlsx filename and X-Total-Rows the row
+    # count that the Stock Take downloads read back; without these the ledger
+    # export saves as its fallback name and reports 0 rows.
+    expose_headers=[
+        "X-Request-ID",
+        "Content-Disposition",
+        "X-Total-Rows",
+        "X-Draft-Rows",
+    ],
 )
 request_context.install(app)
 
@@ -175,12 +189,15 @@ app.include_router(amendment_router)
 app.include_router(vendor_router)
 app.include_router(sample_router)
 app.include_router(transfer_router)
+app.include_router(job_work_router)
 app.include_router(cold_storage_router)
 app.include_router(lookups_router)
 app.include_router(qc_router)
 app.include_router(packing_router)
 app.include_router(customer_returns_router)
+app.include_router(bom_router)
 app.include_router(stock_take_router)
+app.include_router(ledger_router)
 app.include_router(webhook_router)
 app.include_router(ws_router)
 

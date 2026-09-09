@@ -18,7 +18,15 @@ import asyncpg
 
 from app.config import Settings
 from app.modules.stock_take.services import latest_stock_service as stock
+from app.modules.stock_take import floors as floor_profile
 from app.modules.stock_take.services import transactions_service as svc
+from app.modules.stock_take.services import business_day
+
+# This file writes its SQL against new_stock_entries with the ONE-step IST day.
+# Both must stay the service's own choices, or the test would be checking a
+# different table than the code under test.
+assert business_day.ENTRIES_TABLE == "new_stock_entries",     "business_day.ENTRIES_TABLE is now %r" % (business_day.ENTRIES_TABLE,)
+assert business_day.ENTRY_DAY == "(created_at AT TIME ZONE 'Asia/Kolkata')::date",     "business_day.ENTRY_DAY is now %r" % (business_day.ENTRY_DAY,)
 
 _passed = 0
 _failed = 0
@@ -90,46 +98,85 @@ async def main():
     # EMPTY allowed_floors means "no restriction", NOT "no access"
     # (auth_schema.sql:35; the middleware only enforces `if user.allowed_floors`;
     # the profile screen renders it as "All"). An unrestricted user must be
-    # OFFERED every floor, not locked out -- the bug this replaced.
+    # OFFERED floors, not locked out -- the bug this replaced.
+    #
+    # WHAT "EVERY FLOOR" MEANS CHANGED. It used to be every distinct floor_name
+    # in the table, which spans other warehouses and includes the names nobody
+    # canonicalised (TEESTTTT, REJECTION COLD & RACK -- a stock type, not a
+    # place). The admin screen's own label is the rule -- "filtered by
+    # warehouses; empty = all in those warehouses" -- so it is now the DECLARED
+    # floors of the scoped warehouses.
     unres = FakeUser([], ["W202"])
-    sc = svc.effective_scope(unres, available_floors=["Terrace", "Upper Basement"],
+    sc = svc.effective_scope(unres, available_floors=["Terrace", "TEESTTTT"],
                              available_warehouses=["W202"])
     check("empty allowed_floors is unrestricted, not denied",
-          sc["floors_unrestricted"] is True and sc["floors"] == ["Terrace", "Upper Basement"], str(sc))
-    check("an unrestricted user with one available floor gets it pinned",
-          svc.resolve_scope(unres, warehouse=None, location=None,
-                            available_floors=["Terrace"], available_warehouses=["W202"])
-          == ("W202", "Terrace"))
+          sc["floors_unrestricted"] is True
+          and sc["floors"] == floor_profile.declared_floors(["W202"]), str(sc))
+    check("a declared warehouse is never widened by what the table happens to hold",
+          "TEESTTTT" not in sc["floors"], str(sc["floors"]))
+    check("floors are reported per warehouse so the form can narrow them",
+          sc["floors_by_warehouse"] == {"W202": floor_profile.declared_floors(["W202"])},
+          str(sc["floors_by_warehouse"]))
+
+    # A warehouse that declares NO floors (F53, A68) still falls back to its own
+    # data, or nobody assigned to it could post at all.
+    und = FakeUser([], ["F53"])
+    check("an undeclared warehouse falls back to its data, and one floor pins",
+          svc.resolve_scope(und, warehouse=None, location=None,
+                            available_warehouses=["F53"],
+                            places={"F53": ["GROUND FLOOR"]}) == ("F53", "GROUND FLOOR"))
     try:
         svc.resolve_scope(unres, warehouse=None, location=None,
-                          available_floors=["Terrace", "Upper Basement"],
                           available_warehouses=["W202"])
         check("an unrestricted user with several floors must choose", False, "no raise")
     except svc.ScopeError as e:
         check("an unrestricted user with several floors must choose",
               e.code == "floor_required", e.code)
-    check("an unrestricted user may pick any available floor",
+    check("an unrestricted user may pick any declared floor of their warehouse",
           svc.resolve_scope(unres, warehouse=None, location="Upper Basement",
-                            available_floors=["Terrace", "Upper Basement"],
                             available_warehouses=["W202"])[1] == "Upper Basement")
+    try:
+        svc.resolve_scope(unres, warehouse="W202", location="Roasting Area",
+                          available_warehouses=["W202", "A185"])
+        check("another warehouse's floor is refused", False, "no raise")
+    except svc.ScopeError as e:
+        check("a floor from a DIFFERENT warehouse is refused once one is chosen",
+              e.code == "floor_not_allowed", e.code)
 
-    # Admins bypass scope entirely (middleware.py:160), so a grant list must not
-    # narrow them.
-    adm = FakeUser(["Terrace"], ["A185"])
+    # BEING ADMIN MEANS NOT BEING BLOCKED, NOT BEING UNASSIGNED. Admins already
+    # bypass the enforcement check (middleware.py:160), so nothing here needs to
+    # widen them a second time -- and doing so actively hurt: an admin assigned
+    # W202 was shown A185's and F53's floors plus every uncanonicalised name, in
+    # a form whose only job is to pick ONE real place.
+    adm = FakeUser([], ["W202"])
     adm.is_admin = True
-    asc = svc.effective_scope(adm, available_floors=["Terrace", "Upper Basement"],
+    asc = svc.effective_scope(adm, available_floors=["Terrace", "TEESTTTT"],
                               available_warehouses=["W202", "A185"])
-    check("an admin is unrestricted regardless of grants",
-          asc["floors"] == ["Terrace", "Upper Basement"] and asc["warehouses"] == ["A185", "W202"],
-          str(asc))
+    check("an admin's own warehouse assignment still scopes the menu",
+          asc["warehouses"] == ["W202"], str(asc))
+    check("and they are offered that warehouse's declared floors",
+          asc["floors"] == floor_profile.declared_floors(["W202"]), str(asc))
+    check("not another warehouse's", "Roasting Area" not in asc["floors"], str(asc["floors"]))
+
+    # An admin with no assignment at all is still offered everything available.
+    open_adm = FakeUser([], [])
+    open_adm.is_admin = True
+    osc = svc.effective_scope(open_adm, available_warehouses=["W202", "A185"])
+    check("an admin with no assignment sees every warehouse",
+          osc["warehouses"] == ["A185", "W202"], str(osc))
+    check("and every declared floor of both",
+          sorted(osc["floors"]) == sorted(floor_profile.declared_floors(["W202", "A185"])),
+          str(osc["floors"]))
 
     # An UNRESTRICTED user with nothing available is a server/database problem,
     # not a permissions one — the message must not tell them to go ask an admin
     # for floor access when the real cause is DATABASE_URL pointing at a database
-    # with no stocktake_entries.
+    # with no new_stock_entries.
+    # Reachable only for a warehouse that declares nothing AND holds no data --
+    # a declared warehouse always offers its profile floors.
     try:
-        svc.resolve_scope(FakeUser([], ["W202"]), warehouse=None, location=None,
-                          available_floors=[], available_warehouses=["W202"])
+        svc.resolve_scope(FakeUser([], ["A68"]), warehouse=None, location=None,
+                          available_floors=[], available_warehouses=["A68"])
         check("unrestricted with no data blocks", False, "no raise")
     except svc.ScopeError as e:
         check("unrestricted with no data reports a DATA problem, not a permission one",
@@ -153,7 +200,7 @@ async def main():
         row = await conn.fetchrow(
             """SELECT UPPER(BTRIM(item_name)) AS item, UPPER(BTRIM(warehouse)) AS wh,
                       floor_name AS floor, COALESCE(stock_type,'Fresh Stock') AS st
-                 FROM stocktake_entries
+                 FROM new_stock_entries
                 WHERE (status IS NULL OR status != 'draft')
                   AND UPPER(BTRIM(floor_name)) = 'UPPER BASEMENT'
                   AND UPPER(BTRIM(warehouse)) = 'W202'
@@ -324,8 +371,8 @@ async def main():
               pinned["txn_code"][:5] == "26248"
               and any(r["txn_id"] == pinned["txn_id"] for r in found["transactions"]))
 
-        print("\n[6d] Write-back into stocktake_entries")
-        # An adjustment now ALSO writes a row into stocktake_entries so the
+        print("\n[6d] Write-back into new_stock_entries")
+        # An adjustment now ALSO writes a row into new_stock_entries so the
         # counting app and anything reading that table directly see the movement.
         adj_day = await conn.fetchval(
             "SELECT (now() AT TIME ZONE 'Asia/Kolkata')::date")
@@ -341,7 +388,7 @@ async def main():
             warehouse="W202", location="Upper Basement",
             created_by="Ledger Test", created_by_user_id=None)
         e1 = wb1["stock_entry"]
-        check("posting an adjustment writes a stocktake_entries row",
+        check("posting an adjustment writes a new_stock_entries row",
               e1["entry_id"] is not None, str(e1))
         start_kg = e1["day_total_weight"]
 
@@ -368,8 +415,8 @@ async def main():
 
         stored = await conn.fetchrow(
             """SELECT source_kind, status, warehouse, floor_name, stock_type,
-                      ((created_at AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Kolkata')::date AS ist_day
-                 FROM stocktake_entries WHERE id = $1""", e1["entry_id"])
+                      (created_at AT TIME ZONE 'Asia/Kolkata')::date AS ist_day
+                 FROM new_stock_entries WHERE id = $1""", e1["entry_id"])
         check("it is marked ADJUSTMENT, never COUNT",
               stored["source_kind"] == "ADJUSTMENT", str(stored["source_kind"]))
         check("created_at is naive UTC, so its IST day is today",
@@ -380,26 +427,26 @@ async def main():
         # Only ONE adjustment row exists for this article/place/day, enforced by
         # uq_entries_adjustment_day rather than by the service remembering to look.
         n_rows = await conn.fetchval(
-            """SELECT COUNT(*) FROM stocktake_entries
+            """SELECT COUNT(*) FROM new_stock_entries
                 WHERE source_kind = 'ADJUSTMENT'
                   AND UPPER(BTRIM(item_name)) = $1
                   AND UPPER(BTRIM(warehouse)) = 'W202'
                   AND UPPER(BTRIM(floor_name)) = 'UPPER BASEMENT'
-                  AND ((created_at AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Kolkata')::date = $2""",
+                  AND (created_at AT TIME ZONE 'Asia/Kolkata')::date = $2""",
             row["item"], adj_day)
         check("exactly one adjustment row per article/place/day", n_rows == 1, str(n_rows))
 
         print("\n[6e] The write-back must NOT disturb the console figure")
         # THE ASSERTION THAT CATCHES THE COLLAPSE. Writing an adjustment row into
-        # stocktake_entries without excluding it from the baseline makes the
+        # new_stock_entries without excluding it from the baseline makes the
         # newest "count day" an adjustment-only day: the view then reports O\nY
         # the adjusted article and every counted article vanishes. That failure
         # returns HTTP 200 with a confident as_of_date and a plausibly shaped
         # payload, so nothing else in this suite would notice it.
         v = await stock.fetch_latest_stock(conn, warehouse=["W202"], page=1, page_size=500)
         base_day = await conn.fetchval(
-            """SELECT MAX(((created_at AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Kolkata')::date)
-                 FROM stocktake_entries
+            """SELECT MAX((created_at AT TIME ZONE 'Asia/Kolkata')::date)
+                 FROM new_stock_entries
                 WHERE (status IS NULL OR status <> 'draft')
                   AND (source_kind IS NULL OR source_kind = 'COUNT')
                   AND UPPER(BTRIM(warehouse)) = 'W202'""")
@@ -409,11 +456,11 @@ async def main():
         counted_articles = await conn.fetchval(
             """SELECT COUNT(DISTINCT (UPPER(BTRIM(item_name)),
                                       COALESCE(stock_type,'Fresh Stock')))
-                 FROM stocktake_entries
+                 FROM new_stock_entries
                 WHERE (status IS NULL OR status <> 'draft')
                   AND (source_kind IS NULL OR source_kind = 'COUNT')
                   AND UPPER(BTRIM(warehouse)) = 'W202'
-                  AND ((created_at AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Kolkata')::date = $1""",
+                  AND (created_at AT TIME ZONE 'Asia/Kolkata')::date = $1""",
             base_day)
         check("no counted article was dropped from the view",
               v["pagination"]["total"] >= counted_articles,
@@ -456,7 +503,7 @@ async def main():
         agg = await stock.fetch_latest_stock(
             conn, warehouse=["W202"], floor_name=["Upper Basement"], page_size=1000)
         # Compare NORMALISED on both sides. The aggregate returns MIN(item_name),
-        # i.e. the raw stored spelling, and stocktake_entries item names carry
+        # i.e. the raw stored spelling, and new_stock_entries item names carry
         # trailing spaces just like floor names do ('ROASTED PUMPKIN SEEDS ').
         # Matching raw-against-normalised silently found nothing.
         norm = lambda x: (x or "").strip().upper()

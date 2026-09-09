@@ -112,3 +112,286 @@ def build_ledger_workbook(rows: list[dict[str, Any]], filters: dict[str, Any],
     wb.save(out)
     out.seek(0)
     return out
+
+
+# ── Floor count export ─────────────────────────────────────────────────────
+# Ported from backend_st/routes/exports.ts::exportStocktakeEntries. Columns 1-24
+# are that sheet's columns in its own order, so the two files can be diffed
+# row-for-row; "Batch ID" is appended as column 25 rather than inserted, so
+# nothing existing shifts.
+#
+# (key, header, width). `key` names either a row field or a derived value
+# handled in _entry_cell.
+ENTRY_COLUMNS: tuple[tuple[str, str, int], ...] = (
+    ("id",               "Entry ID",                10),
+    ("item_name",        "Item Name",               30),
+    ("item_type",        "Item Type",               12),
+    ("item_category",    "Category",                20),
+    ("item_subcategory", "Subcategory",             20),
+    ("floor_name",       "Floor Name",              15),
+    ("warehouse",        "Warehouse",               15),
+    ("total_quantity",   "Quantity (Units)",        15),
+    ("unit_uom",         "Unit Weight (kg)",        15),
+    ("total_weight",     "Total Weight (kg)",       15),
+    ("entered_by",       "Entered By",              15),
+    ("entered_by_email", "Email",                   25),
+    ("authority",        "Authority",               15),
+    ("stock_type",       "Stock Type",              18),
+    ("created_at",       "Created At",              22),
+    ("updated_at",       "Updated At",              22),
+    ("verified",         "Verified",                12),
+    ("verified_by",      "Verified By",             18),
+    ("verified_at",      "Verified At",             22),
+    ("remark",           "Remark",                  25),
+    ("sig_entered",      "Entry By (Signature)",    35),
+    ("created_at",       "Entry Submitted At",      22),
+    ("verified_by",      "Verified By (Signature)", 25),
+    ("verified_at",      "Verified At (Signature)", 22),
+    ("entry_id",         "Batch ID",                12),
+)
+
+_NUM3 = {"total_quantity"}
+_NUM2 = {"unit_uom", "total_weight"}
+
+# Express's palette, kept so the two sheets read as the same document.
+_FRESH_HEADER = "228B22"     # forest green
+_REJECT_HEADER = "B22222"    # firebrick
+_OTHER_HEADER = "29417A"     # house navy, for a stock type neither bucket claims
+_UNVERIFIED_FILL = PatternFill(start_color="FAEEDA", end_color="FAEEDA", fill_type="solid")
+_SUMMARY_HEAD_FILL = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+_TOTAL_FILL = PatternFill(start_color="EEEEEE", end_color="EEEEEE", fill_type="solid")
+_FOOTER_FILL = PatternFill(start_color="F4F6FA", end_color="F4F6FA", fill_type="solid")
+_FOOTER_FONT = Font(italic=True, size=9)
+_BOLD = Font(bold=True)
+
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def _dt(value: Any) -> str:
+    """Format as "DD Mon YYYY HH:MM", matching the floor app's formatDateDisplay.
+
+    The value arrives already in IST — entries_export converts in SQL — so this
+    only formats. Writing text rather than a real datetime is deliberate: it is
+    what the floor app produces, and these columns are read, not calculated on.
+    """
+    if not isinstance(value, datetime):
+        return ""
+    return (f"{value.day:02d} {_MONTHS[value.month - 1]} {value.year} "
+            f"{value.hour:02d}:{value.minute:02d}")
+
+
+def _num(value: Any) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _entry_cell(row: dict[str, Any], key: str) -> Any:
+    if key == "sig_entered":
+        name = row.get("entered_by") or ""
+        email = row.get("entered_by_email") or ""
+        return f"{name} — {email}" if email else name
+    if key == "verified":
+        return "Yes" if row.get("verified") is True else "No"
+    if key in ("created_at", "updated_at", "verified_at"):
+        return _dt(row.get(key))
+    if key in _NUM3 or key in _NUM2:
+        return _num(row.get(key))
+    return row.get(key) or ""
+
+
+def _stock_bucket(stock_type: Any) -> str:
+    """Which sheet a row belongs on.
+
+    Express drops anything outside its two hardcoded buckets from BOTH sheets
+    while still counting it in the grand total, so the Summary would not add up.
+    Only the two known values exist today (Fresh Stock 7296, Off Grade/Rejection
+    1068), but the rule is made total here rather than left to hold by luck.
+    """
+    s = (stock_type or "Fresh Stock").strip()
+    if s in ("Off Grade/Rejection", "Rejection"):
+        return "Rejection"
+    if s == "Fresh Stock":
+        return "Fresh Stock"
+    return s
+
+
+# Excel forbids these in a sheet name and silently corrupts the file if present.
+_SHEET_ILLEGAL = str.maketrans({c: "-" for c in '[]:*?/\\'})
+
+
+def _sheet_name(bucket: str) -> str:
+    return (bucket.translate(_SHEET_ILLEGAL).strip() or "Other")[:31]
+
+
+def build_entries_workbook(rows: list[dict[str, Any]], filters: dict[str, Any],
+                           draft_count: int, generated_by: str) -> BytesIO:
+    """One sheet per stock type plus a Summary, as the floor app builds it."""
+    verified_n = sum(1 for r in rows if r.get("verified") is True)
+    subtitle = (f"Includes: {verified_n} verified + {len(rows) - verified_n} "
+                "unverified entries")
+    if draft_count:
+        subtitle += f" | {draft_count} draft entries excluded — not yet submitted."
+
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        buckets.setdefault(_stock_bucket(row.get("stock_type")), []).append(row)
+    # Fresh, then Rejection, then anything else — so today's data produces
+    # exactly the floor app's sheet order.
+    order = [b for b in ("Fresh Stock", "Rejection") if b in buckets]
+    order += sorted(b for b in buckets if b not in ("Fresh Stock", "Rejection"))
+
+    wb = Workbook()
+    wb.remove(wb.active)
+    for bucket in order:
+        colour = {"Fresh Stock": _FRESH_HEADER,
+                  "Rejection": _REJECT_HEADER}.get(bucket, _OTHER_HEADER)
+        _entries_sheet(wb, _sheet_name(bucket), buckets[bucket], colour,
+                       subtitle, filters, generated_by)
+    # Always created, and created last, so an export that matched nothing is
+    # still a valid workbook that says so rather than a download that fails.
+    _summary_sheet(wb, order, buckets, len(rows), subtitle, filters, generated_by)
+
+    out = BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out
+
+
+def _entries_sheet(wb: Workbook, name: str, data: list[dict[str, Any]],
+                   header_colour: str, subtitle: str, filters: dict[str, Any],
+                   generated_by: str) -> None:
+    ws = wb.create_sheet(name)
+    ws.sheet_properties.defaultRowHeight = 18
+
+    ws.cell(row=1, column=1, value=subtitle).font = _META_FONT
+    # The floor app's sheet carries no record of what was filtered. A downloaded
+    # figure with no scope on it is unattributable the moment it is emailed on,
+    # so the same line the ledger export writes is added here.
+    ws.cell(row=2, column=1, value=_describe(filters)).font = _META_FONT
+
+    head = 4
+    fill = PatternFill(start_color=header_colour, end_color=header_colour,
+                       fill_type="solid")
+    for i, (_key, header, width) in enumerate(ENTRY_COLUMNS, start=1):
+        c = ws.cell(row=head, column=i, value=header)
+        c.font, c.fill, c.border = _HEADER_FONT, fill, _BORDER
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        ws.column_dimensions[get_column_letter(i)].width = width
+
+    for r, row in enumerate(data, start=head + 1):
+        unverified = row.get("verified") is not True
+        for i, (key, _header, _w) in enumerate(ENTRY_COLUMNS, start=1):
+            c = ws.cell(row=r, column=i, value=_entry_cell(row, key))
+            c.border = _BORDER
+            c.alignment = Alignment(vertical="center")
+            if key in _NUM3:
+                c.number_format = "#,##0.000"
+            elif key in _NUM2:
+                c.number_format = "#,##0.00"
+            # F1: an unverified row is tinted amber across its full width.
+            if unverified:
+                c.fill = _UNVERIFIED_FILL
+
+    ws.freeze_panes = ws.cell(row=head + 1, column=1)
+
+    # TOTAL row, in the floor app's own column positions (1, 7, 8, 10).
+    total_row = head + len(data) + 2
+    ws.cell(row=total_row, column=1, value="TOTAL:").font = _BOLD
+    ws.cell(row=total_row, column=7, value=f"{len(data)} entries").font = _BOLD
+    qty = ws.cell(row=total_row, column=8,
+                  value=sum(_num(r.get("total_quantity")) for r in data))
+    weight = ws.cell(row=total_row, column=10,
+                     value=sum(_num(r.get("total_weight")) for r in data))
+    for cell, fmt in ((qty, "#,##0.000"), (weight, "#,##0.00")):
+        cell.font, cell.number_format = _BOLD, fmt
+        cell.alignment = Alignment(horizontal="right")
+    for col in (1, 7, 8, 10):
+        ws.cell(row=total_row, column=col).fill = _TOTAL_FILL
+
+    _footer(ws, total_row + 3, data, generated_by)
+
+
+def _footer(ws: Any, start: int, data: list[dict[str, Any]], generated_by: str) -> int:
+    """Signature block: who counted, who verified, who exported."""
+    def line(row: int, text: str) -> int:
+        c = ws.cell(row=row, column=1, value=text)
+        c.font, c.fill = _FOOTER_FONT, _FOOTER_FILL
+        return row + 1
+
+    counters = sorted({(r.get("entered_by") or "").strip() for r in data} - {""})
+    verifiers = sorted({(r.get("verified_by") or "").strip() for r in data} - {""})
+
+    r = line(start, "Entry Team Signatures")
+    for who in counters or ["(none)"]:
+        r = line(r, f"  {who}")
+    r = line(r, "")
+    r = line(r, "Verified / Authorised By")
+    for who in verifiers or ["(none)"]:
+        r = line(r, f"  {who}")
+    r = line(r, "")
+    r = line(r, f"Exported by: {generated_by}")
+    r = line(r, f"Export Date: {_dt(datetime.now())}")
+    return line(r, "Candor ERP — Stock Take")
+
+
+def _summary_sheet(wb: Workbook, order: list[str],
+                   buckets: dict[str, list[dict[str, Any]]], total_rows: int,
+                   subtitle: str, filters: dict[str, Any], generated_by: str) -> None:
+    ws = wb.create_sheet("Summary")
+    ws.sheet_properties.defaultRowHeight = 20
+    ws.cell(row=1, column=1, value="Stock Type Summary").font = _TITLE_FONT
+    ws.cell(row=2, column=1, value=_describe(filters)).font = _META_FONT
+
+    head = 4
+    for i, header in enumerate(("Stock Type", "Entries", "Total Quantity",
+                                "Total Weight (kg)"), start=1):
+        c = ws.cell(row=head, column=i, value=header)
+        c.font, c.fill, c.border = _HEADER_FONT, _SUMMARY_HEAD_FILL, _BORDER
+        c.alignment = Alignment(horizontal="center", vertical="center")
+
+    tint = {"Fresh Stock": "E8F5E9", "Rejection": "FFEBEE"}
+    grand_qty = grand_weight = 0.0
+    r = head
+    # EVERY bucket present gets a row, so Entries down this column always sums to
+    # the grand total. The floor app writes its two weights with toFixed(2),
+    # which lands them in Excel as TEXT and cannot be summed; these are numbers.
+    for bucket in order:
+        r += 1
+        data = buckets[bucket]
+        qty = sum(_num(x.get("total_quantity")) for x in data)
+        weight = sum(_num(x.get("total_weight")) for x in data)
+        grand_qty, grand_weight = grand_qty + qty, grand_weight + weight
+        for i, value in enumerate((bucket, len(data), qty, weight), start=1):
+            c = ws.cell(row=r, column=i, value=value)
+            c.border = _BORDER
+            if i == 3:
+                c.number_format = "#,##0.000"
+            elif i == 4:
+                c.number_format = "#,##0.00"
+        shade = tint.get(bucket)
+        if shade:
+            ws.cell(row=r, column=1).fill = PatternFill(
+                start_color=shade, end_color=shade, fill_type="solid")
+
+    r += 1
+    for i, value in enumerate(("GRAND TOTAL", total_rows, grand_qty, grand_weight),
+                              start=1):
+        c = ws.cell(row=r, column=i, value=value)
+        c.font, c.fill, c.border = _BOLD, _TOTAL_FILL, _BORDER
+        if i == 3:
+            c.number_format = "#,##0.000"
+        elif i == 4:
+            c.number_format = "#,##0.00"
+
+    for i, width in enumerate((26, 15, 18, 18), start=1):
+        ws.column_dimensions[get_column_letter(i)].width = width
+
+    if not order:
+        # Nothing matched. Said plainly on the only sheet there is, rather than
+        # leaving the recipient to guess whether the export failed.
+        ws.cell(row=r + 2, column=1,
+                value="No submitted count entries matched these filters.").font = _META_FONT
+    _footer(ws, r + 4, [x for b in order for x in buckets[b]], generated_by)
