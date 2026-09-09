@@ -435,6 +435,48 @@ SQL_FILES = [
     # would re-insert duplicates on every deploy -- and 076_dedupe_permissions.sql
     # runs earlier, so it could not clean up after them.
     DB_DIR / "095_bom_module_rbac.sql",
+    # 098 adds stocktake_transactions, the append-only stock adjustment ledger
+    # behind POST /api/v1/stock-take/transactions. Must run BEFORE that code is
+    # deployed — the endpoint INSERTs into a table that otherwise does not exist.
+    # The file is fully idempotent (CREATE ... IF NOT EXISTS, guarded ALTERs and
+    # trigger creation), so re-running it on every deploy is a no-op.
+    DB_DIR / "098_stocktake_transactions.sql",
+    # 099 adds stocktake_transactions.txn_code, the 8-digit reference the UI
+    # displays. Must run AFTER 098 (it alters that table and temporarily disables
+    # 098's UPDATE trigger to backfill rows that predate the column).
+    DB_DIR / "099_stocktake_txn_code.sql",
+    # 100 supersedes 099's txn_code format: YYDDD+NNN cut in Asia/Kolkata rather
+    # than YYMMDD+NN cut in the server's UTC, so the code's date stops
+    # disagreeing with the date operators see on screen.
+    DB_DIR / "100_stocktake_txn_code_format.sql",
+    # 101 lets a console adjustment write a row that is NOT mistaken for a
+    # physical count: widens chk_entries_source to accept source_kind
+    # ='ADJUSTMENT' and adds the partial unique index behind the daily upsert.
+    # Must run BEFORE the write-back code deploys or every adjustment fails.
+    DB_DIR / "101_stocktake_entries_adjustment_rows.sql",
+    # 102 creates the `stock_take` role and its view/create/export permissions.
+    # Must run BEFORE the backend deploys: every /api/v1/stock-take/* endpoint is
+    # gated on these rows and check_permission denies when no catalog row exists
+    # at any level, so without this the module 403s for everyone but admins.
+    # NULL-safe by NOT EXISTS rather than ON CONFLICT, for the same reason 095
+    # is: two of the four key columns are NULL and the UNIQUE is NULLS DISTINCT.
+    DB_DIR / "102_stock_take_rbac.sql",
+    # 103 backfills new_stock_entries from stocktake_entries, rewriting floor_name
+    # to the names FLOORS_BY_WAREHOUSE declares. Refuses to run when the table is
+    # non-empty, so it cannot double-load and is safe to leave in the deploy list.
+    DB_DIR / "103_new_stock_entries_backfill.sql",
+    # 104 copies across whatever the floor app has written since. Re-runnable by
+    # design — it inserts only ids the target lacks — so running it every deploy
+    # keeps the console current. Also pushes the identity sequence clear of the
+    # id range the floor app still issues, which is what stops a later sync
+    # colliding on a primary key that means two different things.
+    DB_DIR / "104_new_stock_entries_delta_sync.sql",
+    # 105/106 are the floor alias maps the warehouse team supplied. NOT spelling
+    # variants — nothing in the data could have produced them — so they are
+    # recorded as decisions. Idempotent: they match on raw names that no longer
+    # exist once applied.
+    DB_DIR / "105_w202_floor_aliases.sql",
+    DB_DIR / "106_a185_floor_aliases.sql",
 ]
 
 # ── Optional: drop the v1 legacy job-card stack (TEST / Supabase DB ONLY) ──────
