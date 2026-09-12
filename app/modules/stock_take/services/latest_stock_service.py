@@ -418,6 +418,17 @@ async def fetch_latest_stock(
                        FROM place_day pd) ranked
                   WHERE rn = 1
              ),
+             -- Sign-off for the line as a whole. BOOL_AND, not MAX: one
+             -- unverified row behind a figure means the figure is not signed.
+             verif AS (
+                 SELECT UPPER(BTRIM(item_name))                AS k_item,
+                        COALESCE(stock_type, 'Fresh Stock')    AS k_stock,
+                        BOOL_AND(COALESCE(verified, FALSE))    AS verified,
+                        MAX(verified_by)                       AS verified_by,
+                        MAX(verified_at)                       AS verified_at
+                   FROM scoped
+                  GROUP BY 1, 2
+             ),
              -- Minimal projection for the ledger join: deliberately carries no
              -- bare item_name/warehouse, so _build_txn_filters' unqualified
              -- column names cannot become ambiguous against it.
@@ -483,10 +494,18 @@ async def fetch_latest_stock(
                      c.oldest_counted_date                            AS oldest_counted_date,
                      -- NULL for a ledger-only article: "never counted" is not
                      -- the same as "counted zero days ago".
-                     (%(refday)s - c.last_counted_date)::int           AS days_since_count
+                     (%(refday)s - c.last_counted_date)::int           AS days_since_count,
+                     -- FALSE, not NULL, for a ledger-only article: it has rows
+                     -- nobody has signed, which is "not verified", not "unknown".
+                     COALESCE(v.verified, FALSE)                      AS verified,
+                     v.verified_by                                    AS verified_by,
+                     v.verified_at                                    AS verified_at
                    FROM counted c
                    FULL OUTER JOIN txn t
                      ON c.k_item = t.k_item AND c.k_stock = t.k_stock
+                   LEFT JOIN verif v
+                     ON v.k_item  = COALESCE(c.k_item, t.k_item)
+                    AND v.k_stock = COALESCE(c.k_stock, t.k_stock)
              )
     """ % {"where": where, "daycap": date_clause, "txnwhere": txn_where,
            "entries": ENTRIES_TABLE, "entry_day": ENTRY_DAY, "refday": ref_day}
@@ -518,7 +537,8 @@ async def fetch_latest_stock(
                total_quantity, total_weight,
                counted_weight, net_adjustment_kg, net_adjustment_units,
                entry_count, txn_count, warehouse_count, floor_count,
-               last_counted_date, days_since_count, k_stock
+               last_counted_date, days_since_count, k_stock,
+               verified, verified_by, verified_at
           FROM merged
         """ + order_by_sql + """
         LIMIT $%d OFFSET $%d
@@ -555,6 +575,13 @@ async def fetch_latest_stock(
                                       if r["last_counted_date"] else None),
                 "days_since_count": (int(r["days_since_count"])
                                      if r["days_since_count"] is not None else None),
+                # Sign-off for the whole line. Without this the row renders
+                # identically before and after a verify, which makes a working
+                # button look broken.
+                "verified": bool(r["verified"]),
+                "verified_by": r["verified_by"],
+                "verified_at": (r["verified_at"].isoformat()
+                                if r["verified_at"] else None),
             }
             for r in rows
         ],

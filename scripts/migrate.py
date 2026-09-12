@@ -480,6 +480,12 @@ SQL_FILES = [
     # 107 declares W202 "Store" and renames the 301 rows already on STORE.
     # Idempotent: it matches the raw name, which no longer exists once applied.
     DB_DIR / "107_w202_store_floor.sql",
+    # 108 adds the `verify` action and the stock_take_verification role that
+    # holds it. Must run BEFORE the backend deploys: the sign-off endpoint is
+    # gated on it, and check_permission denies when no catalog row exists at
+    # any level. No schema change -- new_stock_entries already carries
+    # verified / verified_by / verified_at, which is where a sign-off lives.
+    DB_DIR / "108_stock_take_verification_role.sql",
 ]
 
 # ── Optional: drop the v1 legacy job-card stack (TEST / Supabase DB ONLY) ──────

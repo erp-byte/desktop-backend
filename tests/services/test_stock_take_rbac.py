@@ -25,6 +25,9 @@ EXPECTED = {
     "/api/v1/stock-take/scope":               {"GET": "view"},
     "/api/v1/stock-take/transactions":        {"GET": "view", "POST": "create"},
     "/api/v1/stock-take/transactions/export": {"GET": "export"},
+    # Sign-off. A separate action ON PURPOSE: the stock_take role holds create
+    # but NOT verify, so nobody can both post an adjustment and approve it.
+    "/api/v1/stock-take/adjustments/verify": {"POST": "verify"},
     "/api/v1/stock-take/balance":             {"GET": "view"},
     "/api/v1/stock-take/entries/export":      {"GET": "export"},
 }
@@ -81,9 +84,29 @@ def test_route_requires_the_stock_take_permission(route):
 
 
 def test_reads_and_writes_are_not_the_same_permission():
-    """Posting an adjustment must not be reachable with read-only access."""
+    """Posting, exporting and signing off are each reachable on their own."""
     actions = {a for r in ROUTES if (p := _permission_of(r)) for a in (p[1],)}
-    assert actions == {"view", "create", "export"}, actions
+    assert actions == {"view", "create", "export", "verify"}, actions
+
+
+def test_posting_and_verifying_are_different_actions():
+    """The separation this whole feature exists for.
+
+    If verify collapsed into create, the role that posts an adjustment would also
+    approve it, and the sign-off would certify nothing.
+    """
+    post = _permission_of(_by_path("/api/v1/stock-take/transactions", "POST"))
+    ver = _permission_of(_by_path("/api/v1/stock-take/adjustments/verify", "POST"))
+    assert post == ("stock_take", "create")
+    assert ver == ("stock_take", "verify")
+    assert post[1] != ver[1]
+
+
+def _by_path(path: str, method: str) -> APIRoute:
+    for r in ROUTES:
+        if r.path == path and method in r.methods:
+            return r
+    raise AssertionError("no %s %s" % (method, path))
 
 
 def test_no_route_still_uses_bare_authentication():

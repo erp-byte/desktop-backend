@@ -384,6 +384,83 @@ async def list_transactions(
             raise _bad_filter(exc) from exc
 
 
+class VerifyBody(BaseModel):
+    """Either an explicit set of adjustment rows, or a day (plus optional place).
+
+    Both shapes exist because both are real: a reviewer working down the screen
+    signs off one article at a time, and the end-of-day flow signs off everything
+    at once. Sending neither means "today, everywhere I am scoped to", which is
+    the common case and the one worth being the default.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    entry_ids: Optional[list[int]] = Field(default=None, alias="entryIds")
+    day: Optional[str] = Field(default=None, description="IST day, YYYY-MM-DD")
+    warehouse: Optional[str] = None
+    location: Optional[str] = Field(default=None, alias="floorName")
+    item_name: Optional[str] = Field(default=None, alias="itemName")
+    stock_type: Optional[str] = Field(default=None, alias="stockType")
+
+
+@router.post("/adjustments/verify")
+async def verify_stock_lines(
+    request: Request,
+    body: VerifyBody = Body(default_factory=VerifyBody),
+    user: AuthUser = Depends(require_permission("stock_take", action="verify")),
+) -> dict[str, Any]:
+    """Sign off stock lines: mark their new_stock_entries rows verified.
+
+    Gated on `verify`, which the stock_take role deliberately does NOT hold --
+    the point of a sign-off is that someone other than the person who posted the
+    adjustment gives it. See app/db/108_stock_take_verification_role.sql.
+
+    The verification is recorded on the ADJUSTMENT row in new_stock_entries.
+    stocktake_transactions is append-only, so it could never carry a mutable
+    flag; a transaction's state is read back from the row it rolls into, joined
+    on the key uq_nse_adjustment_day already enforces. One sign-off therefore
+    covers every posting made against that article and place on that day.
+
+    Adjusting the same article again clears the sign-off — write_back_entry's
+    upsert resets verified/verified_by/verified_at, so a figure that moved after
+    being checked goes back to needing a check with nothing to remember.
+    """
+    day = None
+    if body.day:
+        day = latest_stock_service.normalise_date(body.day)
+        if day is None:
+            raise HTTPException(400, detail={
+                "error": "invalid_day",
+                "message": f"Invalid day {body.day!r}; expected YYYY-MM-DD",
+                "details": {"day": body.day}})
+
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        # Scope-check the place the caller is signing off, so a verifier cannot
+        # sign for a warehouse they are not assigned to.
+        places = await latest_stock_service.fetch_places(conn)
+        whs, _ = _read_scope(user, places)
+        if body.warehouse:
+            if transactions_service._normalise_warehouse(body.warehouse) not in whs:
+                raise HTTPException(403, detail={
+                    "error": "warehouse_not_allowed",
+                    "message": f"You are not assigned to warehouse {body.warehouse!r}.",
+                    "details": {"allowed_warehouses": whs}})
+
+        async with conn.transaction():
+            result = await transactions_service.verify_entries(
+                conn,
+                actor=_actor(user),
+                day=day,
+                warehouse=body.warehouse,
+                location=body.location,
+                item_name=body.item_name,
+                stock_type=body.stock_type,
+                entry_ids=body.entry_ids,
+            )
+    return result
+
+
 @router.get("/transactions/export")
 async def export_transactions(
     request: Request,

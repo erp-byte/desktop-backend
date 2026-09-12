@@ -19,12 +19,13 @@ the operator picked from the catalogue, purely as audit trail.
 from __future__ import annotations
 
 import logging
+from datetime import date
 from typing import Any, Optional, Sequence
 
 import asyncpg
 
 from .. import floors as _floors
-from .business_day import ENTRIES_TABLE, ENTRY_DAY, TXN_DAY
+from .business_day import BUSINESS_TZ, ENTRIES_TABLE, ENTRY_DAY, TXN_DAY
 
 log = logging.getLogger(__name__)
 
@@ -465,6 +466,11 @@ def _shape(rows) -> list[dict[str, Any]]:
     out = []
     for r in rows:
         d = dict(r)
+        # The IST calendar day, kept next to the raw instant. created_at is
+        # timestamptz, so its .isoformat() is UTC and slicing [:10] off it would
+        # put an adjustment posted after 18:30 IST on the previous day -- which
+        # is exactly the key used to find its adjustment row.
+        d["business_day"] = TXN_DAY_OF(d["created_at"])
         d["created_at"] = d["created_at"].isoformat()
         for k in ("units", "qty_kg"):
             d[k] = float(d[k]) if d[k] is not None else None
@@ -516,15 +522,16 @@ async def write_back_entry(
              created_at, updated_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8, $9, 'Console adjustment',
                 $10, 'submitted', 'ADJUSTMENT',
-                -- Pre-verified ON PURPOSE. The floor app's getFloorSummaries
-                -- (Stock_Take/backend_st/routes/items.ts:1174-1190) reports
-                -- COUNT(*) FILTER (WHERE COALESCE(verified,false)=false) as a
-                -- manager's "unverified" queue. A console adjustment is
-                -- authorised at the point it is posted — it carries a mandatory
-                -- reason and a named actor — so leaving it unverified would put
-                -- work in that queue that no floor manager can meaningfully
-                -- verify, and would grow every time anyone adjusts stock.
-                TRUE, $9, now(), TRUE,
+                -- UNVERIFIED. This used to insert TRUE with the poster's own
+                -- name, because the console then wrote stocktake_entries and an
+                -- unverified row there landed in the floor managers' queue
+                -- (Stock_Take/backend_st/routes/items.ts getFloorSummaries counts
+                -- COUNT(*) FILTER (WHERE COALESCE(verified,false)=false)). The
+                -- console now writes new_stock_entries, which that app never
+                -- reads, so the reason is gone -- and a poster stamping their own
+                -- name was never a verification. A separate `verify` action signs
+                -- the day off; see 108_stock_take_verification_role.sql.
+                FALSE, NULL, NULL, TRUE,
                 now(), now())
         ON CONFLICT (((created_at AT TIME ZONE 'Asia/Kolkata')::date),
                      UPPER(BTRIM(item_name)),
@@ -534,7 +541,15 @@ async def write_back_entry(
         DO UPDATE SET
             total_quantity = {ENTRIES_TABLE}.total_quantity + EXCLUDED.total_quantity,
             total_weight   = {ENTRIES_TABLE}.total_weight   + EXCLUDED.total_weight,
-            updated_at     = now()
+            updated_at     = now(),
+            -- "If anything changes, it needs verifying again." The day's figure
+            -- just moved, so a sign-off given against the OLD figure no longer
+            -- describes this row. Clearing all three here is what makes that
+            -- automatic: there is no separate invalidation path to forget,
+            -- because every further adjustment comes through this same upsert.
+            verified       = FALSE,
+            verified_by    = NULL,
+            verified_at    = NULL
         RETURNING id, total_quantity, total_weight,
                   (xmax = 0) AS created_new
         """,
@@ -548,6 +563,179 @@ async def write_back_entry(
         "day_total_quantity": float(row["total_quantity"] or 0),
         "day_total_weight": float(row["total_weight"] or 0),
     }
+
+
+async def _attach_verification(conn: asyncpg.Connection, rows: list[dict[str, Any]]) -> None:
+    """Stamp each ledger row with the sign-off of the adjustment it rolls into.
+
+    stocktake_transactions is append-only -- trg_stk_txn_no_update raises on any
+    UPDATE -- so verification cannot be a column on it. It lives on the
+    ADJUSTMENT row in new_stock_entries, and the two are joined on the key
+    uq_nse_adjustment_day already enforces:
+
+        (IST day, UPPER(BTRIM(item_name)), warehouse, floor_name, stock_type)
+
+    So one sign-off covers every posting made against that article and place that
+    day, which is what "the day's adjustments were verified" means. Two postings
+    for the same article on the same floor share a verification BY CONSTRUCTION,
+    rather than by anything here remembering to keep them in step.
+
+    A second query rather than a join on the main SELECT, matching
+    _attach_reverses_code: the ledger read stays a plain scan of its own table,
+    and this touches only the handful of days actually on the page.
+    """
+    if not rows:
+        return
+
+    days = sorted({r["business_day"] for r in rows if r.get("business_day")})
+    if not days:
+        return
+
+    found = await conn.fetch(
+        f"""
+        SELECT {ENTRY_DAY}                                    AS k_day,
+               UPPER(BTRIM(item_name))                        AS k_item,
+               UPPER(BTRIM(COALESCE(warehouse, '')))          AS k_wh,
+               UPPER(BTRIM(COALESCE(floor_name, '')))         AS k_fl,
+               COALESCE(stock_type, 'Fresh Stock')            AS k_stock,
+               COALESCE(verified, FALSE)                      AS verified,
+               verified_by, verified_at
+          FROM {ENTRIES_TABLE}
+         WHERE source_kind = 'ADJUSTMENT'
+           AND {ENTRY_DAY} = ANY($1::date[])
+        """,
+        [__import__("datetime").date.fromisoformat(d) for d in days],
+    )
+    by_key = {
+        (str(r["k_day"]), r["k_item"], r["k_wh"], r["k_fl"], r["k_stock"]): r
+        for r in found
+    }
+
+    for row in rows:
+        key = (
+            row.get("business_day") or "",
+            _norm(row.get("item_name")),
+            _normalise_warehouse(row.get("warehouse")),
+            _norm(row.get("location")),
+            row.get("stock_type") or "Fresh Stock",
+        )
+        hit = by_key.get(key)
+        row["verified"] = bool(hit["verified"]) if hit else False
+        row["verified_by"] = hit["verified_by"] if hit else None
+        row["verified_at"] = (
+            hit["verified_at"].isoformat() if hit and hit["verified_at"] else None
+        )
+
+
+async def verify_entries(
+    conn: asyncpg.Connection,
+    *,
+    actor: str,
+    day: Optional[date] = None,
+    warehouse: Optional[str] = None,
+    location: Optional[str] = None,
+    item_name: Optional[str] = None,
+    stock_type: Optional[str] = None,
+    entry_ids: Optional[Sequence[int]] = None,
+) -> dict[str, Any]:
+    """Sign off stock lines in new_stock_entries. Returns what was signed.
+
+    COVERS COUNTS AS WELL AS ADJUSTMENTS. A line on the adjust screen is a stock
+    position, and most positions have no adjustment at all -- restricting this to
+    source_kind='ADJUSTMENT' would have left the majority of rows with nothing a
+    reviewer could sign. What is being confirmed is the figure on the line.
+
+    Verification lives here rather than on the ledger because
+    stocktake_transactions is append-only and could not carry a mutable flag. A
+    transaction reads its state back from the adjustment row it rolls into, on
+    the key uq_nse_adjustment_day enforces, so one sign-off still covers every
+    posting against that article and place on that day.
+
+    WHEN `day` BINDS. Naming an article means "this line, however far back it
+    goes", so the day filter is dropped -- a line's counted figure can be weeks
+    old, and the screen says so ("Stock here as of 25 Aug 2026"). With NO article
+    named it defaults to today, because an unbounded bulk sign-off across every
+    article and every day is not something a button should do by accident.
+
+    ONLY UNVERIFIED ROWS ARE TOUCHED. Re-running is therefore a no-op rather
+    than a re-stamp with a new name and time, so a second click cannot quietly
+    rewrite who signed a figure off.
+
+    Nothing here reverses: to withdraw a sign-off, adjust the stock, which the
+    upsert already un-verifies.
+    """
+    conds = ["COALESCE(verified, FALSE) = FALSE"]
+    params: list[Any] = [actor]
+
+    if entry_ids:
+        params.append(list(entry_ids))
+        conds.append(f"id = ANY(${len(params)}::bigint[])")
+    else:
+        if day is not None:
+            params.append(day)
+            conds.append(f"{ENTRY_DAY} = ${len(params)}::date")
+        elif not item_name:
+            # No article and no day: fall back to TODAY in IST, not the server's
+            # date. An adjustment posted at 01:00 IST belongs to the day the
+            # operator is working, and this is the end-of-day button. An article
+            # WAS named, so the line is signed however far back it goes.
+            conds.append(f"{ENTRY_DAY} = (now() AT TIME ZONE 'Asia/Kolkata')::date")
+        if warehouse:
+            params.append(_normalise_warehouse(warehouse))
+            conds.append(f"UPPER(BTRIM(COALESCE(warehouse, ''))) = ${len(params)}")
+        if location:
+            params.append(_norm(location))
+            conds.append(f"UPPER(BTRIM(COALESCE(floor_name, ''))) = ${len(params)}")
+        # Narrowing to one article lets a reviewer sign off a single line on the
+        # adjust screen. Matched on the same UPPER(BTRIM(...)) identity the rest
+        # of the module uses, because item_name is free text with no FK.
+        if item_name:
+            params.append(_norm(item_name))
+            conds.append(f"UPPER(BTRIM(item_name)) = ${len(params)}")
+        if stock_type:
+            params.append(stock_type)
+            conds.append(f"COALESCE(stock_type, 'Fresh Stock') = ${len(params)}")
+
+    rows = await conn.fetch(
+        f"""
+        UPDATE {ENTRIES_TABLE}
+           SET verified = TRUE, verified_by = $1, verified_at = now()
+         WHERE {' AND '.join(conds)}
+        RETURNING id, item_name, warehouse, floor_name, stock_type,
+                  total_quantity, total_weight, verified_by, verified_at,
+                  {ENTRY_DAY} AS day
+        """,
+        *params,
+    )
+    return {
+        "verified_count": len(rows),
+        "verified_by": actor,
+        "rows": [
+            {
+                "entry_id": r["id"],
+                "item_name": r["item_name"],
+                "warehouse": r["warehouse"],
+                "floor_name": r["floor_name"],
+                "stock_type": r["stock_type"],
+                "total_weight": float(r["total_weight"] or 0),
+                "verified_by": r["verified_by"],
+                "verified_at": r["verified_at"],
+                "day": r["day"],
+            }
+            for r in rows
+        ],
+    }
+
+
+def TXN_DAY_OF(ts) -> str:
+    """The Asia/Kolkata calendar day of a timestamptz, as YYYY-MM-DD.
+
+    The Python counterpart of business_day.TXN_DAY. Both exist because the day
+    is needed on both sides of the same question -- SQL filters on it, and the
+    verification join keys on it -- and they must agree.
+    """
+    from zoneinfo import ZoneInfo
+    return ts.astimezone(ZoneInfo(BUSINESS_TZ)).date().isoformat()
 
 
 async def _attach_reverses_code(conn: asyncpg.Connection, rows: list[dict[str, Any]]) -> None:
@@ -583,6 +771,7 @@ async def list_transactions(
     )
     shaped = _shape(rows)
     await _attach_reverses_code(conn, shaped)
+    await _attach_verification(conn, shaped)
     return {
         "transactions": shaped,
         "pagination": {
@@ -608,4 +797,8 @@ async def export_transactions(conn: asyncpg.Connection, **filters: Any) -> tuple
     )
     shaped = _shape(rows)
     await _attach_reverses_code(conn, shaped)
+    # The spreadsheet carries the sign-off too: an export that showed the
+    # postings but not whether anyone had checked them is the half that gets
+    # forwarded and acted on.
+    await _attach_verification(conn, shaped)
     return shaped, applied
