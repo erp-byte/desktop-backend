@@ -104,3 +104,51 @@ def test_a_warehouse_absent_from_the_data_still_appears_with_no_floors():
     whs, by_wh = R._read_scope(FakeUser(["A68"], []), PLACES)
     assert whs == ["A68"]
     assert by_wh["A68"] == []
+
+
+# ── The response model must accept what the endpoint actually returns ──
+#
+# /filter-options shipped broken for exactly this reason: it returned the nested
+# floors_by_warehouse map while still annotated `-> dict[str, list[str]]`.
+# FastAPI derives a response MODEL from that annotation and validates against it,
+# so every call 500'd. The browser treats a failed filter-options as non-fatal —
+# the dropdowns just stay empty — so nothing surfaced except four empty controls.
+
+from fastapi.routing import APIRoute  # noqa: E402
+
+from app.modules.stock_take.router import router as st_router  # noqa: E402
+
+
+def _route(suffix: str) -> APIRoute:
+    for r in st_router.routes:
+        if isinstance(r, APIRoute) and r.path.endswith(suffix):
+            return r
+    raise AssertionError("no route ending %r" % suffix)
+
+
+def test_filter_options_response_model_accepts_the_nested_floor_map():
+    payload = {
+        "warehouses": ["A185", "W202"],
+        "floors": ["First Floor", "Mezzanine"],
+        "item_types": ["RM", "FG"],
+        "stock_types": ["Fresh Stock"],
+        "floors_by_warehouse": {"W202": ["First Floor"], "A185": ["Mezzanine"]},
+    }
+    _, errors = _route("/filter-options").response_field.validate(
+        payload, {}, loc=("response",))
+    assert not errors, errors
+
+
+def test_scope_response_model_accepts_its_nested_floor_map():
+    """Same shape, same trap — /scope grew floors_by_warehouse at the same time."""
+    payload = {
+        "warehouses": ["W202"],
+        "floors": ["First Floor"],
+        "floors_by_warehouse": {"W202": ["First Floor"]},
+        "warehouses_unrestricted": False,
+        "floors_unrestricted": True,
+        "can_post": True,
+        "blocked_reason": None,
+    }
+    _, errors = _route("/scope").response_field.validate(payload, {}, loc=("response",))
+    assert not errors, errors

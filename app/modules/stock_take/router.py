@@ -190,7 +190,12 @@ async def latest_stock(
 async def filter_options(
     request: Request,
     user: AuthUser = Depends(require_permission("stock_take", action="view")),
-) -> dict[str, list[str]]:
+    # dict[str, Any], NOT dict[str, list[str]]: FastAPI turns the return
+    # annotation into a response model and VALIDATES against it, so the nested
+    # floors_by_warehouse map made every call fail with 500 -- and the browser
+    # swallows a failed filter-options, so the only symptom was four empty
+    # dropdowns with nothing in the console.
+) -> dict[str, Any]:
     """Distinct warehouses / floors / item types / stock types the caller may see.
 
     The place dimensions are scoped to the caller's profile; item type and stock
