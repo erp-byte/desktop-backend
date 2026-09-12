@@ -117,6 +117,43 @@ async def latest_stock(
     """
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
+        places = await latest_stock_service.fetch_places(conn)
+        whs, by_wh = _read_scope(user, places)
+
+        # A filter the caller may not use is refused, never silently widened:
+        # dropping an out-of-scope value would leave NO warehouse predicate,
+        # which reads as "everything" -- the opposite of what was asked for.
+        if warehouse:
+            bad = [w for w in warehouse
+                   if transactions_service._normalise_warehouse(w) not in whs]
+            if bad:
+                raise HTTPException(403, detail={
+                    "error": "warehouse_not_allowed",
+                    "message": f"You are not assigned to warehouse {bad[0]!r}.",
+                    "details": {"requested": bad, "allowed_warehouses": whs}})
+        else:
+            # "all" means all of YOURS. Only applied when the profile actually
+            # restricts; an unrestricted caller keeps an unfiltered query rather
+            # than one pinned to whatever happens to be in the table today.
+            if [w for w in (user.allowed_warehouses or []) if str(w).strip()]:
+                warehouse = list(whs)
+
+        # Floors are clamped ONLY when the caller holds floor grants. Defaulting
+        # an ungranted caller to the scoped floor list would hide every row on a
+        # floor the profile never declared -- 301 W202 rows sit on STORE -- and
+        # "I can see the warehouse" has to mean all of it.
+        if [f for f in (user.allowed_floors or []) if str(f).strip()]:
+            allowed_f = {f.strip().upper() for fl in by_wh.values() for f in fl}
+            if floor_name:
+                bad_f = [f for f in floor_name if f.strip().upper() not in allowed_f]
+                if bad_f:
+                    raise HTTPException(403, detail={
+                        "error": "floor_not_allowed",
+                        "message": f"You are not assigned to floor {bad_f[0]!r}.",
+                        "details": {"requested": bad_f, "allowed_floors": sorted(allowed_f)}})
+            else:
+                floor_name = sorted(allowed_f)
+
         try:
             return await latest_stock_service.fetch_latest_stock(
                 conn,
@@ -154,10 +191,30 @@ async def filter_options(
     request: Request,
     user: AuthUser = Depends(require_permission("stock_take", action="view")),
 ) -> dict[str, list[str]]:
-    """Distinct warehouses / floors / item types / stock types, from live data."""
+    """Distinct warehouses / floors / item types / stock types the caller may see.
+
+    The place dimensions are scoped to the caller's profile; item type and stock
+    type are not, because neither is a scope the profile expresses.
+    """
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
-        return await latest_stock_service.fetch_filter_options(conn)
+        opts = await latest_stock_service.fetch_filter_options(conn)
+        places = await latest_stock_service.fetch_places(conn)
+
+    whs, by_wh = _read_scope(user, places)
+    floors: list[str] = []
+    for wh in whs:
+        for f in by_wh[wh]:
+            if f not in floors:
+                floors.append(f)
+    return {
+        **opts,
+        "warehouses": whs,
+        "floors": sorted(floors),
+        # So the browser can narrow Floor once a Warehouse is picked instead of
+        # listing another building's floors, same as the Adjust form.
+        "floors_by_warehouse": by_wh,
+    }
 
 
 async def _available(conn) -> tuple[list[str], list[str], dict[str, list[str]]]:
@@ -170,6 +227,32 @@ async def _available(conn) -> tuple[list[str], list[str], dict[str, list[str]]]:
     opts = await latest_stock_service.fetch_filter_options(conn)
     places = await latest_stock_service.fetch_places(conn)
     return opts.get("warehouses", []), opts.get("floors", []), places
+
+
+def _read_scope(user: AuthUser, places: dict[str, list[str]]) -> tuple[list[str], dict[str, list[str]]]:
+    """(warehouses, floors-per-warehouse) this caller may LOOK at.
+
+    Deliberately built from `places` -- the floors stock is actually recorded at
+    -- and not from the declared floor profile the posting form uses. A floor
+    nobody declared can still hold counted stock, and a read filter that cannot
+    name it makes that stock unreachable rather than merely unpostable.
+
+    Empty grants mean "no restriction", the same rule as everywhere else:
+    auth_schema.sql:35, and the admin screen renders an empty list as "All".
+    """
+    granted_w = [w for w in (user.allowed_warehouses or []) if str(w).strip()]
+    granted_f = [f for f in (user.allowed_floors or []) if str(f).strip()]
+
+    whs = (sorted({transactions_service._normalise_warehouse(w) for w in granted_w})
+           if granted_w else sorted(places))
+    keep = {str(f).strip().upper() for f in granted_f}
+    by_wh: dict[str, list[str]] = {}
+    for wh in whs:
+        floors = list(places.get(wh, []))
+        if keep:
+            floors = [f for f in floors if f.strip().upper() in keep]
+        by_wh[wh] = floors
+    return whs, by_wh
 
 
 @router.get("/scope")
