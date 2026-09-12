@@ -477,6 +477,9 @@ SQL_FILES = [
     # exist once applied.
     DB_DIR / "105_w202_floor_aliases.sql",
     DB_DIR / "106_a185_floor_aliases.sql",
+    # 107 declares W202 "Store" and renames the 301 rows already on STORE.
+    # Idempotent: it matches the raw name, which no longer exists once applied.
+    DB_DIR / "107_w202_store_floor.sql",
 ]
 
 # ── Optional: drop the v1 legacy job-card stack (TEST / Supabase DB ONLY) ──────

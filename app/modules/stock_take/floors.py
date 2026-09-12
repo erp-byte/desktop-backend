@@ -27,6 +27,7 @@ FLOORS_BY_WAREHOUSE: dict[str, list[str]] = {
     "W202": [
         "Lower Basement", "Upper Basement", "First Floor", "First Floor Mezz",
         "Second Floor", "Second Floor Mezz", "Terrace",
+        "Store",
     ],
     "A185": [
         "Roasting Area", "Mezzanine", "Sorting Area", "Printing Area",

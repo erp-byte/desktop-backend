@@ -66,7 +66,10 @@ def test_declared_floors_is_order_preserving_and_deduped():
     got = F.declared_floors(["W202", "A185", "W202"])
     assert got[:2] == ["Lower Basement", "Upper Basement"], "declaration order, not sorted"
     assert len(got) == len(set(got)), "a warehouse listed twice must not duplicate floors"
-    assert len(got) == 19
+    # Derived, not pinned: a magic total means every new floor edits this test,
+    # which trains you to change the number rather than read the assertion. The
+    # sum still fails loudly if two warehouses ever declare the same floor name.
+    assert len(got) == len(F.FLOORS_BY_WAREHOUSE["W202"]) + len(F.FLOORS_BY_WAREHOUSE["A185"])
 
 
 def test_hyphenated_warehouse_codes_resolve():

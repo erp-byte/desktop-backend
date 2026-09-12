@@ -71,6 +71,9 @@ INSERT INTO floor_alias (warehouse, raw, canon) VALUES
     -- merge carrying real weight on an inference rather than a spelling
     -- (256 rows, 29,879 kg); if chocolate is a separate area, drop this row.
     ('W202', 'CHOCOLATE FLOOR 2ND FLOOR', 'Second Floor'),
+    -- Declared 2026-09-12; see 107_w202_store_floor.sql. Keyed on the
+    -- warehouse, because A185's STORE is a different place (-> A185 Stores).
+    ('W202', 'STORE',                     'Store'),
 
     -- ── A185: the 9 declared floors ──────────────────────────────────
     ('A185', 'ROASTING AREA',             'Roasting Area'),

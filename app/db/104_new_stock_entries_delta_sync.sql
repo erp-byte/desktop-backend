@@ -49,6 +49,9 @@ INSERT INTO floor_alias (warehouse, raw, canon) VALUES
     ('W202', 'TOP FLOOR',                 'Terrace'),
     ('W202', 'CHOCOLATE 3RD FLOOR',       'Second Floor Mezz'),
     ('W202', 'CHOCOLATE FLOOR 2ND FLOOR', 'Second Floor'),
+    -- Declared 2026-09-12; see 107_w202_store_floor.sql. Keyed on the
+    -- warehouse, because A185's STORE is a different place (-> A185 Stores).
+    ('W202', 'STORE',                     'Store'),
     ('A185', 'ROASTING AREA',             'Roasting Area'),
     ('A185', 'MEZZANINE',                 'Mezzanine'),
     ('A185', 'MAZERNINE',                 'Mezzanine'),
