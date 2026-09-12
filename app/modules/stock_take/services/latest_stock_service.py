@@ -256,7 +256,8 @@ def _empty(page: int, page_size: int, applied: dict[str, Any], sort: dict[str, s
         "totals": {"items": 0, "entries": 0, "total_quantity": 0.0, "total_weight": 0.0,
                    "counted_weight": 0.0, "net_adjustment_kg": 0.0, "transactions": 0,
                    "oldest_counted_date": None, "newest_counted_date": None,
-                   "stale_items": 0, "never_counted_items": 0},
+                   "stale_items": 0, "never_counted_items": 0,
+                   "off_grade_weight": 0.0, "off_grade_items": 0},
         "pagination": {"page": page, "page_size": page_size, "total": 0, "total_pages": 0},
         "sort": sort,
         "filters": applied,
@@ -522,7 +523,15 @@ async def fetch_latest_stock(
                MIN(last_counted_date)                  AS oldest_counted_date,
                MAX(last_counted_date)                  AS newest_counted_date,
                COUNT(*) FILTER (WHERE days_since_count > 30)::bigint  AS stale_items,
-               COUNT(*) FILTER (WHERE last_counted_date IS NULL)::bigint AS never_counted_items
+               COUNT(*) FILTER (WHERE last_counted_date IS NULL)::bigint AS never_counted_items,
+               -- Off grade broken out of the same aggregate rather than queried
+               -- separately, so it can never disagree with total_weight. kg
+               -- throughout, so the module's "never sum quantities across uom
+               -- classes" rule does not bite here.
+               COALESCE(SUM(total_weight) FILTER (
+                   WHERE k_stock = 'Off Grade/Rejection'), 0)         AS off_grade_weight,
+               COUNT(*) FILTER (WHERE k_stock = 'Off Grade/Rejection')::bigint
+                                                                      AS off_grade_items
           FROM merged
         """,
         *all_params,
@@ -601,6 +610,11 @@ async def fetch_latest_stock(
             "newest_counted_date": (totals["newest_counted_date"].isoformat()
                                     if totals["newest_counted_date"] else None),
             "stale_items": int(totals["stale_items"] or 0),
+            # Off grade is a separate LINE for the same article (233 articles
+            # exist as both), so it is already inside total_weight. Surfacing it
+            # answers "how much of this is rejection stock" without a second read.
+            "off_grade_weight": float(totals["off_grade_weight"] or 0),
+            "off_grade_items": int(totals["off_grade_items"] or 0),
             "never_counted_items": int(totals["never_counted_items"] or 0),
         },
         "pagination": {

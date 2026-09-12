@@ -31,6 +31,14 @@ log = logging.getLogger(__name__)
 
 OPERATIONS = ("ADDITION", "SUBTRACTION")
 
+#: The only two values chk_nse_stock_type admits. Validated HERE, not left to
+#: that CHECK, because write_back_entry runs inside create_transaction's
+#: transaction: a mis-cased "off grade/rejection" would abort the ledger INSERT
+#: too, losing the posting entirely and reporting it as a 500. Stock type is half
+#: the article identity, so a near-miss is not a typo to shrug at -- it would
+#: silently open a third line for an article that is meant to have two.
+STOCK_TYPES = ("Fresh Stock", "Off Grade/Rejection")
+
 # Columns the caller is allowed to supply. An explicit allowlist rather than
 # splatting the pydantic model: a body field like created_by or warehouse must be
 # impossible to inject even if the model later stops forbidding extras.
@@ -329,6 +337,9 @@ async def create_transaction(
     if not item_name:
         raise ValueError("item_name is required")
     stock_type = (payload.get("stock_type") or "Fresh Stock").strip() or "Fresh Stock"
+    if stock_type not in STOCK_TYPES:
+        raise ValueError(
+            f"stock_type must be one of {STOCK_TYPES}, got {stock_type!r}")
 
     balance = await current_balance(
         conn, item_name=item_name, stock_type=stock_type, warehouse=warehouse, location=location)
