@@ -311,6 +311,44 @@ async def main():
             k2 = {(i["item_name"], i["stock_type"]) for i in rp2["items"]}
             check("consecutive pages do not repeat an item", not (k1 & k2), "overlap %s" % (k1 & k2))
 
+        # -- [6b] Adjusted-only --------------------------------------------
+        print("\n[6b] Adjusted-only")
+        full = await svc.fetch_latest_stock(conn, page_size=5000)
+        only = await svc.fetch_latest_stock(conn, adjusted_only=True, page_size=5000)
+        expect = [i for i in full["items"] if i["transaction_count"] > 0]
+        check("every surviving line carries an adjustment",
+              all(i["transaction_count"] > 0 for i in only["items"]),
+              "%d without" % len([i for i in only["items"] if i["transaction_count"] == 0]))
+        check("it keeps exactly the adjusted lines, no more and no fewer",
+              len(only["items"]) == len(expect),
+              "%d vs %d" % (len(only["items"]), len(expect)))
+        # The header is a second query over the same CTE. If the filter reached
+        # only one of them the screen would describe a different set than it
+        # shows -- and a count is the one thing on that line nobody re-checks.
+        check("the totals describe the filtered set, not the whole floor",
+              only["totals"]["items"] == len(only["items"]),
+              "%s vs %s" % (only["totals"]["items"], len(only["items"])))
+        check("counted weight shrinks with the row set",
+              only["totals"]["counted_weight"] <= full["totals"]["counted_weight"])
+        # Unadjusted lines contribute no movement, so the net is the same number
+        # seen against a smaller set -- which is the point of the view.
+        check("net adjustment is unchanged, because only adjusted lines carry it",
+              abs(only["totals"]["net_adjustment_kg"] - full["totals"]["net_adjustment_kg"]) < 0.01,
+              "%s vs %s" % (only["totals"]["net_adjustment_kg"], full["totals"]["net_adjustment_kg"]))
+        check("the filter is echoed back", only["filters"].get("adjustedOnly") is True,
+              str(only["filters"]))
+        check("and is absent when not asked for", "adjustedOnly" not in full["filters"],
+              str(full["filters"]))
+        # Composes with the other filters rather than replacing them.
+        if expect:
+            term = expect[0]["item_name"].strip()[:6]
+            combo = await svc.fetch_latest_stock(
+                conn, search=term, adjusted_only=True, page_size=5000)
+            check("it composes with search",
+                  all(i["transaction_count"] > 0 and term.upper() in i["item_name"].upper()
+                      for i in combo["items"]),
+                  "term %r -> %d rows" % (term, len(combo["items"])))
+
         # -- [7] Injection ----------------------------------------------------
         print("\n[7] Robustness")
         ri = await svc.fetch_latest_stock(conn, search="'; DROP TABLE new_stock_entries;--", page_size=5)

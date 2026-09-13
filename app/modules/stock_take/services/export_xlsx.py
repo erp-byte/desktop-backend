@@ -59,6 +59,7 @@ def _describe(filters: dict[str, Any]) -> str:
         return "No filters — every recorded transaction."
     parts = []
     for key, label in (("warehouse", "Warehouse"), ("location", "Floor"), ("itemName", "Article"),
+                       ("itemSearch", "Article contains"), ("stockType", "Stock type"),
                        ("operation", "Operation"), ("date", "Date"),
                        ("dateFrom", "From"), ("dateTo", "To")):
         if filters.get(key):

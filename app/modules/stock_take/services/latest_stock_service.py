@@ -272,6 +272,7 @@ async def fetch_latest_stock(
     page_size: int = 50,
     sort_by: str = DEFAULT_SORT,
     sort_order: str = "desc",
+    adjusted_only: bool = False,
     **filters: Any,
 ) -> dict[str, Any]:
     """Stock as counted on the most recent count date, plus that date.
@@ -283,6 +284,12 @@ async def fetch_latest_stock(
     Express app's own grouped view so both agree on what one item is.
     """
     conds, params, applied = _build_filters(**filters)
+    # Declared here rather than in _build_filters because it is not a predicate
+    # on a column: it asks whether the ledger half of the merge produced
+    # anything, which only exists once both halves are joined.
+    if adjusted_only:
+        applied["adjustedOnly"] = True
+    adj_only = "WHERE COALESCE(t.txn_count, 0) > 0" if adjusted_only else ""
 
     sort_key = sort_by if sort_by in SORT_COLUMNS else DEFAULT_SORT
     direction = "ASC" if str(sort_order).lower() == "asc" else "DESC"
@@ -507,8 +514,10 @@ async def fetch_latest_stock(
                    LEFT JOIN verif v
                      ON v.k_item  = COALESCE(c.k_item, t.k_item)
                     AND v.k_stock = COALESCE(c.k_stock, t.k_stock)
+                  %(adjonly)s
              )
     """ % {"where": where, "daycap": date_clause, "txnwhere": txn_where,
+           "adjonly": adj_only,
            "entries": ENTRIES_TABLE, "entry_day": ENTRY_DAY, "refday": ref_day}
 
     totals = await conn.fetchrow(

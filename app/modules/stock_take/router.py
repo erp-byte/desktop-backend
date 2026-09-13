@@ -102,6 +102,8 @@ async def latest_stock(
     entered_by: Optional[str] = Query(None, alias="enteredBy", description="Counter name, substring match"),
     search: Optional[str] = Query(None, description="Free text across item, group, warehouse, floor, counter"),
     verified: Optional[bool] = Query(None, description="Filter on the manager verification flag"),
+    adjusted_only: bool = Query(False, alias="adjustedOnly",
+                                description="Only lines with at least one adjustment posted"),
     include_drafts: bool = Query(False, alias="includeDrafts", description="Include unsubmitted draft rows"),
     as_of: Optional[str] = Query(None, alias="asOf", description="Latest count on or before this YYYY-MM-DD"),
     page: int = Query(1, ge=1),
@@ -166,6 +168,7 @@ async def latest_stock(
                 entered_by=entered_by,
                 search=search,
                 verified=verified,
+                adjusted_only=adjusted_only,
                 include_drafts=include_drafts,
                 as_of=as_of,
                 page=page,
@@ -346,7 +349,14 @@ async def create_transaction(
 _LEDGER_QUERY = {
     "warehouse": Query(None, description="Warehouse code; W-202 and W202 both match"),
     "location": Query(None, description="Floor, as granted"),
+    # Exact vs substring, deliberately separate parameters — see _ledger_filters.
+    # itemName identifies ONE article (the adjust screen's row breakdown depends
+    # on it); itemSearch is the screen's Article box.
     "item_name": Query(None, alias="itemName", description="Exact article name"),
+    "item_search": Query(None, alias="itemSearch",
+                         description="Article name contains (case-insensitive)"),
+    "stock_type": Query(None, alias="stockType",
+                        description="Fresh Stock or Off Grade/Rejection"),
     "operation": Query(None, description="ADDITION or SUBTRACTION"),
     "on_date": Query(None, alias="date", description="Exact day, YYYY-MM-DD; overrides the range"),
     "date_from": Query(None, alias="dateFrom", description="Range start, YYYY-MM-DD (inclusive)"),
@@ -364,6 +374,8 @@ async def list_transactions(
     warehouse: Optional[str] = _LEDGER_QUERY["warehouse"],
     location: Optional[str] = _LEDGER_QUERY["location"],
     item_name: Optional[str] = _LEDGER_QUERY["item_name"],
+    item_search: Optional[str] = _LEDGER_QUERY["item_search"],
+    stock_type: Optional[str] = _LEDGER_QUERY["stock_type"],
     operation: Optional[str] = _LEDGER_QUERY["operation"],
     on_date: Optional[str] = _LEDGER_QUERY["on_date"],
     date_from: Optional[str] = _LEDGER_QUERY["date_from"],
@@ -379,6 +391,7 @@ async def list_transactions(
             return await transactions_service.list_transactions(
                 conn, page=page, page_size=page_size,
                 warehouse=warehouse, location=location, item_name=item_name,
+                item_search=item_search, stock_type=stock_type,
                 operation=operation, on_date=on_date, date_from=date_from, date_to=date_to)
         except ValueError as exc:
             raise _bad_filter(exc) from exc
@@ -467,6 +480,8 @@ async def export_transactions(
     warehouse: Optional[str] = _LEDGER_QUERY["warehouse"],
     location: Optional[str] = _LEDGER_QUERY["location"],
     item_name: Optional[str] = _LEDGER_QUERY["item_name"],
+    item_search: Optional[str] = _LEDGER_QUERY["item_search"],
+    stock_type: Optional[str] = _LEDGER_QUERY["stock_type"],
     operation: Optional[str] = _LEDGER_QUERY["operation"],
     on_date: Optional[str] = _LEDGER_QUERY["on_date"],
     date_from: Optional[str] = _LEDGER_QUERY["date_from"],
@@ -485,6 +500,7 @@ async def export_transactions(
         try:
             rows, applied = await transactions_service.export_transactions(
                 conn, warehouse=warehouse, location=location, item_name=item_name,
+                item_search=item_search, stock_type=stock_type,
                 operation=operation, on_date=on_date, date_from=date_from, date_to=date_to)
         except ValueError as exc:
             raise _bad_filter(exc) from exc

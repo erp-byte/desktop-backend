@@ -417,7 +417,8 @@ async def create_transaction(
 
 def _ledger_filters(
     *, warehouse: Optional[str] = None, location: Optional[str] = None,
-    item_name: Optional[str] = None, on_date: Optional[str] = None,
+    item_name: Optional[str] = None, item_search: Optional[str] = None,
+    stock_type: Optional[str] = None, on_date: Optional[str] = None,
     date_from: Optional[str] = None, date_to: Optional[str] = None,
     operation: Optional[str] = None,
 ) -> tuple[str, list[Any], dict[str, Any]]:
@@ -426,6 +427,16 @@ def _ledger_filters(
     One builder on purpose: an export that filtered differently from the screen
     it was launched from would quietly hand someone a spreadsheet that does not
     match what they were looking at.
+
+    TWO ARTICLE FILTERS, AND THEY ARE NOT INTERCHANGEABLE. `item_name` is an
+    exact match because it means identity: the adjust screen expands one row and
+    asks this for the postings behind that row's number. `item_search` is the
+    substring the ledger screen's Article box sends. Collapsing them into one
+    loose match would be a silent wrong answer rather than a missing feature --
+    nine article pairs in this ledger have one name contained in another, so
+    "ZAHIDI DATES" as a substring pulls in PL ZAHIDI DATES 500G, ZAHIDI DATES 1KG
+    and ZAHIDI DATES ROASTED & CUT, and the row breakdown would report their
+    movements as its own.
 
     Dates are compared on the IST calendar day (business_day.TXN_DAY), NOT on the
     server's UTC day: a filter for "the 5th" must return what an operator posted
@@ -449,6 +460,20 @@ def _ledger_filters(
         add("UPPER(BTRIM(location)) = ${n}", _norm(location), "location", location)
     if item_name:
         add("UPPER(BTRIM(item_name)) = ${n}", _norm(item_name), "itemName", item_name)
+    if item_search:
+        # Wildcards are escaped, so someone searching for "50%" gets the literal
+        # string rather than every row. Same helper the counting screen uses, so
+        # the two search boxes behave identically.
+        from .latest_stock_service import _like
+        add("UPPER(item_name) LIKE ${n} ESCAPE '\\'", _like(str(item_search)),
+            "itemSearch", item_search)
+    if stock_type:
+        if stock_type not in STOCK_TYPES:
+            raise ValueError(f"stock_type must be one of {STOCK_TYPES}, got {stock_type!r}")
+        # COALESCE because the column is nullable and a null has always meant
+        # Fresh Stock everywhere else in this module; without it, filtering for
+        # Fresh Stock would quietly drop the rows that predate the column.
+        add("COALESCE(stock_type, 'Fresh Stock') = ${n}", stock_type, "stockType", stock_type)
     if operation:
         op = str(operation).upper()
         if op not in OPERATIONS:

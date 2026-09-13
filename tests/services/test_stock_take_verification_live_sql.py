@@ -73,10 +73,26 @@ async def main():
                   s["verified_by"] is None and s["verified_at"] is None, str(s))
 
             print("\n[2] Signing off stamps the VERIFIER, not the poster")
+            # The end-of-day button signs every unsigned line at the place, not
+            # just this test's row -- on a working day the floor carries the
+            # operators' counts too. Read the expectation with the same predicate
+            # verify_entries uses, so a busy floor does not read as a failure.
+            pending = await conn.fetchval(
+                """SELECT COUNT(*) FROM new_stock_entries
+                    WHERE COALESCE(verified, FALSE) = FALSE
+                      AND (created_at AT TIME ZONE 'Asia/Kolkata')::date
+                          = (now() AT TIME ZONE 'Asia/Kolkata')::date
+                      AND UPPER(BTRIM(COALESCE(warehouse, ''))) = $1
+                      AND UPPER(BTRIM(COALESCE(floor_name, ''))) = $2""",
+                WH.upper(), FLOOR.upper())
             res = await svc.verify_entries(
                 conn, actor=VERIFIER, warehouse=WH, location=FLOOR)
             s = await entry_state(conn, e1["entry_id"])
-            check("one row signed", res["verified_count"] == 1, str(res["verified_count"]))
+            check("every unsigned line at the place is signed, and no more",
+                  res["verified_count"] == pending,
+                  "%s signed, %s were pending" % (res["verified_count"], pending))
+            check("this test's row is among them", res["verified_count"] >= 1,
+                  str(res["verified_count"]))
             check("verified is true", s["verified"] is True)
             check("signed by the verifier", s["verified_by"] == VERIFIER, str(s["verified_by"]))
             check("the poster is not the verifier", s["verified_by"] != POSTER)

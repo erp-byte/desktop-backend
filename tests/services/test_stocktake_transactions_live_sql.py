@@ -197,16 +197,28 @@ async def main():
     await tx.start()
     try:
         # ── Pick a real counted article at a real granted place ───────────────
+        # It must have NO ledger rows: the balance checks below assert the
+        # clean-slate case, and the posting check asserts the net equals exactly
+        # what this test posts. "Newest entry on the floor" stopped satisfying
+        # that once adjustments began -- a write-back IS the newest entry, so the
+        # article picked already carried its own movement.
         row = await conn.fetchrow(
-            """SELECT UPPER(BTRIM(item_name)) AS item, UPPER(BTRIM(warehouse)) AS wh,
-                      floor_name AS floor, COALESCE(stock_type,'Fresh Stock') AS st
-                 FROM new_stock_entries
-                WHERE (status IS NULL OR status != 'draft')
-                  AND UPPER(BTRIM(floor_name)) = 'UPPER BASEMENT'
-                  AND UPPER(BTRIM(warehouse)) = 'W202'
-                ORDER BY created_at DESC LIMIT 1""")
+            """SELECT UPPER(BTRIM(e.item_name)) AS item, UPPER(BTRIM(e.warehouse)) AS wh,
+                      e.floor_name AS floor, COALESCE(e.stock_type,'Fresh Stock') AS st
+                 FROM new_stock_entries e
+                WHERE (e.status IS NULL OR e.status != 'draft')
+                  AND UPPER(BTRIM(e.floor_name)) = 'UPPER BASEMENT'
+                  AND UPPER(BTRIM(e.warehouse)) = 'W202'
+                  AND NOT EXISTS (
+                        SELECT 1 FROM stocktake_transactions t
+                         WHERE UPPER(BTRIM(t.item_name)) = UPPER(BTRIM(e.item_name))
+                           AND COALESCE(t.stock_type,'Fresh Stock')
+                               = COALESCE(e.stock_type,'Fresh Stock')
+                           AND UPPER(BTRIM(t.warehouse)) = UPPER(BTRIM(e.warehouse))
+                           AND UPPER(BTRIM(t.location)) = UPPER(BTRIM(e.floor_name)))
+                ORDER BY e.created_at DESC LIMIT 1""")
         if row is None:
-            print("  SKIP  no counted stock on W202 / Upper Basement to net against")
+            print("  SKIP  no un-adjusted counted stock on W202 / Upper Basement to net against")
             return
 
         print("\n[2] Balance read")
@@ -495,6 +507,72 @@ async def main():
               all(r.get("txn_code") and len(r["txn_code"]) == 8 for r in lst["transactions"]))
         check("listed reversals resolve reverses_txn_code",
               all(r["reverses_txn_code"] for r in lst["transactions"] if r["reverses_txn_id"]))
+
+        print("\n[9b] Article search is not article identity")
+        # The screen's Article box sends itemSearch; the adjust screen's per-row
+        # breakdown sends itemName. They must stay different questions: article
+        # names are free text with no FK, and some contain others outright.
+        names = [r["item_name"] for r in await conn.fetch(
+            "SELECT DISTINCT item_name FROM stocktake_transactions")]
+        pair = next(((a, b) for a in names for b in names
+                     if a != b and a.upper().strip() in b.upper().strip()), None)
+        if pair is None:
+            check("no containing article pair in the ledger to test against", True,
+                  "(skipped -- data-dependent)")
+        else:
+            short, long_ = pair
+            exact = await svc.list_transactions(conn, item_name=short, page_size=500)
+            loose = await svc.list_transactions(conn, item_search=short, page_size=500)
+            ex_names = {r["item_name"].strip().upper() for r in exact["transactions"]}
+            lo_names = {r["item_name"].strip().upper() for r in loose["transactions"]}
+            check("exact match returns exactly one article", len(ex_names) <= 1, str(ex_names))
+            check("exact match is not the substring match",
+                  long_.strip().upper() in lo_names and long_.strip().upper() not in ex_names,
+                  "%r vs %r" % (short, long_))
+            check("every substring hit really contains the term",
+                  all(short.strip().upper() in nm for nm in lo_names), str(lo_names))
+            check("substring is a superset of exact", ex_names <= lo_names,
+                  "%s not within %s" % (ex_names, lo_names))
+
+        # A user searching for a literal "%" must not match every row.
+        every = await svc.list_transactions(conn, page_size=1)
+        pct = await svc.list_transactions(conn, item_search="%", page_size=1)
+        check("LIKE wildcards in the search term are escaped",
+              pct["pagination"]["total"] < every["pagination"]["total"],
+              "%s vs %s" % (pct["pagination"]["total"], every["pagination"]["total"]))
+
+        print("\n[9c] Stock type filter")
+        counts = {}
+        for st in svc.STOCK_TYPES:
+            counts[st] = (await svc.list_transactions(
+                conn, stock_type=st, page_size=1))["pagination"]["total"]
+        check("the two stock types partition the ledger exactly",
+              sum(counts.values()) == every["pagination"]["total"],
+              "%s vs %s" % (counts, every["pagination"]["total"]))
+        typed = await svc.list_transactions(
+            conn, stock_type="Off Grade/Rejection", page_size=500)
+        check("every returned row carries the requested stock type",
+              all(r["stock_type"] == "Off Grade/Rejection" for r in typed["transactions"]))
+        # Rejected, not silently ignored: stock type is half an article's
+        # identity, so a mis-cased value that fell through to "no filter" would
+        # answer a different question than the one asked.
+        bad = None
+        try:
+            await svc.list_transactions(conn, stock_type="off grade/rejection")
+        except ValueError as exc:
+            bad = exc
+        check("an unknown stock type is refused", bad is not None, "no raise")
+
+        print("\n[9d] The export filters identically to the screen")
+        # One builder feeds both; a spreadsheet that disagreed with the screen it
+        # was launched from is the failure this guards.
+        for f in ({"item_search": "A"}, {"stock_type": "Fresh Stock"},
+                  {"warehouse": "W202", "item_search": "A"}):
+            paged = await svc.list_transactions(conn, page_size=1, **f)
+            rows, _applied = await svc.export_transactions(conn, **f)
+            check("export row count matches the screen for %s" % f,
+                  len(rows) == paged["pagination"]["total"],
+                  "%d vs %d" % (len(rows), paged["pagination"]["total"]))
 
         print("")
         print("[10] Netting into the latest-stock view (authoritative)")
