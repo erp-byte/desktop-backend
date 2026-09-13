@@ -103,6 +103,14 @@ def _as_list(value: Any) -> list[str]:
     return []
 
 
+#: Keeps ADJUSTMENT rows out of the COUNTED side of the aggregate -- they reach
+#: the figure through the ledger, so counting them here too would double them.
+#: Named because `verif` needs the same scope WITHOUT it: a sign-off applies to
+#: the whole line, adjustment rows included. Carries no bind parameter, so
+#: removing it from a copy of the condition list cannot shift $n numbering.
+COUNT_ROWS_ONLY = "(source_kind IS NULL OR source_kind = 'COUNT')"
+
+
 def _build_filters(
     *,
     warehouse: Any = None,
@@ -148,7 +156,7 @@ def _build_filters(
     # The ledger stays the single source of adjustments for this view. The
     # entries row exists for the Stock Take app and for anything reading that
     # table directly.
-    conds.append("(source_kind IS NULL OR source_kind = 'COUNT')")
+    conds.append(COUNT_ROWS_ONLY)
 
     # Both sides are trimmed and upper-cased before comparison. The canonical
     # table no longer carries the trailing spaces the floor app writes
@@ -304,6 +312,9 @@ async def fetch_latest_stock(
                     " item_name ASC, k_stock ASC")
 
     where = f"WHERE {' AND '.join(conds)}" if conds else ""
+    # Same filters, but adjustment rows included -- see COUNT_ROWS_ONLY.
+    conds_all = [c for c in conds if c != COUNT_ROWS_ONLY]
+    where_all = f"WHERE {' AND '.join(conds_all)}" if conds_all else ""
 
     as_of_norm = normalise_date(as_of)
     if as_of and not as_of_norm:
@@ -317,6 +328,7 @@ async def fetch_latest_stock(
     # in January and again in July reports its JANUARY figure under asOf=June.
     date_params = list(params)
     date_clause = ""
+    date_clause_all = ""
     as_of_param = None
     # Staleness is measured against the day being VIEWED, so a back-dated page
     # does not report every row as months old against today.
@@ -325,6 +337,9 @@ async def fetch_latest_stock(
         date_params.append(as_of_norm)
         as_of_param = len(date_params)
         date_clause = f"AND {ENTRY_DAY} <= ${as_of_param}::date" if conds \
+            else f"WHERE {ENTRY_DAY} <= ${as_of_param}::date"
+        # Its own WHERE/AND: conds_all can be empty where conds is not.
+        date_clause_all = f"AND {ENTRY_DAY} <= ${as_of_param}::date" if conds_all \
             else f"WHERE {ENTRY_DAY} <= ${as_of_param}::date"
         ref_day = f"${as_of_param}::date"
         applied["asOf"] = as_of_norm.isoformat()
@@ -354,9 +369,18 @@ async def fetch_latest_stock(
         )
         return _empty(page, page_size, applied, sort)
 
-    # Nothing matched. That is an answer, not a failure.
-    if not as_of_date:
-        return _empty(page, page_size, applied, sort)
+    # NO SHORT CUT ON as_of_date. It is MAX(day) over `scoped`, and `scoped`
+    # carries COUNT_ROWS_ONLY -- so it is NULL for a place holding adjustments
+    # but no physical count, and returning empty here answered for the ledger
+    # without asking it. That is what showed "No counted stock at this location
+    # yet." above 33,857.62 kg on A185 / A185 Cold, every kilo of it posted,
+    # attributed and correctly written back.
+    #
+    # The query below already handles the case: `counted` comes out empty, `txn`
+    # does not, and the FULL OUTER JOIN between them yields the ledger's rows.
+    # With nothing on either side it returns an empty page unaided, so the only
+    # thing lost is one saved round trip on a query whose CTEs are then empty.
+    # _empty() is still reached when the table itself is absent, above.
 
     # `scoped` carries the filters AND the asOf cap; there is no longer a single
     # day parameter, because there is no longer a single day.
@@ -391,6 +415,9 @@ async def fetch_latest_stock(
     # between the count and the adjustment will not net. See 098's header.
     ctes = """
         WITH scoped AS (SELECT * FROM %(entries)s %(where)s %(daycap)s),
+             -- The same rows PLUS the adjustment rows, for the sign-off only.
+             -- Never used for a weight: that is what `scoped` is for.
+             scoped_signed AS (SELECT * FROM %(entries)s %(where_all)s %(daycap_all)s),
              -- Sum duplicates FIRST, then pick the latest day. Order matters: a
              -- naive DISTINCT ON over raw rows returns the right 3292
              -- article/place combinations but only 577,465 kg of 895,396 —
@@ -434,7 +461,7 @@ async def fetch_latest_stock(
                         BOOL_AND(COALESCE(verified, FALSE))    AS verified,
                         MAX(verified_by)                       AS verified_by,
                         MAX(verified_at)                       AS verified_at
-                   FROM scoped
+                   FROM scoped_signed
                   GROUP BY 1, 2
              ),
              -- Minimal projection for the ledger join: deliberately carries no
@@ -517,6 +544,7 @@ async def fetch_latest_stock(
                   %(adjonly)s
              )
     """ % {"where": where, "daycap": date_clause, "txnwhere": txn_where,
+           "where_all": where_all, "daycap_all": date_clause_all,
            "adjonly": adj_only,
            "entries": ENTRIES_TABLE, "entry_day": ENTRY_DAY, "refday": ref_day}
 
@@ -566,7 +594,9 @@ async def fetch_latest_stock(
 
     return {
         # The one place the date becomes text, so every caller sees YYYY-MM-DD.
-        "as_of_date": as_of_date.isoformat(),
+        # NULL when this place has never been counted -- its figures then come
+        # from the ledger alone. Callers already type it `string | null`.
+        "as_of_date": as_of_date.isoformat() if as_of_date else None,
         "items": [
             {
                 "item_name": r["item_name"],

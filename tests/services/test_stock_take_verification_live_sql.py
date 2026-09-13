@@ -24,6 +24,7 @@ import sys
 import asyncpg
 
 from app.config import Settings
+from app.modules.stock_take.services import latest_stock_service as stock
 from app.modules.stock_take.services import transactions_service as svc
 
 ITEM = "ZZ VERIFICATION LIVE TEST"
@@ -139,6 +140,66 @@ async def main():
             check("it now reads as verified", all(t["verified"] is True for t in txns))
             check("carrying the verifier's name",
                   all(t["verified_by"] == VERIFIER for t in txns))
+
+            print("\n[6b] ...and to the SCREEN, for a line that was never counted here")
+            # The aggregate is what the operator reads. It builds its sign-off
+            # from new_stock_entries, and the counted side of it deliberately
+            # excludes ADJUSTMENT rows -- so a line adjusted at a place it was
+            # never counted used to have no sign-off row to find, and rendered
+            # "not verified" forever while the stamp sat in the database.
+            # A place that actually HAS counted rows. The aggregate resolves its
+            # as-of date from counted rows alone, so on a floor holding none it
+            # returns empty before any of this is reachable -- W202/First Floor
+            # was wiped on 2026-09-13 and is exactly that case now.
+            place = await conn.fetchrow("""
+                SELECT UPPER(BTRIM(warehouse)) AS wh, BTRIM(floor_name) AS fl
+                  FROM new_stock_entries
+                 WHERE (source_kind IS NULL OR source_kind = 'COUNT')
+                   AND (status IS NULL OR status != 'draft')
+                   AND warehouse IS NOT NULL AND floor_name IS NOT NULL
+                 GROUP BY 1, 2 ORDER BY COUNT(*) DESC LIMIT 1""")
+            AWH, AFL = place["wh"], place["fl"]
+            # The full posting path, not write_back_entry alone: the aggregate
+            # surfaces a never-counted article through the LEDGER half of its
+            # merge, so an entry row with no transaction behind it appears
+            # nowhere at all -- which is how the real CRANBERRY SLICE row exists.
+            await svc.create_transaction(
+                conn,
+                {"item_name": ITEM, "stock_type": "Fresh Stock", "operation": "ADDITION",
+                 "units": 1, "qty_kg": 9.0, "reason": "adjusted where never counted"},
+                warehouse=AWH, location=AFL,
+                created_by=POSTER, created_by_user_id=None)
+            await svc.verify_entries(conn, actor=VERIFIER, warehouse=AWH,
+                                     location=AFL, item_name=ITEM)
+            agg = await stock.fetch_latest_stock(
+                conn, warehouse=[AWH], floor_name=[AFL], page_size=5000)
+            mine = [i for i in agg["items"]
+                    if i["item_name"].strip().upper() == ITEM
+                    and i["stock_type"] == "Fresh Stock"]
+            check("the adjusted-only line is on the screen", len(mine) == 1, str(len(mine)))
+            if mine:
+                row = mine[0]
+                check("and the screen shows it signed off", row["verified"] is True, str(row))
+                check("naming the verifier", row["verified_by"] == VERIFIER,
+                      str(row["verified_by"]))
+                # The guard on the fix: verif reads adjustment rows, the WEIGHT
+                # must not. Counting them on the entries side as well as through
+                # the ledger would double every adjusted figure.
+                check("its counted weight is still zero, not the adjustment",
+                      abs(float(row["counted_weight"])) < 1e-9, str(row["counted_weight"]))
+
+            print("\n[6c] Adjusting a signed line drops the badge again")
+            await svc.write_back_entry(
+                conn, item_name=ITEM, stock_type="Fresh Stock", warehouse=AWH,
+                location=AFL, units_delta=1, kg_delta=4.0, actor=POSTER)
+            agg2 = await stock.fetch_latest_stock(
+                conn, warehouse=[AWH], floor_name=[AFL], page_size=5000)
+            mine2 = [i for i in agg2["items"]
+                     if i["item_name"].strip().upper() == ITEM
+                     and i["stock_type"] == "Fresh Stock"]
+            if mine2:
+                check("the screen goes back to unverified after a change",
+                      mine2[0]["verified"] is False, str(mine2[0]["verified"]))
 
             print("\n[7] A line with NO adjustments can still be signed")
             # Most rows on the adjust screen have never been adjusted. Restricting

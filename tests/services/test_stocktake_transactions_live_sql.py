@@ -625,6 +625,52 @@ async def main():
                   new_rows[0]["counted_weight"] == 0 and abs(new_rows[0]["total_weight"] - 7) < 0.01,
                   str(new_rows[0]))
             check("it reports no counting entries", new_rows[0]["entry_count"] == 0)
+
+        print("\n[10b] A place with NO physical count still shows what was posted")
+        # The aggregate resolves as_of_date from `scoped`, which carries
+        # COUNT_ROWS_ONLY -- so a floor holding adjustments but no counts has no
+        # counted day. Short-circuiting on that answered for the ledger without
+        # asking it, and hid every posting made to such a place: six live A185
+        # floors, ~150 tonnes, including the one an operator had just posted to
+        # and been told "No counted stock at this location yet."
+        GHOST = "ZZ LEDGER ONLY TEST FLOOR"
+        pre = await stock.fetch_latest_stock(
+            conn, warehouse=["W202"], floor_name=[GHOST], page_size=100)
+        check("a place with nothing at all is still empty",
+              pre["items"] == [] and pre["as_of_date"] is None, str(pre["totals"]["items"]))
+
+        await svc.create_transaction(
+            conn,
+            {"item_name": "ZZ LEDGER ONLY ARTICLE", "material_type": "RM",
+             "item_category": "X", "item_subcategory": "Y", "stock_type": "Fresh Stock",
+             "units": 3, "qty_kg": 12.5, "operation": "ADDITION",
+             "reason": "posted where nothing was ever counted"},
+            warehouse="W202", location=GHOST,
+            created_by="Ledger Test", created_by_user_id=None)
+
+        post = await stock.fetch_latest_stock(
+            conn, warehouse=["W202"], floor_name=[GHOST], page_size=100)
+        check("the posting appears on the screen", len(post["items"]) == 1,
+              "%d lines" % len(post["items"]))
+        if post["items"]:
+            it = post["items"][0]
+            check("nothing is reported as counted",
+                  abs(it["counted_weight"]) < 1e-9, str(it["counted_weight"]))
+            check("the adjustment carries the whole figure",
+                  abs(it["net_adjustment_kg"] - 12.5) < 1e-9
+                  and abs(it["total_weight"] - 12.5) < 1e-9, str(it))
+            check("and it is attributed to a transaction", it["transaction_count"] == 1,
+                  str(it["transaction_count"]))
+            check("never counted, so it has no count date",
+                  it["last_counted_date"] is None, str(it["last_counted_date"]))
+        # NULL is the honest answer here and the frontend already branches on it:
+        # a date would claim a count that never happened.
+        check("as_of_date stays NULL for a never-counted place",
+              post["as_of_date"] is None, str(post["as_of_date"]))
+        check("the totals describe the same single line",
+              post["totals"]["items"] == 1
+              and abs(post["totals"]["total_weight"] - 12.5) < 1e-9,
+              str(post["totals"]))
     finally:
         await tx.rollback()
         left = await conn.fetchval("SELECT COUNT(*) FROM stocktake_transactions")
