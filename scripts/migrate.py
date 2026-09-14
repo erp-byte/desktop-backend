@@ -486,6 +486,19 @@ SQL_FILES = [
     # any level. No schema change -- new_stock_entries already carries
     # verified / verified_by / verified_at, which is where a sign-off lives.
     DB_DIR / "108_stock_take_verification_role.sql",
+    # 109 widens txn_code's daily counter from 3 digits to 4 (8 chars -> 9).
+    # 2026-09-13 exhausted 999/day at ~22:00 IST and every further adjustment
+    # that evening failed with a bare "Internal server error". Existing codes are
+    # NOT renumbered -- they have been quoted -- so the shape CHECK admits both
+    # widths and the generator reads the counter to end-of-string.
+    DB_DIR / "109_stocktake_txn_code_widen.sql",
+    # 110 puts verified / verified_by / verified_at ON the ledger and narrows the
+    # append-only trigger to those three columns, so a POSTING is still final
+    # while its sign-off can change. Must run BEFORE the backend deploys: the
+    # per-transaction verify endpoint selects the columns. The backfill copies
+    # the verification each transaction already displayed via the adjustment row
+    # it rolls into, so nothing on screen moves when it runs.
+    DB_DIR / "110_stocktake_txn_verification.sql",
 ]
 
 # ── Optional: drop the v1 legacy job-card stack (TEST / Supabase DB ONLY) ──────

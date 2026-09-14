@@ -28,6 +28,11 @@ EXPECTED = {
     # Sign-off. A separate action ON PURPOSE: the stock_take role holds create
     # but NOT verify, so nobody can both post an adjustment and approve it.
     "/api/v1/stock-take/adjustments/verify": {"POST": "verify"},
+    # The per-posting half of the sign-off. Same gate as the line-level one, and
+    # deliberately so: the two reconcile into each other (verifying the last
+    # posting signs its line off, verifying a line signs off its postings), so a
+    # weaker gate here would be a way round the stronger one there.
+    "/api/v1/stock-take/transactions/verify": {"POST": "verify"},
     "/api/v1/stock-take/balance":             {"GET": "view"},
     "/api/v1/stock-take/entries/export":      {"GET": "export"},
 }

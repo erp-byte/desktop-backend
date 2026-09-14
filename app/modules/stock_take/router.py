@@ -35,10 +35,12 @@ module records.
 """
 from __future__ import annotations
 
+import logging
 from datetime import date
 from decimal import Decimal
 from typing import Any, Optional
 
+import asyncpg
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
@@ -48,7 +50,73 @@ from app.modules.stock_take.services import (
     entries_export, export_xlsx, latest_stock_service, transactions_service,
 )
 
+log = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api/v1/stock-take", tags=["Stock Take"])
+
+
+# SQLSTATEs this module can say something useful about. Anything not listed
+# becomes a logged 500 with a reference, never a silent one.
+#
+# WHY THIS EXISTS AT ALL. The write path used to catch ValueError and nothing
+# else, so every database-raised error -- a CHECK, a foreign key, a PL/pgSQL
+# RAISE -- reached FastAPI unhandled and the operator was shown the four words
+# "Internal server error", with nothing written to the log to say what happened.
+# On 2026-09-13 that hid gen_stocktake_txn_code() running out of daily reference
+# numbers at 22:00: every adjustment from then until midnight failed, the floor
+# gave up for the night, and the only trace left in the database was seventeen
+# gaps in a sequence. Diagnosing it afterwards took an afternoon of archaeology
+# that one log line would have made unnecessary.
+_DB_ERRORS: dict[str, tuple[int, str, str]] = {
+    # (HTTP status, error code, message shown to the operator)
+    "2200H": (409, "txn_code_exhausted",
+              "This day's stock-take reference numbers are all used up, so no "
+              "further adjustment can be posted today. Nothing you entered is "
+              "wrong. Tell IT — the daily numbering needs widening; posting "
+              "works again after midnight."),
+    "23503": (400, "unknown_reference",
+              "This article is no longer in the SKU catalogue. Reload the page "
+              "and pick it again."),
+    "23505": (409, "duplicate",
+              "That adjustment has already been recorded. Reload the page "
+              "before posting again."),
+    "23514": (400, "rejected_by_database",
+              "The database rejected these values. Check the units, quantity "
+              "and reason, then try again."),
+    "22001": (400, "value_too_long",
+              "One of these values is too long to store. Shorten the article "
+              "name or reason and try again."),
+}
+
+
+def _db_failure(exc: asyncpg.PostgresError, action: str, **context: Any) -> HTTPException:
+    """Log a database error in full, and return what the operator should see.
+
+    The log line is the point. `context` carries the article, place and operator,
+    so a report of "it says internal server error" can be matched to a row in the
+    log without reproducing anything.
+    """
+    sqlstate = getattr(exc, "sqlstate", None)
+    status, code, message = _DB_ERRORS.get(
+        sqlstate or "",
+        (500, "database_error",
+         "Something went wrong saving this. It has been logged — tell IT, and "
+         "quote the time."),
+    )
+    log.error(
+        "stock_take %s failed: sqlstate=%s constraint=%s table=%s context=%s :: %s",
+        action, sqlstate, getattr(exc, "constraint_name", None),
+        getattr(exc, "table_name", None), context, exc,
+        exc_info=True,
+    )
+    return HTTPException(status, detail={
+        "error": code,
+        "message": message,
+        # The database's own words. The RAISEs in app/db are written to be read
+        # by whoever has to fix them, and dropping them here is what made the
+        # 2026-09-13 outage opaque.
+        "details": {"sqlstate": sqlstate, "db_message": str(exc)},
+    })
 
 
 def _actor(user: AuthUser) -> str:
@@ -339,6 +407,18 @@ async def create_transaction(
             except ValueError as exc:
                 raise HTTPException(400, detail={
                     "error": "invalid_transaction", "message": str(exc)}) from exc
+            except asyncpg.PostgresError as exc:
+                # Both statements in create_transaction can fail in the database
+                # rather than in Python -- the ledger INSERT through its CHECKs,
+                # its foreign keys and the txn_code trigger's RAISE, and the
+                # write-back through the entries table's own constraints. None of
+                # those are ValueError, so without this they were 500s.
+                raise _db_failure(
+                    exc, "create_transaction",
+                    item=payload.get("item_name"), warehouse=warehouse,
+                    floor=location, stock_type=payload.get("stock_type"),
+                    operation=payload.get("operation"), actor=_actor(user),
+                ) from exc
 
 
 # The two ledger reads share one filter set on purpose (see _ledger_filters):
@@ -414,6 +494,24 @@ class VerifyBody(BaseModel):
     location: Optional[str] = Field(default=None, alias="floorName")
     item_name: Optional[str] = Field(default=None, alias="itemName")
     stock_type: Optional[str] = Field(default=None, alias="stockType")
+    # Defaults TRUE so every existing caller keeps its meaning; FALSE withdraws
+    # the sign-off, which is now possible on both halves.
+    verified: bool = True
+
+
+class VerifyTransactionsBody(BaseModel):
+    """The postings to sign off, by txn_id.
+
+    EXPLICIT IDS ONLY -- no day/place shape like VerifyBody has. A per-posting
+    sign-off is a person looking at a specific line and saying yes to it, so
+    there is no bulk form to get wrong; the bulk form is verifying the LINE,
+    which cascades here anyway.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    txn_ids: list[int] = Field(alias="txnIds", min_length=1, max_length=500)
+    verified: bool = True
 
 
 @router.post("/adjustments/verify")
@@ -461,17 +559,90 @@ async def verify_stock_lines(
                     "details": {"allowed_warehouses": whs}})
 
         async with conn.transaction():
-            result = await transactions_service.verify_entries(
-                conn,
-                actor=_actor(user),
-                day=day,
-                warehouse=body.warehouse,
-                location=body.location,
-                item_name=body.item_name,
-                stock_type=body.stock_type,
-                entry_ids=body.entry_ids,
-            )
+            try:
+                result = await transactions_service.verify_entries(
+                    conn,
+                    actor=_actor(user),
+                    day=day,
+                    warehouse=body.warehouse,
+                    location=body.location,
+                    item_name=body.item_name,
+                    stock_type=body.stock_type,
+                    entry_ids=body.entry_ids,
+                    verified=body.verified,
+                )
+            except asyncpg.PostgresError as exc:
+                # The other write in this module, and it had no database-error
+                # handling either. A sign-off that fails silently is worse than a
+                # posting that does: the figure stays unverified and the person
+                # who tried has no reason to think it did not work.
+                raise _db_failure(
+                    exc, "verify_entries", day=body.day, warehouse=body.warehouse,
+                    floor=body.location, item=body.item_name, actor=_actor(user),
+                ) from exc
     return result
+
+
+@router.post("/transactions/verify")
+async def verify_transactions(
+    request: Request,
+    body: VerifyTransactionsBody = Body(...),
+    user: AuthUser = Depends(require_permission("stock_take", action="verify")),
+) -> dict[str, Any]:
+    """Sign off individual postings, by txn_id. The other half of the sign-off.
+
+    Gated on `verify` exactly as the line-level endpoint is, and for the same
+    reason: the stock_take role deliberately does not hold it, because the point
+    of a sign-off is that someone other than the poster gives it
+    (app/db/108_stock_take_verification_role.sql).
+
+    WHAT ELSE MOVES. Every posting this touches drags its line with it -- when
+    the last unsigned posting for an article, place, stock type and IST day is
+    signed, that day's adjustment row in new_stock_entries is signed too; when
+    one is un-signed, the row's signature comes off. The response says how many
+    rows moved, so the caller can refresh what it needs rather than guessing.
+
+    SCOPE IS CHECKED ON THE ROWS THEMSELVES, not on the request: txn_ids name
+    postings, and a poster's warehouse is a property of those rows. Naming a
+    posting outside the caller's scope is a 403 rather than a silent skip -- a
+    verifier who thinks they signed twenty rows and signed eighteen has been
+    told something untrue.
+    """
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        places = await latest_stock_service.fetch_places(conn)
+        whs, _ = _read_scope(user, places)
+
+        rows = await conn.fetch(
+            "SELECT txn_id, warehouse FROM stocktake_transactions "
+            "WHERE txn_id = ANY($1::bigint[])", body.txn_ids)
+        found = {r["txn_id"] for r in rows}
+        if missing := [t for t in body.txn_ids if t not in found]:
+            raise HTTPException(404, detail={
+                "error": "unknown_transaction",
+                "message": f"{len(missing)} transaction(s) do not exist.",
+                "details": {"txn_ids": missing[:20]}})
+
+        outside = sorted({
+            r["warehouse"] for r in rows
+            if transactions_service._normalise_warehouse(r["warehouse"]) not in whs})
+        if outside:
+            raise HTTPException(403, detail={
+                "error": "warehouse_not_allowed",
+                "message": "You are not assigned to "
+                           + ", ".join(repr(w) for w in outside) + ".",
+                "details": {"allowed_warehouses": whs}})
+
+        async with conn.transaction():
+            try:
+                return await transactions_service.verify_transactions(
+                    conn, actor=_actor(user), txn_ids=body.txn_ids,
+                    verified=body.verified)
+            except asyncpg.PostgresError as exc:
+                raise _db_failure(
+                    exc, "verify_transactions", txn_ids=body.txn_ids[:20],
+                    verified=body.verified, actor=_actor(user),
+                ) from exc
 
 
 @router.get("/transactions/export")

@@ -55,7 +55,49 @@ _INSERT_COLS = (
 # It is minted by a BEFORE INSERT trigger, so it is never in _INSERT_COLS — it is
 # only ever read back. txn_id remains the key: reverses_txn_id points at it, and a
 # correction chain must not depend on a display format.
-_RETURNING = ", ".join(("txn_id", "txn_code") + _INSERT_COLS + ("created_at",))
+#
+# verified/verified_by/verified_at are read back but never inserted: a posting is
+# born unsigned (110_stocktake_txn_verification.sql defaults them), and the only
+# way they change afterwards is verify_transactions or the cascade out of
+# verify_entries. Putting them in _INSERT_COLS would let a poster sign their own
+# work, which is the control 108 exists to add.
+_VERIFY_COLS = ("verified", "verified_by", "verified_at")
+_RETURNING = ", ".join(
+    ("txn_id", "txn_code") + _INSERT_COLS + ("created_at",) + _VERIFY_COLS)
+
+#: The group a sign-off reconciles over: one adjustment row in new_stock_entries
+#: covers every posting for one article, at one place, of one stock type, on one
+#: IST day — the key uq_nse_adjustment_day enforces.
+#:
+#: WRITTEN ONCE, USED FOUR TIMES. Both reconciliation directions, the backfill in
+#: 110 and the index it creates all have to agree character for character, and an
+#: index is not an error when it fails to match — it is just silently unused. The
+#: warehouse is de-hyphenated on THIS side only: the ledger holds both 'W-202' and
+#: 'W202', new_stock_entries only the unhyphenated form.
+TXN_GROUP_KEY = (
+    "(created_at AT TIME ZONE 'Asia/Kolkata')::date",
+    "UPPER(BTRIM(item_name))",
+    "REPLACE(UPPER(BTRIM(COALESCE(warehouse, ''))), '-', '')",
+    "UPPER(BTRIM(COALESCE(location, '')))",
+    "COALESCE(stock_type, 'Fresh Stock')",
+)
+_GROUP_ALIASES = ("k_day", "k_item", "k_wh", "k_fl", "k_stock")
+#: "expr AS alias, expr AS alias, ..." for a SELECT list.
+TXN_GROUP_SELECT = ", ".join(
+    f"{expr} AS {alias}" for expr, alias in zip(TXN_GROUP_KEY, _GROUP_ALIASES))
+
+#: The same five values read off a new_stock_entries row. Deliberately NOT
+#: de-hyphenated — that table only ever holds the unhyphenated spelling, and
+#: applying REPLACE here too would hide a real mismatch rather than expose it.
+ENTRY_GROUP_KEY = (
+    "(created_at AT TIME ZONE 'Asia/Kolkata')::date",
+    "UPPER(BTRIM(item_name))",
+    "UPPER(BTRIM(COALESCE(warehouse, '')))",
+    "UPPER(BTRIM(COALESCE(floor_name, '')))",
+    "COALESCE(stock_type, 'Fresh Stock')",
+)
+ENTRY_GROUP_SELECT = ", ".join(
+    f"{expr} AS {alias}" for expr, alias in zip(ENTRY_GROUP_KEY, _GROUP_ALIASES))
 
 
 class ScopeError(Exception):
@@ -510,6 +552,14 @@ def _shape(rows) -> list[dict[str, Any]]:
         d["created_at"] = d["created_at"].isoformat()
         for k in ("units", "qty_kg"):
             d[k] = float(d[k]) if d[k] is not None else None
+        # The sign-off now comes off the row itself rather than being looked up
+        # afterwards (110_stocktake_txn_verification.sql). Same three keys the
+        # old _attach_verification stamped, so every caller and the .xlsx export
+        # keep working unchanged.
+        if "verified" in d:
+            d["verified"] = bool(d["verified"])
+            d["verified_at"] = (d["verified_at"].isoformat()
+                                if d.get("verified_at") else None)
         out.append(d)
     return out
 
@@ -601,66 +651,161 @@ async def write_back_entry(
     }
 
 
-async def _attach_verification(conn: asyncpg.Connection, rows: list[dict[str, Any]]) -> None:
-    """Stamp each ledger row with the sign-off of the adjustment it rolls into.
+async def reconcile_entry_from_transactions(
+    conn: asyncpg.Connection, *, actor: str, groups: Sequence[dict[str, Any]],
+) -> int:
+    """Rule 1: an adjustment row is signed exactly when all its postings are.
 
-    stocktake_transactions is append-only -- trg_stk_txn_no_update raises on any
-    UPDATE -- so verification cannot be a column on it. It lives on the
-    ADJUSTMENT row in new_stock_entries, and the two are joined on the key
-    uq_nse_adjustment_day already enforces:
+    Runs after verify_transactions, over only the groups that call touched. The
+    rule is an equivalence, not a one-way trigger, so this both SETS and CLEARS:
+    verifying the last unsigned posting in a group signs the row off, and
+    un-verifying any one of them takes the signature back off. Anything else
+    would let the row claim a sign-off that no longer describes its postings.
 
-        (IST day, UPPER(BTRIM(item_name)), warehouse, floor_name, stock_type)
+    THE EMPTY GROUP IS THE TRAP. "Every transaction is verified" is vacuously
+    true of a group with no transactions at all, and most adjustment rows on the
+    screen are for lines nobody has ever adjusted. COUNT(*) > 0 in the HAVING is
+    what stops this from silently signing off the entire table.
 
-    So one sign-off covers every posting made against that article and place that
-    day, which is what "the day's adjustments were verified" means. Two postings
-    for the same article on the same floor share a verification BY CONSTRUCTION,
-    rather than by anything here remembering to keep them in step.
-
-    A second query rather than a join on the main SELECT, matching
-    _attach_reverses_code: the ledger read stays a plain scan of its own table,
-    and this touches only the handful of days actually on the page.
+    Returns the number of adjustment rows whose state actually moved.
     """
-    if not rows:
-        return
+    if not groups:
+        return 0
 
-    days = sorted({r["business_day"] for r in rows if r.get("business_day")})
-    if not days:
-        return
-
-    found = await conn.fetch(
+    rows = await conn.fetch(
         f"""
-        SELECT {ENTRY_DAY}                                    AS k_day,
-               UPPER(BTRIM(item_name))                        AS k_item,
-               UPPER(BTRIM(COALESCE(warehouse, '')))          AS k_wh,
-               UPPER(BTRIM(COALESCE(floor_name, '')))         AS k_fl,
-               COALESCE(stock_type, 'Fresh Stock')            AS k_stock,
-               COALESCE(verified, FALSE)                      AS verified,
-               verified_by, verified_at
-          FROM {ENTRIES_TABLE}
-         WHERE source_kind = 'ADJUSTMENT'
-           AND {ENTRY_DAY} = ANY($1::date[])
+        WITH touched(k_day, k_item, k_wh, k_fl, k_stock) AS (
+            SELECT x.k_day::date, x.k_item, x.k_wh, x.k_fl, x.k_stock
+              FROM UNNEST($2::date[], $3::text[], $4::text[], $5::text[], $6::text[])
+                     AS x(k_day, k_item, k_wh, k_fl, k_stock)
+        ),
+        state AS (
+            SELECT {TXN_GROUP_SELECT},
+                   BOOL_AND(verified) AS all_verified,
+                   COUNT(*)           AS n
+              FROM stocktake_transactions
+             GROUP BY 1, 2, 3, 4, 5
+            HAVING COUNT(*) > 0
+        ),
+        want AS (
+            SELECT s.* FROM state s JOIN touched t USING (k_day, k_item, k_wh, k_fl, k_stock)
+        )
+        UPDATE {ENTRIES_TABLE} e
+           SET verified    = w.all_verified,
+               verified_by = CASE WHEN w.all_verified THEN $1 ELSE NULL END,
+               verified_at = CASE WHEN w.all_verified THEN now() ELSE NULL END,
+               updated_at  = now()
+          FROM want w
+         WHERE e.source_kind = 'ADJUSTMENT'
+           AND ({ENTRY_GROUP_KEY[0]}, {ENTRY_GROUP_KEY[1]}, {ENTRY_GROUP_KEY[2]},
+                {ENTRY_GROUP_KEY[3]}, {ENTRY_GROUP_KEY[4]})
+               = (w.k_day, w.k_item, w.k_wh, w.k_fl, w.k_stock)
+           -- Only rows whose state actually moves, so a no-op reconcile does not
+           -- re-stamp a signature with a new name and time.
+           AND COALESCE(e.verified, FALSE) IS DISTINCT FROM w.all_verified
+        RETURNING e.id
         """,
-        [__import__("datetime").date.fromisoformat(d) for d in days],
+        actor,
+        [g["k_day"] for g in groups], [g["k_item"] for g in groups],
+        [g["k_wh"] for g in groups], [g["k_fl"] for g in groups],
+        [g["k_stock"] for g in groups],
     )
-    by_key = {
-        (str(r["k_day"]), r["k_item"], r["k_wh"], r["k_fl"], r["k_stock"]): r
-        for r in found
+    return len(rows)
+
+
+async def verify_transactions(
+    conn: asyncpg.Connection, *, actor: str, txn_ids: Sequence[int],
+    verified: bool = True,
+) -> dict[str, Any]:
+    """Sign off (or un-sign) individual postings, then apply rule 1.
+
+    THE LEDGER IS STILL APPEND-ONLY. 110 narrowed trg_stk_txn_no_update to the
+    three verification columns rather than removing it, so this UPDATE is the
+    only shape of UPDATE the table accepts; touching any other column from here
+    would raise exactly as it always did.
+
+    ONLY ROWS WHOSE STATE MOVES ARE TOUCHED, so re-ticking an already-signed
+    posting is a no-op rather than a re-stamp under a new name. That also keeps
+    `changed` honest as "what this call did".
+
+    Reversals are ordinary postings here: a correction is itself something
+    somebody has to look at, so both it and the row it reverses must be signed
+    before their line reconciles.
+    """
+    if not txn_ids:
+        return {"changed": 0, "entries_reconciled": 0, "transactions": []}
+
+    rows = await conn.fetch(
+        f"""
+        UPDATE stocktake_transactions
+           SET verified    = $2,
+               verified_by = CASE WHEN $2 THEN $3 ELSE NULL END,
+               verified_at = CASE WHEN $2 THEN now() ELSE NULL END
+         WHERE txn_id = ANY($1::bigint[])
+           AND verified IS DISTINCT FROM $2
+        RETURNING txn_id, txn_code, verified, verified_by, verified_at,
+                  {TXN_GROUP_SELECT}
+        """,
+        list(txn_ids), verified, actor,
+    )
+
+    groups = {(r["k_day"], r["k_item"], r["k_wh"], r["k_fl"], r["k_stock"]) for r in rows}
+    reconciled = await reconcile_entry_from_transactions(
+        conn, actor=actor,
+        groups=[dict(zip(_GROUP_ALIASES, g)) for g in groups])
+
+    return {
+        "changed": len(rows),
+        "entries_reconciled": reconciled,
+        "verified": verified,
+        "transactions": [
+            {"txn_id": r["txn_id"], "txn_code": r["txn_code"],
+             "verified": bool(r["verified"]), "verified_by": r["verified_by"],
+             "verified_at": r["verified_at"].isoformat() if r["verified_at"] else None}
+            for r in rows
+        ],
     }
 
-    for row in rows:
-        key = (
-            row.get("business_day") or "",
-            _norm(row.get("item_name")),
-            _normalise_warehouse(row.get("warehouse")),
-            _norm(row.get("location")),
-            row.get("stock_type") or "Fresh Stock",
+
+async def cascade_transactions_from_entries(
+    conn: asyncpg.Connection, *, actor: str, entry_ids: Sequence[int], verified: bool,
+) -> int:
+    """Rule 2: signing a line off signs off every posting behind it.
+
+    The inverse of reconcile_entry_from_transactions, and deliberately a separate
+    one-shot call rather than a database trigger on either table. Triggers in
+    both directions would re-enter each other on every write; two explicit
+    statements, each called once by the endpoint that owns the decision, cannot.
+
+    A line with no postings -- most of them, since a stock position usually has
+    only counts behind it -- matches nothing here and is a no-op.
+
+    Returns the number of postings whose state actually moved.
+    """
+    if not entry_ids:
+        return 0
+
+    rows = await conn.fetch(
+        f"""
+        WITH target AS (
+            SELECT {ENTRY_GROUP_SELECT}
+              FROM {ENTRIES_TABLE}
+             WHERE id = ANY($1::bigint[])
         )
-        hit = by_key.get(key)
-        row["verified"] = bool(hit["verified"]) if hit else False
-        row["verified_by"] = hit["verified_by"] if hit else None
-        row["verified_at"] = (
-            hit["verified_at"].isoformat() if hit and hit["verified_at"] else None
-        )
+        UPDATE stocktake_transactions t
+           SET verified    = $2,
+               verified_by = CASE WHEN $2 THEN $3 ELSE NULL END,
+               verified_at = CASE WHEN $2 THEN now() ELSE NULL END
+          FROM target g
+         WHERE ({TXN_GROUP_KEY[0]}, {TXN_GROUP_KEY[1]}, {TXN_GROUP_KEY[2]},
+                {TXN_GROUP_KEY[3]}, {TXN_GROUP_KEY[4]})
+               = (g.k_day, g.k_item, g.k_wh, g.k_fl, g.k_stock)
+           AND t.verified IS DISTINCT FROM $2
+        RETURNING t.txn_id
+        """,
+        list(entry_ids), verified, actor,
+    )
+    return len(rows)
 
 
 async def verify_entries(
@@ -673,6 +818,7 @@ async def verify_entries(
     item_name: Optional[str] = None,
     stock_type: Optional[str] = None,
     entry_ids: Optional[Sequence[int]] = None,
+    verified: bool = True,
 ) -> dict[str, Any]:
     """Sign off stock lines in new_stock_entries. Returns what was signed.
 
@@ -693,15 +839,28 @@ async def verify_entries(
     named it defaults to today, because an unbounded bulk sign-off across every
     article and every day is not something a button should do by accident.
 
-    ONLY UNVERIFIED ROWS ARE TOUCHED. Re-running is therefore a no-op rather
-    than a re-stamp with a new name and time, so a second click cannot quietly
-    rewrite who signed a figure off.
+    ONLY ROWS WHOSE STATE MOVES ARE TOUCHED. Re-running is therefore a no-op
+    rather than a re-stamp with a new name and time, so a second click cannot
+    quietly rewrite who signed a figure off.
 
-    Nothing here reverses: to withdraw a sign-off, adjust the stock, which the
-    upsert already un-verifies.
+    IT REVERSES NOW. `verified=False` withdraws the sign-off, clearing the name
+    and time with it -- leaving the name of whoever last signed a row that is no
+    longer signed reads as an accusation. Before per-transaction verification the
+    only way back was to adjust the stock and let write_back_entry's upsert
+    un-verify the line, which is still what happens when a new posting lands.
+
+    THE CASCADE IS THE POINT. Every line this touches has its postings moved to
+    match (rule 2, cascade_transactions_from_entries), and the inverse -- a line
+    following its postings -- is rule 1 in reconcile_entry_from_transactions.
+    The two together are one invariant: an adjustment row is signed exactly when
+    every posting behind it is.
     """
-    conds = ["COALESCE(verified, FALSE) = FALSE"]
-    params: list[Any] = [actor]
+    # Only rows whose state actually moves. As a one-way action this read
+    # "= FALSE" and meant "a second click cannot quietly rewrite who signed a
+    # figure off"; as a two-way one it has to mean the same in both directions,
+    # so it is now a difference from the target rather than a fixed value.
+    conds = ["COALESCE(verified, FALSE) IS DISTINCT FROM $2"]
+    params: list[Any] = [actor, verified]
 
     if entry_ids:
         params.append(list(entry_ids))
@@ -735,7 +894,10 @@ async def verify_entries(
     rows = await conn.fetch(
         f"""
         UPDATE {ENTRIES_TABLE}
-           SET verified = TRUE, verified_by = $1, verified_at = now()
+           SET verified    = $2,
+               verified_by = CASE WHEN $2 THEN $1 ELSE NULL END,
+               verified_at = CASE WHEN $2 THEN now() ELSE NULL END,
+               updated_at  = now()
          WHERE {' AND '.join(conds)}
         RETURNING id, item_name, warehouse, floor_name, stock_type,
                   total_quantity, total_weight, verified_by, verified_at,
@@ -743,9 +905,21 @@ async def verify_entries(
         """,
         *params,
     )
+
+    # RULE 2. Signing the line off signs off every posting behind it, and taking
+    # the signature back off takes theirs off too -- otherwise un-verifying a
+    # line would leave its postings claiming a sign-off the line itself no longer
+    # has, and rule 1 would immediately put the line back. Done here rather than
+    # in a database trigger: a trigger on each table would re-enter the other on
+    # every write, where two explicit one-shot calls cannot.
+    cascaded = await cascade_transactions_from_entries(
+        conn, actor=actor, entry_ids=[r["id"] for r in rows], verified=verified)
+
     return {
         "verified_count": len(rows),
-        "verified_by": actor,
+        "verified": verified,
+        "transactions_cascaded": cascaded,
+        "verified_by": actor if verified else None,
         "rows": [
             {
                 "entry_id": r["id"],
@@ -807,7 +981,6 @@ async def list_transactions(
     )
     shaped = _shape(rows)
     await _attach_reverses_code(conn, shaped)
-    await _attach_verification(conn, shaped)
     return {
         "transactions": shaped,
         "pagination": {
@@ -833,8 +1006,8 @@ async def export_transactions(conn: asyncpg.Connection, **filters: Any) -> tuple
     )
     shaped = _shape(rows)
     await _attach_reverses_code(conn, shaped)
-    # The spreadsheet carries the sign-off too: an export that showed the
+    # The spreadsheet carries the sign-off too -- an export that showed the
     # postings but not whether anyone had checked them is the half that gets
-    # forwarded and acted on.
-    await _attach_verification(conn, shaped)
+    # forwarded and acted on. It rides along in _RETURNING now rather than
+    # needing a second query, because the sign-off is a column on the row.
     return shaped, applied

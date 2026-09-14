@@ -246,13 +246,53 @@ async def main():
                   "%s older rows still unverified" % left)
 
             print("\n[9] The ledger itself is still append-only")
+            # 110_stocktake_txn_verification.sql narrowed the rule from "no
+            # UPDATE reaches this table" to "no UPDATE CHANGES a posting", so
+            # that the sign-off columns could become mutable. Both halves are
+            # asserted here; this used to be a single "SET reason = reason"
+            # case, which the value-based trigger now allows precisely because
+            # it changes nothing.
+            oldest = "WHERE txn_id = (SELECT MIN(txn_id) FROM stocktake_transactions)"
+            for col, val in (("reason", "'rewritten'"), ("qty_kg", "qty_kg + 1"),
+                             ("item_name", "'HACKED'"), ("created_by", "'someone else'")):
+                await conn.execute("SAVEPOINT s_frozen")
+                try:
+                    await conn.execute(
+                        f"UPDATE stocktake_transactions SET {col} = {val} {oldest}")
+                    check("changing %s is blocked" % col, False, "no raise")
+                except asyncpg.PostgresError as exc:
+                    check("changing %s is blocked" % col,
+                          "append-only" in str(exc), str(exc)[:60])
+                await conn.execute("ROLLBACK TO SAVEPOINT s_frozen")
+
+            await conn.execute("SAVEPOINT s_noop")
             try:
                 await conn.execute(
-                    "UPDATE stocktake_transactions SET reason = reason "
-                    "WHERE txn_id = (SELECT MIN(txn_id) FROM stocktake_transactions)")
-                check("UPDATE is blocked", False, "no raise")
+                    f"UPDATE stocktake_transactions SET reason = reason {oldest}")
+                check("an UPDATE that changes nothing is allowed", True)
             except asyncpg.PostgresError as exc:
-                check("UPDATE is blocked", "append-only" in str(exc), str(exc)[:60])
+                check("an UPDATE that changes nothing is allowed", False, str(exc)[:60])
+            await conn.execute("ROLLBACK TO SAVEPOINT s_noop")
+
+            await conn.execute("SAVEPOINT s_signoff")
+            try:
+                await conn.execute(
+                    "UPDATE stocktake_transactions "
+                    "SET verified = TRUE, verified_by = 'x', verified_at = now() "
+                    + oldest)
+                check("the sign-off columns ARE writable", True)
+            except asyncpg.PostgresError as exc:
+                check("the sign-off columns ARE writable", False, str(exc)[:60])
+            await conn.execute("ROLLBACK TO SAVEPOINT s_signoff")
+
+            await conn.execute("SAVEPOINT s_delete")
+            try:
+                await conn.execute(f"DELETE FROM stocktake_transactions {oldest}")
+                check("DELETE is blocked outright", False, "no raise")
+            except asyncpg.PostgresError as exc:
+                check("DELETE is blocked outright", "append-only" in str(exc),
+                      str(exc)[:60])
+            await conn.execute("ROLLBACK TO SAVEPOINT s_delete")
         finally:
             await tx.rollback()
             print("\nrolled back — nothing written")
