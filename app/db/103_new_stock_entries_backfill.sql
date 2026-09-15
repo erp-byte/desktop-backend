@@ -118,7 +118,12 @@ SELECT
 FROM stocktake_entries s
 LEFT JOIN floor_alias a
        ON a.warehouse = UPPER(BTRIM(COALESCE(s.warehouse,  '')))
-      AND a.raw       = UPPER(BTRIM(COALESCE(s.floor_name, '')));
+      AND a.raw       = UPPER(BTRIM(COALESCE(s.floor_name, '')))
+-- Same cutoff as 104, so a database built fresh matches production: counts
+-- dated before the 2026-09-13 stock take restart were deleted and must not be
+-- loaded back. Naive-UTC column, two-step conversion to the IST day.
+WHERE ((s.created_at AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Kolkata')::date
+      >= DATE '2026-09-13';
 
 -- GENERATED ALWAYS keeps its own counter; without this the next insert reuses
 -- id 1 and trips the primary key.

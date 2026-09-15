@@ -93,7 +93,15 @@ FROM stocktake_entries s
 LEFT JOIN floor_alias a
        ON a.warehouse = UPPER(BTRIM(COALESCE(s.warehouse,  '')))
       AND a.raw       = UPPER(BTRIM(COALESCE(s.floor_name, '')))
-WHERE NOT EXISTS (SELECT 1 FROM new_stock_entries n WHERE n.id = s.id);
+WHERE NOT EXISTS (SELECT 1 FROM new_stock_entries n WHERE n.id = s.id)
+  -- THE STOCK TAKE RESTARTED ON 2026-09-13 (IST). Every count dated earlier was
+  -- deleted from new_stock_entries on 2026-09-15 by decision, and the id guard
+  -- above would copy each one straight back: a deleted row is precisely a row
+  -- whose id is missing. That is how the 13 Sep wipe of W202 First Floor came
+  -- back on the next migrate run. stocktake_entries itself still holds them.
+  -- created_at is naive UTC in that table, hence the two-step IST conversion.
+  AND ((s.created_at AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Kolkata')::date
+      >= DATE '2026-09-13';
 
 -- Keep the console's own inserts clear of every id the floor app can still
 -- issue. GREATEST so re-running never walks the sequence backwards.
