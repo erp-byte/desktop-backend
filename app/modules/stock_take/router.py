@@ -46,6 +46,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.modules.auth.middleware import AuthUser, require_permission
+from app.modules.stock_take import floors as _floors
 from app.modules.stock_take.services import (
     entries_export, export_xlsx, latest_stock_service, transactions_service,
 )
@@ -308,10 +309,16 @@ async def _available(conn) -> tuple[list[str], list[str], dict[str, list[str]]]:
 def _read_scope(user: AuthUser, places: dict[str, list[str]]) -> tuple[list[str], dict[str, list[str]]]:
     """(warehouses, floors-per-warehouse) this caller may LOOK at.
 
-    Deliberately built from `places` -- the floors stock is actually recorded at
-    -- and not from the declared floor profile the posting form uses. A floor
-    nobody declared can still hold counted stock, and a read filter that cannot
-    name it makes that stock unreachable rather than merely unpostable.
+    Built from `places` -- the floors stock is actually recorded at -- PLUS the
+    floors each warehouse declares. `places` alone is not enough in either
+    direction:
+      * a floor nobody declared can still hold counted stock (STORE), and a read
+        filter that cannot name it makes that stock unreachable;
+      * a declared floor can hold nothing at all (A185 / Dmart Production Area
+        after the 13 Sep restart). `places` does not know it exists, so it
+        dropped out of by_wh and /latest-stock refused a GRANTED floor with
+        "You are not assigned to floor" -- on the Adjust screen, which offers
+        that floor via /scope and lets the same person post to it.
 
     Empty grants mean "no restriction", the same rule as everywhere else:
     auth_schema.sql:35, and the admin screen renders an empty list as "All".
@@ -325,6 +332,14 @@ def _read_scope(user: AuthUser, places: dict[str, list[str]]) -> tuple[list[str]
     by_wh: dict[str, list[str]] = {}
     for wh in whs:
         floors = list(places.get(wh, []))
+        # Declared floors go AFTER the data's own spellings, and only when no
+        # spelling of them is there already, so STORE is not listed twice as
+        # "STORE" and "Store".
+        seen = {f.strip().upper() for f in floors}
+        for f in _floors.FLOORS_BY_WAREHOUSE.get(wh, ()):
+            if f.strip().upper() not in seen:
+                floors.append(f)
+                seen.add(f.strip().upper())
         if keep:
             floors = [f for f in floors if f.strip().upper() in keep]
         by_wh[wh] = floors

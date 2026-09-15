@@ -4,7 +4,9 @@ _read_scope answers "what may I SEE", which is NOT the same question /scope
 answers. /scope offers the floors the ERP declares, because you should not be
 able to file an adjustment against TEESTTTT. A read filter built from that list
 would hide real counted stock: 301 W202 rows sit on STORE, a floor nobody
-declared. So the read scope comes from where stock is actually RECORDED.
+declared. So the read scope comes from where stock is actually RECORDED --
+plus the declared floors, because a declared floor can hold nothing yet, and a
+granted floor missing from this list is refused outright by /latest-stock.
 """
 from __future__ import annotations
 
@@ -31,7 +33,35 @@ def test_no_grants_means_everything_not_nothing():
     """auth_schema.sql:35 — an empty list is 'no restriction', not 'no access'."""
     whs, by_wh = R._read_scope(FakeUser([], []), PLACES)
     assert whs == ["A185", "F53", "W202"]
-    assert by_wh["W202"] == PLACES["W202"]
+    assert by_wh["W202"][:len(PLACES["W202"])] == PLACES["W202"]
+    assert "Second Floor" in by_wh["W202"], "declared, even with no rows"
+
+
+# Suraj Bhilare's live profile on 2026-09-15: A185, five floors.
+SURAJ = FakeUser(["A185"], ["Dmart Packing Area", "FFS Packing Area", "FG store",
+                            "Sorting Area", "Dmart Production Area"])
+
+
+def test_a_granted_floor_holding_nothing_is_still_nameable():
+    """The Adjust screen offered Dmart Production Area (from /scope, which reads
+    the declared profile), let him post to it, and then /latest-stock refused
+    it: "You are not assigned to floor 'Dmart Production Area'". The floor held
+    no rows after the 13 Sep restart, so `places` did not list it."""
+    _, by_wh = R._read_scope(SURAJ, PLACES)
+    assert "Dmart Production Area" in by_wh["A185"]
+    assert sorted(by_wh["A185"]) == sorted(SURAJ.allowed_floors)
+
+
+def test_declared_floors_never_widen_a_floor_grant():
+    """Adding the declared list must not hand out floors the profile withholds."""
+    _, by_wh = R._read_scope(FakeUser(["A185"], ["Mezzanine"]), PLACES)
+    assert by_wh["A185"] == ["Mezzanine"]
+
+
+def test_a_declared_floor_is_not_listed_twice_under_another_spelling():
+    """The data says STORE, W202 declares Store: one floor, one entry."""
+    _, by_wh = R._read_scope(FakeUser(["W202"], []), PLACES)
+    assert [f for f in by_wh["W202"] if f.upper() == "STORE"] == ["STORE"]
 
 
 def test_a_warehouse_grant_narrows_the_list():
@@ -95,7 +125,9 @@ def test_being_admin_does_not_widen_the_read_scope():
 @pytest.mark.parametrize("floors", [None, [], ["   "]])
 def test_blank_floor_grants_are_treated_as_no_grant(floors):
     _, by_wh = R._read_scope(FakeUser(["W202"], floors), PLACES)
-    assert by_wh["W202"] == PLACES["W202"]
+    _, one_floor = R._read_scope(FakeUser(["W202"], ["First Floor"]), PLACES)
+    assert by_wh["W202"][:len(PLACES["W202"])] == PLACES["W202"]
+    assert len(by_wh["W202"]) > len(one_floor["W202"])
 
 
 def test_a_warehouse_absent_from_the_data_still_appears_with_no_floors():
