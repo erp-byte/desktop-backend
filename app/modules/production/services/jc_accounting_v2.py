@@ -687,6 +687,42 @@ PM_VARIANCE_CATEGORIES = frozenset({
 PM_VALID_UOMS = frozenset({'PCS', 'NOS', 'ROLL', 'SETS', 'BUNDLE'})
 
 
+async def _adopt_byproduct_row(conn, *, job_card_id: int, batch_id: int | None, category: str,
+                               material_name: str | None, bom_line_id: int | None) -> None:
+    """save_byproducts' twin of job_card_v2._adopt_consumption_row: re-tag an
+    existing (category, article) row in batch X under another spelling, else a
+    legacy no-batch row, instead of inserting a second one. Spec 2d."""
+    if batch_id is None:
+        return
+    exact = await conn.fetchval(
+        "/* adopt:exact */ SELECT byproduct_id FROM job_card_byproducts_v2 "
+        "WHERE job_card_id = $1 AND COALESCE(batch_id, 0) = $2 AND category = $3 "
+        "AND COALESCE(material_name, '') = COALESCE($4, '')",
+        job_card_id, batch_id, category, material_name)
+    if exact is not None:
+        return
+    if material_name:
+        match = "UPPER(BTRIM(material_name)) = UPPER(BTRIM($4))"
+        args = (job_card_id, batch_id, category, material_name)
+    else:
+        match = "material_name IS NULL"
+        args = (job_card_id, batch_id, category)
+    row_id = await conn.fetchval(
+        f"""/* adopt:candidate */
+        SELECT byproduct_id FROM job_card_byproducts_v2
+         WHERE job_card_id = $1 AND category = $3 AND {match}
+           AND (batch_id = $2 OR batch_id IS NULL)
+         ORDER BY (batch_id IS NULL), byproduct_id
+         LIMIT 1
+        """, *args)
+    if row_id is None:
+        return
+    await conn.execute(
+        "UPDATE job_card_byproducts_v2 SET batch_id = $2, material_name = $3, bom_line_id = $4 "
+        "WHERE byproduct_id = $1",
+        row_id, batch_id, material_name, bom_line_id)
+
+
 async def save_byproducts(conn, *, job_card_id: int,
                           rows: list[dict],
                           recorded_by: str | None = None,
@@ -721,11 +757,18 @@ async def save_byproducts(conn, *, job_card_id: int,
     # Categories that genuinely don't carry an article (control_sample,
     # pm_*, dust as a whole-batch sweep) are NOT affected — their
     # incoming rows pass NULL too, so this set excludes them.
+    #
+    # Only rows with a quantity attribute: the web saves a cleared
+    # (category, article) row as 0, and that clears — it attributes
+    # nothing. And only the saved batch's no-article rows go (plus legacy
+    # no-batch ones, which show under every batch): another batch's
+    # no-article row is that batch's own figure.
     attributed_cats = sorted({
         r.get("category") for r in rows
         if r.get("category")
         and isinstance(r.get("material_name"), str)
         and r["material_name"].strip()
+        and _f(r.get("quantity")) > 0
     })
     if attributed_cats:
         await conn.execute(
@@ -734,8 +777,9 @@ async def save_byproducts(conn, *, job_card_id: int,
             WHERE  job_card_id = $1
               AND  material_name IS NULL
               AND  category = ANY($2::text[])
+              AND  (COALESCE(batch_id, 0) = COALESCE($3::bigint, 0) OR batch_id IS NULL)
             """,
-            job_card_id, attributed_cats,
+            job_card_id, attributed_cats, batch_id,
         )
 
     saved: list[dict] = []
@@ -775,6 +819,8 @@ async def save_byproducts(conn, *, job_card_id: int,
             bom_line_id = int(bom_line_id) if bom_line_id not in (None, "") else None
         except (TypeError, ValueError):
             bom_line_id = None
+        await _adopt_byproduct_row(conn, job_card_id=job_card_id, batch_id=batch_id, category=cat,
+                                   material_name=material_name, bom_line_id=bom_line_id)
 
         async def _insert(
             _job_card_id=job_card_id, _cat=cat, _qty=qty, _uom=uom,

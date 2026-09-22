@@ -2,8 +2,13 @@
 
     GET /api/v1/stock-take/latest-stock    stock as counted on the most recent
                                            count date, plus that date
+    GET /api/v1/stock-take/latest-stock/export
+                                           current stock per warehouse + floor
+                                           as .xlsx (cold stores included)
     GET /api/v1/stock-take/filter-options  distinct values for the filter controls
     GET /api/v1/stock-take/entries/export  every matching count row as .xlsx
+    GET /api/v1/stock-take/floor-stock     everything on one warehouse + floor,
+                                           netted (the job card's material tab)
 
 Rows come from `new_stock_entries` (business_day.ENTRIES_TABLE), the canonical
 copy of the `stocktake_entries` that the separate Stock Take app
@@ -47,8 +52,10 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.modules.auth.middleware import AuthUser, require_permission
 from app.modules.stock_take import floors as _floors
+from app.modules.stock_take import place_scope
 from app.modules.stock_take.services import (
-    entries_export, export_xlsx, latest_stock_service, transactions_service,
+    entries_export, export_xlsx, floor_stock_service, latest_stock_service,
+    transactions_service,
 )
 
 log = logging.getLogger(__name__)
@@ -189,47 +196,14 @@ async def latest_stock(
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
         places = await latest_stock_service.fetch_places(conn)
-        whs, by_wh = _read_scope(user, places)
-
-        # A filter the caller may not use is refused, never silently widened:
-        # dropping an out-of-scope value would leave NO warehouse predicate,
-        # which reads as "everything" -- the opposite of what was asked for.
-        if warehouse:
-            bad = [w for w in warehouse
-                   if transactions_service._normalise_warehouse(w) not in whs]
-            if bad:
-                raise HTTPException(403, detail={
-                    "error": "warehouse_not_allowed",
-                    "message": f"You are not assigned to warehouse {bad[0]!r}.",
-                    "details": {"requested": bad, "allowed_warehouses": whs}})
-        else:
-            # "all" means all of YOURS. Only applied when the profile actually
-            # restricts; an unrestricted caller keeps an unfiltered query rather
-            # than one pinned to whatever happens to be in the table today.
-            if [w for w in (user.allowed_warehouses or []) if str(w).strip()]:
-                warehouse = list(whs)
-
-        # Floors are clamped ONLY when the caller holds floor grants. Defaulting
-        # an ungranted caller to the scoped floor list would hide every row on a
-        # floor the profile never declared -- 301 W202 rows sit on STORE -- and
-        # "I can see the warehouse" has to mean all of it.
-        if [f for f in (user.allowed_floors or []) if str(f).strip()]:
-            allowed_f = {f.strip().upper() for fl in by_wh.values() for f in fl}
-            if floor_name:
-                bad_f = [f for f in floor_name if f.strip().upper() not in allowed_f]
-                if bad_f:
-                    raise HTTPException(403, detail={
-                        "error": "floor_not_allowed",
-                        "message": f"You are not assigned to floor {bad_f[0]!r}.",
-                        "details": {"requested": bad_f, "allowed_floors": sorted(allowed_f)}})
-            else:
-                floor_name = sorted(allowed_f)
+        warehouse, floor_name, place_scope = _clamp_to_read_scope(user, places, warehouse, floor_name)
 
         try:
             return await latest_stock_service.fetch_latest_stock(
                 conn,
                 warehouse=warehouse,
                 floor_name=floor_name,
+                place_scope=place_scope,
                 item_type=item_type,
                 category=category,
                 subcategory=subcategory,
@@ -256,6 +230,121 @@ async def latest_stock(
                     "details": {"asOf": as_of},
                 },
             ) from exc
+
+
+def _clamp_to_read_scope(
+    user: AuthUser, places: dict[str, list[str]],
+    warehouse: Optional[list[str]], floor_name: Optional[list[str]],
+) -> tuple[Optional[list[str]], Optional[list[str]], Optional[dict[str, list[str]]]]:
+    """The (warehouse, floor, place scope) a stock read may run with for this caller.
+
+    Shared by the page (/latest-stock) and its download (/latest-stock/export),
+    so a file can never show more than the screen it was taken from.
+
+    The place scope is None for a caller with no floor grants. Otherwise it is
+    {"whole": warehouses seen in full, "pairs": ["W202|FIRST FLOOR", ...]}, and a
+    row is readable when its warehouse is whole or its warehouse|floor is a pair
+    (latest_stock_service._place_scope_sql).
+    """
+    whs, by_wh, whole = _read_scope_detail(user, places)
+
+    # A filter the caller may not use is refused, never silently widened:
+    # dropping an out-of-scope value would leave NO warehouse predicate,
+    # which reads as "everything" -- the opposite of what was asked for.
+    if warehouse:
+        bad = [w for w in warehouse
+               if transactions_service._normalise_warehouse(w) not in whs]
+        if bad:
+            raise HTTPException(403, detail={
+                "error": "warehouse_not_allowed",
+                "message": f"You are not assigned to warehouse {bad[0]!r}.",
+                "details": {"requested": bad, "allowed_warehouses": whs}})
+    else:
+        # "all" means all of YOURS. Only applied when the profile actually
+        # restricts; an unrestricted caller keeps an unfiltered query rather
+        # than one pinned to whatever happens to be in the table today.
+        if [w for w in (user.allowed_warehouses or []) if str(w).strip()]:
+            warehouse = list(whs)
+
+    # Floors are clamped ONLY when the caller holds floor grants. Defaulting
+    # an ungranted caller to the scoped floor list would hide every row on a
+    # floor the profile never declared -- 301 W202 rows sit on STORE -- and
+    # "I can see the warehouse" has to mean all of it.
+    #
+    # PLACE BY PLACE, not one floor list for every warehouse. The single list
+    # ANDed with the warehouse list could not say "these W202 floors, and all of
+    # Savla D-39": a caller granted D-39 plus W202 floors saw no cold stock at
+    # all, because Savla is not one of their floor names -- and the admin screen
+    # cannot grant it, since it offers floors for W202 and A185 only.
+    place_scope = None
+    if [f for f in (user.allowed_floors or []) if str(f).strip()]:
+        allowed_f = {f.strip().upper() for fl in by_wh.values() for f in fl}
+        if floor_name:
+            bad_f = [f for f in floor_name if f.strip().upper() not in allowed_f]
+            if bad_f:
+                raise HTTPException(403, detail={
+                    "error": "floor_not_allowed",
+                    "message": f"You are not assigned to floor {bad_f[0]!r}.",
+                    "details": {"requested": bad_f, "allowed_floors": sorted(allowed_f)}})
+        place_scope = {
+            "whole": sorted(whole),
+            "pairs": sorted({f"{wh}|{f.strip().upper()}"
+                             for wh in whs if wh not in whole for f in by_wh[wh]}),
+        }
+    return warehouse, floor_name, place_scope
+
+
+@router.get("/latest-stock/export")
+async def export_latest_stock(
+    request: Request,
+    warehouse: Optional[list[str]] = Query(None, description="Warehouse code(s); repeat the param"),
+    floor_name: Optional[list[str]] = Query(None, alias="floorName", description="Floor name(s)"),
+    item_type: Optional[list[str]] = Query(None, alias="itemType", description="PM / RM / FG"),
+    category: Optional[list[str]] = Query(None, description="Item group(s)"),
+    subcategory: Optional[list[str]] = Query(None, description="Item sub-group(s)"),
+    stock_type: Optional[list[str]] = Query(None, alias="stockType", description="Fresh Stock / Off Grade/Rejection"),
+    search: Optional[str] = Query(None, description="Free text across item, group, warehouse, floor, counter"),
+    as_of: Optional[str] = Query(None, alias="asOf", description="Latest count on or before this YYYY-MM-DD"),
+    user: AuthUser = Depends(require_permission("stock_take", action="export")),
+) -> StreamingResponse:
+    """Current stock by warehouse and floor as .xlsx: what the page shows, kept
+    apart per place, for every warehouse the caller may see (cold stores included).
+
+    Same filters and the same scope rules as /latest-stock. Unpaginated.
+    Sheet 1 totals each warehouse and floor; sheet 2 lists every article there.
+    """
+    asked_wh, asked_fl = warehouse, floor_name
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        places = await latest_stock_service.fetch_places(conn)
+        warehouse, floor_name, place_scope = _clamp_to_read_scope(user, places, warehouse, floor_name)
+        try:
+            rows, applied = await latest_stock_service.fetch_stock_by_place(
+                conn, warehouse=warehouse, floor_name=floor_name, place_scope=place_scope,
+                item_type=item_type,
+                category=category, subcategory=subcategory, stock_type=stock_type,
+                search=search, as_of=as_of)
+        except ValueError as exc:
+            raise HTTPException(400, detail={
+                "error": "invalid_as_of", "message": str(exc),
+                "details": {"asOf": as_of}}) from exc
+    # The sheet header says "Warehouse: all" when the person picked all, not the
+    # ten codes their profile expanded that to.
+    if not asked_wh:
+        applied.pop("warehouse", None)
+    if not asked_fl:
+        applied.pop("floorName", None)
+
+    stream = export_xlsx.build_stock_workbook(rows, applied, _actor(user))
+    stamp = (as_of or date.today().isoformat()).replace("-", "")
+    return StreamingResponse(
+        stream,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f'attachment; filename="Current_Stock_{stamp}.xlsx"',
+            "X-Total-Rows": str(len(rows)),
+        },
+    )
 
 
 @router.get("/filter-options")
@@ -291,6 +380,9 @@ async def filter_options(
         # So the browser can narrow Floor once a Warehouse is picked instead of
         # listing another building's floors, same as the Adjust form.
         "floors_by_warehouse": by_wh,
+        # "Savla D-39" rather than "D39" in the dropdown; the value stays the code.
+        "warehouse_labels": {w: _floors.warehouse_label(w) for w in whs},
+        "cold_warehouses": [w for w in whs if w in _floors.COLD_WAREHOUSES],
     }
 
 
@@ -307,7 +399,50 @@ async def _available(conn) -> tuple[list[str], list[str], dict[str, list[str]]]:
 
 
 def _read_scope(user: AuthUser, places: dict[str, list[str]]) -> tuple[list[str], dict[str, list[str]]]:
-    """(warehouses, floors-per-warehouse) this caller may LOOK at.
+    """(warehouses, floors-per-warehouse) this caller may LOOK at. See _read_scope_detail."""
+    whs, by_wh, _whole = _read_scope_detail(user, places)
+    return whs, by_wh
+
+
+#: Every floor the admin screen can offer (it lists W202's and A185's only).
+_DECLARED_FLOORS = frozenset(f.strip().upper()
+                             for fl in _floors.FLOORS_BY_WAREHOUSE.values() for f in fl)
+
+
+def _floor_grants_narrow(wh: str, keep: set[str], warehouse_granted: bool) -> bool:
+    """Whether the caller's floor grants limit what they see of warehouse `wh`.
+
+    Decided from the GRANTS ALONE, never from which floors hold rows today: a
+    rule that read the data would open a whole cold store, or close one, the
+    moment a count was deleted or a floor renamed, with no admin involved.
+
+    Floor grants are warehouse-blind names, and the admin screen offers them
+    for W202 and A185 only ("filtered by warehouses"): it has no floors to offer
+    for a cold store or a godown. So:
+      * a warehouse that declares floors is narrowed by the grants, as always;
+      * a profile whose grants name only those declared floors said nothing
+        about any other warehouse, so a cold store or godown it grants by name
+        is the caller's in full. Before, it came back empty: someone granted
+        D-39 plus a few W202 floors saw none of Savla's 312,067 kg;
+      * a profile that names floors the screen cannot offer (Savla, Savla
+        Bond -- set directly in auth_user) was written with those warehouses in
+        mind, so every warehouse is narrowed to exactly what it names, and a
+        misspelt name shows nothing rather than everything.
+
+    Without a warehouse grant nothing was granted by name, so the floor grants
+    narrow every warehouse, as before.
+    """
+    if not keep:
+        return False
+    if not warehouse_granted or wh in _floors.FLOORS_BY_WAREHOUSE:
+        return True
+    return bool(keep - _DECLARED_FLOORS)
+
+
+def _read_scope_detail(
+    user: AuthUser, places: dict[str, list[str]],
+) -> tuple[list[str], dict[str, list[str]], list[str]]:
+    """(warehouses, floors-per-warehouse, warehouses seen whole) this caller may LOOK at.
 
     Built from `places` -- the floors stock is actually recorded at -- PLUS the
     floors each warehouse declares. `places` alone is not enough in either
@@ -330,6 +465,7 @@ def _read_scope(user: AuthUser, places: dict[str, list[str]]) -> tuple[list[str]
            if granted_w else sorted(places))
     keep = {str(f).strip().upper() for f in granted_f}
     by_wh: dict[str, list[str]] = {}
+    whole: list[str] = []
     for wh in whs:
         floors = list(places.get(wh, []))
         # Declared floors go AFTER the data's own spellings, and only when no
@@ -340,10 +476,12 @@ def _read_scope(user: AuthUser, places: dict[str, list[str]]) -> tuple[list[str]
             if f.strip().upper() not in seen:
                 floors.append(f)
                 seen.add(f.strip().upper())
-        if keep:
+        if _floor_grants_narrow(wh, keep, bool(granted_w)):
             floors = [f for f in floors if f.strip().upper() in keep]
+        else:
+            whole.append(wh)
         by_wh[wh] = floors
-    return whs, by_wh
+    return whs, by_wh, whole
 
 
 @router.get("/scope")
@@ -366,6 +504,7 @@ async def my_scope(
     warehouses, floors = scope["warehouses"], scope["floors"]
     return {
         **scope,
+        "warehouse_labels": {w: _floors.warehouse_label(w) for w in warehouses},
         "can_post": bool(warehouses and floors),
         # Named so the UI renders the ACTUAL cause. "unrestricted but nothing
         # available" is a server/database misconfiguration, not a permissions
@@ -704,6 +843,44 @@ async def export_transactions(
             "X-Total-Rows": str(len(rows)),
         },
     )
+
+
+def _floor_stock_place(user: AuthUser, warehouse: Optional[str], floor: Optional[str]) -> tuple[str, str]:
+    """The (warehouse, floor) this caller may read the floor stock of, or an HTTP error.
+
+    Read straight off the caller's GRANTS, not off `places`: a job card's floor can
+    hold no counts yet, and refusing it would report a permissions problem where
+    the truth is "nothing recorded here". Empty grants mean "no restriction"
+    (auth_schema.sql:35), the same rule as _read_scope.
+    """
+    wh = transactions_service._normalise_warehouse(warehouse)
+    fl = (floor or "").strip()
+    if not wh or not fl:
+        raise HTTPException(400, detail={
+            "error": "place_required",
+            "message": "Pick a warehouse and a floor to see its stock.",
+            "details": {"warehouse": warehouse, "floorName": floor}})
+    place_scope.assert_place_allowed(user, wh, fl)
+    return wh, fl
+
+
+@router.get("/floor-stock")
+async def floor_stock(
+    request: Request,
+    warehouse: Optional[str] = Query(None, description="Warehouse code; W-202 and W202 both work"),
+    floor_name: Optional[str] = Query(None, alias="floorName", description="Floor name"),
+    user: AuthUser = Depends(require_permission("stock_take", action="view")),
+) -> dict[str, Any]:
+    """Every article recorded at one warehouse + floor: latest count there, plus
+    adjustments posted there since, largest first. Read-only.
+
+    The job card's "Material allocation and requisition" tab reads this for the
+    job card's own plant and floor.
+    """
+    wh, fl = _floor_stock_place(user, warehouse, floor_name)
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await floor_stock_service.fetch_floor_stock(conn, warehouse=wh, floor=fl)
 
 
 @router.get("/balance")

@@ -38,9 +38,31 @@ FLOORS_BY_WAREHOUSE: dict[str, list[str]] = {
 }
 
 
+#: What a person calls the cold stores, keyed by the normalised code. The code
+#: alone reads as noise on a report ("D39", "ESKIMO"); these are the names the
+#: rest of the ERP already uses (transfer DC, gate pass, inventory ledger).
+#: A warehouse missing here is shown by its code.
+WAREHOUSE_LABELS: dict[str, str] = {
+    "D39": "Savla D-39",
+    "D514": "Savla D-514",
+    "RISHI": "Rishi",
+    "ESKIMO": "Eskimo",
+    "SUPREME": "Supreme",
+}
+
+#: The third-party cold stores, listed after the factories on screens and sheets.
+COLD_WAREHOUSES: frozenset[str] = frozenset(WAREHOUSE_LABELS)
+
+
 def normalise_warehouse(code: str | None) -> str:
     """'W-202' -> 'W202'. auth_user.allowed_warehouses carries both spellings."""
     return (code or "").strip().upper().replace("-", "")
+
+
+def warehouse_label(code: str | None) -> str:
+    """'D39' / 'D-39' -> 'Savla D-39'; a code with no name comes back as the code."""
+    key = normalise_warehouse(code)
+    return WAREHOUSE_LABELS.get(key, key)
 
 
 def declared_floors(warehouses: Iterable[str]) -> list[str]:

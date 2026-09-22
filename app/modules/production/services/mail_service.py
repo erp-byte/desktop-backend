@@ -51,7 +51,9 @@ async def _lookup_user_email(conn, identifier: str | None) -> str | None:
 def _send(subject: str, body: str, to_addrs: list[str], cc_addrs: list[str],
           *, entity_type: str | None = None, entity_id: str | None = None,
           event: str | None = None, status: str | None = None,
-          actor: str | None = None) -> None:
+          actor: str | None = None) -> bool:
+    """Best-effort send. Returns True only when the SMTP server accepted the
+    message; False when SMTP is not configured or the send failed (never raises)."""
     settings = Settings()
     host = (settings.SMTP_HOST or "").strip()
     sender = (settings.SMTP_EMAIL or "").strip()
@@ -59,7 +61,7 @@ def _send(subject: str, body: str, to_addrs: list[str], cc_addrs: list[str],
     if not host:
         logger.info("[mail] SMTP_HOST not configured — skipping send (to=%s cc=%s subject=%s)",
                     to_addrs, cc_addrs, subject)
-        return
+        return False
 
     msg = EmailMessage()
     msg["From"] = sender
@@ -85,8 +87,10 @@ def _send(subject: str, body: str, to_addrs: list[str], cc_addrs: list[str],
                 s.login(sender, pw)
             s.send_message(msg, from_addr=sender, to_addrs=recipients)
         logger.info("[mail] sent subject=%r to=%s cc=%s", subject, to_addrs, cc_addrs)
+        return True
     except Exception:
         logger.exception("[mail] failed subject=%r to=%s cc=%s", subject, to_addrs, cc_addrs)
+        return False
 
 
 def _build_cc(business_head_key: str | None) -> list[str]:

@@ -101,17 +101,37 @@ def test_hyphenated_warehouse_codes_resolve():
     assert whs == ["W202"]
 
 
-def test_a_granted_warehouse_with_no_matching_floor_grant_comes_back_empty():
-    """Documents today's behaviour, which is a real edge worth seeing.
+def test_a_granted_warehouse_with_no_floors_of_its_own_is_seen_whole():
+    """Changed deliberately on 2026-09-18 (this test used to pin F53 -> []).
 
-    A caller granted F53 plus only W202 floor names gets F53 with an empty floor
-    list -- the warehouse is theirs but no floor in it is. Whether that should
-    instead mean 'unrestricted within F53' is a policy question, not a bug; this
-    test exists so changing it is a deliberate act rather than a surprise.
+    F53 declares no floors, so the admin screen had none to offer, and the
+    grant "Terrace" cannot have been about it. Granted by name, it is the
+    caller's in full. The case that forced the decision: an admin granted
+    D-39 plus W202/A185 floors saw none of Savla's 312,067 kg.
     """
     whs, by_wh = R._read_scope(FakeUser(["F53"], ["Terrace"]), PLACES)
     assert whs == ["F53"]
-    assert by_wh["F53"] == []
+    assert by_wh["F53"] == PLACES["F53"]
+
+
+def test_a_declared_warehouse_is_still_narrowed_to_nothing_by_other_floors():
+    """A185 declares floors, so a W202-only floor grant still leaves it empty."""
+    _, by_wh = R._read_scope(FakeUser(["A185", "W202"], ["Terrace"]), PLACES)
+    assert by_wh["A185"] == []
+    assert by_wh["W202"] == ["Terrace"]
+
+
+def test_a_grant_that_names_an_undeclared_warehouse_floor_narrows_it():
+    """Set directly in the table (user 164 holds Savla, Savla Bond, ...): a floor
+    grant that names one of F53's recorded floors is about F53, so it narrows."""
+    _, by_wh = R._read_scope(FakeUser(["F53"], ["Store Area"]), PLACES)
+    assert by_wh["F53"] == ["STORE AREA"]
+
+
+def test_without_a_warehouse_grant_floor_grants_narrow_everything():
+    """Nothing was granted by name, so nothing is seen whole."""
+    _, by_wh = R._read_scope(FakeUser([], ["Terrace"]), PLACES)
+    assert by_wh["F53"] == [] and by_wh["W202"] == ["Terrace"]
 
 
 def test_being_admin_does_not_widen_the_read_scope():

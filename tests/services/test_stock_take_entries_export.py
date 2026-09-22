@@ -181,12 +181,12 @@ async def main():
         # ── [5] Filters narrow both the rows and the draft footnote ──────
         print("\n[5] Filters")
         wh = await conn.fetchval(
-            "SELECT UPPER(TRIM(warehouse)) FROM new_stock_entries"
+            "SELECT REPLACE(UPPER(TRIM(warehouse)), '-', '') FROM new_stock_entries"
             " WHERE warehouse IS NOT NULL GROUP BY 1 ORDER BY COUNT(*) DESC LIMIT 1")
         f_rows, f_applied, f_drafts = await entries_export.fetch_entries(conn, warehouse=[wh])
         f_n = await conn.fetchval(
             f"SELECT COUNT(*)::int FROM new_stock_entries"
-            f" WHERE {COUNTED} AND UPPER(TRIM(warehouse)) = $1", wh)
+            f" WHERE {COUNTED} AND REPLACE(UPPER(TRIM(warehouse)), '-', '') = $1", wh)
         check("warehouse filter matches SQL", len(f_rows) == f_n,
               "got %d want %d" % (len(f_rows), f_n))
         check("applied echoes the filter for the sheet header",

@@ -39,6 +39,7 @@ from app.modules.packing.router import router as packing_router
 from app.modules.customer_returns.router import router as customer_returns_router
 from app.modules.bom.router import router as bom_router
 from app.modules.stock_take.router import router as stock_take_router
+from app.modules.floor_requisition.router import router as floor_requisition_router
 from app.modules.so.services.item_matcher import load_master_items
 from app.modules.production.services.master_ingest import run_master_ingest
 
@@ -158,7 +159,9 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["X-Request-ID"],
+    # The download headers too: a cross-origin fetch reads an unlisted header as
+    # null, so an export's row count and file name silently fell back to defaults.
+    expose_headers=["X-Request-ID", "X-Total-Rows", "X-Draft-Rows", "Content-Disposition"],
 )
 request_context.install(app)
 
@@ -183,6 +186,7 @@ app.include_router(packing_router)
 app.include_router(customer_returns_router)
 app.include_router(bom_router)
 app.include_router(stock_take_router)
+app.include_router(floor_requisition_router)
 app.include_router(webhook_router)
 app.include_router(ws_router)
 

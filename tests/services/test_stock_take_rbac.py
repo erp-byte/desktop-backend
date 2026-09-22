@@ -21,6 +21,7 @@ from app.modules.stock_take.router import router
 #: about what a new endpoint is allowed to do.
 EXPECTED = {
     "/api/v1/stock-take/latest-stock":        {"GET": "view"},
+    "/api/v1/stock-take/latest-stock/export": {"GET": "export"},
     "/api/v1/stock-take/filter-options":      {"GET": "view"},
     "/api/v1/stock-take/scope":               {"GET": "view"},
     "/api/v1/stock-take/transactions":        {"GET": "view", "POST": "create"},
@@ -34,6 +35,9 @@ EXPECTED = {
     # weaker gate here would be a way round the stronger one there.
     "/api/v1/stock-take/transactions/verify": {"POST": "verify"},
     "/api/v1/stock-take/balance":             {"GET": "view"},
+    # Everything on one warehouse + floor, for the job card's material tab. A
+    # read like latest-stock, so the same gate.
+    "/api/v1/stock-take/floor-stock":         {"GET": "view"},
     "/api/v1/stock-take/entries/export":      {"GET": "export"},
 }
 

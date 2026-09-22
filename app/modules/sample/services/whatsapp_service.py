@@ -1490,6 +1490,17 @@ async def handle_inbound(conn, *, from_phone: str, text: str, context_id: str | 
     body = (text or "").strip()
     first = body.split(maxsplit=1)[0].upper() if body else ""
 
+    # ── FLOOR REQUISITION store Accept / Hold — resolved before EVERYTHING else. The
+    #    floor_requisition_raised_store buttons read "Accept" and "Hold", the NPD review
+    #    verbs, so a store user who is also an NPD reviewer would otherwise have the tap
+    #    read as a sample-request decision. Its payload (floor_req:<action>:<id>) marks it
+    #    exactly; None means the tap is not a floor-requisition reply. ──
+    from app.modules.floor_requisition.services import wa_tap as _fr_tap  # lazy: avoid cycle
+    fr_res = await _fr_tap.handle_store_tap(conn, wa, _button_payload(raw) if raw else None,
+                                            sent_at=(raw or {}).get("timestamp"))
+    if fr_res is not None:
+        return fr_res
+
     # ── CUSTOMER-RETURNS head approval (context.id → wa_return_message) — resolved FIRST,
     #    since the BU-Head approver is neither an npd_team reviewer nor a promote approver.
     #    Returns None when the tap isn't a customer-return message, so the flows below run. ──

@@ -499,6 +499,36 @@ SQL_FILES = [
     # the verification each transaction already displayed via the adjustment row
     # it rolls into, so nothing on screen moves when it runs.
     DB_DIR / "110_stocktake_txn_verification.sql",
+    # 111 creates floor_requisition (the job card tab's Request → store Issue →
+    # floor Received record; tracking only, touches no stock-take table), its
+    # one-open-request-per-article index, and production.floor_requisitions.*
+    # permissions granted to admin / floor_manager / store_head. MUST follow 017
+    # (job_card_v2) and 085 (store_head). Idempotent.
+    DB_DIR / "111_floor_requisition.sql",
+    # 112 adds store_response / store_response_by / store_response_at to
+    # floor_requisition: store's Accept / Hold tap on the floor_requisition_raised_store
+    # WhatsApp template. Not a status. MUST follow 111. The backend checks the columns
+    # exist before reading them, so deploy order does not matter. Idempotent.
+    DB_DIR / "112_floor_requisition_store_response.sql",
+    # 113 lets sfg_box hold store's manually printed boxes (item_type 'rm') and
+    # creates floor_requisition_box: one row per box store scanned or printed for
+    # a request (Stores -> Production Indents -> Scan). MUST follow 067/073 and 111.
+    # Idempotent.
+    DB_DIR / "113_floor_requisition_box.sql",
+    # 114 makes floor_requisition_box.box_code unique across requests: a box goes
+    # out on one floor requisition. Fails (with a query in its header) if a box is
+    # already on two. MUST follow 113. Idempotent.
+    DB_DIR / "114_floor_requisition_box_unique.sql",
+    # 115 creates job_card_bom_change (an RM/PM article removed from / added to ONE
+    # job card's BOM, never the BOM module) and swaps the returns unique index to
+    # uq_jcbm_v2_jc_batch_line_type (unique per article for rows with no bom_line_id).
+    # DEPLOY THE SERVER FIRST: the old accounting record screen names the old index.
+    # MUST follow 044 (which stands down once the new index exists), 092 and 111.
+    # Idempotent.
+    DB_DIR / "115_job_card_bom_change.sql",
+    # 116 lets job_card_bom_change hold FG/SFG articles (accounted as RM, required qty
+    # in kg). MUST follow 115. Idempotent.
+    DB_DIR / "116_job_card_bom_change_types.sql",
 ]
 
 # ── Optional: drop the v1 legacy job-card stack (TEST / Supabase DB ONLY) ──────

@@ -111,7 +111,7 @@ async def main():
             place_day AS (
                 SELECT UPPER(BTRIM(item_name)) AS k,
                        COALESCE(stock_type, 'Fresh Stock') AS st,
-                       COALESCE(UPPER(BTRIM(warehouse)), '') AS wh,
+                       COALESCE(REPLACE(UPPER(BTRIM(warehouse)), '-', ''), '') AS wh,
                        COALESCE(UPPER(BTRIM(floor_name)), '') AS fl,
                        {ED} AS d,
                        SUM(total_quantity) AS q, SUM(total_weight) AS w,
@@ -138,7 +138,7 @@ async def main():
                   LEFT JOIN place_latest b
                          ON b.k  = UPPER(BTRIM(t.item_name))
                         AND b.st = COALESCE(t.stock_type, 'Fresh Stock')
-                        AND b.wh = COALESCE(UPPER(BTRIM(t.warehouse)), '')
+                        AND b.wh = COALESCE(REPLACE(UPPER(BTRIM(t.warehouse)), '-', ''), '')
                         AND b.fl = COALESCE(UPPER(BTRIM(t.location)), '')
                  WHERE (b.d IS NULL
                         OR (t.created_at AT TIME ZONE 'Asia/Kolkata')::date >= b.d)
@@ -179,7 +179,7 @@ async def main():
         print("\n[2] Filters")
         wh = await conn.fetchrow(
             f"""
-            SELECT UPPER(TRIM(warehouse)) AS w,
+            SELECT REPLACE(UPPER(TRIM(warehouse)), '-', '') AS w,
                    MAX((created_at AT TIME ZONE 'Asia/Kolkata')::date) AS d
             FROM new_stock_entries WHERE {non_draft}
             GROUP BY 1 ORDER BY MAX(created_at) ASC LIMIT 1
@@ -196,12 +196,12 @@ async def main():
             f"""
             WITH scoped AS (
                 SELECT * FROM new_stock_entries
-                 WHERE {non_draft} AND UPPER(TRIM(warehouse)) = $1
+                 WHERE {non_draft} AND REPLACE(UPPER(TRIM(warehouse)), '-', '') = $1
             ),
             place_day AS (
                 SELECT UPPER(BTRIM(item_name)) AS k,
                        COALESCE(stock_type, 'Fresh Stock') AS st,
-                       COALESCE(UPPER(BTRIM(warehouse)), '') AS wh,
+                       COALESCE(REPLACE(UPPER(BTRIM(warehouse)), '-', ''), '') AS wh,
                        COALESCE(UPPER(BTRIM(floor_name)), '') AS fl,
                        {ED} AS d, SUM(total_weight) AS w
                   FROM scoped GROUP BY 1, 2, 3, 4, 5
@@ -220,9 +220,9 @@ async def main():
                                LEFT JOIN place_latest b
                                       ON b.k  = UPPER(BTRIM(t.item_name))
                                      AND b.st = COALESCE(t.stock_type, 'Fresh Stock')
-                                     AND b.wh = COALESCE(UPPER(BTRIM(t.warehouse)), '')
+                                     AND b.wh = COALESCE(REPLACE(UPPER(BTRIM(t.warehouse)), '-', ''), '')
                                      AND b.fl = COALESCE(UPPER(BTRIM(t.location)), '')
-                              WHERE UPPER(BTRIM(t.warehouse)) = $1
+                              WHERE REPLACE(UPPER(BTRIM(t.warehouse)), '-', '') = $1
                                 AND (b.d IS NULL
                                      OR (t.created_at AT TIME ZONE 'Asia/Kolkata')::date >= b.d)), 0)::float8
             """,

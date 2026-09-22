@@ -10,13 +10,15 @@ writes "N floor(s) excluded" into its export.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from typing import Any
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+
+from .. import floors as _floors
 
 # (key, header, width). Order is the sheet's column order.
 COLUMNS: tuple[tuple[str, str, int], ...] = (
@@ -396,3 +398,190 @@ def _summary_sheet(wb: Workbook, order: list[str],
         ws.cell(row=r + 2, column=1,
                 value="No submitted count entries matched these filters.").font = _META_FONT
     _footer(ws, r + 4, [x for b in order for x in buckets[b]], generated_by)
+
+
+# ── Current stock export ───────────────────────────────────────────────────
+# The page's figures, per warehouse and floor: each article at its own latest
+# count there, plus the adjustments posted there since. Two sheets, because the
+# first question is "how much is where" and only then "which articles":
+#   Summary         one line per warehouse + floor, a total per warehouse,
+#                   then cold storage and grand totals
+#   Stock by floor  one line per article at each floor, filterable
+# Rows come from latest_stock_service.fetch_stock_by_place.
+
+STOCK_COLUMNS: tuple[tuple[str, str, int], ...] = (
+    ("warehouse",         "Warehouse",           16),
+    ("floor",             "Floor",               20),
+    ("item_name",         "Item",                42),
+    ("item_type",         "Type",                 8),
+    ("item_category",     "Group",               20),
+    ("item_subcategory",  "Sub-group",           20),
+    ("stock_type",        "Stock type",          18),
+    ("total_quantity",    "Qty (units)",         12),
+    ("counted_weight",    "Counted (kg)",        14),
+    ("net_adjustment_kg", "Adjustments (kg)",    15),
+    ("total_weight",      "Current stock (kg)",  17),
+    ("last_counted_date", "Last counted",        13),
+    ("days_since_count",  "Days since count",    11),
+)
+_KG = "#,##0.00"
+_UNITS = "#,##0.###"
+_DATE = "dd-mmm-yyyy"
+_WH_TOTAL_FILL = PatternFill(start_color="E8EDF5", end_color="E8EDF5", fill_type="solid")
+_COLD_FILL = PatternFill(start_color="E3F2FD", end_color="E3F2FD", fill_type="solid")
+# The server runs on UTC (Lambda); the people reading this work to IST.
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _describe_stock(filters: dict[str, Any]) -> str:
+    parts = []
+    whs = filters.get("warehouse")
+    parts.append("Warehouse: " + (", ".join(_floors.warehouse_label(w) for w in whs)
+                                  if whs else "all"))
+    for key, label in (("floorName", "Floor"), ("itemType", "Type"), ("category", "Group"),
+                       ("subcategory", "Sub-group"), ("stockType", "Stock type"),
+                       ("search", "Search"), ("asOf", "As of")):
+        v = filters.get(key)
+        if v:
+            parts.append(f"{label}: {', '.join(v) if isinstance(v, list) else v}")
+    return "; ".join(parts)
+
+
+def _warehouse_order(code: str) -> tuple[int, int, str]:
+    """Factories A-Z first, then the cold stores in WAREHOUSE_LABELS order."""
+    if code in _floors.COLD_WAREHOUSES:
+        return (1, list(_floors.WAREHOUSE_LABELS).index(code), code)
+    return (0, 0, code)
+
+
+def _floor_order(code: str, floor_key: str) -> tuple[int, str]:
+    """Declared floors in the order the building is walked, then the rest A-Z."""
+    declared = [f.upper() for f in _floors.FLOORS_BY_WAREHOUSE.get(code, [])]
+    return ((declared.index(floor_key), "") if floor_key in declared
+            else (len(declared), floor_key))
+
+
+def _floor_label(code: str, floor_key: str, spelled: str) -> str:
+    """The declared spelling when there is one ("Store", not "STORE"), else as recorded."""
+    for f in _floors.FLOORS_BY_WAREHOUSE.get(code, []):
+        if f.upper() == floor_key:
+            return f
+    return (spelled or "").strip() or "(no floor)"
+
+
+def build_stock_workbook(rows: list[dict[str, Any]], filters: dict[str, Any],
+                         generated_by: str) -> BytesIO:
+    # A place is warehouse + floor KEY, not the floor as spelled: one floor can
+    # reach here as "STORE" from its counts and "Store" from its adjustments.
+    places: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    labels: dict[tuple[str, str], str] = {}
+    for r in rows:
+        key = (r["warehouse"], r.get("floor_key") or (r.get("floor") or "").strip().upper())
+        places.setdefault(key, []).append(r)
+        labels.setdefault(key, _floor_label(key[0], key[1], r.get("floor") or ""))
+    order = sorted(places, key=lambda p: (_warehouse_order(p[0]), _floor_order(*p)))
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Summary"
+    ws.cell(row=1, column=1, value="Current stock by warehouse and floor").font = _TITLE_FONT
+    ws.cell(row=2, column=1,
+            value="Each item at its own latest physical count, plus adjustments posted since.").font = _META_FONT
+    ws.cell(row=3, column=1, value=_describe_stock(filters)).font = _META_FONT
+    ws.cell(row=4, column=1,
+            value=f"Exported {_dt(datetime.now(_IST))} IST by {generated_by}").font = _META_FONT
+
+    head = 6
+    headers = ("Warehouse", "Floor", "Items", "Counted (kg)", "Adjustments (kg)",
+               "Current stock (kg)", "Off grade (kg)", "Last counted")
+    for i, (header, width) in enumerate(zip(headers, (18, 22, 8, 15, 16, 18, 15, 13)), start=1):
+        c = ws.cell(row=head, column=i, value=header)
+        c.font, c.fill, c.border = _HEADER_FONT, _HEADER_FILL, _BORDER
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        ws.column_dimensions[get_column_letter(i)].width = width
+
+    def totals(data: list[dict[str, Any]]) -> tuple:
+        dates = [d["last_counted_date"] for d in data if d.get("last_counted_date")]
+        # Items as the screen counts them: an item + stock type once, however
+        # many floors it is on. Equal to the row count on a single floor.
+        items = {(d.get("item_key") or (d.get("item_name") or "").strip().upper(),
+                  d.get("stock_type")) for d in data}
+        return (len(items),
+                sum(_num(d["counted_weight"]) for d in data),
+                sum(_num(d["net_adjustment_kg"]) for d in data),
+                sum(_num(d["total_weight"]) for d in data),
+                sum(_num(d["total_weight"]) for d in data
+                    if d.get("stock_type") == "Off Grade/Rejection"),
+                max(dates) if dates else None)
+
+    r = head
+
+    def line(first: str, second: str, data: list[dict[str, Any]],
+             font: Any = None, fill: Any = None) -> None:
+        nonlocal r
+        r += 1
+        for i, v in enumerate((first, second) + totals(data), start=1):
+            c = ws.cell(row=r, column=i, value=v)
+            c.border = _BORDER
+            if font:
+                c.font = font
+            if fill:
+                c.fill = fill
+            if i in (4, 5, 6, 7):
+                c.number_format = _KG
+            elif i == 8:
+                c.number_format = _DATE
+
+    by_wh: dict[str, list[tuple[str, str]]] = {}
+    for p in order:
+        by_wh.setdefault(p[0], []).append(p)
+    for code, wh_places in by_wh.items():
+        label = _floors.warehouse_label(code) or "(no warehouse)"
+        cold = code in _floors.COLD_WAREHOUSES
+        for p in wh_places:
+            line(label, labels[p], places[p], fill=_COLD_FILL if cold else None)
+        line(f"{label} total", "", [x for p in wh_places for x in places[p]],
+             font=_BOLD, fill=_WH_TOTAL_FILL)
+
+    cold_rows = [x for x in rows if x["warehouse"] in _floors.COLD_WAREHOUSES]
+    if cold_rows and len(cold_rows) < len(rows):
+        # Only when both kinds are present; otherwise it would repeat the grand total.
+        r += 1
+        line("Factories and godowns", "",
+             [x for x in rows if x["warehouse"] not in _floors.COLD_WAREHOUSES], font=_BOLD)
+        line("Cold storage", "", cold_rows, font=_BOLD, fill=_COLD_FILL)
+    line("GRAND TOTAL", "", rows, font=_BOLD, fill=_TOTAL_FILL)
+    ws.freeze_panes = ws.cell(row=head + 1, column=1)
+    if not rows:
+        ws.cell(row=r + 2, column=1, value="No stock matched these filters.").font = _META_FONT
+
+    # ── Sheet 2: every item, per floor ──
+    ds = wb.create_sheet("Stock by floor")
+    for i, (_key, header, width) in enumerate(STOCK_COLUMNS, start=1):
+        c = ds.cell(row=1, column=i, value=header)
+        c.font, c.fill, c.border = _HEADER_FONT, _HEADER_FILL, _BORDER
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        ds.column_dimensions[get_column_letter(i)].width = width
+    n = 1
+    for p in order:
+        for item in places[p]:
+            n += 1
+            for i, (key, _header, _w) in enumerate(STOCK_COLUMNS, start=1):
+                v = (_floors.warehouse_label(item["warehouse"]) if key == "warehouse"
+                     else labels[p] if key == "floor" else item.get(key))
+                c = ds.cell(row=n, column=i, value=v)
+                if key == "total_quantity":
+                    c.number_format = _UNITS
+                elif key in ("counted_weight", "net_adjustment_kg", "total_weight"):
+                    c.number_format = _KG
+                elif key == "last_counted_date":
+                    c.number_format = _DATE
+            if item["warehouse"] in _floors.COLD_WAREHOUSES:
+                ds.cell(row=n, column=1).fill = _COLD_FILL
+    ds.freeze_panes = "C2"
+    ds.auto_filter.ref = f"A1:{get_column_letter(len(STOCK_COLUMNS))}{max(n, 1)}"
+
+    out = BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out

@@ -150,10 +150,16 @@ BEGIN
         );
     END LOOP;
 
-    CREATE UNIQUE INDEX IF NOT EXISTS uq_jcbm_v2_jc_batch_bom_type
-        ON job_card_balance_material_v2
-           (job_card_id, COALESCE(batch_id, 0),
-            COALESCE(bom_line_id, 0), balance_type);
+    -- 115 replaces this index with uq_jcbm_v2_jc_batch_line_type (unique per
+    -- article for rows with no bom_line_id). This file re-runs on every deploy,
+    -- so it must not re-create the old, coarser index once the new one exists:
+    -- rows the new index allows would make the rebuild fail and stop the runner.
+    IF to_regclass('public.uq_jcbm_v2_jc_batch_line_type') IS NULL THEN
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_jcbm_v2_jc_batch_bom_type
+            ON job_card_balance_material_v2
+               (job_card_id, COALESCE(batch_id, 0),
+                COALESCE(bom_line_id, 0), balance_type);
+    END IF;
 END $$;
 
 COMMIT;

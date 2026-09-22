@@ -313,7 +313,9 @@ async def current_balance(
                AND (source_kind IS NULL OR source_kind = 'COUNT')
                AND UPPER(BTRIM(item_name))  = $1
                AND COALESCE(stock_type, 'Fresh Stock') = $2
-               AND UPPER(BTRIM(warehouse))  = $3
+               -- Hyphen-blind: the cold stores' counts are stored as 'D-39'
+               -- while $3 (and every ledger row) is 'D39'.
+               AND REPLACE(UPPER(BTRIM(warehouse)), '-', '') = $3
                AND UPPER(BTRIM(floor_name)) = $4
         ),
         baseline AS (SELECT MAX({ENTRY_DAY}) AS d FROM scoped)
@@ -325,7 +327,7 @@ async def current_balance(
                         FROM stocktake_transactions
                        WHERE UPPER(BTRIM(item_name)) = $1
                          AND COALESCE(stock_type, 'Fresh Stock') = $2
-                         AND UPPER(BTRIM(warehouse))  = $3
+                         AND REPLACE(UPPER(BTRIM(warehouse)), '-', '') = $3
                          AND UPPER(BTRIM(location))   = $4
                          AND ((SELECT d FROM baseline) IS NULL
                               OR {TXN_DAY} >= (SELECT d FROM baseline))), 0) AS net_adjustment_kg
@@ -496,7 +498,8 @@ def _ledger_filters(
         applied[key] = echo
 
     if warehouse:
-        add("UPPER(BTRIM(warehouse)) = ${n}", _normalise_warehouse(warehouse),
+        # Column normalised too: the ledger holds both 'W-202' and 'W202'.
+        add("REPLACE(UPPER(BTRIM(warehouse)), '-', '') = ${n}", _normalise_warehouse(warehouse),
             "warehouse", _normalise_warehouse(warehouse))
     if location:
         add("UPPER(BTRIM(location)) = ${n}", _norm(location), "location", location)
@@ -877,7 +880,8 @@ async def verify_entries(
             conds.append(f"{ENTRY_DAY} = (now() AT TIME ZONE 'Asia/Kolkata')::date")
         if warehouse:
             params.append(_normalise_warehouse(warehouse))
-            conds.append(f"UPPER(BTRIM(COALESCE(warehouse, ''))) = ${len(params)}")
+            # Hyphen-blind, so signing off a Savla line reaches its 'D-39' counts.
+            conds.append(f"REPLACE(UPPER(BTRIM(COALESCE(warehouse, ''))), '-', '') = ${len(params)}")
         if location:
             params.append(_norm(location))
             conds.append(f"UPPER(BTRIM(COALESCE(floor_name, ''))) = ${len(params)}")

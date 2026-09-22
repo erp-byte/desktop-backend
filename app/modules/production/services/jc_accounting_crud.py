@@ -245,7 +245,41 @@ def _norm(col: str, v):
 
 
 def _line_key(spec: dict, row: dict) -> tuple:
-    return tuple(_norm(k, row.get(k)) for k in spec["key"])
+    key = tuple(_norm(k, row.get(k)) for k in spec["key"])
+    extra = spec.get("key_extra")
+    return key + (extra(row),) if extra else key
+
+
+# Migration 115's returns index (uq_jcbm_v2_jc_batch_line_type), as the ON
+# CONFLICT inference must spell it: the CASE in its own parentheses, exactly as
+# the index. tests/services/test_accounting_crud_balance_key.py checks it
+# against the migration text.
+BALANCE_LINE_TYPE_CONFLICT = (
+    "(job_card_id, COALESCE(batch_id, 0), COALESCE(bom_line_id, 0), "
+    "(CASE WHEN bom_line_id IS NULL THEN UPPER(BTRIM(material_name)) ELSE '' END), "
+    "balance_type)"
+)
+
+
+def _balance_article_part(row: dict):
+    """The key's third part after 115: the article for a row with no BOM line,
+    '' for a row with one (so renaming a BOM-line row stays an update). None when
+    there is neither, so an empty line is still caught as 'no identifying value'."""
+    if _norm("bom_line_id", row.get("bom_line_id")) is not None:
+        return ""
+    name = (row.get("material_name") or "").strip().upper()
+    return name or None
+
+
+_BALANCE_115 = {**_BALANCE, "conflict": BALANCE_LINE_TYPE_CONFLICT, "key_extra": _balance_article_part}
+
+
+async def _balance_spec(conn) -> dict:
+    """Which returns key applies: 115's per-article key once its index exists.
+    Called after the transaction has read job_card_balance_material_v2, so its
+    ACCESS SHARE lock holds the index swap off until the writes are done."""
+    new = await conn.fetchval("SELECT to_regclass('public.uq_jcbm_v2_jc_batch_line_type') IS NOT NULL")
+    return _BALANCE_115 if new else _BALANCE
 
 
 # ---------------------------------------------------------------------------
@@ -453,7 +487,7 @@ def _incoming_lines(payload: dict) -> dict:
     }
 
 
-def _validate_lines(incoming: dict) -> dict | None:
+def _validate_lines(incoming: dict, balance_spec: dict = _BALANCE) -> dict | None:
     """Reject payloads whose lines collide on their own natural key.
 
     Two rm_consumed rows naming the same material would silently merge in the
@@ -462,7 +496,7 @@ def _validate_lines(incoming: dict) -> dict | None:
     """
     for section, spec in (("consumption", _CONSUMPTION),
                           ("byproducts", _BYPRODUCTS),
-                          ("balance_materials", _BALANCE),
+                          ("balance_materials", balance_spec),
                           ("additives", _ADDITIVES)):
         seen: dict[tuple, int] = {}
         for i, row in enumerate(incoming[section]):
@@ -787,11 +821,12 @@ async def _write(conn, *, job_card_id: int, plan_id: int, batch_id: int,
                  payload: dict, actor: str | None, jc, creating: bool) -> dict:
     """Shared body for create and update. `creating` only changes the messages."""
     incoming = _incoming_lines(payload)
-    bad = _validate_lines(incoming)
+    stored_sections = await _fetch_sections(conn, job_card_id, batch_id)
+    balance_spec = await _balance_spec(conn)
+    bad = _validate_lines(incoming, balance_spec)
     if bad:
         return bad
 
-    stored_sections = await _fetch_sections(conn, job_card_id, batch_id)
     stored_output = await _fetch_output(conn, job_card_id, batch_id)
     out_vals = _output_values(payload, jc)
 
@@ -836,7 +871,7 @@ async def _write(conn, *, job_card_id: int, plan_id: int, batch_id: int,
     tallies = {}
     for name, spec in (("consumption", _CONSUMPTION),
                        ("byproducts", _BYPRODUCTS),
-                       ("balance_materials", _BALANCE),
+                       ("balance_materials", balance_spec),
                        ("additives", _ADDITIVES)):
         tallies[name] = await _upsert_section(
             conn, spec, job_card_id=job_card_id, batch_id=batch_id,

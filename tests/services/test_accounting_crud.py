@@ -745,3 +745,56 @@ async def test_pre_094_database_breaks_inserts_but_not_reads_or_plain_updates():
             await tx.rollback()
     finally:
         await conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Returns rows per article — migration 115 (spec 2e). Before 115 the returns
+# key is (bom_line_id, balance_type), so two returns rows with no BOM line are
+# a duplicate_line; after it, a row with no BOM line is keyed by its article.
+# ---------------------------------------------------------------------------
+
+
+async def _has_115_index(conn) -> bool:
+    return bool(await conn.fetchval(
+        "SELECT to_regclass('public.uq_jcbm_v2_jc_batch_line_type') IS NOT NULL"))
+
+
+def _two_unlinked_returns(fx: dict) -> dict:
+    p = _payload(fx)
+    p["balance_materials"] = [
+        {"material_name": "Added Article A", "balance_type": "returned", "qty_kg": 1.0,
+         "bom_line_id": None, "material_id": None, "remarks": None},
+        {"material_name": "Added Article B", "balance_type": "returned", "qty_kg": 2.0,
+         "bom_line_id": None, "material_id": None, "remarks": None},
+    ]
+    return p
+
+
+@pytest.mark.asyncio
+async def test_after_115_two_returns_without_a_bom_line_are_two_rows(ctx):
+    conn, fx = ctx
+    if not await _has_115_index(conn):
+        pytest.skip("migration 115 not applied to this database")
+    ids = {k: fx[k] for k in ("job_card_id", "plan_id", "batch_id")}
+    created = await svc.create_record(conn, **ids, payload=_two_unlinked_returns(fx), actor="t")
+    assert created.get("created"), created
+    got = await svc.get_record(conn, **ids)
+    assert sorted(r["qty_kg"] for r in got["balance_materials"]) == [1.0, 2.0]
+    # Renaming a BOM-line row stays an update. The record exists now, so the
+    # BOM-line payload goes in through update_record, not a second create.
+    p = _payload(fx)
+    await svc.update_record(conn, **ids, payload=p, actor="t")
+    p["balance_materials"][0]["material_name"] = fx["material"] + " (renamed)"
+    res = await svc.update_record(conn, **ids, payload=p, actor="t")
+    assert res["changes"]["balance_materials"]["updated"] == 1
+    assert res["changes"]["balance_materials"]["inserted"] == 0
+
+
+@pytest.mark.asyncio
+async def test_before_115_two_returns_without_a_bom_line_are_a_duplicate(ctx):
+    conn, fx = ctx
+    if await _has_115_index(conn):
+        pytest.skip("migration 115 already applied")
+    ids = {k: fx[k] for k in ("job_card_id", "plan_id", "batch_id")}
+    res = await svc.create_record(conn, **ids, payload=_two_unlinked_returns(fx), actor="t")
+    assert res.get("error") == "duplicate_line"

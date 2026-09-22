@@ -484,6 +484,39 @@ async def _materialise_indents(
     return (rm_count, pm_count)
 
 
+async def _adopt_consumption_row(conn, *, job_card_id: int, batch_id: int | None,
+                                 name: str, bom_line_id: int | None) -> None:
+    """Before the upsert: when batch X has no row with this exact spelling,
+    re-tag an existing row of the same article -- in batch X under another
+    spelling / without a bom_line_id (an added article the BOM has since caught
+    up with), else a legacy row with no batch -- so it is updated, not
+    duplicated. This is what the 'promote batch_id' comment below always meant:
+    the upsert key uses COALESCE(batch_id, 0), so a batch-X save never reached a
+    NULL-batch row. Spec 2d."""
+    if batch_id is None:
+        return
+    exact = await conn.fetchval(
+        "/* adopt:exact */ SELECT consumption_id FROM job_card_material_consumption_v2 "
+        "WHERE job_card_id = $1 AND COALESCE(batch_id, 0) = $2 AND material_sku_name = $3",
+        job_card_id, batch_id, name)
+    if exact is not None:
+        return
+    row_id = await conn.fetchval(
+        """/* adopt:candidate */
+        SELECT consumption_id FROM job_card_material_consumption_v2
+         WHERE job_card_id = $1 AND UPPER(BTRIM(material_sku_name)) = UPPER(BTRIM($3))
+           AND (batch_id = $2 OR batch_id IS NULL)
+         ORDER BY (batch_id IS NULL), consumption_id
+         LIMIT 1
+        """, job_card_id, batch_id, name)
+    if row_id is None:
+        return
+    await conn.execute(
+        "UPDATE job_card_material_consumption_v2 SET batch_id = $2, material_sku_name = $3, "
+        "bom_line_id = $4 WHERE consumption_id = $1",
+        row_id, batch_id, name, bom_line_id)
+
+
 async def upsert_consumption_lines(
     conn,
     *,
@@ -539,6 +572,8 @@ async def upsert_consumption_lines(
         uom         = e.get("uom") or "KGS"
         remarks     = e.get("remarks")
         src_dispatch = e.get("source_dispatch_id")
+        await _adopt_consumption_row(conn, job_card_id=job_card_id, batch_id=batch_id,
+                                     name=sku, bom_line_id=bom_line_id)
         # Snapshot the prior consumed qty so a genuine edit is recorded in the JC
         # edit log (drives the FE red marker). None → new row (first entry, not an
         # edit). Keyed on the same (JC, batch, material) as the upsert.
@@ -1449,6 +1484,14 @@ async def create_merged_process_run(
         return {"error": "already_started",
                 "message": (f"Lines have already-started job cards: {started}. Only "
                             "un-started chains can be merged.")}
+    # BOM changes (spec 2i): a removal carried into a shared process run would
+    # apply to every member's share, so the merge waits until they are undone.
+    from app.modules.production.services import jc_bom_changes
+    held = await jc_bom_changes.lines_with_live_changes(conn, member_ids)
+    if held:
+        return {"error": "bom_changes_on_merged_lines",
+                "message": ("These job cards have BOM changes: " + ", ".join(held) + ". Undo them "
+                            "(Material allocation tab), merge, then make the changes on the merged run.")}
 
     # ---- qty per member + shared totals ----------------------------------
     def _fq(v):
@@ -1801,6 +1844,11 @@ async def replace_job_cards_for_line(
     plan_step rows are then rebuilt by create_job_cards_for_line. MUST run inside
     an outer transaction.
     """
+    # Lock-order rule (spec 2c): the plan line row before any card row -- the
+    # BOM-change endpoints and Save Output lock it first too.
+    await conn.execute(
+        "SELECT 1 FROM production_plan_line_v2 WHERE plan_line_id = $1 FOR UPDATE", plan_line_id,
+    )
     existing = await conn.fetch(
         "SELECT job_card_id, status FROM job_card_v2 "
         "WHERE plan_line_id = $1 AND deleted_at IS NULL",
@@ -1819,6 +1867,11 @@ async def replace_job_cards_for_line(
             "message": "These job cards have already started — they can't be edited.",
         }
 
+    # The first cards of the live chains, read before they are deleted: only
+    # their BOM changes carry over (a cancelled chain's changes stay put).
+    from app.modules.production.services import jc_bom_changes
+    old_heads = await jc_bom_changes.chain_heads(conn, [r["job_card_id"] for r in existing])
+
     # Drop the whole chain in one statement (indents cascade; the bidirectional
     # prev/next self-FK is satisfied because the entire referenced set goes too).
     await conn.execute(
@@ -1831,6 +1884,11 @@ async def replace_job_cards_for_line(
     )
     if "error" not in result:
         result["replaced"] = len(existing)
+        # BOM changes carry over to the rebuilt chain (spec 2i).
+        ids = result.get("job_card_ids") or []
+        if ids:
+            result["bom_changes_carried"] = await jc_bom_changes.repoint_after_rebuild(
+                conn, plan_line_id=plan_line_id, new_head=ids[0], old_heads=old_heads)
     return result
 
 
@@ -2024,7 +2082,13 @@ async def apply_live_job_card_edits(
         be removed if it's the latest running stage (no started downstream); the
         removed card is force-recorded (snapshot) then cancelled.
     """
+    # Lock-order rule (spec 2c): the plan line row before any card row -- the
+    # BOM-change endpoints and Save Output lock it first too.
+    await conn.execute(
+        "SELECT 1 FROM production_plan_line_v2 WHERE plan_line_id = $1 FOR UPDATE", plan_line_id,
+    )
     import json
+    from app.modules.production.services import jc_bom_changes
     EDITABLE = _JC_EDITABLE_STATUSES        # ('locked', 'unlocked')
     remove_reasons = remove_reasons or {}
     actor = user or None
@@ -2074,6 +2138,11 @@ async def apply_live_job_card_edits(
     if leading != surviving_started:
         return {"error": "cannot_reorder_started_region",
                 "message": "Started processes must stay first and in order; only the un-started tail can change."}
+
+    # The chain's first card before the edit: BOM changes are stored against it,
+    # and removing stage 1 or adding a step in front of it gives the chain a new
+    # one (spec 2i -- the changes carry over, see after the relink).
+    old_heads = await jc_bom_changes.chain_heads(conn, [r["job_card_id"] for r in rows])
 
     audit: list[tuple] = []   # (action, job_card_id, before, after, reason)
 
@@ -2275,6 +2344,13 @@ async def apply_live_job_card_edits(
 
         if floor_changed:
             audit.append(("floor_change", jid, {"floor": r["floor"]}, {"floor": desired_floor}, None))
+
+    # The relink gave full_chain[0] no previous stage, so it is now the chain's
+    # first card. If that changed, move the chain's live BOM changes onto it --
+    # otherwise they stay on the old first card and silently stop applying.
+    if set(old_heads) - {full_chain[0]}:
+        await jc_bom_changes.repoint_after_rebuild(
+            conn, plan_line_id=plan_line_id, new_head=full_chain[0], old_heads=old_heads)
 
     # ── renumber plan_step.step_order: two-pass park→final so the DEFERRABLE
     # INITIALLY IMMEDIATE uq_pps_v2_line_order never sees a duplicate. Pass 1
@@ -3798,6 +3874,11 @@ async def replace_balance_materials(conn, *, job_card_id: int,
                     f"(got '{jc_meta['stage']}')."
                 ),
             }
+        # Per-job-card BOM changes (spec 2d): a removed article is not on the
+        # job card's BOM; an added one takes its change row's accounting kind
+        # (an added FG/SFG is RM, spec Addendum A2).
+        from app.modules.production.services import jc_bom_changes as _bomc
+        bom_res = await _bomc.resolver_for(conn, job_card_id)
         # B6 H2/H3 fix: prefer bom_line_id when the row carries it; only
         # fall back to fuzzy name match otherwise. ORDER BY line_number on
         # the name fallback so the choice is deterministic if multiple
@@ -3815,22 +3896,34 @@ async def replace_balance_materials(conn, *, job_card_id: int,
             material_name = (r.get("material_name") or r.get("material_sku_name") or "").strip()
             if material_name.upper() == EGA_CONSOLIDATED_SENTINEL:
                 continue
-            bom_line_id = r.get("bom_line_id")
-            if bom_line_id:
-                item_type = await conn.fetchval(
-                    "SELECT item_type FROM bom_line WHERE bom_line_id=$1",
-                    bom_line_id,
-                )
-                lookup_key = f"bom_line_id={bom_line_id}"
+            name_for_check = r.get("material_name") or r.get("material_sku_name")
+            if bom_res.is_removed(name=name_for_check, bom_line_id=r.get("bom_line_id")):
+                return {
+                    "error": "ega_material_not_in_bom",
+                    "lookup": f"material='{name_for_check}'",
+                    "message": f"{name_for_check} was removed from this job card's BOM.",
+                }
+            added_row = bom_res.added_row(name_for_check)
+            if added_row is not None:
+                item_type = _bomc.kind_of(added_row["item_type"])
+                lookup_key = f"material='{name_for_check}'"
             else:
-                material_name = r.get("material_name") or r.get("material_sku_name")
-                item_type = await conn.fetchval(
-                    "SELECT item_type FROM bom_line "
-                    "WHERE  bom_id=$1 AND material_sku_name=$2 "
-                    "ORDER  BY line_number LIMIT 1",
-                    jc_meta["bom_id"], material_name,
-                )
-                lookup_key = f"material='{material_name}'"
+                bom_line_id = r.get("bom_line_id")
+                if bom_line_id:
+                    item_type = await conn.fetchval(
+                        "SELECT item_type FROM bom_line WHERE bom_line_id=$1",
+                        bom_line_id,
+                    )
+                    lookup_key = f"bom_line_id={bom_line_id}"
+                else:
+                    material_name = r.get("material_name") or r.get("material_sku_name")
+                    item_type = await conn.fetchval(
+                        "SELECT item_type FROM bom_line "
+                        "WHERE  bom_id=$1 AND material_sku_name=$2 "
+                        "ORDER  BY line_number LIMIT 1",
+                        jc_meta["bom_id"], material_name,
+                    )
+                    lookup_key = f"material='{material_name}'"
             if item_type is None:
                 return {
                     "error": "ega_material_not_in_bom",
@@ -5359,6 +5452,15 @@ async def get_job_card(conn, job_card_id: int) -> dict | None:
     section_2a_rm_indent = [_serialize(r) for r in rm]
     section_2b_pm_indent = [_serialize(r) for r in pm]
 
+    # Per-job-card BOM changes (migration 115): the chain's removed articles
+    # drop out and its added ones are appended. Before 115, or with no changes,
+    # this is exactly the bom_line catalogue.
+    from app.modules.production.services import jc_bom_changes
+    bom_lines_out, bom_changes_out = await jc_bom_changes.detail_bom(
+        conn, job_card_id, [_serialize(r) for r in bom_line_rows],
+        section_2a_rm_indent, section_2b_pm_indent,
+    )
+
     return {
         # v2 native shape
         **h,
@@ -5366,7 +5468,8 @@ async def get_job_card(conn, job_card_id: int) -> dict | None:
         "outputs":    [_serialize(r) for r in outputs],
         "rm_indents":        section_2a_rm_indent,
         "pm_indents":        section_2b_pm_indent,
-        "bom_lines":         [_serialize(r) for r in bom_line_rows],
+        "bom_lines":         bom_lines_out,
+        "bom_changes":       bom_changes_out,
         "consumption_lines": [_serialize(r) for r in consumption_rows],
         "sign_offs":         [_serialize(r) for r in signoffs],
 

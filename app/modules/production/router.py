@@ -4241,6 +4241,11 @@ class ByproductLineV2(BaseModel):
     material_name: str | None = None
     bom_line_id:   int | None = None
 
+    @field_validator("bom_line_id", mode="before")
+    @classmethod
+    def _line_id(cls, v):
+        return _coerce_line_id(v)
+
 
 class RmConsumptionLineV2(BaseModel):
     """Consumption of a single BOM RM line for this job card."""
@@ -4258,6 +4263,11 @@ class BalanceMaterialV2(BaseModel):
     balance_type: str               # extra_given | returned | wastage | control_sample
     qty_kg: float
     remarks: str | None = None
+
+    @field_validator("bom_line_id", mode="before")
+    @classmethod
+    def _line_id(cls, v):
+        return _coerce_line_id(v)
 
 
 class AdditiveLineV2(BaseModel):
@@ -5179,7 +5189,7 @@ async def create_merged_process_run_v2(
         raise HTTPException(status_code=400, detail=result.get("message"))
     if err in ("line_not_found",):
         raise HTTPException(status_code=404, detail=result.get("message"))
-    if err in ("not_a_group", "already_started", "no_common_rm"):
+    if err in ("not_a_group", "already_started", "no_common_rm", "bom_changes_on_merged_lines"):
         raise HTTPException(status_code=409, detail=result.get("message"))
     if err:
         raise HTTPException(status_code=400, detail=result.get("message") or err)
@@ -6353,12 +6363,27 @@ def _coerce_float(v):
     return float(v)
 
 
+def _coerce_line_id(v):
+    """A bom_line_id of 0, below 0 or blank means "no BOM line" (an article added
+    to this job card, or a client that sends 0 for none) -- never an FK value."""
+    if v is None or v == "":
+        return None
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
 class ConsumedLineV2(BaseModel):
     """Per-BOM-line consumption row. `consumed_qty` is in the row's own
     UOM (the v2 indent CHECK constraint already pinned the UOM at
     materialisation time, so we accept the operator's number as-is and
-    stamp it onto the indent row by bom_line_id)."""
-    bom_line_id:       int
+    stamp it onto the indent row by bom_line_id).
+
+    `bom_line_id` is None for an article added to this job card
+    (job_card_bom_change); the line is then matched by name."""
+    bom_line_id:       int | None = None
     material_sku_name: str | None = None
     consumed_qty:      float
     remarks:           str | None = None
@@ -6372,6 +6397,11 @@ class ConsumedLineV2(BaseModel):
     @classmethod
     def _to_float(cls, v):
         return _coerce_float(v)
+
+    @field_validator("bom_line_id", mode="before")
+    @classmethod
+    def _line_id(cls, v):
+        return _coerce_line_id(v)
 
 
 class RecordOutputV2Request(BaseModel):
@@ -6523,6 +6553,28 @@ async def record_output_v2(
             lock_err = await assert_not_locked(conn, job_card_id)
             _raise_if_locked(lock_err)
 
+            # Per-job-card BOM changes (spec 2d). The plan-line KEY SHARE is the
+            # same row the BOM-change endpoints take FOR UPDATE, so a removal cannot
+            # land between these checks and the writes below. It MUST be the first
+            # row lock in this transaction (before the admin-override batch updates).
+            from app.modules.production.services import jc_bom_changes as _bomc
+            await _bomc.lock_line_for_card(conn, job_card_id)
+            # R10 — diff-on-save: rm_consumed / pm_consumed are
+            # Optional. None = "section omitted, leave alone" (treated
+            # like empty here — no rows to validate or upsert).
+            rm_rows = body.rm_consumed or []
+            pm_rows = body.pm_consumed or []
+            resolver = None
+            if rm_rows or pm_rows or body.balance_materials or body.byproducts:
+                resolver = await _bomc.resolver_for(conn, job_card_id)
+                problem = resolver.check_consumption(
+                    [r.model_dump() for r in rm_rows] + [p.model_dump() for p in pm_rows])
+                problem = problem or resolver.check_rows(
+                    balance=[b.model_dump() for b in (body.balance_materials or [])],
+                    byproducts=[b.model_dump() for b in (body.byproducts or [])])
+                if problem:
+                    raise HTTPException(status_code=400, detail=problem)
+
             # ── Stage 2: resolve batch_id ─────────────────────────────
             # When the caller doesn't pass an explicit batch_id, fall
             # back to "the JC's currently-open batch".  Exactly one
@@ -6662,61 +6714,21 @@ async def record_output_v2(
                             },
                         )
             # ── Per-BOM-line consumption ──────────────────────────────
-            # Validated against the JC's BOM catalog (bom_line for the
-            # JC's bom_id) — every stage can record consumption against
-            # every BOM article, not just the ones materialised into
-            # this stage's indent rows. The packaging (last) stage
-            # commonly records both RM and PM here.
-            #
-            # R10 — diff-on-save: rm_consumed / pm_consumed are now
-            # Optional. None = "section omitted, leave alone" (treated
-            # like empty in the set-union below — no rows to validate
-            # or upsert).
-            rm_rows = body.rm_consumed or []
-            pm_rows = body.pm_consumed or []
-            submitted_bom_lines = (
-                {int(r.bom_line_id) for r in rm_rows} |
-                {int(p.bom_line_id) for p in pm_rows}
-            )
-            if submitted_bom_lines:
-                valid = await conn.fetch(
-                    """
-                    SELECT bom_line_id
-                    FROM   bom_line bl
-                    JOIN   job_card_v2 jc ON jc.bom_id = bl.bom_id
-                    WHERE  jc.job_card_id = $1
-                    """,
-                    job_card_id,
-                )
-                valid_ids = {r["bom_line_id"] for r in valid}
-                invalid = submitted_bom_lines - valid_ids
-                if invalid:
-                    raise HTTPException(
-                        status_code=400,
-                        detail={
-                            "error": "invalid_bom_line",
-                            "message": (
-                                f"bom_line_id(s) {sorted(invalid)} do not "
-                                "belong to this job card's BOM"
-                            ),
-                        },
-                    )
-
-                # Upsert into job_card_material_consumption_v2 — Stage 2
-                # UNIQUE is (job_card_id, COALESCE(batch_id, 0),
-                # material_sku_name) so the same article can be
-                # recorded once per batch.  Re-save on the same batch
-                # updates in place; first save on a new batch inserts.
+            # Checked above against the job card's BOM (bom_line for its bom_id,
+            # minus removed articles, plus added ones). Every stage can record
+            # consumption against every article on it. The gate is "any line",
+            # not "any line with a bom_line_id": an added article has none.
+            if rm_rows or pm_rows:
                 rec_by = user.full_name or user.phone
                 await upsert_consumption_lines(
                     conn, job_card_id=job_card_id,
-                    entries=[r.model_dump() for r in rm_rows],
+                    entries=[resolver.stored_entry(r.model_dump()) for r in rm_rows],
                     input_kind='RM', recorded_by=rec_by,
                     batch_id=resolved_batch_id,
                 )
                 await upsert_consumption_lines(
                     conn, job_card_id=job_card_id,
-                    entries=[p.model_dump() for p in pm_rows],
+                    entries=[resolver.stored_entry(p.model_dump()) for p in pm_rows],
                     input_kind='PM', recorded_by=rec_by,
                     batch_id=resolved_batch_id,
                 )
@@ -8694,6 +8706,12 @@ async def receive_material_v2(
             if not jc:
                 raise HTTPException(status_code=404, detail="Job card not found")
 
+            # BOM changes (spec 2g): plan-line lock before the per-box loop and
+            # outside its savepoints; a removed article's box is refused per box.
+            from app.modules.production.services import jc_bom_changes as _bomc
+            await _bomc.lock_line_for_card(conn, job_card_id)
+            removed_keys = await _bomc.removed_keys_for(conn, job_card_id)
+
             # Per-box atomicity: wrap each box's lookup+update in a
             # savepoint so a hard failure on box N (network blip,
             # constraint violation, etc.) doesn't roll back the boxes
@@ -8715,7 +8733,7 @@ async def receive_material_v2(
                         # same scanned_box_ids snapshot and double-issue.
                         indent = await conn.fetchrow(
                             """
-                            SELECT rm_indent_id, scanned_box_ids
+                            SELECT rm_indent_id, scanned_box_ids, material_sku_name
                             FROM   job_card_rm_indent_v2
                             WHERE  job_card_id = $1
                               AND  material_sku_name ILIKE $2
@@ -8726,6 +8744,10 @@ async def receive_material_v2(
                         if not indent:
                             attached.append({"box_id": box_id, "error": "no_matching_indent",
                                              "material_sku_name": box["material_sku_name"]})
+                            continue
+                        if _bomc.article_key(indent["material_sku_name"]) in removed_keys:
+                            attached.append({"box_id": box_id, "error": "article_removed_from_job_card",
+                                             "material_sku_name": indent["material_sku_name"]})
                             continue
                         existing = list(indent["scanned_box_ids"] or [])
                         if box_id in existing:
@@ -9014,8 +9036,19 @@ async def create_box_scan(
         raise HTTPException(status_code=409, detail=f"Duplicate box scanned — {result.get('box_id')} is already recorded.")
     if result.get("error") == "job_card_not_found":
         raise HTTPException(status_code=404, detail="Job card not found")
+    if result.get("error") == "sent_for_other_job_card":
+        # 422, not 409: the Raw Material tab shows every 409 as the "Duplicate box" chip.
+        job_card = result.get("job_card_number") or result.get("job_card_id")
+        raise HTTPException(
+            status_code=422,
+            detail=(f"Box {result.get('box_id')} was sent by Stores for job card {job_card} "
+                    f"(request #{result.get('requisition_id')}). Scan it on that job card."))
     if result.get("error") == "article_required":
-        raise HTTPException(status_code=422, detail=f"'{body.code}' isn't in any catalogue — enter an article to store it.")
+        # A code, not just text: the Raw Material tab has no article field (Manual
+        # print replaces it) and tells the operator to print a sticker instead.
+        raise HTTPException(status_code=422, detail={
+            "error": "article_required",
+            "message": f"'{body.code}' isn't in any catalogue — enter an article to store it."})
     if result.get("error") == "box_not_found":
         raise HTTPException(status_code=400, detail="No box code provided")
     if result.get("error") == "ambiguous_box":
@@ -9030,13 +9063,114 @@ async def create_box_scan(
     return result
 
 
+class BoxPrintLine(BaseModel):
+    box_number:   int
+    net_weight:   float
+    gross_weight: float | None = None
+    count:        int | None = None
+    lot_number:   str | None = Field(default=None, max_length=100)
+
+
+class BoxPrintRequest(BaseModel):
+    """POST /job-cards-v2/{id}/box-scans/print — Manual print on the Raw Material
+    tab. The lengths here only bound the payload: the print rules (article, box
+    count, box numbers, weights) are the service's, refused in plain English."""
+    article: str = Field(..., max_length=2000)
+    boxes:   list[BoxPrintLine] = Field(..., max_length=2000)
+
+
+@router.post("/job-cards-v2/{job_card_id}/box-scans/print")
+async def print_box_scans(
+    request: Request,
+    job_card_id: int,
+    body: BoxPrintRequest,
+    user=Depends(require_permission("production", "job_cards", "material_scan", action="scan")),
+):
+    """Manual print on the Raw Material tab — Stores' Manual print, recorded on
+    this job card: each box is minted in sfg_box as an RM box and scanned into
+    jc_box_scan, all in one transaction. The browser prints the stickers with the
+    ids returned. A refusal answers {"error", "message", **details}."""
+    from app.modules.floor_requisition.services.requisition_service import RequisitionError
+    from app.modules.production.services import box_scan_service as svc
+    pool = request.app.state.db_pool
+    try:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                return await svc.print_boxes(
+                    conn,
+                    job_card_id=job_card_id,
+                    article=body.article,
+                    boxes=[b.model_dump() for b in body.boxes],
+                    actor=user.full_name or user.phone,
+                )
+    except RequisitionError as exc:
+        raise HTTPException(status_code=exc.status, detail={
+            "error": exc.error, "message": exc.message, **exc.details}) from None
+
+
+class BomChangeBody(BaseModel):
+    """POST /job-cards-v2/{id}/bom-changes — remove an article from, or add one to,
+    this job card's BOM (every stage of its chain). The BOM module is not written.
+    `add` takes a sku_id, or a material_sku_name with an optional item_type hint
+    (Use on other floor stock; spec Addendum A3)."""
+    action: Literal["remove", "add"]
+    material_sku_name: str | None = Field(default=None, max_length=300)
+    sku_id: int | None = None
+    item_type: str | None = Field(default=None, max_length=20)
+    required_qty: str | float | None = None
+    note: str | None = Field(default=None, max_length=500)
+
+
+@router.post("/job-cards-v2/{job_card_id}/bom-changes")
+async def create_bom_change(
+    request: Request, job_card_id: int, body: BomChangeBody,
+    user=Depends(require_permission("production", "job_cards", "overview", action="start")),
+):
+    from app.modules.production.services import jc_bom_changes as bomc
+    if body.action == "add" and body.sku_id is None and not (body.material_sku_name or "").strip():
+        raise HTTPException(status_code=422, detail={"error": "sku_required", "message": "Pick an article to add."})
+    if body.action == "remove" and not (body.material_sku_name or "").strip():
+        raise HTTPException(status_code=422, detail={"error": "article_required",
+                                                     "message": "Name the article to remove."})
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            try:
+                if body.action == "remove":
+                    return await bomc.remove_article(conn, actor=_actor_name(user), job_card_id=job_card_id,
+                                                     material_sku_name=body.material_sku_name, note=body.note)
+                return await bomc.add_article(
+                    conn, actor=_actor_name(user), job_card_id=job_card_id, sku_id=body.sku_id,
+                    material_sku_name=(body.material_sku_name if body.sku_id is None else None),
+                    item_type_hint=body.item_type, required_qty=body.required_qty, note=body.note)
+            except bomc.BomChangeError as e:
+                raise HTTPException(status_code=e.http_status, detail=e.detail()) from None
+
+
+@router.delete("/job-cards-v2/{job_card_id}/bom-changes/{change_id}")
+async def undo_bom_change(
+    request: Request, job_card_id: int, change_id: int,
+    user=Depends(require_permission("production", "job_cards", "overview", action="start")),
+):
+    from app.modules.production.services import jc_bom_changes as bomc
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            try:
+                return await bomc.undo_change(conn, actor=_actor_name(user), job_card_id=job_card_id,
+                                              change_id=change_id)
+            except bomc.BomChangeError as e:
+                raise HTTPException(status_code=e.http_status, detail=e.detail()) from None
+
+
 @router.get("/job-cards-v2/{job_card_id}/box-scans")
 async def list_box_scans(
     request: Request,
     job_card_id: int,
     user=Depends(require_permission("production", "job_cards", "material_scan", action="scan")),
 ):
-    """All box scans for this job card (enriched with floor/entity/SKU) + totals."""
+    """All box scans for this job card (enriched with floor/entity/SKU) + totals,
+    each box's Stores / printed-here reference, and Manual print's next Box #."""
     from app.modules.production.services import box_scan_service as svc
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:

@@ -58,6 +58,34 @@ def _fmt_num(v):
         return str(v)
 
 
+def bom_rows(jc_data: dict) -> list[dict]:
+    """The RM rows of the printed Bill Of Material: the RM indent rows minus the
+    articles removed from this job card, plus the RM, FG and SFG articles added to
+    it (job_card_bom_change; spec 2h, Addendum A2: an added FG/SFG is RM input).
+    PM is not printed.
+
+    bom_changes covers the whole chain, so every stage card carries it. Added RM
+    is printed only on the stage that opens on RM -- no previous stage, the rule
+    the web's Accounting uses (keepArticle / isFirstStage) -- as the RM indents
+    live there too; a later stage or a merged run's packing card would otherwise
+    ask the floor for it again."""
+    changes = jc_data.get('bom_changes') or {}
+    removed = {(c.get('material_sku_name') or '').strip().upper() for c in changes.get('removed') or []}
+    rows = [r for r in jc_data.get('section_2a_rm_indent', [])
+            if (r.get('material_sku_name') or '').strip().upper() not in removed]
+    try:
+        step = int(jc_data.get('step_number') or 1)
+    except (TypeError, ValueError):
+        step = 1
+    if step > 1 or jc_data.get('prev_job_card_id') is not None:
+        return rows
+    for a in changes.get('added') or []:
+        if (a.get('item_type') or '').strip().lower() != 'pm' and not a.get('superseded'):
+            rows.append({'material_sku_name': a.get('material_sku_name'), 'reqd_qty': a.get('required_qty'),
+                         'issued_qty': None, 'batch_no': '', 'uom': 'Kgs'})
+    return rows
+
+
 def generate_job_card_pdf(jc_data: dict, mode: str = 'full') -> bytes:
     """Generate a job card PDF.
 
@@ -102,7 +130,7 @@ def generate_job_card_pdf(jc_data: dict, mode: str = 'full') -> bytes:
     pdf.set_font('Helvetica', 'B', 8)
     pdf.cell(0, 5, 'Bill Of Material', 0, 1)
 
-    rm_lines = jc_data.get('section_2a_rm_indent', [])
+    rm_lines = bom_rows(jc_data)
     # Consumption rows live under `consumption_lines` on the v2 detail dict
     # (get_job_card) and under `material_consumption` on the v1 detail shape.
     # Read both so the RM/PM actual-qty lookup AND the SFG/WIP input lines

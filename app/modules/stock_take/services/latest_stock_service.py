@@ -35,9 +35,22 @@ from typing import Any, Optional, Sequence
 
 import asyncpg
 
+from .. import floors as _floors
 from .business_day import ENTRIES_TABLE, ENTRY_DAY, TXN_DAY
 
 log = logging.getLogger(__name__)
+
+#: A row's warehouse as ONE code, whatever its spelling: 'D-39', 'd39 ' and
+#: 'D39' are all D39. Both tables name the column `warehouse`, so the same text
+#: serves the entries and the ledger.
+#:
+#: The hyphen is stripped on the COLUMN side, not only on the value. The cold
+#: stores were loaded on 16 Sep 2026 as 'D-39' and 'D-514', while grants, the
+#: ledger and every filter value use 'D39' -- so an exact match hid 387,773 kg of
+#: Savla stock from "all warehouses" and from the D39 filter, with no error.
+#: Costs the idx_nse_place_canon index on this predicate; the table is small
+#: enough (under 2,000 rows) that a scan is not noticeable.
+WAREHOUSE_KEY = "REPLACE(UPPER(BTRIM(warehouse)), '-', '')"
 
 # A missing table/column is an environment state here, not a bug — see the module
 # docstring. Same posture as modules/ledger/services/leaves_service.py.
@@ -111,6 +124,20 @@ def _as_list(value: Any) -> list[str]:
 COUNT_ROWS_ONLY = "(source_kind IS NULL OR source_kind = 'COUNT')"
 
 
+def _place_scope_sql(place_scope: Any, floor_col: str, first: int) -> tuple[str, list[Any]]:
+    """A caller's floor grants as one predicate, place by place.
+
+    `place_scope` is router._clamp_to_read_scope's {"whole": [codes],
+    "pairs": ["W202|FIRST FLOOR", ...]}: a row is readable when its warehouse is
+    seen whole, or its warehouse|floor is a granted pair. A floor granted in one
+    warehouse therefore opens nothing in another, and a NULL floor matches no
+    pair. `first` is the $n the first of the two parameters takes.
+    """
+    sql = (f"({WAREHOUSE_KEY} = ANY(${first}::text[])"
+           f" OR {WAREHOUSE_KEY} || '|' || UPPER(BTRIM({floor_col})) = ANY(${first + 1}::text[]))")
+    return sql, [list(place_scope.get("whole") or []), list(place_scope.get("pairs") or [])]
+
+
 def _build_filters(
     *,
     warehouse: Any = None,
@@ -123,6 +150,7 @@ def _build_filters(
     search: Optional[str] = None,
     verified: Optional[bool] = None,
     include_drafts: bool = False,
+    place_scope: Optional[dict[str, list[str]]] = None,
 ) -> tuple[list[str], list[Any], dict[str, Any]]:
     """WHERE fragments + positional params + an echo of what was applied.
 
@@ -163,8 +191,20 @@ def _build_filters(
     # ("UPPER BASEMENT "), but the rule stays: it is what the Express backend's
     # buildEntryFilters does, so the two agree on what a floor is, and it keeps a
     # filter value typed against either table selecting the same rows.
+    whs = _as_list(warehouse)
+    if whs:
+        # One code per warehouse, so 'D39' selects the rows stored as 'D-39'.
+        add(WAREHOUSE_KEY + " = ANY(${n}::text[])",
+            [_floors.normalise_warehouse(v) for v in whs], "warehouse", whs)
+
+    if place_scope is not None:
+        # The caller's floor grants. Not echoed: it is their profile, not a
+        # filter they chose.
+        sql, values = _place_scope_sql(place_scope, "floor_name", len(params) + 1)
+        params.extend(values)
+        conds.append(sql)
+
     for value, tmpl, key in (
-        (_as_list(warehouse), "UPPER(TRIM(warehouse)) = ANY(${n}::text[])", "warehouse"),
         (_as_list(floor_name), "UPPER(TRIM(floor_name)) = ANY(${n}::text[])", "floorName"),
         (_as_list(item_type), "UPPER(TRIM(COALESCE(item_type, ''))) = ANY(${n}::text[])", "itemType"),
         (_as_list(category), "UPPER(TRIM(COALESCE(item_category, ''))) = ANY(${n}::text[])", "category"),
@@ -185,7 +225,9 @@ def _build_filters(
             f"UPPER(item_name) LIKE ${n} ESCAPE '\\'"
             f" OR UPPER(COALESCE(item_category, '')) LIKE ${n} ESCAPE '\\'"
             f" OR UPPER(COALESCE(item_subcategory, '')) LIKE ${n} ESCAPE '\\'"
-            f" OR UPPER(COALESCE(warehouse, '')) LIKE ${n} ESCAPE '\\'"
+            # Hyphen-blind on both sides, like WAREHOUSE_KEY: "D-39" and "D39"
+            # must find the same Savla counts and the same D39 postings.
+            f" OR REPLACE(UPPER(COALESCE(warehouse, '')), '-', '') LIKE REPLACE(${n}, '-', '') ESCAPE '\\'"
             f" OR UPPER(COALESCE(floor_name, '')) LIKE ${n} ESCAPE '\\'"
             f" OR UPPER(COALESCE(entered_by, '')) LIKE ${n} ESCAPE '\\'"
             ")"
@@ -227,8 +269,19 @@ def _build_txn_filters(
         params.append(value)
         conds.append(sql_tmpl.format(n=start_index + len(params)))
 
+    whs = _as_list(filters.get("warehouse"))
+    if whs:
+        # The ledger holds both 'W-202' and 'W202' (see TXN_GROUP_KEY), so the
+        # column is normalised here too, not only the value.
+        add(WAREHOUSE_KEY + " = ANY(${n}::text[])", [_floors.normalise_warehouse(v) for v in whs])
+
+    if filters.get("place_scope") is not None:
+        sql, values = _place_scope_sql(filters["place_scope"], "location",
+                                       start_index + len(params) + 1)
+        params.extend(values)
+        conds.append(sql)
+
     for value, tmpl in (
-        (_as_list(filters.get("warehouse")), "UPPER(BTRIM(warehouse)) = ANY(${n}::text[])"),
         (_as_list(filters.get("floor_name")), "UPPER(BTRIM(location)) = ANY(${n}::text[])"),
         (_as_list(filters.get("item_type")), "UPPER(BTRIM(material_type)) = ANY(${n}::text[])"),
         (_as_list(filters.get("category")), "UPPER(BTRIM(item_category)) = ANY(${n}::text[])"),
@@ -236,10 +289,7 @@ def _build_txn_filters(
         (_as_list(filters.get("stock_type")), "UPPER(COALESCE(stock_type, 'Fresh Stock')) = ANY(${n}::text[])"),
     ):
         if value:
-            # Warehouse codes are stored unhyphenated on both sides; normalise so a
-            # 'W-202' filter still matches ledger rows written as 'W202'.
-            add(tmpl, [v.upper().strip().replace("-", "") if "warehouse" in tmpl else v.upper().strip()
-                       for v in value])
+            add(tmpl, [v.upper().strip() for v in value])
 
     search = filters.get("search")
     if search:
@@ -250,7 +300,9 @@ def _build_txn_filters(
             f"UPPER(item_name) LIKE ${n} ESCAPE '\\'"
             f" OR UPPER(COALESCE(item_category, '')) LIKE ${n} ESCAPE '\\'"
             f" OR UPPER(COALESCE(item_subcategory, '')) LIKE ${n} ESCAPE '\\'"
-            f" OR UPPER(COALESCE(warehouse, '')) LIKE ${n} ESCAPE '\\'"
+            # Hyphen-blind on both sides, like WAREHOUSE_KEY: "D-39" and "D39"
+            # must find the same Savla counts and the same D39 postings.
+            f" OR REPLACE(UPPER(COALESCE(warehouse, '')), '-', '') LIKE REPLACE(${n}, '-', '') ESCAPE '\\'"
             f" OR UPPER(COALESCE(location, '')) LIKE ${n} ESCAPE '\\'"
             ")"
         )
@@ -272,24 +324,23 @@ def _empty(page: int, page_size: int, applied: dict[str, Any], sort: dict[str, s
     }
 
 
-async def fetch_latest_stock(
-    conn: asyncpg.Connection,
-    *,
-    as_of: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 50,
-    sort_by: str = DEFAULT_SORT,
-    sort_order: str = "desc",
-    adjusted_only: bool = False,
-    **filters: Any,
-) -> dict[str, Any]:
-    """Stock as counted on the most recent count date, plus that date.
+def _stock_sql(*, as_of: Optional[str], adjusted_only: bool, by_place: bool,
+               filters: dict[str, Any]) -> dict[str, Any]:
+    """The statement behind both stock reads: the page and the stock download.
 
-    Rows are aggregated per item AND per stock type — Fresh Stock and
-    Off Grade/Rejection are different stock and must never be summed together —
-    across warehouses and floors, so `warehouse`/`floor_name` narrow the set
-    rather than splitting it. Item keying is UPPER(TRIM(item_name)), matching the
-    Express app's own grouped view so both agree on what one item is.
+    Returns the CTE chain ending in `merged` plus its parameters, the filters as
+    applied, and the lookup for the newest count day under those filters. Each
+    caller adds its own SELECT over `merged`.
+
+    `by_place=False` (the page): one line per article and stock type, summed over
+    every warehouse and floor it sits at.
+    `by_place=True` (the download): the same lines kept apart per warehouse and
+    floor, carrying k_wh, k_fl and floor_label. The netting is per place in both
+    modes (see "SINCE IS PER PLACE" below), so an article's per-floor lines add
+    up to exactly the page's figure for it -- which is what lets the download's
+    totals be checked against the screen.
+
+    Raises ValueError for an unusable asOf.
     """
     conds, params, applied = _build_filters(**filters)
     # Declared here rather than in _build_filters because it is not a predicate
@@ -298,18 +349,6 @@ async def fetch_latest_stock(
     if adjusted_only:
         applied["adjustedOnly"] = True
     adj_only = "WHERE COALESCE(t.txn_count, 0) > 0" if adjusted_only else ""
-
-    sort_key = sort_by if sort_by in SORT_COLUMNS else DEFAULT_SORT
-    direction = "ASC" if str(sort_order).lower() == "asc" else "DESC"
-    sort = {"sort_by": sort_key, "sort_order": direction.lower()}
-    # Both halves come from this module's own literals, so no request text
-    # reaches the statement. NULLS LAST keeps never-counted articles (ledger-only
-    # rows, last_counted_date NULL) off the head of a "most recently counted"
-    # sort. k_stock joins the tie-break because one item_name legitimately
-    # appears twice, once per stock type — item_name alone is not a total order,
-    # and paging across a weight tie could then repeat or skip a row.
-    order_by_sql = (f"ORDER BY {SORT_COLUMNS[sort_key]} {direction} NULLS LAST,"
-                    " item_name ASC, k_stock ASC")
 
     where = f"WHERE {' AND '.join(conds)}" if conds else ""
     # Same filters, but adjustment rows included -- see COUNT_ROWS_ONLY.
@@ -344,44 +383,6 @@ async def fetch_latest_stock(
         ref_day = f"${as_of_param}::date"
         applied["asOf"] = as_of_norm.isoformat()
 
-    try:
-        # MAX(...) as a real `date`, not to_char'd text: it is bound straight back
-        # into the two queries below, and asyncpg types a `$n::date` parameter
-        # from the statement. It is formatted to YYYY-MM-DD once, at the response
-        # boundary — a date has no timezone, so no conversion can shift the day.
-        as_of_date = await conn.fetchval(
-            f"""
-            SELECT MAX({ENTRY_DAY})
-            FROM {ENTRIES_TABLE}
-            {where}
-            {date_clause}
-            """,
-            *date_params,
-        )
-    except _MISSING_SCHEMA as exc:
-        # The entries table is not part of this app's schema. Pointed at a
-        # database without it (the Supabase config carries no stocktake tables),
-        # an empty result is the honest answer and the console renders its empty
-        # state; a 500 would just be noise.
-        log.warning(
-            "stock_take: %s unavailable — returning empty (%s: %s)", ENTRIES_TABLE,
-            type(exc).__name__, exc,
-        )
-        return _empty(page, page_size, applied, sort)
-
-    # NO SHORT CUT ON as_of_date. It is MAX(day) over `scoped`, and `scoped`
-    # carries COUNT_ROWS_ONLY -- so it is NULL for a place holding adjustments
-    # but no physical count, and returning empty here answered for the ledger
-    # without asking it. That is what showed "No counted stock at this location
-    # yet." above 33,857.62 kg on A185 / A185 Cold, every kilo of it posted,
-    # attributed and correctly written back.
-    #
-    # The query below already handles the case: `counted` comes out empty, `txn`
-    # does not, and the FULL OUTER JOIN between them yields the ledger's rows.
-    # With nothing on either side it returns an empty page unaided, so the only
-    # thing lost is one saved round trip on a query whose CTEs are then empty.
-    # _empty() is still reached when the table itself is absent, above.
-
     # `scoped` carries the filters AND the asOf cap; there is no longer a single
     # day parameter, because there is no longer a single day.
     day_params = list(date_params)
@@ -409,6 +410,25 @@ async def fetch_latest_stock(
     txn_where = "WHERE " + " AND ".join(txn_conds)
     all_params = day_params + txn_params
 
+    # Place keys, carried through `counted`, `txn` and `merged` for the download
+    # only. The page sums an article over its places; the download keeps them.
+    if by_place:
+        keys = {
+            "c_keys": "\n                        k_wh, k_fl, MIN(fl_name) AS floor_label,",
+            "c_group": "1, 2, 3, 4",
+            "t_keys": ("\n                        COALESCE(%s, '') AS k_wh,"
+                       "\n                        COALESCE(UPPER(BTRIM(location)), '') AS k_fl,"
+                       "\n                        MIN(BTRIM(location)) AS floor_label," % WAREHOUSE_KEY),
+            "t_group": "1, 2, 3, 4",
+            "m_keys": ("\n                     COALESCE(c.k_wh, t.k_wh) AS k_wh,"
+                       "\n                     COALESCE(c.k_fl, t.k_fl) AS k_fl,"
+                       "\n                     COALESCE(c.floor_label, t.floor_label) AS floor_label,"),
+            "m_join": " AND c.k_wh = t.k_wh AND c.k_fl = t.k_fl",
+        }
+    else:
+        keys = {"c_keys": "", "c_group": "1, 2", "t_keys": "", "t_group": "1, 2",
+                "m_keys": "", "m_join": ""}
+
     # Both halves key on the SAME identity the rest of the system uses:
     # UPPER(BTRIM(item_name)) plus stock_type. That is a string join, not a key --
     # item_name is free text with no FK -- so an article renamed
@@ -431,9 +451,12 @@ async def fetch_latest_stock(
                         -- join below, so an un-coalesced key drops those rows
                         -- and their articles entirely — no error, just a smaller
                         -- number.
-                        COALESCE(UPPER(BTRIM(warehouse)), '')  AS k_wh,
+                        -- The warehouse as one code: the cold stores'
+                        -- 'D-39' rows and the ledger's 'D39' are one place.
+                        COALESCE(%(wh_key)s, '') AS k_wh,
                         COALESCE(UPPER(BTRIM(floor_name)), '') AS k_fl,
                         %(entry_day)s                          AS count_day,
+                        MIN(BTRIM(floor_name))                 AS fl_name,
                         MIN(item_name)                         AS item_name,
                         MIN(item_type)                         AS item_type,
                         MIN(item_category)                     AS item_category,
@@ -471,7 +494,7 @@ async def fetch_latest_stock(
                  SELECT k_item, k_stock, k_wh, k_fl, count_day FROM place_latest
              ),
              counted AS (
-                 SELECT k_item, k_stock,
+                 SELECT k_item, k_stock,%(c_keys)s
                         MIN(item_name)                                AS item_name,
                         MIN(item_type)                                AS item_type,
                         MIN(item_category)                            AS item_category,
@@ -484,11 +507,11 @@ async def fetch_latest_stock(
                         MAX(count_day)                                AS last_counted_date,
                         MIN(count_day)                                AS oldest_counted_date
                    FROM place_latest
-                  GROUP BY 1, 2
+                  GROUP BY %(c_group)s
              ),
              txn AS (
                  SELECT UPPER(BTRIM(item_name))                       AS k_item,
-                        COALESCE(stock_type, 'Fresh Stock')           AS k_stock,
+                        COALESCE(stock_type, 'Fresh Stock')           AS k_stock,%(t_keys)s
                         MIN(item_name)                                AS item_name,
                         MIN(material_type)                            AS item_type,
                         MIN(item_category)                            AS item_category,
@@ -502,15 +525,15 @@ async def fetch_latest_stock(
                    LEFT JOIN place_base b
                           ON b.k_item  = UPPER(BTRIM(item_name))
                          AND b.k_stock = COALESCE(stock_type, 'Fresh Stock')
-                         AND b.k_wh    = COALESCE(UPPER(BTRIM(warehouse)), '')
+                         AND b.k_wh    = COALESCE(%(wh_key)s, '')
                          AND b.k_fl    = COALESCE(UPPER(BTRIM(location)), '')
                    %(txnwhere)s
-                  GROUP BY 1, 2
+                  GROUP BY %(t_group)s
              ),
              merged AS (
                  SELECT
                      COALESCE(c.k_item, t.k_item)                     AS k_item,
-                     COALESCE(c.k_stock, t.k_stock)                   AS k_stock,
+                     COALESCE(c.k_stock, t.k_stock)                   AS k_stock,%(m_keys)s
                      COALESCE(c.item_name, t.item_name)               AS item_name,
                      COALESCE(c.item_type, t.item_type)               AS item_type,
                      COALESCE(c.item_category, t.item_category)       AS item_category,
@@ -537,7 +560,7 @@ async def fetch_latest_stock(
                      v.verified_at                                    AS verified_at
                    FROM counted c
                    FULL OUTER JOIN txn t
-                     ON c.k_item = t.k_item AND c.k_stock = t.k_stock
+                     ON c.k_item = t.k_item AND c.k_stock = t.k_stock%(m_join)s
                    LEFT JOIN verif v
                      ON v.k_item  = COALESCE(c.k_item, t.k_item)
                     AND v.k_stock = COALESCE(c.k_stock, t.k_stock)
@@ -545,8 +568,84 @@ async def fetch_latest_stock(
              )
     """ % {"where": where, "daycap": date_clause, "txnwhere": txn_where,
            "where_all": where_all, "daycap_all": date_clause_all,
-           "adjonly": adj_only,
-           "entries": ENTRIES_TABLE, "entry_day": ENTRY_DAY, "refday": ref_day}
+           "adjonly": adj_only, "wh_key": WAREHOUSE_KEY,
+           "entries": ENTRIES_TABLE, "entry_day": ENTRY_DAY, "refday": ref_day,
+           **keys}
+
+    return {
+        "ctes": ctes,
+        "params": all_params,
+        "applied": applied,
+        # MAX(...) as a real `date`, not to_char'd text: it is bound straight back
+        # into the caller's queries, and asyncpg types a `$n::date` parameter
+        # from the statement. It is formatted to YYYY-MM-DD once, at the response
+        # boundary — a date has no timezone, so no conversion can shift the day.
+        "day_sql": f"SELECT MAX({ENTRY_DAY}) FROM {ENTRIES_TABLE} {where} {date_clause}",
+        "day_params": date_params,
+    }
+
+
+async def fetch_latest_stock(
+    conn: asyncpg.Connection,
+    *,
+    as_of: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 50,
+    sort_by: str = DEFAULT_SORT,
+    sort_order: str = "desc",
+    adjusted_only: bool = False,
+    **filters: Any,
+) -> dict[str, Any]:
+    """Stock as counted on the most recent count date, plus that date.
+
+    Rows are aggregated per item AND per stock type — Fresh Stock and
+    Off Grade/Rejection are different stock and must never be summed together —
+    across warehouses and floors, so `warehouse`/`floor_name` narrow the set
+    rather than splitting it. Item keying is UPPER(TRIM(item_name)), matching the
+    Express app's own grouped view so both agree on what one item is.
+    """
+    sort_key = sort_by if sort_by in SORT_COLUMNS else DEFAULT_SORT
+    direction = "ASC" if str(sort_order).lower() == "asc" else "DESC"
+    sort = {"sort_by": sort_key, "sort_order": direction.lower()}
+    # Both halves come from this module's own literals, so no request text
+    # reaches the statement. NULLS LAST keeps never-counted articles (ledger-only
+    # rows, last_counted_date NULL) off the head of a "most recently counted"
+    # sort. k_stock joins the tie-break because one item_name legitimately
+    # appears twice, once per stock type — item_name alone is not a total order,
+    # and paging across a weight tie could then repeat or skip a row.
+    order_by_sql = (f"ORDER BY {SORT_COLUMNS[sort_key]} {direction} NULLS LAST,"
+                    " item_name ASC, k_stock ASC")
+
+    q = _stock_sql(as_of=as_of, adjusted_only=adjusted_only, by_place=False, filters=filters)
+    applied = q["applied"]
+    try:
+        as_of_date = await conn.fetchval(q["day_sql"], *q["day_params"])
+    except _MISSING_SCHEMA as exc:
+        # The entries table is not part of this app's schema. Pointed at a
+        # database without it (the Supabase config carries no stocktake tables),
+        # an empty result is the honest answer and the console renders its empty
+        # state; a 500 would just be noise.
+        log.warning(
+            "stock_take: %s unavailable — returning empty (%s: %s)", ENTRIES_TABLE,
+            type(exc).__name__, exc,
+        )
+        return _empty(page, page_size, applied, sort)
+
+    # NO SHORT CUT ON as_of_date. It is MAX(day) over `scoped`, and `scoped`
+    # carries COUNT_ROWS_ONLY -- so it is NULL for a place holding adjustments
+    # but no physical count, and returning empty here answered for the ledger
+    # without asking it. That is what showed "No counted stock at this location
+    # yet." above 33,857.62 kg on A185 / A185 Cold, every kilo of it posted,
+    # attributed and correctly written back.
+    #
+    # The query below already handles the case: `counted` comes out empty, `txn`
+    # does not, and the FULL OUTER JOIN between them yields the ledger's rows.
+    # With nothing on either side it returns an empty page unaided, so the only
+    # thing lost is one saved round trip on a query whose CTEs are then empty.
+    # _empty() is still reached when the table itself is absent, above.
+
+    ctes, all_params = q["ctes"], q["params"]
+
 
     totals = await conn.fetchrow(
         ctes + """
@@ -667,6 +766,71 @@ async def fetch_latest_stock(
     }
 
 
+async def fetch_stock_by_place(
+    conn: asyncpg.Connection,
+    *,
+    as_of: Optional[str] = None,
+    adjusted_only: bool = False,
+    **filters: Any,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Current stock per warehouse + floor + article + stock type, for the download.
+
+    The same figures as fetch_latest_stock, under the same filters, kept apart per
+    place instead of summed over them -- so every warehouse (the cold stores
+    included) and every floor comes out, including a floor whose stock exists only
+    as adjustments. Unpaginated: a download that stops at a page is worse than a
+    slow one, because nobody can tell it is partial.
+
+    Rows are ordered warehouse, floor, then heaviest first. Returns the rows and
+    the filters as applied. Raises ValueError for an unusable asOf.
+    """
+    q = _stock_sql(as_of=as_of, adjusted_only=adjusted_only, by_place=True, filters=filters)
+    try:
+        rows = await conn.fetch(
+            q["ctes"] + """
+            SELECT k_wh, k_fl, floor_label, k_item, item_name, item_type, item_category,
+                   item_subcategory, k_stock AS stock_type,
+                   total_quantity, total_weight, counted_weight, net_adjustment_kg,
+                   entry_count, txn_count, last_counted_date, days_since_count
+              FROM merged
+             ORDER BY k_wh, k_fl, total_weight DESC, item_name, k_stock
+            """,
+            *q["params"],
+        )
+    except _MISSING_SCHEMA as exc:
+        log.warning("stock_take: %s unavailable — empty stock download (%s: %s)",
+                    ENTRIES_TABLE, type(exc).__name__, exc)
+        return [], q["applied"]
+
+    return [
+        {
+            "warehouse": r["k_wh"] or "",
+            # The item KEY, so a total line can count an item once however many
+            # floors it sits on -- the way the page's Items figure counts it.
+            "item_key": r["k_item"] or "",
+            # The floor KEY is what identifies the place: one floor can come back
+            # spelled "STORE" by its counts and "Store" by its adjustments.
+            "floor_key": r["k_fl"] or "",
+            "floor": r["floor_label"] or "",
+            "item_name": r["item_name"],
+            "item_type": r["item_type"],
+            "item_category": r["item_category"],
+            "item_subcategory": r["item_subcategory"],
+            "stock_type": r["stock_type"],
+            "total_quantity": float(r["total_quantity"] or 0),
+            "counted_weight": float(r["counted_weight"] or 0),
+            "net_adjustment_kg": float(r["net_adjustment_kg"] or 0),
+            "total_weight": float(r["total_weight"] or 0),
+            "entry_count": int(r["entry_count"] or 0),
+            "transaction_count": int(r["txn_count"] or 0),
+            "last_counted_date": r["last_counted_date"],
+            "days_since_count": (int(r["days_since_count"])
+                                 if r["days_since_count"] is not None else None),
+        }
+        for r in rows
+    ], q["applied"]
+
+
 async def fetch_filter_options(conn: asyncpg.Connection) -> dict[str, list[str]]:
     """Distinct values for the console's filter controls, built from live data.
 
@@ -680,9 +844,11 @@ async def fetch_filter_options(conn: asyncpg.Connection) -> dict[str, list[str]]
             # spelling is the whole point of the dropdown. Matching is unaffected:
             # _build_filters compares UPPER(TRIM(floor_name)) against values this
             # module upper-cases in Python, so either casing selects the same rows.
+            # The warehouse, by contrast, is the one normalised CODE (D39, not
+            # D-39): the code the grants, the ledger and the filter all use.
             f"""
             SELECT DISTINCT
-                UPPER(TRIM(warehouse))                        AS warehouse,
+                {WAREHOUSE_KEY}                               AS warehouse,
                 BTRIM(floor_name)                             AS floor_name,
                 UPPER(TRIM(COALESCE(item_type, '')))          AS item_type,
                 COALESCE(stock_type, 'Fresh Stock')           AS stock_type
@@ -719,11 +885,15 @@ async def fetch_places(conn: asyncpg.Connection) -> dict[str, list[str]]:
     Only consulted for warehouses that declare no floors of their own (F53, A68).
     A declared warehouse is offered what the ERP profile says it has, never what
     somebody once typed — see app/modules/stock_take/floors.py.
+
+    Keyed by the normalised code, so the cold stores' 'D-39' rows land under the
+    'D39' a grant names. Keyed as spelled, a caller granted D39 was offered no
+    floors there and "all warehouses" left the Savla stock out entirely.
     """
     try:
         rows = await conn.fetch(
             f"""
-            SELECT DISTINCT UPPER(TRIM(warehouse)) AS wh, BTRIM(floor_name) AS fl
+            SELECT DISTINCT {WAREHOUSE_KEY} AS wh, BTRIM(floor_name) AS fl
               FROM {ENTRIES_TABLE}
              WHERE (status IS NULL OR status != 'draft')
                AND warehouse IS NOT NULL AND BTRIM(COALESCE(floor_name, '')) <> ''

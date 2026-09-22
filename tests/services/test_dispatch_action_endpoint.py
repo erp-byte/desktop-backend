@@ -13,7 +13,7 @@ Run:  PYTHONPATH=. python -m pytest tests/services/test_dispatch_action_endpoint
 from __future__ import annotations
 
 import asyncio
-from datetime import date
+from datetime import date, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -23,6 +23,10 @@ from app.modules.sample import router, schemas
 from app.modules.sample.services import requisition_service
 
 REQ_PK = 42
+
+# The endpoint refuses a date that is not after today, so a hard-coded date goes stale.
+FUTURE = date.today() + timedelta(days=7)
+FUTURE_DMY = FUTURE.strftime("%d-%m-%Y")
 
 
 def _user():
@@ -138,15 +142,15 @@ def _post(body):
 def test_change_date_moves_it_and_records_the_reason(calls):
     out = _post(schemas.DispatchActionBody(
         action="CHANGE_DATE", reason="Raw material delayed",
-        expected_dispatch_date="20-09-2026"))
-    assert calls["redate"] == [(REQ_PK, date(2026, 9, 20), "Raw material delayed")]
-    assert out["expected_dispatch_date"] == date(2026, 9, 20)
+        expected_dispatch_date=FUTURE_DMY))
+    assert calls["redate"] == [(REQ_PK, FUTURE, "Raw material delayed")]
+    assert out["expected_dispatch_date"] == FUTURE
 
 
 def test_change_date_clears_the_overdue_chase(calls):
     """Otherwise the rows from yesterday's chase silence the new date's warning."""
     _post(schemas.DispatchActionBody(action="CHANGE_DATE", reason="Slipped",
-                                     expected_dispatch_date="20-09-2026"))
+                                     expected_dispatch_date=FUTURE_DMY))
     assert calls["released"] == [REQ_PK]
 
 
@@ -154,8 +158,8 @@ def test_an_iso_date_is_accepted_too(calls):
     """The WhatsApp leg speaks dd-mm-yyyy because that is what the prompt asks a human
     for; an API caller will send ISO. Both reach the same service call."""
     _post(schemas.DispatchActionBody(action="CHANGE_DATE", reason="Slipped",
-                                     expected_dispatch_date="2026-09-20"))
-    assert calls["redate"][0][1] == date(2026, 9, 20)
+                                     expected_dispatch_date=FUTURE.isoformat()))
+    assert calls["redate"][0][1] == FUTURE
 
 
 def test_cancel_cancels_with_the_reason(calls):

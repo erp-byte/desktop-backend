@@ -31,6 +31,8 @@ _SFG_INPUT_KINDS = ("SFG", "WIP")
 # action (update_wip_boxes with mark_printed) flips them to PRINTED. Both states
 # are pre-receive and editable; a box can only be scanned downstream once PRINTED.
 _BOX_PENDING_STATUS = "PENDING"
+# A cancelled box is neither boxed material nor a label waiting to be printed.
+_BOX_CANCELLED_STATUS = "CANCELLED"
 # A box can be received while it is still PRINTED or (once a dispatch step is
 # wired) DISPATCHED — both are valid pre-receive states.
 _BOX_RECEIVABLE_STATUSES = ("PRINTED", "DISPATCHED")
@@ -502,8 +504,33 @@ async def _record_wip_transfer_note(conn, *, accepted, downstream_jc,
     return note_id
 
 
+def _is_printed(box: dict) -> bool:
+    """Has this box's label been printed at some point?
+
+    Only a PENDING box is still waiting for one: DISPATCHED / RECEIVED /
+    CONSUMED are all reached through PRINTED, and the next stage scanning a box
+    in flips the producing card's row to RECEIVED (scan_receive_sfg_box). Asking
+    for status == 'PRINTED' would un-print a box the moment it moved on, and the
+    boxes tab would ask for labels that already exist.
+    """
+    return box["status"] not in (_BOX_PENDING_STATUS, _BOX_CANCELLED_STATUS)
+
+
 async def get_boxes_for_jc(conn, job_card_id: int) -> dict:
-    """All boxes produced by a WIP-stage JC + their reconciliation total."""
+    """All boxes produced by a WIP-stage JC + their reconciliation totals.
+
+    Alongside the box list: ``printed_count`` (boxes whose label has been
+    printed — anything past PENDING, see _is_printed) and ``by_batch`` — one
+    ``{"batch_id", "boxes", "printed", "net_kg"}`` entry per distinct batch
+    among the boxes, ordered by batch id with the no-batch entry (legacy boxes;
+    a new box always carries one) last. Cancelled boxes are left out of both.
+    Both are counted in Python from the rows below — no extra query. Only this
+    JC's SFG boxes are read, so an RM box printed on the Raw Material tab
+    (item_type 'rm') is never counted.
+
+    ``count`` / ``total_net_kg`` / ``boxes`` are the older totals and are
+    unchanged: they still list every box, cancelled ones included.
+    """
     rows = await conn.fetch(
         """
         SELECT carton_id AS box_id, item_type, job_card_id, job_card_number, sfg_code,
@@ -518,10 +545,28 @@ async def get_boxes_for_jc(conn, job_card_id: int) -> dict:
         job_card_id,
     )
     boxes = [dict(r) for r in rows]
+    per_batch: dict[int | None, dict] = {}
+    for b in boxes:
+        if b["status"] == _BOX_CANCELLED_STATUS:
+            continue
+        e = per_batch.setdefault(
+            b["batch_id"],
+            {"batch_id": b["batch_id"], "boxes": 0, "printed": 0, "net_kg": 0.0},
+        )
+        e["boxes"] += 1
+        if _is_printed(b):
+            e["printed"] += 1
+        e["net_kg"] += float(b["net_weight"])
+    for e in per_batch.values():
+        e["net_kg"] = round(e["net_kg"], 3)
     return {
         "job_card_id": job_card_id,
         "count": len(boxes),
         "total_net_kg": round(sum(float(b["net_weight"]) for b in boxes), 3),
+        "printed_count": sum(1 for b in boxes if _is_printed(b)),
+        # Null batch_id sorts last (the `is None` flag), the rest by batch id.
+        "by_batch": sorted(per_batch.values(),
+                           key=lambda e: (e["batch_id"] is None, e["batch_id"] or 0)),
         "boxes": boxes,
     }
 
@@ -737,7 +782,8 @@ async def get_jc_genealogy(conn, job_card_id: int,
                            allowed_entities: list[str] | None = None) -> dict:
     """Per-JC genealogy: boxes this JC PRODUCED + boxes it CONSUMED.
 
-    produced = sfg_box WHERE job_card_id = id (this JC minted them).
+    produced = sfg_box WHERE job_card_id = id (this JC minted them), leaving out
+    store's manually printed boxes (item_type 'rm', migration 113).
     consumed = sfg_box WHERE received_into_job_card_id = id (scanned in here).
     Each consumed box also carries ``source_job_card_id`` = the producing box's
     job_card_id (the upstream stage that minted it).
@@ -750,7 +796,7 @@ async def get_jc_genealogy(conn, job_card_id: int,
     scope = set(allowed_entities) if allowed_entities else None
     produced_rows = await conn.fetch(
         f"SELECT {_BOX_GENEALOGY_COLS} FROM sfg_box "
-        f"WHERE job_card_id = $1 ORDER BY created_at, carton_id",
+        f"WHERE job_card_id = $1 AND item_type <> 'rm' ORDER BY created_at, carton_id",
         job_card_id,
     )
     consumed_rows = await conn.fetch(
