@@ -20,7 +20,7 @@ from typing import Any
 
 from app.core.middleware.request_context import AuthError
 from app.modules.purchase.services import po_diff
-from app.modules.purchase.services.parser import parse_po_book
+from app.modules.purchase.services.parser import PoBookFormatError, parse_po_book
 from app.modules.so.services.item_matcher import MasterItem, match_sku
 
 logger = logging.getLogger(__name__)
@@ -150,6 +150,13 @@ async def preview(
 
     try:
         parsed = parse_po_book(file_bytes)
+    except PoBookFormatError as e:
+        # The workbook opened fine, it just isn't a PO Book. This message is
+        # ours (no parser internals, so WR-07 is satisfied) and is the only
+        # thing telling the user why their upload produced nothing — the old
+        # silent fallback returned 200 with phantom POs and zero lines.
+        logger.info("po.preview.unrecognised_layout file=%s", filename)
+        raise AuthError("unrecognised_po_book", str(e), 400)
     except Exception as e:
         # WR-07: don't echo parser internals (paths, library type names, etc.)
         # to the client — keep the detail in the server log for ops only.

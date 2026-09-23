@@ -5,7 +5,7 @@ import logging
 from datetime import date, datetime
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -21,6 +21,8 @@ from app.modules.production.schemas.job_card_edit import (
 # L3: B13 cost-metric gate. Hoisted to the top so endpoint bodies stay
 # clean and the gate is one obvious dependency at the module head.
 from app.modules.production.services.response_filters import strip_cost_fields
+# Every route that creates a job card tells its floor — see _notify_new_job_cards.
+from app.modules.production.services import job_card_notify
 from app.core.warehouse_scope import user_has_warehouse
 
 logger = logging.getLogger(__name__)
@@ -69,6 +71,23 @@ def _actor_name(user: AuthUser) -> str:
     """
     return (user.full_name or user.email or user.phone
             or f"user:{user.user_id}")
+
+
+def _notify_new_job_cards(request: Request, background_tasks: BackgroundTasks,
+                          user: AuthUser, job_card_ids) -> None:
+    """Tell the floor managers of every job card this request has just created.
+
+    Called by each creating route AFTER its transaction block, so a refused or
+    rolled-back create tells nobody, and run as a background task
+    (services/job_card_notify.py) so a slow mail server or Graph API cannot delay
+    the planner's response. Only ids travel: the notice re-reads the cards on its
+    own connection, holding nothing across the commit, and it never raises.
+    """
+    ids = [jid for jid in (job_card_ids or []) if jid]
+    if not ids:
+        return
+    background_tasks.add_task(job_card_notify.notify_floor_of_new_job_cards,
+                              request.app.state.db_pool, ids, created_by=_actor_name(user))
 
 
 # ---------------------------------------------------------------------------
@@ -4780,7 +4799,7 @@ async def update_plan_v2(request: Request, plan_id: int, body: PlanV2Update, use
 
 
 @router.post("/plans-v2/{plan_id}/approve")
-async def approve_plan_v2(request: Request, plan_id: int, body: PlanV2Approve, user=Depends(require_permission("production", "plans", "approve", action="create"))):
+async def approve_plan_v2(request: Request, plan_id: int, body: PlanV2Approve, background_tasks: BackgroundTasks, user=Depends(require_permission("production", "plans", "approve", action="create"))):
     from app.modules.production.services.plan_v2 import approve_plan
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -4790,6 +4809,11 @@ async def approve_plan_v2(request: Request, plan_id: int, body: PlanV2Approve, u
         raise HTTPException(status_code=400, detail=result.get("message"))
     if result.get("error") == "not_found_or_invalid_status":
         raise HTTPException(status_code=404, detail="Plan not found or status not approvable")
+    # Committed: tell the floors. A re-approve that generated nothing (the
+    # job_cards_already_exist guard) has no lines here, so it notifies nobody.
+    _notify_new_job_cards(request, background_tasks, user,
+                          [jid for line in (result.get("job_cards") or {}).get("lines") or []
+                           for jid in line.get("job_card_ids") or []])
     return result
 
 
@@ -4978,6 +5002,7 @@ async def add_step_v2(
     request: Request,
     plan_line_id: int,
     body: StepV2Add,
+    background_tasks: BackgroundTasks,
     user=Depends(require_permission("production", "plans", action="edit")),
 ):
     """Append a step at the end of the line.
@@ -5000,6 +5025,8 @@ async def add_step_v2(
             result = await add_step(conn, plan_line_id, body.model_dump())
     if result.get("error") == "missing_process_name":
         raise HTTPException(status_code=400, detail=result.get("message"))
+    # A step added to an already-carded line spawns a job card — tell its floor.
+    _notify_new_job_cards(request, background_tasks, user, [result.get("spawned_job_card_id")])
     return result
 
 
@@ -5032,6 +5059,7 @@ async def create_line_job_cards_v2(
     request: Request,
     plan_line_id: int,
     body: JobCardLineCreate,
+    background_tasks: BackgroundTasks,
     user=Depends(require_permission("production", "job_cards", "generate", action="create")),
 ):
     """Create the chained job cards for ONE plan line (the Plan-List
@@ -5096,6 +5124,8 @@ async def create_line_job_cards_v2(
         raise HTTPException(status_code=409, detail=result.get("message"))
     if err in ("invalid_qty", "no_wip_steps", "missing_pkg_floor"):
         raise HTTPException(status_code=400, detail=result.get("message"))
+    # Committed: tell every floor on the new chain.
+    _notify_new_job_cards(request, background_tasks, user, result.get("job_card_ids"))
     return result
 
 
@@ -5148,6 +5178,7 @@ class ProcessMergeCreateRequest(BaseModel):
 async def create_merged_process_run_v2(
     request: Request,
     body: ProcessMergeCreateRequest,
+    background_tasks: BackgroundTasks,
     user=Depends(require_permission("production", "job_cards", "generate", action="create")),
 ):
     """Merge several products that share factory + floor + RM articles into ONE
@@ -5193,6 +5224,10 @@ async def create_merged_process_run_v2(
         raise HTTPException(status_code=409, detail=result.get("message"))
     if err:
         raise HTTPException(status_code=400, detail=result.get("message") or err)
+    # Committed: the shared process chain AND every member's packaging card.
+    _notify_new_job_cards(request, background_tasks, user,
+                          list(result.get("process_job_card_ids") or [])
+                          + [m.get("job_card_id") for m in result.get("packaging") or []])
     return result
 
 
@@ -5235,6 +5270,7 @@ async def replace_line_job_cards_v2(
     request: Request,
     plan_line_id: int,
     body: JobCardLineCreate,
+    background_tasks: BackgroundTasks,
     user=Depends(require_permission("production", "job_cards", "generate", action="create")),
 ):
     """Edit (replace) a plan line's job cards from the wizard. Deletes the
@@ -5269,6 +5305,8 @@ async def replace_line_job_cards_v2(
         raise HTTPException(status_code=409, detail=result.get("message"))
     if err in ("invalid_qty", "no_wip_steps", "missing_pkg_floor"):
         raise HTTPException(status_code=400, detail=result.get("message"))
+    # The replaced cards are gone; these are the ones this request created.
+    _notify_new_job_cards(request, background_tasks, user, result.get("job_card_ids"))
     return result
 
 
@@ -5300,6 +5338,7 @@ async def apply_line_job_card_edits_v2(
     request: Request,
     plan_line_id: int,
     body: JobCardLineApplyEdits,
+    background_tasks: BackgroundTasks,
     user=Depends(require_permission("production", "plans", action="edit")),
 ):
     """Apply constrained LIVE edits to a plan line's job cards even after stages
@@ -5348,6 +5387,8 @@ async def apply_line_job_card_edits_v2(
         raise HTTPException(status_code=409, detail=result.get("message"))
     if err in ("invalid_qty", "no_wip_steps"):
         raise HTTPException(status_code=400, detail=result.get("message"))
+    # Only the processes this edit ADDED are new cards; the rest stayed in place.
+    _notify_new_job_cards(request, background_tasks, user, result.get("created_job_card_ids"))
     return result
 
 

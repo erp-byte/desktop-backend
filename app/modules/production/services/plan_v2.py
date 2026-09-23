@@ -1630,6 +1630,7 @@ async def add_step(conn, plan_line_id: int, step_data: dict) -> dict:
     # report the skip so the admin sees the gap.
     safety = await _line_jcs_safety(conn, plan_line_id)
     jc_sync: dict | None = None
+    new_jc_id: int | None = None
     if safety["jcs"] and safety["safe"]:
         new_jc_id = await _spawn_jc_for_new_step(
             conn,
@@ -1658,6 +1659,9 @@ async def add_step(conn, plan_line_id: int, step_data: dict) -> dict:
         }
 
     out = {"added": True, "step": _serialize_row(result)}
+    if new_jc_id is not None:
+        # Named so the route can tell this card's floor about it once we commit.
+        out["spawned_job_card_id"] = new_jc_id
     if jc_sync is not None:
         out["jc_sync"] = jc_sync
     return out

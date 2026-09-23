@@ -46,23 +46,32 @@ invocation only returns once background tasks finish, so there the response DOES
 wait for the notice (bounded by the SMTP and per-phone WhatsApp timeouts).
 Either way nothing here raises: every failure is logged and reported in the
 returned dict, and the committed request is never undone.
+
+Who the recipients are, which places they cover, how a template variable is
+sanitised and how the Graph call is made are shared with the new-job-card notice
+through production/services/wa_notify.py — the two must never drift apart. What
+is specific to this notice (the store_head role, the template, its wording and
+its quick replies) stays here.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-import re
-from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
-from typing import Any, Iterable, Optional
+from datetime import datetime, timezone
+from typing import Any, Optional
 
-import httpx
-
-from app.config import Settings
 from app.modules.auth.services.phone import normalize as normalize_phone
 from app.modules.floor_requisition.services import requisition_service
 from app.modules.production.services import mail_service
-from app.modules.stock_take import place_scope
+# Shared with the new-job-card notice (production/services/job_card_notify.py):
+# one recipient rule, one place rule, one sanitiser, one Graph call. covers_place
+# and _RECIPIENTS_SQL are re-exported under their old names — services/wa_tap.py
+# reads the place rule off this module.
+from app.modules.production.services.wa_notify import (
+    IST, RECIPIENTS_SQL as _RECIPIENTS_SQL, covering, covers_place,
+    current_settings as _settings, param as _param, role_holders,
+    send_template as _send_whatsapp_template, whatsapp_off_reason as _whatsapp_off_reason,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -76,63 +85,13 @@ _HEADER_FIXED = "Material requested — Job card "      # 30 characters
 _HEADER_MAX = 60                                        # Meta's limit for a text header
 PAYLOAD_PREFIX = "floor_req"
 ACCEPT, HOLD = "accept", "hold"                         # button index 0, 1
-IST = timezone(timedelta(hours=5, minutes=30))
-
-# One row per user. Role resolution mirrors auth_service._effective_roles and the
-# account test mirrors validate_session (is_active AND status = 'active').
-_RECIPIENTS_SQL = """
-    SELECT u.user_id, u.full_name, u.email, u.phone, u.allowed_warehouses, u.allowed_floors
-      FROM auth_user u
-     WHERE u.is_active
-       AND COALESCE(u.status, 'active') = 'active'
-       AND (
-             EXISTS (SELECT 1 FROM auth_user_role ur JOIN auth_role r ON r.role_id = ur.role_id
-                      WHERE ur.user_id = u.user_id AND r.role_name = ANY($1::text[]))
-          OR (NOT EXISTS (SELECT 1 FROM auth_user_role ur WHERE ur.user_id = u.user_id)
-              AND EXISTS (SELECT 1 FROM auth_role r
-                           WHERE r.role_id = u.role_id AND r.role_name = ANY($1::text[])))
-           )
-     ORDER BY u.full_name, u.user_id
-"""
-
-
-def _settings():
-    """One read of the settings per notification (tests replace this)."""
-    return Settings()
 
 
 # ── who ──────────────────────────────────────────────────────────────────────
 
-def covers_place(allowed_warehouses: Optional[Iterable[str]], allowed_floors: Optional[Iterable[str]],
-                 warehouse: str, floor: str) -> bool:
-    """Whether a user with these grants may open a request at warehouse/floor —
-    place_scope's rule exactly, so notification and access never disagree."""
-    granted_w, granted_f = place_scope.granted(SimpleNamespace(
-        allowed_warehouses=list(allowed_warehouses or []), allowed_floors=list(allowed_floors or [])))
-    wh = place_scope._normalise_warehouse(warehouse)
-    fl = (floor or "").strip().upper()
-    return (not granted_w or wh in granted_w) and (not granted_f or fl in granted_f)
-
-
 async def store_role_holders(conn) -> list[dict[str, Any]]:
     """Every user who can sign in with store_head among their roles, one entry each."""
-    rows = await conn.fetch(_RECIPIENTS_SQL, list(STORE_ROLES))
-    seen: set[int] = set()
-    out: list[dict[str, Any]] = []
-    for r in rows:
-        if r["user_id"] in seen:
-            continue
-        seen.add(r["user_id"])
-        out.append({"user_id": r["user_id"], "name": r["full_name"],
-                    "email": (r["email"] or "").strip(), "phone": (r["phone"] or "").strip(),
-                    "allowed_warehouses": r["allowed_warehouses"], "allowed_floors": r["allowed_floors"]})
-    return out
-
-
-def covering(holders: list[dict[str, Any]], warehouse: str, floor: str) -> list[dict[str, Any]]:
-    """The holders whose granted places include this warehouse and floor."""
-    return [h for h in holders
-            if covers_place(h["allowed_warehouses"], h["allowed_floors"], warehouse, floor)]
+    return await role_holders(conn, STORE_ROLES)
 
 
 # ── what ─────────────────────────────────────────────────────────────────────
@@ -214,23 +173,12 @@ def compose_email(req: dict[str, Any], card: Optional[dict[str, Any]], web_url: 
     return subject, "\n".join(lines)
 
 
-_SPACES = re.compile(r"\s+")
-
 # Meta refuses a template message whose body, with the variables filled in, is
 # longer than 1024 characters. The approved body's fixed text is 265 characters,
 # so the eleven variables share a budget of 700 (965 at most).
 _BODY_BUDGET = (("number", 12), ("job_card", 60), ("fg", 110), ("customer", 80), ("material", 120),
                 ("requested", 30), ("shortage", 30), ("place", 78), ("raised_by", 60),
                 ("raised_at", 20), ("note", 100))
-
-
-def _param(text: str, limit: int) -> str:
-    """A WhatsApp template variable: Meta refuses empty values, new lines, tabs and
-    runs of spaces, so collapse all whitespace, cap the length and never send blank."""
-    t = _SPACES.sub(" ", str(text or "")).strip()
-    if len(t) > limit:
-        t = t[: limit - 1].rstrip() + "…"
-    return t or "-"
 
 
 def button_payload(action: str, requisition_id: Any) -> str:
@@ -290,27 +238,6 @@ def template_message(to: str, req: dict[str, Any], card: Optional[dict[str, Any]
 
 
 # ── send ─────────────────────────────────────────────────────────────────────
-
-async def _send_whatsapp_template(settings, message: dict[str, Any]) -> None:
-    base = (settings.WHATSAPP_GRAPH_BASE or "https://graph.facebook.com/v21.0").rstrip("/")
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.post(
-            f"{base}/{settings.WHATSAPP_PHONE_NUMBER_ID.strip()}/messages",
-            headers={"Authorization": f"Bearer {settings.WHATSAPP_ACCESS_TOKEN.strip()}",
-                     "Content-Type": "application/json"},
-            json=message,
-        )
-    if resp.status_code >= 400:
-        raise RuntimeError(f"HTTP {resp.status_code} - {resp.text[:200]}")
-
-
-def _whatsapp_off_reason(settings) -> Optional[str]:
-    if not settings.WHATSAPP_ENABLED:
-        return "whatsapp_disabled"
-    if not str(settings.WHATSAPP_ACCESS_TOKEN or "").strip() or not str(settings.WHATSAPP_PHONE_NUMBER_ID or "").strip():
-        return "whatsapp_credentials_missing"
-    return None
-
 
 async def notify_store_of_raise(pool, requisition: dict[str, Any]) -> dict[str, Any]:
     """Email + WhatsApp the store users for a just-committed requisition. Never raises."""

@@ -11,6 +11,18 @@ from app.core.helpers import safe_float as _safe_float_or_none, safe_str as _saf
 logger = logging.getLogger(__name__)
 
 
+class PoBookFormatError(ValueError):
+    """The workbook carries no recognisable PO Book header row.
+
+    Raised instead of parsing on with guessed column positions. A wrong map
+    does not fail loudly: `_is_header_row` fires on every row with anything in
+    the date column, so each data row mints its own PO and `_is_line_row` can
+    never fire — the caller gets hundreds of POs with `lines: []` and identity
+    fields read off whatever happened to sit at those indices. Preview feeds
+    commit, so that garbage is one click from po_header/po_line.
+    """
+
+
 def _parse_date(val) -> str | None:
     if val is None:
         return None
@@ -77,25 +89,25 @@ _GL_FIELDS: tuple[str, ...] = (
     "other_charges_non_gst",
 )
 
-# Fallback when no header row can be found: the historical Jan-Mar layout.
-_DEFAULT_COL_MAP: dict[str, int] = {
-    "date": 0, "particulars": 1, "voucher_type": 2, "po_number": 3,
-    "order_reference_no": 4, "narration": 5,
-    "quantity": 9, "alt_units": 10, "rate": 11, "value": 12,
-    "gross_total": 13, "sgst_amount": 15, "cgst_amount": 16, "round_off": 17,
-    "igst_amount": 20, "packing_charges": 23, "freight_transport_local": 26,
-    "apmc_tax": 27, "other_charges_non_gst": 28,
-    "freight_transport_charges": 40, "loading_unloading_charges": 42,
-}
-_DEFAULT_DATA_ROW = 13
+# How far down to look for the header row. Tally repeats the company
+# letterhead above it (name, address, FSSAI/CIN/UDYAM lines, report title,
+# period), and its height varies per entity — CFPL's runs to row 11, and an
+# entity carrying more registrations pushes the header further down. Scanning
+# only 15 rows made a taller letterhead indistinguishable from "not a PO Book".
+_MAX_HEADER_SCAN_ROWS = 40
 
 
 def _detect_columns(ws) -> tuple[dict[str, int], int]:
     """Find the header row and build {field: column index}.
 
     Returns (col_map, data_start_row) with data_start_row 1-indexed.
+
+    Raises:
+        PoBookFormatError: no header row names both Particulars and Quantity.
     """
-    for row_idx, row in enumerate(ws.iter_rows(min_row=1, max_row=15, values_only=True), start=1):
+    for row_idx, row in enumerate(
+        ws.iter_rows(min_row=1, max_row=_MAX_HEADER_SCAN_ROWS, values_only=True), start=1
+    ):
         cells = [str(c).strip().lower() if c is not None else "" for c in row]
         joined = " ".join(cells)
         # A real header row names several of these; the letterhead names none.
@@ -121,11 +133,17 @@ def _detect_columns(ws) -> tuple[dict[str, int], int]:
             return col_map, row_idx + 1
 
     logger.warning(
-        "Could not detect PO Book headers — falling back to the Jan-Mar column "
-        "layout. If this workbook uses a different layout, every line field "
-        "from Quantity rightwards will be read from the wrong column."
+        "No PO Book header row in the first %d rows of sheet %r — refusing the "
+        "workbook rather than reading columns from guessed positions.",
+        _MAX_HEADER_SCAN_ROWS, getattr(ws, "title", "?"),
     )
-    return dict(_DEFAULT_COL_MAP), _DEFAULT_DATA_ROW
+    raise PoBookFormatError(
+        "This does not look like a Purchase Order Book export. No header row "
+        "naming both 'Particulars' and 'Quantity' was found in the first "
+        f"{_MAX_HEADER_SCAN_ROWS} rows. Export the Purchase Order Register from "
+        "Tally (Date, Particulars, Voucher Type, Voucher No., Quantity, Rate, "
+        "Value) and upload that."
+    )
 
 
 def _get(row: tuple, col_map: dict[str, int], field: str):

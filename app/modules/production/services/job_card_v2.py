@@ -2224,6 +2224,7 @@ async def apply_live_job_card_edits(
     ) or 0)
 
     final_wip_ids: list[int] = []
+    created_ids: list[int] = []          # the cards this edit ADDS — the router tells their floor
     step_for: dict[int, dict] = {}
     for pos, s in enumerate(submitted):
         jid = s.get("job_card_id")
@@ -2262,6 +2263,7 @@ async def apply_live_job_card_edits(
             )
         new_jc_id = await insert_with_pk_retry(conn, _ins_jc)
         final_wip_ids.append(new_jc_id)
+        created_ids.append(new_jc_id)
         step_for[new_jc_id] = s
         audit.append(("add_process", new_jc_id, None, {"process": proc, "floor": floor}, None))
 
@@ -2406,6 +2408,9 @@ async def apply_live_job_card_edits(
         "plan_id": plan_id,
         "plan_line_id": plan_line_id,
         "job_card_ids": full_chain,
+        # Named apart from the chain so the route can tell a card this edit created
+        # from one it merely moved — only the new ones earn a floor notice.
+        "created_job_card_ids": created_ids,
         "removed": len(removed_ids),
         "added": sum(1 for a in audit if a[0] == 'add_process'),
         "floors_changed": sum(1 for a in audit if a[0] == 'floor_change'),

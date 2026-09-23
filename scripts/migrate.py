@@ -529,6 +529,12 @@ SQL_FILES = [
     # 116 lets job_card_bom_change hold FG/SFG articles (accounted as RM, required qty
     # in kg). MUST follow 115. Idempotent.
     DB_DIR / "116_job_card_bom_change_types.sql",
+    # 117 creates the store_head role (085's insert) and re-applies every grant
+    # written for it. A grant that ran while the role was still absent granted
+    # nothing, which is why RDS has the floor-requisition permissions but no
+    # stores role. Grants nothing new; runs last so file order cannot matter.
+    # Idempotent.
+    DB_DIR / "117_store_head_role.sql",
 ]
 
 # ── Optional: drop the v1 legacy job-card stack (TEST / Supabase DB ONLY) ──────

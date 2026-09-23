@@ -17,13 +17,23 @@ import openpyxl
 from app.modules.purchase.services.parser import parse_po_book
 
 
+# The Jan-Mar 2026 header row, in full. The rows below address columns by
+# index (9=Quantity, 10=Alt. Units, 11=Rate, 12=Value), so the header has to
+# name those columns at those positions — the parser resolves them by name.
+JAN_MAR_HEADER = [
+    "Date", "Particulars", "Voucher Type", "Voucher No.", "Order Reference No.",
+    "Narration", "Terms of Payment", "Other References", "Terms of Delivery",
+    "Quantity", "Alt. Units", "Rate", "Value",
+]
+
+
 def _book(*line_rows):
     """A minimal PO book: letterhead through row 11, header row 12, data from 13."""
     wb = openpyxl.Workbook()
     ws = wb.active
     for _ in range(11):
         ws.append([None])
-    ws.append(["Date", "Particulars", "Voucher Type", "Voucher No."])
+    ws.append(list(JAN_MAR_HEADER))
 
     header = [None] * 13
     header[0] = "1-Apr-25"
