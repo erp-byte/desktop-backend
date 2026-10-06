@@ -581,6 +581,9 @@ async def close_batch(conn, *, batch_id: int,
         "output":              _serialize(output_row),
         "dispatch":            _serialize(dispatch_row) if dispatch_row else None,
         "downstream_unlocked": downstream_unlocked,
+        # The card that can now start: the NEXT card, never this batch's own
+        # card. The unlock notice is addressed from this id.
+        "unlocked_job_card_id": jc["next_job_card_id"] if downstream_unlocked else None,
         "wip_batch_id":        wip_batch_id,
     }
 

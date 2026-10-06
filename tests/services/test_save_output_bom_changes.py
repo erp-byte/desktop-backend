@@ -5,7 +5,7 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
-from fastapi import HTTPException
+from fastapi import BackgroundTasks, HTTPException
 
 from app.modules.production import router as PR
 from app.modules.production.services import jc_bom_changes as m
@@ -155,7 +155,8 @@ def _call(conn, body):
     pool = SimpleNamespace(acquire=lambda: _Ctx(conn))
     req = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(db_pool=pool)))
     user = SimpleNamespace(full_name="Op", phone=None, is_admin=False)
-    return asyncio.run(PR.record_output_v2(req, 3, PR.RecordOutputV2Request(**body), user=user))
+    return asyncio.run(PR.record_output_v2(req, 3, PR.RecordOutputV2Request(**body), BackgroundTasks(),
+                                           user=user))
 
 
 def test_a_save_with_only_added_articles_is_stored_under_the_change_rows_spelling(monkeypatch):
