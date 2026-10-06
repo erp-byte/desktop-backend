@@ -23,6 +23,8 @@ from app.modules.production.schemas.job_card_edit import (
 from app.modules.production.services.response_filters import strip_cost_fields
 # Every route that creates a job card tells its floor — see _notify_new_job_cards.
 from app.modules.production.services import job_card_notify
+# Every route that unlocks one tells the unlocked card's people — see _notify_unlocked_job_cards.
+from app.modules.production.services import job_card_unlock_notify
 from app.core.warehouse_scope import user_has_warehouse
 
 logger = logging.getLogger(__name__)
@@ -88,6 +90,36 @@ def _notify_new_job_cards(request: Request, background_tasks: BackgroundTasks,
         return
     background_tasks.add_task(job_card_notify.notify_floor_of_new_job_cards,
                               request.app.state.db_pool, ids, created_by=_actor_name(user))
+
+
+def _notify_unlocked_job_cards(request: Request, background_tasks: BackgroundTasks,
+                               user: AuthUser, unlocks) -> None:
+    """Tell the people of every job card this request has just UNLOCKED.
+
+    Each unlock names the card that can now start — the next card in the chain,
+    exactly as the service reported it — never the card whose batch closed or
+    whose material was dispatched. Called after the transaction block, on the
+    success path only, and run as a background task like _notify_new_job_cards.
+    """
+    items = [u for u in (unlocks or []) if u and u.get("job_card_id")]
+    if not items:
+        return
+    background_tasks.add_task(job_card_unlock_notify.notify_floor_of_unlocked_job_cards,
+                              request.app.state.db_pool, items,
+                              unlocked_by=_actor_name(user), actor_user_id=getattr(user, "user_id", None))
+
+
+def _unlock_from_dispatch(result) -> list[dict]:
+    """The unlock a batch close / dispatch result reports: the downstream card it
+    released (`unlocked_job_card_id`), fed by its dispatch row. Nothing when the
+    result is an error or the next card was not waiting."""
+    result = result or {}
+    jid = result.get("unlocked_job_card_id")
+    if result.get("error") or not jid:
+        return []
+    dispatch = result.get("dispatch") or {}
+    return [{"job_card_id": jid, "from_job_card_id": dispatch.get("from_job_card_id"),
+             "qty_kg": dispatch.get("qty_kg"), "how": "dispatch"}]
 
 
 # ---------------------------------------------------------------------------
@@ -5235,6 +5267,7 @@ async def create_merged_process_run_v2(
 async def dispatch_process_group_v2(
     request: Request,
     process_job_card_id: int,
+    background_tasks: BackgroundTasks,
     user=Depends(require_permission("production", "job_cards", "lifecycle", action="edit")),
 ):
     """Fan-out the shared process card's produced SFG to every member packaging
@@ -5252,6 +5285,11 @@ async def dispatch_process_group_v2(
         raise HTTPException(status_code=404, detail=result.get("message") or err)
     if err:
         raise HTTPException(status_code=400, detail=result.get("message") or err)
+    # Each packaging card this fan-out released — not the process card itself.
+    _notify_unlocked_job_cards(request, background_tasks, user, [
+        {"job_card_id": r["packaging_job_card_id"], "from_job_card_id": process_job_card_id,
+         "qty_kg": r.get("qty_kg"), "how": "dispatch"}
+        for r in result.get("results") or [] if r.get("unlocked")])
     return result
 
 
@@ -5389,6 +5427,10 @@ async def apply_line_job_card_edits_v2(
         raise HTTPException(status_code=400, detail=result.get("message"))
     # Only the processes this edit ADDED are new cards; the rest stayed in place.
     _notify_new_job_cards(request, background_tasks, user, result.get("created_job_card_ids"))
+    # A locked card the edit left at the head was released: it can start now.
+    _notify_unlocked_job_cards(request, background_tasks, user,
+                               [{"job_card_id": jid, "how": "chain_edit"}
+                                for jid in result.get("unlocked_job_card_ids") or []])
     return result
 
 
@@ -6370,6 +6412,7 @@ async def dispatch_to_next_v2(
     request: Request,
     job_card_id: int,
     body: DispatchToNextRequest,
+    background_tasks: BackgroundTasks,
     user=Depends(require_permission("production", "job_cards", "overview", action="complete")),
 ):
     """Hand qty from this JC to its next_job_card_id partner. Auto-unlocks
@@ -6390,6 +6433,8 @@ async def dispatch_to_next_v2(
         raise HTTPException(status_code=404, detail="Job card not found")
     if result.get("error") in ("invalid_qty", "no_next_stage", "chain_broken"):
         raise HTTPException(status_code=400, detail=result.get("message", result["error"]))
+    # The next card, if this dispatch is what released it.
+    _notify_unlocked_job_cards(request, background_tasks, user, _unlock_from_dispatch(result))
     return result
 
 
@@ -6567,6 +6612,7 @@ async def record_output_v2(
     request: Request,
     job_card_id: int,
     body: RecordOutputV2Request,
+    background_tasks: BackgroundTasks,
     user=Depends(require_permission("production", "job_cards", "output", action="create")),
 ):
     """Append an output row (RM consumed + output qty + yield) for this JC.
@@ -7023,6 +7069,8 @@ async def record_output_v2(
                 ),
             },
         )
+    # Completing the batch auto-dispatches: tell the NEXT card it released, not this one.
+    _notify_unlocked_job_cards(request, background_tasks, user, _unlock_from_dispatch(result.get("batch_close")))
     return result
 
 
@@ -7121,6 +7169,7 @@ async def batch_close_v2(
     job_card_id: int,
     batch_id: int,
     body: BatchCloseRequest,
+    background_tasks: BackgroundTasks,
     user=Depends(require_permission("production", "job_cards", "overview", action="complete")),
 ):
     """R13: close a batch. In one txn: stamp batch row, write the output,
@@ -7166,6 +7215,8 @@ async def batch_close_v2(
         raise HTTPException(status_code=409, detail=result)
     if result.get("error") in ("invalid_produced_qty", "yield_unreasonable"):
         raise HTTPException(status_code=400, detail=result.get("message", result["error"]))
+    # The NEXT card this close auto-dispatched into and released — not job_card_id.
+    _notify_unlocked_job_cards(request, background_tasks, user, _unlock_from_dispatch(result))
     return result
 
 
@@ -7631,6 +7682,7 @@ async def force_unlock_v2(
     request: Request,
     job_card_id: int,
     body: ForceUnlockV2Request,
+    background_tasks: BackgroundTasks,
     user=Depends(require_permission("production", "job_cards", "force_unlock", action="create")),
 ):
     """Admin override: flip a locked JC to 'unlocked' regardless of
@@ -7654,6 +7706,9 @@ async def force_unlock_v2(
         raise HTTPException(status_code=404, detail="Job card not found")
     if result.get("error") in ("missing_authority", "missing_reason", "not_locked"):
         raise HTTPException(status_code=400, detail=result["message"])
+    if result.get("force_unlocked"):
+        _notify_unlocked_job_cards(request, background_tasks, user, [
+            {"job_card_id": job_card_id, "how": "force_unlock", "reason": body.reason}])
     return result
 
 

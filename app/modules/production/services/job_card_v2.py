@@ -2059,6 +2059,21 @@ async def sync_so_from_qty_delta(conn, plan_line_id: int, *,
     }
 
 
+async def _unlock_new_head(conn, head_id: int, status: str | None) -> int | None:
+    """Release a card that a chain edit left at the head while still locked
+    (nothing upstream remains to unlock it). Returns its id when it was released,
+    so the edit can tell its floor; None when the head was not locked."""
+    if status != 'locked':
+        return None
+    await conn.execute(
+        """UPDATE job_card_v2
+              SET status='unlocked', is_locked=FALSE, locked_reason=NULL, updated_at=NOW()
+            WHERE job_card_id=$1 AND status='locked'""",
+        head_id,
+    )
+    return head_id
+
+
 async def apply_live_job_card_edits(
     conn, plan_line_id: int, *,
     qty_kg, qty_units=None,
@@ -2381,13 +2396,7 @@ async def apply_live_job_card_edits(
     # If the previously-running stage was removed, the new head may be a locked
     # card with nothing upstream to release it — unlock it so work can resume.
     head_id = full_chain[0]
-    if by_id[head_id]["status"] == 'locked':
-        await conn.execute(
-            """UPDATE job_card_v2
-                  SET status='unlocked', is_locked=FALSE, locked_reason=NULL, updated_at=NOW()
-                WHERE job_card_id=$1 AND status='locked'""",
-            head_id,
-        )
+    unlocked_head = await _unlock_new_head(conn, head_id, by_id[head_id]["status"])
 
     # ── audit log ─────────────────────────────────────────────────────────
     for action, jid, before, after, rsn in audit:
@@ -2411,6 +2420,8 @@ async def apply_live_job_card_edits(
         # Named apart from the chain so the route can tell a card this edit created
         # from one it merely moved — only the new ones earn a floor notice.
         "created_job_card_ids": created_ids,
+        # A locked card this edit made the head and released — it earns the unlock notice.
+        "unlocked_job_card_ids": [unlocked_head] if unlocked_head else [],
         "removed": len(removed_ids),
         "added": sum(1 for a in audit if a[0] == 'add_process'),
         "floors_changed": sum(1 for a in audit if a[0] == 'floor_change'),
@@ -3504,6 +3515,13 @@ async def dispatch_to_next(conn, *, job_card_id: int, qty_kg: float,
         "UPDATE job_card_v2 SET dispatched_to_next_kg = dispatched_to_next_kg + $1 WHERE job_card_id=$2",
         qty_kg, job_card_id,
     )
+    # The next card's state BEFORE the release below, so the caller learns whether
+    # this dispatch is what freed it (and the unlock notice goes to that card only).
+    nxt = await conn.fetchrow(
+        "SELECT status, locked_reason FROM job_card_v2 WHERE job_card_id=$1 FOR UPDATE",
+        src["next_job_card_id"],
+    )
+    unlocked_now = bool(nxt) and nxt["status"] == 'locked' and nxt["locked_reason"] == 'awaiting_previous_stage'
     await conn.execute(
         """
         UPDATE job_card_v2
@@ -3548,6 +3566,7 @@ async def dispatch_to_next(conn, *, job_card_id: int, qty_kg: float,
             entity=src["entity"], recorded_by=dispatched_by,
         )
     return {"dispatched": True, "dispatch": _serialize(audit),
+            "unlocked_job_card_id": src["next_job_card_id"] if unlocked_now else None,
             "wip_batch_id": wip_batch_id}
 
 
@@ -3679,10 +3698,13 @@ async def dispatch_process_group(conn, *, process_job_card_id: int,
             "packaging_job_card_id": c["job_card_id"],
             "plan_line_id": c["plan_line_id"], "qty_kg": want,
             "wip_batch_id": wip_batch_id,
+            # Read under FOR UPDATE above, before the release: this dispatch freed it.
+            "unlocked": c["status"] == 'locked' and c["locked_reason"] == 'awaiting_previous_stage',
         })
 
     return {"dispatched": True, "process_group_id": src["process_group_id"],
-            "produced_kg": produced, "results": results}
+            "produced_kg": produced, "results": results,
+            "unlocked_job_card_ids": [r["packaging_job_card_id"] for r in results if r["unlocked"]]}
 
 
 # ---------------------------------------------------------------------------

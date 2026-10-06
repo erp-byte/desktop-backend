@@ -540,3 +540,44 @@ def test_completion_post_really_does_omit_process_loss(client_with, spy):
     r = client.post(URL, json=_body(complete_batch=True, is_balanced=True))
     assert r.status_code == 200, r.text
     assert spy["close_kwargs"]["process_loss_kg"] is None
+
+
+# ── Completing a batch can release the next stage: tell THAT card's people ──
+NEXT_JC = 74337018
+
+
+@pytest.fixture
+def unlock_notices(monkeypatch):
+    """Record what the unlock notice is handed (TestClient runs background tasks)."""
+    from app.modules.production.services import job_card_unlock_notify
+    seen: list[dict] = []
+
+    async def notifier(pool, unlocks, unlocked_by=None, actor_user_id=None):
+        seen.append({"unlocks": unlocks, "unlocked_by": unlocked_by, "actor_user_id": actor_user_id})
+
+    monkeypatch.setattr(job_card_unlock_notify, "notify_floor_of_unlocked_job_cards", notifier)
+    return seen
+
+
+def test_completing_a_batch_notifies_the_next_card_it_unlocked_not_this_one(client_with, spy, unlock_notices):
+    spy["close_result"] = {
+        "closed": True, "batch_id": BATCH, "downstream_unlocked": True, "unlocked_job_card_id": NEXT_JC,
+        "dispatch": {"from_job_card_id": JC, "to_job_card_id": NEXT_JC, "qty_kg": 149.8}}
+    res = client_with(_Conn()).post(URL, json=_body(complete_batch=True, is_balanced=True))
+    assert res.status_code == 200, res.text
+    assert unlock_notices == [{
+        "unlocks": [{"job_card_id": NEXT_JC, "from_job_card_id": JC, "qty_kg": 149.8, "how": "dispatch"}],
+        "unlocked_by": SESSION["full_name"], "actor_user_id": SESSION["user_id"]}]
+
+
+@pytest.mark.parametrize("complete, close_result", [
+    (False, None),                                                             # saved, not completed
+    (True, {"closed": True, "batch_id": BATCH, "downstream_unlocked": False,   # next card was not waiting
+            "unlocked_job_card_id": None}),
+])
+def test_a_save_that_unlocked_nothing_notifies_nobody(client_with, spy, unlock_notices, complete, close_result):
+    if close_result:
+        spy["close_result"] = close_result
+    res = client_with(_Conn()).post(URL, json=_body(complete_batch=complete, is_balanced=True))
+    assert res.status_code == 200, res.text
+    assert unlock_notices == []
