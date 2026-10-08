@@ -688,6 +688,14 @@ async def approve_plan(conn, plan_id: int, approved_by: str) -> dict:
 _SPLIT_MODES = ("per_line", "sku", "customer")
 
 
+def _stored_first_floor(member: dict, fallback: str) -> str:
+    """A merge member's first-step floor as stored (trimmed), for display and
+    pre-fill; `fallback` (the lowercased grouping floor) if it has none."""
+    steps = member.get("steps") or []
+    stored = (steps[0].get("floor") or "").strip() if steps else ""
+    return stored or fallback
+
+
 async def validate_process_merge(conn, plan_ids: list[int]) -> dict:
     """Group the selected plans' UNCARDED lines into cross-product process-merge
     clusters. Two lines can share a merged process run iff they match on
@@ -805,7 +813,12 @@ async def validate_process_merge(conn, plan_ids: list[int]) -> dict:
         grp = by_memberset.get(mset)
         if grp is None:
             grp = {
-                "key": {"factory": factory, "entity": entity, "floor": floor1,
+                # Grouped on the lowercased floor, but sent back as stored: the
+                # wizard pre-fills floors from it and the merge endpoint checks
+                # them against allowed_floors exactly, so "roasting area" was
+                # refused for a user assigned to "Roasting Area".
+                "key": {"factory": factory, "entity": entity,
+                        "floor": _stored_first_floor(members[0], floor1),
                         "rm_articles": [rm]},
                 "members": members,
                 "total_qty_kg": sum(m["planned_qty_kg"] or 0.0 for m in members),
