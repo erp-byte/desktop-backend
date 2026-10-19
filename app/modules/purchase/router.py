@@ -5,7 +5,7 @@ import math
 from datetime import date, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, UploadFile, File
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.modules.auth.middleware import require_permission
 
@@ -601,6 +601,215 @@ async def stores_receive(request: Request, transaction_no: str, body: StoresRece
 
 
 # ---------------------------------------------------------------------------
+# Inventory batches for received boxes
+# ---------------------------------------------------------------------------
+
+# One inventory batch per weighed box — the box's net weight becomes stock.
+# original_qty_kg is NOT NULL, so a box saved before it is weighed gets its
+# batch later, when PUT /boxes records the weight.
+_INWARD_BATCH_SQL = """
+    INSERT INTO inventory_batch
+        (batch_id, sku_name, item_type, transaction_no, lot_number, source,
+         inward_date, manufacturing_date, expiry_date,
+         original_qty_kg, current_qty_kg, warehouse_id, floor_id, entity)
+    VALUES ($1, $2, 'rm', $3, $4, 'INWARD',
+            COALESCE($5, CURRENT_DATE), $6, $7,
+            $8, $8, $9, 'rm_store', $10)
+    ON CONFLICT (batch_id) DO NOTHING
+"""
+
+
+def _is_weighed(net_weight) -> bool:
+    return net_weight is not None and net_weight > 0
+
+
+async def _book_missing_inward_batches(conn, header, transaction_no: str, box_ids: list[str]) -> None:
+    """Create the batch for boxes of this PO that now carry a net weight but
+    have no batch yet (they were saved before weighing). Boxes that already
+    have a batch are left as they are."""
+    if not box_ids:
+        return
+    rows = await conn.fetch(
+        """
+        SELECT b.box_id, b.lot_number, b.net_weight, l.sku_name,
+               s.manufacturing_date, s.expiry_date
+          FROM po_box b
+          LEFT JOIN po_line l
+                 ON l.transaction_no = b.transaction_no AND l.line_number = b.line_number
+          LEFT JOIN po_section s
+                 ON s.transaction_no = b.transaction_no AND s.line_number = b.line_number
+                AND s.section_number = b.section_number
+         WHERE b.transaction_no = $1
+           AND b.box_id = ANY($2::text[])
+           AND b.net_weight > 0
+           AND NOT EXISTS (SELECT 1 FROM inventory_batch ib WHERE ib.batch_id = b.box_id)
+        """,
+        transaction_no,
+        box_ids,
+    )
+    if not rows:
+        return
+    inward_date = _coerce_date(header.get('po_date', None))
+    await conn.executemany(_INWARD_BATCH_SQL, [
+        (
+            r['box_id'], r['sku_name'] or 'UNKNOWN', transaction_no, r['lot_number'],
+            inward_date, _coerce_date(r['manufacturing_date']), _coerce_date(r['expiry_date']),
+            r['net_weight'], header.get('warehouse', None), header.get('entity', 'cfpl'),
+        )
+        for r in rows
+    ])
+
+
+# Batches in these states are used up: the stock is gone, so a later edit of
+# the box must not rewrite them.
+_USED_UP = ("ISSUED", "SCRAPPED", "DISCARDED")
+
+
+async def _lock_box_batches(conn, transaction_no: str, box_ids: list[str]) -> dict[str, dict]:
+    """The edited boxes that have a batch, with that batch, as they stand before
+    the edit: box_id -> row. Both rows stay locked until commit, so a
+    consumption of the batch can't slip in between reading and correcting it."""
+    if not box_ids:
+        return {}
+    rows = await conn.fetch(
+        """
+        SELECT b.box_id, b.line_number, b.box_number, b.net_weight, b.lot_number,
+               ib.status, ib.original_qty_kg, ib.current_qty_kg
+          FROM po_box b
+          JOIN inventory_batch ib ON ib.batch_id = b.box_id
+         WHERE b.transaction_no = $1
+           AND b.box_id = ANY($2::text[])
+           FOR UPDATE OF b, ib
+        """,
+        transaction_no,
+        box_ids,
+    )
+    return {r['box_id']: dict(r) for r in rows}
+
+
+async def _sync_box_corrections(conn, transaction_no: str, before: dict[str, dict], actor: str | None) -> None:
+    """Carry corrected box weights and lots into the boxes' batches.
+
+    A weight correction keeps what has already been drawn from the batch: its
+    original becomes the new weight and its current moves by the same amount
+    (10 kg corrected to 9.5 kg with 2 kg issued leaves 7.5 kg). A used-up batch,
+    or one with more drawn than the new weight, is refused with 409 — that needs
+    a stock adjustment, not a Material In edit. Each weight correction is logged
+    as an ADJUSTED inventory event."""
+    if not before:
+        return
+    after = await conn.fetch(
+        "SELECT box_id, net_weight, lot_number FROM po_box "
+        "WHERE transaction_no = $1 AND box_id = ANY($2::text[])",
+        transaction_no,
+        list(before),
+    )
+    refused, weights, events, lots = [], [], [], []
+    for new in after:
+        old = before[new['box_id']]
+        used_up = old['status'] in _USED_UP
+        if new['net_weight'] is not None and new['net_weight'] != old['net_weight']:
+            current = new['net_weight'] - (old['original_qty_kg'] - old['current_qty_kg'])
+            if used_up or current < 0:
+                refused.append(f"line {old['line_number']} box {old['box_number']}")
+                continue
+            weights.append((new['box_id'], new['net_weight'], current))
+            events.append((
+                new['box_id'], old['status'], current - old['current_qty_kg'], actor,
+                f"Material In {transaction_no}: box weight corrected "
+                f"{old['net_weight']} -> {new['net_weight']} kg",
+            ))
+        if new['lot_number'] != old['lot_number'] and not used_up:
+            lots.append((new['box_id'], new['lot_number']))
+    if refused:
+        raise HTTPException(409, detail={
+            "error": "box_stock_used",
+            "message": (
+                f"Can't change the weight of {', '.join(refused)}: the stock is used up, or more has "
+                "already been issued than the new weight. Undo that change and ask the inventory "
+                "team to adjust the stock."
+            ),
+            "boxes": refused,
+        })
+    if weights:
+        await conn.executemany(
+            "UPDATE inventory_batch SET original_qty_kg = $2, current_qty_kg = $3, updated_at = NOW() "
+            "WHERE batch_id = $1",
+            weights,
+        )
+        await conn.executemany(
+            """
+            INSERT INTO inventory_event_log
+                (batch_id, event_type, from_status, to_status, quantity_kg,
+                 reference_type, performed_by, notes)
+            VALUES ($1, 'ADJUSTED', $2, $2, $3, 'material_in', $4, $5)
+            """,
+            events,
+        )
+    if lots:
+        await conn.executemany(
+            "UPDATE inventory_batch SET lot_number = $2, updated_at = NOW() WHERE batch_id = $1",
+            lots,
+        )
+
+
+async def _sync_section_dates(conn, transaction_no: str, line_number: int, section_number: int) -> None:
+    """Carry the section's manufacturing / expiry dates into the batches of all
+    its boxes still in stock — not only the boxes loaded on screen."""
+    sec = await conn.fetchrow(
+        "SELECT manufacturing_date, expiry_date FROM po_section "
+        "WHERE transaction_no = $1 AND line_number = $2 AND section_number = $3",
+        transaction_no, line_number, section_number,
+    )
+    if sec is None:
+        return
+    mfg, exp = _coerce_date(sec['manufacturing_date']), _coerce_date(sec['expiry_date'])
+    if mfg is None and exp is None:
+        return
+    await conn.execute(
+        """
+        UPDATE inventory_batch ib
+           SET manufacturing_date = COALESCE($4::date, ib.manufacturing_date),
+               expiry_date        = COALESCE($5::date, ib.expiry_date),
+               updated_at         = NOW()
+          FROM po_box b
+         WHERE b.transaction_no = $1 AND b.line_number = $2 AND b.section_number = $3
+           AND ib.batch_id = b.box_id
+           AND ib.status <> ALL($6::text[])
+           AND (ib.manufacturing_date IS DISTINCT FROM COALESCE($4::date, ib.manufacturing_date)
+                OR ib.expiry_date IS DISTINCT FROM COALESCE($5::date, ib.expiry_date))
+        """,
+        transaction_no, line_number, section_number, mfg, exp, list(_USED_UP),
+    )
+
+
+# po_box_request_key (migration 128) has been seen. Until then the table is
+# looked for on each save, so the check starts working once the migration runs.
+_request_keys_ready = False
+
+
+async def _claim_request_key(conn, transaction_no: str, client_key: str | None) -> bool:
+    """Record the browser's key for one section payload of POST /boxes.
+
+    False when an earlier attempt already applied that payload — a retry after
+    its reply was lost — so the caller skips it instead of adding the boxes
+    twice. True when there is no key, or no key table yet."""
+    global _request_keys_ready
+    if not client_key:
+        return True
+    if not _request_keys_ready:
+        if not await conn.fetchval("SELECT to_regclass('public.po_box_request_key')"):
+            return True
+        _request_keys_ready = True
+    claimed = await conn.fetchval(
+        "INSERT INTO po_box_request_key (transaction_no, client_key) VALUES ($1, $2) "
+        "ON CONFLICT DO NOTHING RETURNING 1",
+        transaction_no, client_key,
+    )
+    return claimed is not None
+
+
+# ---------------------------------------------------------------------------
 # Stores Team: Update existing sections & boxes
 # ---------------------------------------------------------------------------
 
@@ -648,6 +857,9 @@ async def stores_update_boxes(request: Request, transaction_no: str, body: Updat
 
     async with pool.acquire() as conn:
         async with conn.transaction():
+            box_ids = [b.box_id for s in body.sections for b in s.boxes]
+            # The edited boxes' stock as it stands before this edit (locked).
+            before = await _lock_box_batches(conn, transaction_no, box_ids)
             for section in body.sections:
                 # Update section fields
                 await conn.execute(
@@ -671,6 +883,7 @@ async def stores_update_boxes(request: Request, transaction_no: str, body: Updat
                 )
 
                 # Update boxes within this section — one batched round-trip.
+                # Only this PO's boxes: a box_id from another PO is left alone.
                 if section.boxes:
                     await conn.executemany(
                         """
@@ -680,13 +893,20 @@ async def stores_update_boxes(request: Request, transaction_no: str, body: Updat
                             gross_weight = COALESCE($4, gross_weight),
                             lot_number = COALESCE($5, lot_number),
                             count = COALESCE($6, count)
-                        WHERE box_id = $1
+                        WHERE box_id = $1 AND transaction_no = $7
                         """,
                         [
-                            (b.box_id, b.box_number, b.net_weight, b.gross_weight, b.lot_number, b.count)
+                            (b.box_id, b.box_number, b.net_weight, b.gross_weight, b.lot_number, b.count,
+                             transaction_no)
                             for b in section.boxes
                         ],
                     )
+                if section.manufacturing_date is not None or section.expiry_date is not None:
+                    await _sync_section_dates(conn, transaction_no, section.line_number, section.section_number)
+            # Corrected weights and lots reach the boxes' stock; boxes saved
+            # before weighing get their stock batch once weighed.
+            await _sync_box_corrections(conn, transaction_no, before, getattr(user, "full_name", None))
+            await _book_missing_inward_batches(conn, existing, transaction_no, box_ids)
             await _refresh_receiving_status(conn, transaction_no)
 
     updated = await pool.fetchrow(
@@ -719,6 +939,9 @@ class SectionInput(BaseModel):
     lot_number: str | None = None
     manufacturing_date: str | None = None
     expiry_date: str | None = None
+    # The browser's random key for this payload. A payload whose key was already
+    # applied (a retry after a lost reply) is skipped — see _claim_request_key.
+    client_key: str | None = Field(default=None, max_length=64)
     boxes: list[BoxInput] = []
 
 
@@ -786,6 +1009,10 @@ async def stores_add_boxes(request: Request, transaction_no: str, body: AddSecti
             next_box_seq = (_max_seq or 0) + 1
 
             for section in body.sections:
+                # The same payload again (a retry after its reply was lost):
+                # its boxes are already saved, so don't add them twice.
+                if not await _claim_request_key(conn, transaction_no, section.client_key):
+                    continue
                 if section.section_number is not None:
                     # Append boxes to an EXISTING section (the per-section
                     # "+ Add Boxes" panel). Verify it exists, then grow its
@@ -890,11 +1117,14 @@ async def stores_add_boxes(request: Request, transaction_no: str, body: AddSecti
                         b_box_id, transaction_no, section.line_number, section_number,
                         this_box_number, b.net_weight, b.gross_weight, b.lot_number, b.count,
                     ))
-                    batch_rows.append((
-                        b_box_id, sku_for_batch, transaction_no, b.lot_number,
-                        inward_date, mfg_date, exp_date,
-                        b.net_weight, warehouse_for_batch, entity_for_batch,
-                    ))
+                    # Unweighed boxes (net weight empty) are saved without a
+                    # batch; PUT /boxes books it once the weight is recorded.
+                    if _is_weighed(b.net_weight):
+                        batch_rows.append((
+                            b_box_id, sku_for_batch, transaction_no, b.lot_number,
+                            inward_date, mfg_date, exp_date,
+                            b.net_weight, warehouse_for_batch, entity_for_batch,
+                        ))
 
                 if po_box_rows:
                     await conn.executemany(
@@ -907,17 +1137,9 @@ async def stores_add_boxes(request: Request, transaction_no: str, body: AddSecti
                         """,
                         po_box_rows,
                     )
-                    # Auto-create one inventory batch per box.
-                    await conn.executemany("""
-                        INSERT INTO inventory_batch
-                            (batch_id, sku_name, item_type, transaction_no, lot_number, source,
-                             inward_date, manufacturing_date, expiry_date,
-                             original_qty_kg, current_qty_kg, warehouse_id, floor_id, entity)
-                        VALUES ($1, $2, 'rm', $3, $4, 'INWARD',
-                                COALESCE($5, CURRENT_DATE), $6, $7,
-                                $8, $8, $9, 'rm_store', $10)
-                        ON CONFLICT (batch_id) DO NOTHING
-                    """, batch_rows)
+                if batch_rows:
+                    # Auto-create one inventory batch per weighed box.
+                    await conn.executemany(_INWARD_BATCH_SQL, batch_rows)
             await _refresh_receiving_status(conn, transaction_no)
 
     updated = await pool.fetchrow(

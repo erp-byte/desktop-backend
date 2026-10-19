@@ -535,6 +535,11 @@ SQL_FILES = [
     # stores role. Grants nothing new; runs last so file order cannot matter.
     # Idempotent.
     DB_DIR / "117_store_head_role.sql",
+    # 128 adds po_box_request_key: POST /purchase/{txn}/boxes records each section
+    # payload's browser key and skips a payload it has already applied, so a retry
+    # after a lost reply doesn't add the boxes twice. The backend skips the check
+    # while the table is missing, so it may run before or after the deploy. Idempotent.
+    DB_DIR / "128_po_box_request_key.sql",
 ]
 
 # ── Optional: drop the v1 legacy job-card stack (TEST / Supabase DB ONLY) ──────
