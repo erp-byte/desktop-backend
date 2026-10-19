@@ -35,20 +35,26 @@ async def write(
     payload: dict[str, Any] | None = None,
 ) -> None:
     try:
-        await conn.execute(
-            """
-            INSERT INTO po_event_log
-                (transaction_no, entity, event_type, actor_user_id, actor_role, reason, payload)
-            VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
-            """,
-            transaction_no,
-            entity,
-            event_type,
-            actor_user_id,
-            actor_role,
-            reason,
-            json.dumps(payload, default=str) if payload else None,
-        )
+        # Its own savepoint: the caller's transaction holds the PO itself, and a
+        # failed statement aborts a whole Postgres transaction — its COMMIT then
+        # silently rolls back. Without this, a failing audit insert (RDS's older
+        # po_event_log shape, before migration 129) quietly discarded every PO
+        # commit and delete while the API reported success.
+        async with conn.transaction():
+            await conn.execute(
+                """
+                INSERT INTO po_event_log
+                    (transaction_no, entity, event_type, actor_user_id, actor_role, reason, payload)
+                VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+                """,
+                transaction_no,
+                entity,
+                event_type,
+                actor_user_id,
+                actor_role,
+                reason,
+                json.dumps(payload, default=str) if payload else None,
+            )
     except Exception as e:
         # Audit must never break the request. If the table is missing or the
         # write fails for any reason, log it for ops and move on.

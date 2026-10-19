@@ -540,6 +540,10 @@ SQL_FILES = [
     # after a lost reply doesn't add the boxes twice. The backend skips the check
     # while the table is missing, so it may run before or after the deploy. Idempotent.
     DB_DIR / "128_po_box_request_key.sql",
+    # 129 gives po_event_log the columns the PO audit writer inserts (actor_role,
+    # reason, payload) and makes actor_user_id TEXT; RDS had an older shape, so
+    # every PO audit insert failed. Safe before or after the deploy. Idempotent.
+    DB_DIR / "129_po_event_log_columns.sql",
 ]
 
 # ── Optional: drop the v1 legacy job-card stack (TEST / Supabase DB ONLY) ──────
