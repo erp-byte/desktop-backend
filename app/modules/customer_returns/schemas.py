@@ -63,6 +63,12 @@ class CRCreate(BaseModel):
 
 
 class CRHeaderUpdate(BaseModel):
+    """Header edit (PUT /{company}/{cr_id}). Deliberately no ``status``: a return is
+    decided only through approval_service.apply_cr_action (in-app POST /approve, the
+    mailed link, the WhatsApp tap), which checks who decides and when and records
+    approved_by / approved_at. An incoming ``status`` is dropped like any unknown key
+    (pydantic's default extra='ignore'), so a body with nothing else is the 400
+    empty_update."""
     factory_unit: Optional[str] = None
     customer: Optional[str] = None
     invoice_number: Optional[str] = None
@@ -73,7 +79,6 @@ class CRHeaderUpdate(BaseModel):
     sales_poc_email: Optional[str] = None
     business_head: Optional[str] = None
     remark: Optional[str] = None
-    status: Optional[str] = None
     vehicle_number: Optional[str] = None
     transporter_name: Optional[str] = None
     driver_name: Optional[str] = None

@@ -52,7 +52,12 @@ async def _insert_header(conn, tables: dict, header: schemas.CRHeaderCreate,
                          created_by: str) -> tuple[str, int]:
     """Insert the header; return (rtv_id, surrogate id). The id is the FK lines/boxes
     hang off in the legacy _rtv_* schema. rtv_id is UNIQUE — a same-second collision
-    retries with a numeric suffix inside a SAVEPOINT."""
+    retries with a numeric suffix inside a SAVEPOINT.
+
+    rtv_date and created_ts are stamped NOW() explicitly, as IMS's create_rtv did,
+    rather than left to legacy column defaults that may not exist. NOW() lands in the
+    naive columns as UTC (the session TimeZone), like every IMS row; the read side
+    shows it in IST. The payload carries no rtv_date (CRHeaderCreate has none)."""
     base = _generate_cr_id()
     conversion = q._to_float(header.conversion) or 0.0
     for attempt in range(6):
@@ -62,11 +67,12 @@ async def _insert_header(conn, tables: dict, header: schemas.CRHeaderCreate,
                 row = await conn.fetchrow(
                     f"""
                     INSERT INTO {tables['header']}
-                        (rtv_id, factory_unit, customer, invoice_number, challan_no, dn_no,
-                         conversion, sales_poc, sales_poc_email, business_head, remark,
+                        (rtv_id, rtv_date, factory_unit, customer, invoice_number, challan_no,
+                         dn_no, conversion, sales_poc, sales_poc_email, business_head, remark,
                          vehicle_number, transporter_name, driver_name, inward_manager,
-                         status, created_by)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'Pending',$16)
+                         status, created_by, created_ts)
+                    VALUES ($1,NOW(),$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
+                            'Pending',$16,NOW())
                     RETURNING id
                     """,
                     cand, header.factory_unit, header.customer, header.invoice_number,
@@ -102,9 +108,10 @@ async def create_cr(conn, company: str, data: schemas.CRCreate, created_by: str)
     return await q.get_cr(conn, company, cr_id)
 
 
+# No "status": a return is decided only through approval_service.apply_cr_action.
 _HEADER_UPDATABLE = [
     "factory_unit", "customer", "invoice_number", "challan_no", "dn_no", "conversion",
-    "sales_poc", "sales_poc_email", "business_head", "remark", "status",
+    "sales_poc", "sales_poc_email", "business_head", "remark",
     "vehicle_number", "transporter_name", "driver_name", "inward_manager",
 ]
 

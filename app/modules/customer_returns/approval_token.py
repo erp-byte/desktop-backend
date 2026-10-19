@@ -3,9 +3,13 @@ buttons.
 
 HS256 JWT reusing the app's JWT signing secret (via auth.jwt_service), with a
 dedicated ``type`` claim so an approval link can never be swapped for an auth
-token (or vice-versa). Default 14-day TTL. The token is the whole authorization
-for the emailed one-click action — it is signed + expiring (unlike the legacy
-live tokenless ``/rtv/action`` scheme, which trusted an unsigned bh_email query).
+token (or vice-versa). Default 14-day TTL. The token says WHO the link was minted
+for (``approver``, an e-mail) and what it does; it is signed + expiring (unlike the
+legacy live tokenless ``/rtv/action`` scheme, which trusted an unsigned bh_email
+query). It is not the whole authorization: the click opens a confirmation page
+(GET /email-action changes nothing) and the confirm POST decides as that e-mail
+through approval_service.apply_cr_action, which re-checks at that moment that the
+address is still one of the CR's approvers — the same rule as in-app and WhatsApp.
 """
 from __future__ import annotations
 
@@ -39,7 +43,9 @@ def make_action_token(company: str, cr_id: str, action: str, approver_email: str
 
 def verify_action_token(token: str) -> Optional[dict]:
     """Claims for a valid CR-action token, else None (expired / tampered /
-    wrong type / bad action)."""
+    wrong type / bad action / no approver to decide as)."""
+    if not token:
+        return None
     try:
         claims = pyjwt.decode(token, _secret(), algorithms=[_alg()])
     except pyjwt.InvalidTokenError:
@@ -49,5 +55,8 @@ def verify_action_token(token: str) -> Optional[dict]:
     if claims.get("action") not in _VALID_ACTIONS:
         return None
     if not claims.get("cr_id") or not claims.get("company"):
+        return None
+    # The decision is taken as this address, so a link without one decides nothing.
+    if not str(claims.get("approver") or "").strip():
         return None
     return claims

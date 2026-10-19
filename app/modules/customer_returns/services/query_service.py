@@ -3,12 +3,15 @@ and the async get_cr/list_crs functions.
 """
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
 
+from app.core.sites import scope_keys
+from app.core.warehouse_scope import WAREHOUSE_NORM_ANY_SQL
 from app.modules.customer_returns.tables import cr_table_names
 
 # _rtv_header carries every header column the module reads (extra id/approved_* are
@@ -62,6 +65,13 @@ def _like_escape(term: str) -> str:
     return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def _factory_unit_clause(n: int) -> str:
+    """The factory_unit filter as a site (app.core.sites): bind scope_keys(factory_unit)
+    at $n, so ?factory_unit=Savla D-39 also finds returns stored 'D-39' or 'Old Savla',
+    and 'A185' those stored 'A-185' or 'Warehouse A185'."""
+    return WAREHOUSE_NORM_ANY_SQL("h.factory_unit", f"${n}")
+
+
 def _convert_date(s: Optional[str]) -> Optional[date]:
     """Parse a DD-MM-YYYY filter string; 400 on bad format; None passes through."""
     if not s:
@@ -76,10 +86,84 @@ def _convert_date(s: Optional[str]) -> Optional[date]:
         )
 
 
+# ── IST ─────────────────────────────────────────────────────────────────────
+# The warehouse works to Asia/Kolkata, so every CR date is an IST date. The legacy
+# _rtv_* columns are `timestamp without time zone` holding UTC (IMS and the ERP
+# both write NOW() in a UTC session), so asyncpg hands them back naive; a
+# timestamptz column comes back aware; IMS wrote approved_at as utcnow() TEXT.
+# _ist() turns any of them into one aware IST datetime, which the API serialises
+# with its offset ("2026-10-19T02:00:00+05:30") — never an offset-less UTC clock
+# face that a browser would read as its own local time.
+IST = ZoneInfo("Asia/Kolkata")
+
+
+def _ist(v: Any) -> Any:
+    """A stored timestamp as an aware IST datetime. Naive means UTC; text is read as
+    ISO-8601 (IMS's 'YYYY-MM-DD HH:MM:SS' included) and returned as is when it isn't
+    one; a bare date is that IST calendar day; None stays None."""
+    if v is None:
+        return None
+    if isinstance(v, str):
+        try:
+            v = datetime.fromisoformat(v.strip())
+        except ValueError:
+            return v
+    if isinstance(v, datetime):
+        if v.utcoffset() is None:
+            v = v.replace(tzinfo=timezone.utc)
+        return v.astimezone(IST)
+    if isinstance(v, date):
+        return datetime(v.year, v.month, v.day, tzinfo=IST)
+    return v
+
+
+def _ist_text(v: Any) -> Any:
+    """_ist() for a str-typed field: the ISO-8601 string with its +05:30 offset
+    (unreadable text and None pass through)."""
+    t = _ist(v)
+    return t.isoformat() if isinstance(t, datetime) else t
+
+
+def _ist_day_start_utc(d: date) -> datetime:
+    """The IST midnight that opens calendar day d, as the naive UTC instant the
+    _rtv_* columns are compared with (19 Oct 2026 -> 2026-10-18 18:30)."""
+    return datetime(d.year, d.month, d.day, tzinfo=IST).astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _day_bound(value: str, d: date, *, days: int = 0) -> datetime:
+    """_ist_day_start_utc(d + days) for the filter string `value`. Two DD-MM-YYYY
+    days parse but have no such bound in Python's datetime range (IST midnight on
+    01-01-0001 is in year 0 UTC; the day after 31-12-9999 is in year 10000): they
+    are a 400 like a malformed date, not an OverflowError's 500."""
+    try:
+        return _ist_day_start_utc(d + timedelta(days=days))
+    except OverflowError:
+        raise HTTPException(
+            400,
+            detail={"error": "invalid_date", "message": "date out of range",
+                    "details": {"value": value}},
+        )
+
+
+def _add_date_filters(clauses: list, args: list, from_date: Optional[str],
+                      to_date: Optional[str]) -> None:
+    """from_date / to_date (DD-MM-YYYY) are IST calendar days, both inclusive. The
+    bounds are bound as naive UTC: right for the naive-UTC _rtv_* columns, and for a
+    timestamptz column too (Postgres reads the bound in the session TimeZone, UTC).
+    A NULL rtv_date matches neither bound, so such rows stay out of a dated list."""
+    df = _convert_date(from_date)
+    if df:
+        args.append(_day_bound(from_date, df)); clauses.append(f"h.rtv_date >= ${len(args)}::timestamp")
+    dt = _convert_date(to_date)
+    if dt:
+        args.append(_day_bound(to_date, dt, days=1))
+        clauses.append(f"h.rtv_date < ${len(args)}::timestamp")
+
+
 def _map_header_row(r: dict) -> dict:
-    return {
+    out = {
         "rtv_id": r.get("rtv_id"),
-        "rtv_date": r.get("rtv_date"),
+        "rtv_date": _ist(r.get("rtv_date")),
         "factory_unit": r.get("factory_unit") or "",
         "customer": r.get("customer") or "",
         "invoice_number": r.get("invoice_number"),
@@ -96,9 +180,14 @@ def _map_header_row(r: dict) -> dict:
         "inward_manager": r.get("inward_manager"),
         "status": r.get("status") or "Pending",
         "created_by": r.get("created_by"),
-        "created_ts": r.get("created_ts"),
-        "updated_at": r.get("updated_at"),
+        "created_ts": _ist(r.get("created_ts")),
+        "updated_at": _ist(r.get("updated_at")),
     }
+    # approved_at is not in HEADER_COLS; a read that does select it gets it in IST
+    # as text, since IMS stored it as TEXT (a value that won't parse stays as stored).
+    if "approved_at" in r:
+        out["approved_at"] = _ist_text(r["approved_at"])
+    return out
 
 
 def _map_line_row(r: dict) -> dict:
@@ -120,8 +209,8 @@ def _map_line_row(r: dict) -> dict:
         "item_mark": r.get("item_mark"),
         "spl_remarks": r.get("spl_remarks"),
         "vakkal": r.get("vakkal"),
-        "created_at": r.get("created_at"),
-        "updated_at": r.get("updated_at"),
+        "created_at": _ist(r.get("created_at")),
+        "updated_at": _ist(r.get("updated_at")),
     }
 
 
@@ -140,8 +229,8 @@ def _map_box_row(r: dict) -> dict:
         "net_weight": _num_str(r.get("net_weight")),
         "gross_weight": _num_str(r.get("gross_weight")),
         "count": r.get("count"),
-        "created_at": r.get("created_at"),
-        "updated_at": r.get("updated_at"),
+        "created_at": _ist(r.get("created_at")),
+        "updated_at": _ist(r.get("updated_at")),
     }
 
 
@@ -235,16 +324,11 @@ async def list_crs(conn, *, company: str, page: int, per_page: int,
     if status:
         args.append(status); clauses.append(f"h.status = ${len(args)}")
     if factory_unit:
-        args.append(factory_unit); clauses.append(f"h.factory_unit = ${len(args)}")
+        args.append(scope_keys(factory_unit)); clauses.append(_factory_unit_clause(len(args)))
     if customer:
         args.append(f"%{_like_escape(customer)}%")
         clauses.append(f"h.customer ILIKE ${len(args)} ESCAPE '\\'")
-    df = _convert_date(from_date)
-    if df:
-        args.append(df); clauses.append(f"h.rtv_date >= ${len(args)}")
-    dt = _convert_date(to_date)
-    if dt:
-        args.append(dt); clauses.append(f"h.rtv_date < (${len(args)}::date + 1)")
+    _add_date_filters(clauses, args, from_date, to_date)
     where = " AND ".join(clauses)
 
     total = await conn.fetchval(
@@ -301,10 +385,11 @@ EXPORT_COLUMNS = [
 
 
 def _export_row(r: dict) -> dict:
-    """Flatten one joined header/line/box record into the 33-col export dict."""
+    """Flatten one joined header/line/box record into the 33-col export dict. RTV Date
+    and Created At are aware IST datetimes (export_xlsx writes them as IST dates)."""
     return {
         "RTV ID": r.get("rtv_id") or "",
-        "RTV Date": str(r.get("rtv_date") or ""),
+        "RTV Date": _ist(r.get("rtv_date")) or "",
         "Factory Unit": r.get("factory_unit") or "",
         "Customer": r.get("customer") or "",
         "Invoice Number": r.get("invoice_number") or "",
@@ -316,7 +401,7 @@ def _export_row(r: dict) -> dict:
         "Remark": r.get("remark") or "",
         "Status": r.get("status") or "",
         "Created By": r.get("created_by") or "",
-        "Created At": str(r.get("created_ts") or ""),
+        "Created At": _ist(r.get("created_ts")) or "",
         "Material Type": r.get("material_type") or "",
         "Item Category": r.get("item_category") or "",
         "Sub Category": r.get("sub_category") or "",
@@ -350,16 +435,11 @@ async def export_cr_records(conn, *, company: str, status=None, customer=None,
     if status:
         args.append(status); clauses.append(f"h.status = ${len(args)}")
     if factory_unit:
-        args.append(factory_unit); clauses.append(f"h.factory_unit = ${len(args)}")
+        args.append(scope_keys(factory_unit)); clauses.append(_factory_unit_clause(len(args)))
     if customer:
         args.append(f"%{_like_escape(customer)}%")
         clauses.append(f"h.customer ILIKE ${len(args)} ESCAPE '\\'")
-    df = _convert_date(from_date)
-    if df:
-        args.append(df); clauses.append(f"h.rtv_date >= ${len(args)}")
-    dt = _convert_date(to_date)
-    if dt:
-        args.append(dt); clauses.append(f"h.rtv_date < (${len(args)}::date + 1)")
+    _add_date_filters(clauses, args, from_date, to_date)
     where = " AND ".join(clauses)
 
     col = _SORTABLE.get(sort_by, "created_ts")

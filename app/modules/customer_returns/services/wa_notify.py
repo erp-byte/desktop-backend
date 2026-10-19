@@ -1,13 +1,20 @@
 """Customer-Returns WhatsApp head-approval notification.
 
-On "Send for Approval" the mapped Business Head AND every standing deputy approver
-(`deputy_approver` rows in cr_email_routing) get the `customer_returns_head_approval`
-template on the shared WABA: an IMAGE header (the articles table rendered as a PNG) +
-positional body variables ({{1}}..{{11}}) + the template's built-in Approve / Reject /
-Hold quick-reply buttons. A button tap is quoted back with `context.id` = the sent
-message's wamid; the shared webhook (sample/whatsapp_service.handle_inbound) resolves it
-via `wa_return_message` and calls `handle_return_button_tap` here, which applies the CR
-decision through the SAME approval_service the email magic-link uses.
+On "Send for Approval" every approver of the CR — its Business Head (when the name
+resolves to an e-mail) AND every standing deputy approver (`deputy_approver` rows in
+cr_email_routing), i.e. mail_service.resolve_approvers, the people approval_service
+lets decide — except whoever raised it (mail_service.eligible_approvers: nobody
+decides their own return, so they are not sent buttons that would only refuse them)
+gets the `customer_returns_head_approval` template on the shared WABA:
+an IMAGE header (the articles table rendered as a PNG) + positional body variables
+({{1}}..{{11}}) + the template's built-in Approve / Reject / Hold quick-reply buttons.
+Each is sent to the number on the ERP account with that approver's e-mail. A button
+tap is quoted back with `context.id` = the sent message's wamid; the shared webhook
+(sample/whatsapp_service.handle_inbound) resolves it via `wa_return_message` and calls
+`handle_return_button_tap` here. A tap counts only from the number that message went
+to, and decides as the e-mail of the ERP user on that number through the SAME
+approval_service.apply_cr_action the mail link and the app use — so the same people
+may decide, and a decided CR stays decided.
 
 One message per approver means one wamid per approver, so a deputy's tap resolves
 through their own row — the inbound handler needed no change to accept it. Two people
@@ -16,8 +23,10 @@ actioned.
 
 Self-contained WABA client (mirrors purchase/qc_intimation + sample/whatsapp_service —
 each tenant on this number has its own). Best-effort: a missing/unconfigured WABA or a
-send failure is logged and swallowed so it never breaks the send-for-approval action.
-Config + creds read from os.environ at call time (hydrated in main.py lifespan).
+send failure is logged and never breaks the send-for-approval action — but the result
+says what happened (status sent / partial / failed / skipped, with counts), so a
+failed send is not reported as sent. Config + creds read from os.environ at call time
+(hydrated in main.py lifespan).
 """
 from __future__ import annotations
 
@@ -28,6 +37,7 @@ import tempfile
 from typing import Any, Optional
 
 import httpx
+from fastapi import HTTPException
 
 from app.modules.customer_returns.services import approval_service, mail_service, query_service
 
@@ -71,6 +81,13 @@ def _fmt_phone(raw) -> str:
     if len(digits) == 10:
         digits = "91" + digits
     return digits
+
+
+def _same_phone(a, b) -> bool:
+    """Two numbers are one when their digits are, read the way wa_phone was stored
+    (_fmt_phone: '+' and separators dropped, a bare 10-digit number given 91)."""
+    ka = _fmt_phone(a)
+    return bool(ka) and ka == _fmt_phone(b)
 
 
 # ── number formatting ─────────────────────────────────────────────────────────
@@ -265,70 +282,71 @@ def _wamid(resp: dict) -> Optional[str]:
 
 
 # ── 3. recipient / actor resolution ───────────────────────────────────────────
-async def _resolve_bh_phone(conn, business_head: Optional[str]) -> Optional[str]:
-    """Phone of a person by auth_user.full_name (active, non-blank phone).
+async def _phone_for_email(conn, email: Optional[str]) -> Optional[str]:
+    """WhatsApp number (E.164 digits) of the active ERP user with this e-mail, else None.
 
-    Used for the CR's mapped Business Head and, identically, for each standing
-    deputy — a deputy's `match_key` in cr_email_routing IS their full_name.
+    By e-mail, not display name: the account found is the one whose tap resolves
+    back (_resolve_actor_email) to this same e-mail, which is what approval_service
+    checks — so everyone messaged can actually decide, and a namesake of the BU Head
+    is never sent the buttons.
     """
-    if not business_head or not str(business_head).strip():
+    if not email or not str(email).strip():
         return None
     phone = await conn.fetchval(
-        "SELECT phone FROM auth_user WHERE lower(btrim(full_name)) = lower(btrim($1)) "
-        "AND COALESCE(is_active, TRUE) AND phone IS NOT NULL AND btrim(phone) <> '' LIMIT 1",
-        business_head,
+        "SELECT phone FROM auth_user WHERE lower(btrim(email)) = lower(btrim($1)) "
+        "AND COALESCE(is_active, TRUE) AND phone IS NOT NULL AND btrim(phone) <> '' "
+        "ORDER BY user_id LIMIT 1",
+        str(email).strip(),
     )
     return _fmt_phone(phone) if phone else None
 
 
 async def _resolve_approver_phones(conn, detail: dict) -> list[tuple[str, str]]:
-    """[(name, phone)] for the BU Head and every standing deputy, deduped by number.
+    """[(name, phone)] for every approver of the CR — the BU Head (when their name
+    resolves to an e-mail) and each standing deputy, mail_service.resolve_approvers:
+    the same people approval_service lets decide — but the person who raised it
+    (mail_service.eligible_approvers), deduped by number.
 
     Deduped by PHONE, not by name: if a deputy happens to be the CR's own BU Head
     they must not get the same template twice, which would also write two
     wa_return_message rows and let one person's second tap look like a second
     decision.
 
-    A deputy with no auth_user row (or no number on it) is simply absent from this
-    list — their mail still carries the buttons. WhatsApp is the faster channel,
-    never the only one.
+    An approver with no active account under their e-mail (or no number on it) is
+    simply absent from this list — their mail still carries the buttons. WhatsApp
+    is the faster channel, never the only one.
     """
-    names = [detail.get("business_head")]
-    try:
-        routing = await mail_service.fetch_routing(conn)
-        names += [d.get("name") for d in routing.get("deputy_approver", [])]
-    except Exception:  # noqa: BLE001 — a routing failure must not cost the BH send
-        logger.exception("[cr-wa] deputy routing lookup failed — BU Head only")
-
+    routing = await mail_service.fetch_routing(conn)
+    approvers = mail_service.resolve_approvers(routing, detail.get("business_head"))
     out: list[tuple[str, str]] = []
     seen: set[str] = set()
-    for name in names:
-        if not name or not str(name).strip():
-            continue
-        phone = await _resolve_bh_phone(conn, name)
+    for a in mail_service.eligible_approvers(approvers, detail.get("created_by")):
+        phone = await _phone_for_email(conn, a["email"])
         if not phone:
-            logger.info("[cr-wa] no phone on file for %r — skipping their WhatsApp", name)
+            logger.info("[cr-wa] no phone on file for %r (%s) — skipping their WhatsApp",
+                        a["name"], a["email"])
             continue
         if phone in seen:
             continue
         seen.add(phone)
-        out.append((str(name).strip(), phone))
+        out.append((a["name"], phone))
     return out
 
 
-async def _resolve_actor(conn, wa: str) -> str:
-    """Identify the tapping user for the approval audit (email/name), else the phone."""
+async def _resolve_actor_email(conn, wa: str) -> Optional[str]:
+    """E-mail of the active ERP user on the tapping number, else None — the identity
+    a tap decides as (approval_service checks it like the other channels)."""
     try:
         from app.modules.auth.services.phone import lookup_keys
         keys = lookup_keys(wa)
     except Exception:  # noqa: BLE001
         keys = [wa]
     row = await conn.fetchrow(
-        "SELECT email, full_name FROM auth_user WHERE phone = ANY($1::text[]) "
-        "AND COALESCE(is_active, TRUE) LIMIT 1", list(keys))
-    if row:
-        return (row["email"] or row["full_name"] or wa)
-    return wa
+        "SELECT email FROM auth_user WHERE phone = ANY($1::text[]) "
+        "AND COALESCE(is_active, TRUE) "
+        "ORDER BY (COALESCE(btrim(email), '') = ''), user_id LIMIT 1", list(keys))
+    email = str((row["email"] if row else None) or "").strip()
+    return email or None
 
 
 # ── 4. wamid <-> CR mapping ────────────────────────────────────────────────────
@@ -373,14 +391,36 @@ def _body_params(detail: dict) -> list[str]:
     ]
 
 
+def _wa_outcome(targets: list, recipients: list[dict], reason: Optional[str] = None) -> dict:
+    """{status, sent, failed, reason?, recipients[, to, wamid]} — status is 'sent' when
+    every approver's message went out (and its tap can be traced back), 'failed' when
+    none did, 'partial' in between. `to`/`wamid` stay top-level (the first recipient)
+    for the single-recipient shape the logs already read."""
+    ok = sum(1 for r in recipients if r.get("sent"))
+    failed = max(len(targets), len(recipients)) - ok
+    out: dict = {"status": "sent" if not failed else ("partial" if ok else "failed"),
+                 "sent": ok, "failed": failed, "recipients": recipients}
+    if reason and failed:
+        out["reason"] = reason
+    if recipients:
+        out["to"], out["wamid"] = recipients[0]["to"], recipients[0]["wamid"]
+    return out
+
+
 async def notify_cr_head_approval(conn, detail: dict) -> dict:
-    """Send the head-approval WhatsApp (image header + body + buttons) to the CR's
-    Business Head AND every standing deputy. Best-effort — never raises.
+    """Send the head-approval WhatsApp (image header + body + buttons) to every
+    approver of the CR who can decide it (_resolve_approver_phones). Best-effort —
+    never raises — and truthful: {status: sent | partial | failed | skipped, sent,
+    failed, reason?}. 'skipped' (WhatsApp not configured, or no such approver has a
+    number on file) is not a failure: the mail carries the same buttons.
 
     Each recipient gets their own message, so each has its own wamid and its own
     wa_return_message row; a tap resolves through the row it quotes, which is what
     lets a deputy act on the same CR without any change to the inbound handler.
-    The decision itself is idempotent, so two people tapping is safe.
+    The decision itself is idempotent, so two people tapping is safe. A message
+    Graph refuses (no wamid) is that recipient's failure and the rest still go; a
+    mapping row that cannot be stored stops the run — that tap could not be traced
+    back to the CR, and neither could any later one.
 
     The articles PNG is rendered and uploaded ONCE and the media id reused — the
     image is identical for every recipient, and re-uploading it per person would
@@ -389,20 +429,22 @@ async def notify_cr_head_approval(conn, detail: dict) -> dict:
     company = str(detail.get("company") or "").upper()
     cr_id = str(detail.get("rtv_id") or "")
     if not _wa_enabled():
-        return {"status": "skipped", "reason": "wa_disabled"}
+        return {"status": "skipped", "reason": "wa_disabled", "sent": 0, "failed": 0}
     png_path = None
+    targets: list[tuple[str, str]] = []
+    recipients: list[dict] = []
     try:
         targets = await _resolve_approver_phones(conn, detail)
         if not targets:
             logger.info("[cr-wa] no approver phone for %s (business_head=%r) — skipping",
                         cr_id, detail.get("business_head"))
-            return {"status": "skipped", "reason": "no_bh_phone"}
+            return {"status": "skipped", "reason": "no_approver_phone", "sent": 0, "failed": 0}
         png_path = render_articles_png(detail.get("customer") or "", detail.get("lines") or [])
         media_id = await _upload_media(png_path)
         if not media_id:
-            return {"status": "error", "reason": "media_upload_failed"}
+            return _wa_outcome(targets, [], "media_upload_failed")
 
-        sent: list[dict] = []
+        reason: Optional[str] = None
         for name, phone in targets:
             payload = {
                 "messaging_product": "whatsapp", "to": phone, "type": "template",
@@ -415,22 +457,28 @@ async def notify_cr_head_approval(conn, detail: dict) -> dict:
                     ],
                 },
             }
-            resp = await _post_message(payload)
-            wamid = _wamid(resp)
-            if wamid:
+            wamid = _wamid(await _post_message(payload))
+            if not wamid:
+                # _post_message logged Graph's refusal; the next number may still go.
+                reason = reason or "send_failed"
+                recipients.append({"name": name, "to": phone, "wamid": None, "sent": False})
+                logger.warning("[cr-wa] head-approval NOT sent cr=%s to=%s (%s)", cr_id, phone, name)
+                continue
+            try:
                 await _store_return_message(conn, wamid, company, cr_id, phone)
-            sent.append({"name": name, "to": phone, "wamid": wamid})
+            except Exception:  # noqa: BLE001 — delivered, but its tap could not find the CR
+                logger.exception("[cr-wa] wa_return_message write failed cr=%s wamid=%s — "
+                                 "stopping the WhatsApp leg", cr_id, wamid)
+                recipients.append({"name": name, "to": phone, "wamid": wamid, "sent": False})
+                return _wa_outcome(targets, recipients, "mapping_store_failed")
+            recipients.append({"name": name, "to": phone, "wamid": wamid, "sent": True})
             logger.info("[cr-wa] head-approval sent cr=%s to=%s (%s) wamid=%s",
                         cr_id, phone, name, wamid)
-
-        first = sent[0]
-        # `to`/`wamid` stay top-level for the single-recipient shape callers and the
-        # existing logs already read.
-        return {"status": "sent", "to": first["to"], "wamid": first["wamid"],
-                "recipients": sent}
+        return _wa_outcome(targets, recipients, reason)
     except Exception:  # noqa: BLE001 — must not break send-for-approval
         logger.exception("[cr-wa] notify_cr_head_approval failed cr=%s", cr_id)
-        return {"status": "error", "reason": "exception"}
+        return _wa_outcome(targets, recipients, "exception") if (targets or recipients) else \
+            {"status": "failed", "reason": "exception", "sent": 0, "failed": 0}
     finally:
         if png_path:
             try:
@@ -448,7 +496,13 @@ _TAP_ACTION = {"APPROVE": "approve", "APPROVED": "approve",
 async def handle_return_button_tap(conn, wa: str, text: str, context_id: Optional[str]) -> Optional[dict]:
     """If `context_id` quotes a head-approval message we sent, apply the tapped
     decision and reply. Returns a result dict when handled, or None when the tap is
-    NOT a customer-return message (so the caller's NPD/promote flow continues)."""
+    NOT a customer-return message (so the caller's NPD/promote flow continues).
+
+    A tap decides only when it comes from the number that message was sent to
+    (wa_return_message.wa_phone) — from any other number it is answered and changes
+    nothing — and then as the e-mail of the ERP user on that number, through
+    approval_service.apply_cr_action like the mail link and the app: a refusal (not
+    an approver, their own return, no approver) is replied with its reason."""
     if not context_id:
         return None
     # Best-effort resolution: if the lookup fails (wa_return_message absent because 083
@@ -467,17 +521,31 @@ async def handle_return_button_tap(conn, wa: str, text: str, context_id: Optiona
     # would double-process it in another flow) and never raise out of the shared webhook.
     company, cr_id = row["company"], row["rtv_id"]
     try:
+        if not _same_phone(wa, row["wa_phone"]):
+            logger.warning("[cr-wa] tap on cr=%s from %s, but it was sent to %s — nothing done",
+                           cr_id, wa, row["wa_phone"])
+            await _send_text(wa, "This approval was sent to a different number.")
+            return {"ok": False, "reason": "cr_wrong_phone", "rtv_id": cr_id}
+
         first = (text or "").strip().split(maxsplit=1)[0].upper() if text else ""
         action = _TAP_ACTION.get(first)
         if not action:
             await _send_text(wa, f"Reply Approve / Reject / Hold on customer return {cr_id}.")
             return {"ok": False, "reason": "cr_unparsed", "rtv_id": cr_id}
 
-        actor = await _resolve_actor(conn, wa)
-        result = await approval_service.apply_cr_action(conn, company, cr_id, action, actor)
+        actor = await _resolve_actor_email(conn, wa)
+        try:
+            result = await approval_service.apply_cr_action(conn, company, cr_id, action, actor)
+        except HTTPException as exc:
+            await _send_text(wa, f"Customer return {cr_id} was not changed. "
+                                 f"{approval_service.error_message(exc)}")
+            error = exc.detail.get("error") if isinstance(exc.detail, dict) else None
+            return {"ok": False, "reason": "cr_refused", "error": error,
+                    "status_code": exc.status_code, "rtv_id": cr_id}
         status = result["status"]
         if result["already_actioned"]:
-            await _send_text(wa, f"Customer return {cr_id} is already “{status}”.")
+            await _send_text(wa, f"Customer return {cr_id} is already "
+                                 f"“{approval_service.status_label(status)}”.")
             return {"ok": True, "already_actioned": True, "rtv_id": cr_id, "status": status}
 
         # threaded status mail, mirroring the email-action endpoint (best-effort)
@@ -492,4 +560,8 @@ async def handle_return_button_tap(conn, wa: str, text: str, context_id: Optiona
         return {"ok": True, "rtv_id": cr_id, "status": status, "actor": actor}
     except Exception:  # noqa: BLE001 — an owned tap must not raise into the shared webhook
         logger.exception("[cr-wa] handle_return_button_tap failed cr=%s", cr_id)
+        # Nothing after the decision raises (the status mail is guarded above), so the
+        # tap was not recorded — say so rather than leave the approver guessing.
+        await _send_text(wa, f"Your reply on customer return {cr_id} could not be recorded. "
+                             f"Please use the approval e-mail or the ERP.")
         return {"ok": False, "reason": "cr_exception", "rtv_id": cr_id}

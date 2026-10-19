@@ -4,34 +4,31 @@ box_number); box_id is NULL until Print and never regenerated once set.
 """
 from __future__ import annotations
 
-import re
 import time
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
 
+from app.core.sites import is_cold_site
 from app.modules.customer_returns import schemas
 from app.modules.customer_returns.services import query_service as q
 from app.modules.customer_returns.tables import cr_table_names
 
+
 # Cold-storage warehouses whose returned boxes IMS mirrors into {prefix}_cold_stocks
 # (rtv_tools._RTV_COLD_UNIT_MAP: Savla D-39 / D-514, Rishi, Supreme, Eskimo — NOT
-# W-202). CFERP does NOT yet rebuild that mirror (Phase 4), so to avoid silently
-# desyncing IMS cold inventory, cold-warehouse box entry is refused here and done in
-# IMS. Matched on the raw stored factory_unit AND its canonical form, separator/case
-# insensitive.
-_COLD_UNITS = {"d39", "d514", "rishi", "supreme", "eskimo", "savlad39", "savlad514"}
-
-
+# W-202; IMS also folds Savla Bond into Savla D-39). CFERP does NOT yet rebuild that
+# mirror (Phase 4), so to avoid silently desyncing IMS cold inventory, cold-warehouse
+# box entry is refused here and done in IMS. A cold site is one of the site table
+# (app.core.sites.is_cold_site), in any spelling: 'D-39', 'Savla D-39', 'Supreme Cold',
+# 'Old Savla', 'Savla Bond'. A warehouse floor such as 'A185 Cold' is not one.
 def _is_cold_warehouse(factory_unit) -> bool:
-    if not factory_unit:
-        return False
-    return re.sub(r"[^a-z0-9]", "", str(factory_unit).lower()) in _COLD_UNITS
+    return is_cold_site(str(factory_unit) if factory_unit else None)
 
 
 async def _resolve_box_writable_header_id(conn, tables: dict, cr_id: str) -> int:
     """header_id for a box write; 404 if absent, 409 if it's a cold-storage return
-    (those go through IMS so its cold_stocks mirror stays correct — see _COLD_UNITS)."""
+    (those go through IMS so its cold_stocks mirror stays correct — see _is_cold_warehouse)."""
     row = await conn.fetchrow(
         f"SELECT id, factory_unit FROM {tables['header']} WHERE rtv_id = $1", cr_id)
     if row is None:

@@ -7,6 +7,11 @@ when the JC/plan rows were created with legacy 'A-185'.
 
 Use ``normalise_warehouse_code`` for in-process comparisons and
 ``WAREHOUSE_NORM_SQL`` for column-level comparisons inside a query.
+
+Both fold case and punctuation only. Which spellings name one site ('D-39' and
+'Savla D-39', 'Warehouse A185' and 'A185') is app.core.sites' table:
+``user_has_warehouse`` compares through it, and a query matches every spelling
+of a site by binding ``sites.scope_keys(...)`` into ``WAREHOUSE_NORM_ANY_SQL``.
 """
 
 from __future__ import annotations
@@ -28,15 +33,17 @@ def user_has_warehouse(
     user_warehouses: Iterable[str] | None,
     code: str | None,
 ) -> bool:
-    """True when ``code`` matches any of ``user_warehouses`` after
-    normalising both sides. Empty/None on either side returns False —
-    callers that want admin/wildcard semantics must check that themselves."""
-    target = normalise_warehouse_code(code)
-    if not target:
+    """True when ``code`` names the same site as any of ``user_warehouses``
+    (``app.core.sites.same_site``): 'A185' == 'A-185' == 'Warehouse A185', and
+    the grant code 'D-39' == 'Savla D-39'. Empty/None on either side returns
+    False — callers that want admin/wildcard semantics must check that themselves."""
+    from app.core.sites import same_site  # imported here: sites imports this module
+
+    if not normalise_warehouse_code(code):
         return False
     if not user_warehouses:
         return False
-    return any(normalise_warehouse_code(w) == target for w in user_warehouses)
+    return any(same_site(w, code) for w in user_warehouses)
 
 
 def user_has_any_warehouse(
