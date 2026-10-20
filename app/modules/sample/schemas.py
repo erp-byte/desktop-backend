@@ -416,6 +416,11 @@ class PromoteEmailReject(BaseModel):
     remarks: str
 
 
+class DevJobCardLinkRequest(BaseModel):
+    """Link a dev job card to the request it was developed for (the row id, not request_id)."""
+    requisition_id: int
+
+
 class DevDispatchBody(BaseModel):
     recipient: Optional[str] = None
     qty: Optional[float] = Field(default=None, ge=0)

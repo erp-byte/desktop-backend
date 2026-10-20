@@ -129,15 +129,22 @@ async def due_buckets(conn, today: date) -> dict:
     """
     placeholders = ", ".join(f"'{s}'" for s in OPEN_STATUSES)   # module constants, not input
     rows = await conn.fetch(
-        f"""SELECT * FROM sample_requisitions
-             WHERE deleted_at IS NULL
-               AND expected_dispatch_date IS NOT NULL
-               AND status IN ({placeholders})
+        f"""SELECT sr.* FROM sample_requisitions sr
+             WHERE sr.deleted_at IS NULL
+               AND sr.expected_dispatch_date IS NOT NULL
+               AND sr.status IN ({placeholders})
                -- $1::date, not $1: asyncpg sends the parameter untyped, so Postgres
                -- resolves the addition first, picks integer + integer, and the predicate
                -- becomes `date <= integer` — no such operator, and every tick raises.
-               AND expected_dispatch_date <= $1::date + 1
-             ORDER BY expected_dispatch_date, id""", today)
+               AND sr.expected_dispatch_date <= $1::date + 1
+               -- Once NPD has closed the request's development job card the sample exists
+               -- and its dispatch date is confirmed; the request closes itself when the
+               -- sample is dispatched. Chasing BD's original date daily after that was
+               -- noise (six requests had 40-176 reminders each with their card closed).
+               AND NOT EXISTS (SELECT 1 FROM npd_dev_job_cards jc
+                                WHERE jc.status = 'CLOSED'
+                                  AND (jc.source_requisition_id = sr.id OR jc.id = sr.linked_dev_jc_id))
+             ORDER BY sr.expected_dispatch_date, sr.id""", today)
     due, over = [], []
     for r in rows:
         d = dict(r)
