@@ -148,6 +148,7 @@ class PoListItem(BaseModel):
     narration: str | None = None
     vendor_supplier_name: str | None = None
     consignee_address: str | None = None
+    consignee_site: str | None = None     # plant the address is for: W202, A185, A68
     supplier_id: str | None = None
     gross_total: float | None = None
     total_amount: float | None = None

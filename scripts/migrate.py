@@ -548,6 +548,14 @@ SQL_FILES = [
     # "Consignee Address" column. The PO commit writes it, so apply BEFORE the
     # deploy. Idempotent.
     DB_DIR / "130_po_header_consignee_address.sql",
+    # 131 adds client_key to po_section and po_box, so Material In can save one box
+    # at a time without a retry adding it twice. The backend skips the key lookups
+    # while the columns are missing, so it may run before or after the deploy.
+    DB_DIR / "131_po_box_client_keys.sql",
+    # 132 recomputes po_header.status for POs with boxes by the receipt rule the
+    # backend now applies (services/receipt_match.py), adding 'fully received'.
+    # Data only; idempotent; safe before or after the deploy.
+    DB_DIR / "132_po_receiving_status_backfill.sql",
 ]
 
 # ── Optional: drop the v1 legacy job-card stack (TEST / Supabase DB ONLY) ──────

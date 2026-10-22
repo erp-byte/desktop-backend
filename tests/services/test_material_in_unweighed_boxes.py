@@ -67,6 +67,8 @@ class FakeConn:
             return [self.after[b] for b in args[1] if b in self.after]
         if "NOT EXISTS (SELECT 1 FROM inventory_batch" in s:
             return self.unbatched
+        if s.startswith("SELECT box_number FROM po_box"):
+            return []                      # numbers taken in the section: none yet
         raise AssertionError(f"unexpected fetch: {s}")
 
     async def execute(self, sql, *args):
@@ -109,7 +111,7 @@ def _request(conn):
     return SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(db_pool=FakePool(conn))))
 
 
-USER = SimpleNamespace(full_name="Stores Clerk")
+USER = SimpleNamespace(full_name="Stores Clerk", is_admin=False, allowed_warehouses=[])
 
 
 def _add(conn, boxes, **section):

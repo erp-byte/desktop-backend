@@ -22,6 +22,11 @@ from datetime import date as date_type
 from typing import Any
 
 from app.core.middleware.request_context import AuthError
+from app.core.sites import scope_keys
+from app.modules.purchase.services.consignee_site import (
+    CONSIGNEE_SITE_KEY_SQL,
+    consignee_site,
+)
 
 
 _NUMERIC_RANGE_FIELDS: tuple[str, ...] = (
@@ -78,7 +83,15 @@ _RECEIVED_PREDICATE = (
     "EXISTS (SELECT 1 FROM po_box b WHERE b.transaction_no = po_header.transaction_no)"
 )
 
-_VALID_SECTIONS: frozenset[str] = frozenset({"today", "pending", "completed"})
+_VALID_SECTIONS: frozenset[str] = frozenset({"site", "today", "pending", "completed"})
+
+
+def _site_keys(raw: Any) -> list[str] | None:
+    """Scope keys of a comma-separated `site` filter ("W202,A185"), every
+    spelling of each site included; None when no `site` was given."""
+    if raw is None:
+        return None
+    return scope_keys([s.strip() for s in str(raw).split(",") if s.strip()])
 
 
 def _parse_date(s: str | None, label: str) -> date_type | None:
@@ -121,12 +134,15 @@ def build_where(
     filters: dict[str, Any],
     include_deleted: bool,
     entity_scope: list[str] | None,
+    hidden_sites: list[str] | None = None,
 ) -> tuple[str, list[Any]]:
     """Return (where_sql, params).
 
     `entity_scope`: None means "no scope restriction" (admin); a list means
     the user can only see those entities (overrides any user-supplied
     entity= filter that's outside the list).
+    `hidden_sites`: site keys whose POs the user may not see
+    (po_site_scope.hidden_sites_for); POs addressed to no site stay visible.
     """
     conditions: list[str] = []
     params: list[Any] = []
@@ -184,23 +200,35 @@ def build_where(
         if hi is not None:
             _add(f"{f} <= ${{i}}", hi)
 
-    # Material In dashboard section partition (today / pending / completed).
-    #   today     — po_date is the client's local today, whatever the receipt state
-    #   completed — NOT today AND any box has been received (partially/extra)
-    #   pending   — NOT today AND no box received yet
-    # The three are mutually exclusive (Today takes priority), matching the
-    # client's partition, so each section paginates independently server side.
+    # Material In dashboard section partition, by consignee site:
+    #   site      — no box received yet AND the consignee address is for one of
+    #               the `site` filter's sites (consignee_site.py reads the plant
+    #               code off the start of the address)
+    #   pending   — no box received yet AND, when `site` is given, not for those
+    #   completed — any box received (partially/extra), whatever the site
+    # The older client partitions by date instead: `today` is po_date = its
+    # `today_date`, whatever the receipt state, and pending / completed leave
+    # that day out when `today_date` is sent. Either way the sections are
+    # mutually exclusive, so each paginates independently server side.
     section = filters.get("section")
     if section:
         section = str(section).lower()
         if section not in _VALID_SECTIONS:
             raise AuthError(
                 "validation_error",
-                f"Invalid section {section!r}; expected today|pending|completed",
+                f"Invalid section {section!r}; expected site|pending|completed",
                 400,
             )
+        sites = _site_keys(filters.get("site"))
+        site_match = f"COALESCE({CONSIGNEE_SITE_KEY_SQL} = ANY(${{i}}::text[]), FALSE)"
         today = _parse_date(filters.get("today_date"), "today_date")
-        if section == "today":
+        if section == "site":
+            if sites:
+                _add(site_match, sites)
+            else:
+                conditions.append("FALSE")
+            conditions.append(f"NOT ({_RECEIVED_PREDICATE})")
+        elif section == "today":
             if today is not None:
                 _add("po_date = ${i}", today)
             else:
@@ -208,8 +236,8 @@ def build_where(
         else:
             if today is not None:
                 _add("po_date IS DISTINCT FROM ${i}", today)
-            else:
-                conditions.append("po_date IS DISTINCT FROM CURRENT_DATE")
+            if section == "pending" and sites:
+                _add(f"NOT {site_match}", sites)
             conditions.append(
                 f"({_RECEIVED_PREDICATE})"
                 if section == "completed"
@@ -219,6 +247,10 @@ def build_where(
     # Visibility
     if not include_deleted:
         conditions.append("deleted_at IS NULL")
+
+    # Site scope (po_site_scope): leave out POs addressed to another warehouse.
+    if hidden_sites:
+        _add(f"NOT COALESCE({CONSIGNEE_SITE_KEY_SQL} = ANY(${{i}}::text[]), FALSE)", hidden_sites)
 
     # Entity scope (admin → None; non-admin → restricted to allowed list)
     if entity_scope is not None:
@@ -276,6 +308,8 @@ def header_row_to_listitem(row) -> dict:
         "narration": row["narration"],
         "vendor_supplier_name": row["vendor_supplier_name"],
         "consignee_address": row["consignee_address"] if "consignee_address" in row.keys() else None,
+        "consignee_site": consignee_site(row["consignee_address"])
+        if "consignee_address" in row.keys() else None,
         "supplier_id": row["supplier_id"] if "supplier_id" in row.keys() else None,
         "status": row["status"] if "status" in row.keys() else None,
         "gross_total": _f(row["gross_total"]),

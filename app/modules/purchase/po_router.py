@@ -38,7 +38,8 @@ from app.modules.purchase.schemas.po_api import (
     PoListResponse,
     PreviewResponse,
 )
-from app.modules.purchase.services import po_commit, po_delete, po_preview, po_query
+from app.modules.purchase.services import po_commit, po_delete, po_preview, po_query, receipt_match
+from app.modules.purchase.services.po_site_scope import address_hidden, hidden_sites_for
 from app.modules.purchase.services import po_intimation, qc_intimation
 
 logger = logging.getLogger(__name__)
@@ -206,8 +207,11 @@ async def list_pos(
     other_charges_non_gst_min: float | None = Query(None),
     other_charges_non_gst_max: float | None = Query(None),
     # Material In dashboard section partition
-    section: str | None = Query(None, pattern="^(today|pending|completed)$"),
+    section: str | None = Query(None, pattern="^(site|today|pending|completed)$"),
     today_date: str | None = Query(None),
+    # Consignee sites for the site section ("W202" or "W202,A185"); the pending
+    # section leaves them out when given.
+    site: str | None = Query(None, max_length=200),
     # visibility / pagination
     include_deleted: bool = Query(False),
     page: int = Query(1, ge=1),
@@ -249,16 +253,18 @@ async def list_pos(
         loading_unloading_charges_max=loading_unloading_charges_max,
         other_charges_non_gst_min=other_charges_non_gst_min,
         other_charges_non_gst_max=other_charges_non_gst_max,
-        section=section, today_date=today_date,
+        section=section, today_date=today_date, site=site,
     )
 
+    pool = request.app.state.db_pool
+    hidden = await hidden_sites_for(pool, user)
     where_sql, params = po_query.build_where(
         filters=filters,
         include_deleted=include_deleted,
         entity_scope=allowed,
+        hidden_sites=hidden,
     )
 
-    pool = request.app.state.db_pool
     async with pool.acquire() as conn:
         total = await conn.fetchval(
             f"SELECT COUNT(*) FROM po_header WHERE {where_sql}", *params,
@@ -315,6 +321,10 @@ async def _fetch_header(
         raise AuthError("not_found", "Purchase order not found", 404)
     if allowed is not None and (row["entity"] or "").lower() not in allowed:
         # Don't leak existence across entities — same code as not-found.
+        raise AuthError("not_found", "Purchase order not found", 404)
+    hidden = await hidden_sites_for(pool, user)
+    if address_hidden(row["consignee_address"], hidden):
+        # Another warehouse's PO (po_site_scope) — same code as not-found.
         raise AuthError("not_found", "Purchase order not found", 404)
     return po_query.header_row_to_listitem(row)
 
@@ -381,75 +391,19 @@ async def get_receipt_summary(
 
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT l.line_number, l.sku_name, l.particulars,
-                   l.pack_count, l.po_weight,
-                   COALESCE(r.rec_wt, 0)  AS received_weight,
-                   COALESCE(r.rec_cnt, 0) AS received_count,
-                   COALESCE(r.n_boxes, 0) AS received_boxes
-              FROM po_line l
-              LEFT JOIN LATERAL (
-                  SELECT COALESCE(SUM(b.net_weight), 0)          AS rec_wt,
-                         COALESCE(SUM(b.count), COUNT(b.box_id)) AS rec_cnt,
-                         COUNT(b.box_id)                          AS n_boxes
-                    FROM po_box b
-                   WHERE b.transaction_no = l.transaction_no
-                     AND b.line_number    = l.line_number
-              ) r ON TRUE
-             WHERE l.transaction_no = $1
-             ORDER BY l.line_number
-            """,
-            transaction_no,
-        )
+        rows = await conn.fetch(receipt_match.LINE_RECEIPT_SQL, transaction_no)
 
-    factor = po_query._WEIGHT_MATCH_FACTOR
-    lines: list[dict] = []
-    any_box = False
-    all_matched = True
-    total_received = 0.0
-    total_ordered = 0.0
-    for row in rows:
-        ordered_weight = float(row["po_weight"]) if row["po_weight"] is not None else None
-        received_weight = float(row["received_weight"] or 0)
-        ordered_count = int(row["pack_count"]) if row["pack_count"] is not None else None
-        received_count = int(row["received_count"] or 0)
-        n_boxes = int(row["received_boxes"] or 0)
-        if n_boxes > 0:
-            any_box = True
-        total_received += received_weight
-        total_ordered += ordered_weight or 0
-        weight_matched = ordered_weight is None or received_weight >= ordered_weight * factor
-        count_matched = ordered_count is None or received_count >= ordered_count
-        matched = weight_matched and count_matched
-        if not matched:
-            all_matched = False
-        lines.append({
-            "line_number": row["line_number"],
-            "sku_name": row["sku_name"],
-            "particulars": row["particulars"],
-            "ordered_weight": ordered_weight,
-            "received_weight": received_weight,
-            "ordered_count": ordered_count,
-            "received_count": received_count,
-            "received_boxes": n_boxes,
-            "weight_matched": weight_matched,
-            "count_matched": count_matched,
-            "matched": matched,
-        })
-
-    if not any_box:
-        status = "pending"
-    elif total_received > total_ordered:
-        status = "extra received"
-    else:
-        status = "partially received"
-
+    # The same rule as the stored po_header.status (services/receipt_match.py).
+    lines = [
+        {**receipt_match.line_match(r), "sku_name": r["sku_name"], "particulars": r["particulars"]}
+        for r in rows
+    ]
+    status = receipt_match.receiving_status(lines)
     return {
         "transaction_no": transaction_no,
         "entity": header.get("entity"),
         "consignee_address": header.get("consignee_address"),
-        "completed": any_box and all_matched,
+        "completed": any(l["received_boxes"] for l in lines) and all(l["matched"] for l in lines),
         "status": status,
         "total_lines": len(lines),
         "lines": lines,
