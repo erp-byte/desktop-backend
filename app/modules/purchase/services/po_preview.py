@@ -257,8 +257,8 @@ async def preview(
             existing_proj = {
                 k: existing.get(k) for k in (
                     "po_number", "po_date", "voucher_type", "order_reference_no",
-                    "narration", "vendor_supplier_name", "supplier_id",
-                    "gross_total", "total_amount", "sgst_amount", "cgst_amount",
+                    "narration", "vendor_supplier_name", "consignee_address",
+                    "supplier_id", "gross_total", "total_amount", "sgst_amount", "cgst_amount",
                     "igst_amount", "round_off", "freight_transport_local",
                     "apmc_tax", "packing_charges", "freight_transport_charges",
                     "loading_unloading_charges", "other_charges_non_gst",

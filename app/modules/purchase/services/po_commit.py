@@ -41,6 +41,7 @@ _HEADER_COLUMNS: tuple[str, ...] = (
     "order_reference_no",
     "narration",
     "vendor_supplier_name",
+    "consignee_address",
     "supplier_id",
     "gross_total",
     "total_amount",
@@ -116,7 +117,7 @@ async def _insert_po(conn, *, transaction_no: str, entity: str,
             gross_total, total_amount, sgst_amount, cgst_amount, igst_amount,
             round_off, freight_transport_local, apmc_tax, packing_charges,
             freight_transport_charges, loading_unloading_charges,
-            other_charges_non_gst
+            other_charges_non_gst, consignee_address
         )
         VALUES (
             $1, $2, $3, $4, $5,
@@ -124,7 +125,7 @@ async def _insert_po(conn, *, transaction_no: str, entity: str,
             $10, $11, $12, $13, $14,
             $15, $16, $17, $18,
             $19, $20,
-            $21
+            $21, $22
         )
         """,
         transaction_no, entity, h.get("po_date"), h.get("voucher_type"), h.get("po_number"),
@@ -135,7 +136,7 @@ async def _insert_po(conn, *, transaction_no: str, entity: str,
         h.get("round_off"), h.get("freight_transport_local"), h.get("apmc_tax"),
         h.get("packing_charges"),
         h.get("freight_transport_charges"), h.get("loading_unloading_charges"),
-        h.get("other_charges_non_gst"),
+        h.get("other_charges_non_gst"), h.get("consignee_address"),
     )
     await _insert_lines(conn, transaction_no, lines)
 
@@ -166,7 +167,8 @@ async def _update_po(conn, *, transaction_no: str, entity: str,
             packing_charges               = COALESCE($17, packing_charges),
             freight_transport_charges     = COALESCE($18, freight_transport_charges),
             loading_unloading_charges     = COALESCE($19, loading_unloading_charges),
-            other_charges_non_gst         = COALESCE($20, other_charges_non_gst)
+            other_charges_non_gst         = COALESCE($20, other_charges_non_gst),
+            consignee_address             = COALESCE($22, consignee_address)
          WHERE transaction_no = $1
            AND entity = $21
            AND deleted_at IS NULL
@@ -182,6 +184,7 @@ async def _update_po(conn, *, transaction_no: str, entity: str,
         h.get("freight_transport_charges"), h.get("loading_unloading_charges"),
         h.get("other_charges_non_gst"),
         entity,
+        h.get("consignee_address"),
     )
     # Replace lines wholesale
     await conn.execute("DELETE FROM po_line WHERE transaction_no = $1", transaction_no)

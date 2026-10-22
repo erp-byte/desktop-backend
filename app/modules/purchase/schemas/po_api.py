@@ -56,6 +56,7 @@ class PreviewHeader(BaseModel):
     order_reference_no: str | None = None
     narration: str | None = None
     vendor_supplier_name: str | None = None
+    consignee_address: str | None = None
     supplier_id: str | None = None
     gross_total: float | None = None
     total_amount: float | None = None
@@ -146,6 +147,7 @@ class PoListItem(BaseModel):
     order_reference_no: str | None = None
     narration: str | None = None
     vendor_supplier_name: str | None = None
+    consignee_address: str | None = None
     supplier_id: str | None = None
     gross_total: float | None = None
     total_amount: float | None = None

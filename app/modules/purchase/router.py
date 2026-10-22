@@ -129,7 +129,7 @@ async def view_pos(
     entity: str = Query(None),
     sort_by: str = Query(
         "po_date",
-        pattern="^(transaction_no|po_date|vendor_supplier_name|customer_party_name|gross_total|warehouse)$",
+        pattern="^(transaction_no|po_date|vendor_supplier_name|consignee_address|customer_party_name|gross_total|warehouse)$",
     ),
     sort_order: str = Query("desc", pattern="^(asc|desc)$"),
     vendor: str = Query(None),
@@ -226,6 +226,7 @@ async def view_pos(
         "transaction_no": "h.transaction_no",
         "po_date": "h.po_date",
         "vendor_supplier_name": "h.vendor_supplier_name",
+        "consignee_address": "h.consignee_address",
         "customer_party_name": "h.customer_party_name",
         "gross_total": "h.gross_total",
         "warehouse": "h.warehouse",
@@ -269,7 +270,7 @@ async def export_pos(
     entity: str = Query(None),
     sort_by: str = Query(
         "po_date",
-        pattern="^(transaction_no|po_date|vendor_supplier_name|customer_party_name|gross_total|warehouse)$",
+        pattern="^(transaction_no|po_date|vendor_supplier_name|consignee_address|customer_party_name|gross_total|warehouse)$",
     ),
     sort_order: str = Query("desc", pattern="^(asc|desc)$"),
     vendor: str = Query(None),
@@ -296,6 +297,7 @@ async def export_pos(
         "transaction_no": "h.transaction_no",
         "po_date": "h.po_date",
         "vendor_supplier_name": "h.vendor_supplier_name",
+        "consignee_address": "h.consignee_address",
         "customer_party_name": "h.customer_party_name",
         "gross_total": "h.gross_total",
         "warehouse": "h.warehouse",

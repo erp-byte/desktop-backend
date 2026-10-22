@@ -544,6 +544,10 @@ SQL_FILES = [
     # reason, payload) and makes actor_user_id TEXT; RDS had an older shape, so
     # every PO audit insert failed. Safe before or after the deploy. Idempotent.
     DB_DIR / "129_po_event_log_columns.sql",
+    # 130 adds po_header.consignee_address, read from the PO Book upload's
+    # "Consignee Address" column. The PO commit writes it, so apply BEFORE the
+    # deploy. Idempotent.
+    DB_DIR / "130_po_header_consignee_address.sql",
 ]
 
 # ── Optional: drop the v1 legacy job-card stack (TEST / Supabase DB ONLY) ──────

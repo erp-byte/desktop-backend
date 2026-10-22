@@ -52,7 +52,7 @@ async def ingest_po_book(
                         sgst_amount, cgst_amount, igst_amount, round_off,
                         freight_transport_local, apmc_tax, packing_charges,
                         freight_transport_charges, loading_unloading_charges,
-                        other_charges_non_gst
+                        other_charges_non_gst, consignee_address
                     )
                     VALUES (
                         $1, $2, $3, $4, $5,
@@ -61,7 +61,7 @@ async def ingest_po_book(
                         $11, $12, $13, $14,
                         $15, $16, $17,
                         $18, $19,
-                        $20
+                        $20, $21
                     )
                     """,
                     transaction_no,
@@ -84,6 +84,7 @@ async def ingest_po_book(
                     po.get("freight_transport_charges"),
                     po.get("loading_unloading_charges"),
                     po.get("other_charges_non_gst"),
+                    po.get("consignee_address"),
                 )
 
                 line_dicts = []
@@ -173,6 +174,7 @@ async def ingest_po_book(
                     "order_reference_no": po.get("order_reference_no"),
                     "narration": po.get("narration"),
                     "vendor_supplier_name": po.get("vendor_supplier_name"),
+                    "consignee_address": po.get("consignee_address"),
                     "gross_total": po.get("gross_total"),
                     "total_amount": po.get("total_amount"),
                     "sgst_amount": po.get("sgst_amount"),

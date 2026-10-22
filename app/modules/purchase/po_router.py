@@ -183,6 +183,7 @@ async def list_pos(
     order_reference_no_contains: str | None = Query(None),
     vendor_supplier_name_contains: str | None = Query(None),
     narration_contains: str | None = Query(None),
+    consignee_address_contains: str | None = Query(None),
     # date range
     po_date_from: str | None = Query(None),
     po_date_to: str | None = Query(None),
@@ -229,6 +230,7 @@ async def list_pos(
         order_reference_no_contains=order_reference_no_contains,
         vendor_supplier_name_contains=vendor_supplier_name_contains,
         narration_contains=narration_contains,
+        consignee_address_contains=consignee_address_contains,
         po_date_from=po_date_from, po_date_to=po_date_to,
         gross_total_min=gross_total_min, gross_total_max=gross_total_max,
         total_amount_min=total_amount_min, total_amount_max=total_amount_max,
@@ -446,6 +448,7 @@ async def get_receipt_summary(
     return {
         "transaction_no": transaction_no,
         "entity": header.get("entity"),
+        "consignee_address": header.get("consignee_address"),
         "completed": any_box and all_matched,
         "status": status,
         "total_lines": len(lines),

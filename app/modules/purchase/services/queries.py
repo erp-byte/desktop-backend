@@ -29,6 +29,7 @@ def build_where_clause(
         conditions.append(
             f"(h.transaction_no ILIKE ${param_idx}"
             f" OR h.vendor_supplier_name ILIKE ${param_idx}"
+            f" OR h.consignee_address ILIKE ${param_idx}"
             f" OR h.customer_party_name ILIKE ${param_idx}"
             f" OR h.po_number ILIKE ${param_idx}"
             f" OR h.invoice_number ILIKE ${param_idx})"
@@ -207,6 +208,7 @@ def build_po_detail(header, lines, sections_by_line, boxes_by_line_section, sect
         "order_reference_no": h.get("order_reference_no"),
         "narration": h.get("narration"),
         "vendor_supplier_name": h.get("vendor_supplier_name"),
+        "consignee_address": h.get("consignee_address"),
         "gross_total": _float_or_none(h.get("gross_total")),
         "total_amount": _float_or_none(h.get("total_amount")),
         "sgst_amount": _float_or_none(h.get("sgst_amount")),

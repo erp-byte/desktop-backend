@@ -59,6 +59,9 @@ _HEADER_ALIASES: tuple[tuple[str, str], ...] = (
     ("voucher no", "po_number"),
     ("vch no", "po_number"),
     ("narration", "narration"),
+    # The full phrase only: a bare "consignee" would also take a "Consignee
+    # Name" / "Consignee GSTIN" column sitting to its left.
+    ("consignee address", "consignee_address"),
     ("particulars", "particulars"),
     ("date", "date"),
     ("alt. units", "alt_units"),
@@ -72,6 +75,7 @@ _HEADER_ALIASES: tuple[tuple[str, str], ...] = (
     ("cgst", "cgst_amount"),
     ("igst", "igst_amount"),
     ("round off", "round_off"),
+    ("rounding off", "round_off"),    # the Oct 26 export's name for it
     ("apmc", "apmc_tax"),
     ("packing charges", "packing_charges"),
     ("loading", "loading_unloading_charges"),
@@ -174,6 +178,16 @@ def _is_grand_total_row(row: tuple, col_map: dict[str, int]) -> bool:
     return particulars is not None and particulars.lower().startswith("grand total")
 
 
+def _is_cancelled_voucher(row: tuple, col_map: dict[str, int]) -> bool:
+    """Tally keeps a cancelled voucher in the register as a bare row: date and
+    voucher no., Particulars "(cancelled )", no supplier, address or lines.
+    Parsed as a PO it commits as supplier "(cancelled )" with no lines, and on
+    re-upload of a PO entered before it was cancelled, the update would replace
+    its lines with none."""
+    particulars = _safe_str(_get(row, col_map, "particulars"))
+    return particulars is not None and particulars.lower().startswith("(cancelled")
+
+
 def parse_po_book(file_bytes: bytes) -> list[dict]:
     """
     Parse a Purchase Order Book Excel file.
@@ -185,6 +199,7 @@ def parse_po_book(file_bytes: bytes) -> list[dict]:
 
     current_po = None
     all_orders = []
+    cancelled: list[str] = []
 
     col_map, data_start_row = _detect_columns(ws)
 
@@ -192,6 +207,15 @@ def parse_po_book(file_bytes: bytes) -> list[dict]:
         row_vals = tuple(row)
 
         if _is_grand_total_row(row_vals, col_map):
+            continue
+
+        if _is_header_row(row_vals, col_map) and _is_cancelled_voucher(row_vals, col_map):
+            # Close the PO before it; anything up to the next voucher row is
+            # not attached to the cancelled one (it has no lines of its own).
+            if current_po is not None:
+                all_orders.append(current_po)
+            current_po = None
+            cancelled.append(_safe_str(_get(row_vals, col_map, "po_number")) or "?")
             continue
 
         if _is_header_row(row_vals, col_map):
@@ -202,6 +226,7 @@ def parse_po_book(file_bytes: bytes) -> list[dict]:
             current_po = {
                 "po_date": _parse_date(_get(row_vals, col_map, "date")),
                 "vendor_supplier_name": _safe_str(_get(row_vals, col_map, "particulars")),
+                "consignee_address": _safe_str(_get(row_vals, col_map, "consignee_address")),
                 "voucher_type": _safe_str(_get(row_vals, col_map, "voucher_type")),
                 "po_number": _safe_str(_get(row_vals, col_map, "po_number")),
                 "order_reference_no": _safe_str(_get(row_vals, col_map, "order_reference_no")),
@@ -223,6 +248,12 @@ def parse_po_book(file_bytes: bytes) -> list[dict]:
         elif _is_line_row(row_vals, col_map):
             if current_po is None:
                 continue
+
+            # The address is per PO and normally sits on the voucher row; take
+            # it from the first line that carries one if that row left it blank.
+            if not current_po["consignee_address"]:
+                current_po["consignee_address"] = _safe_str(
+                    _get(row_vals, col_map, "consignee_address"))
 
             # "Alt. Units" is Tally's secondary *quantity*, not a unit weight.
             # Kept for reference but must NOT feed `uom`: uom is the per-unit
@@ -257,8 +288,9 @@ def parse_po_book(file_bytes: bytes) -> list[dict]:
             line["line_number"] = i
 
     logger.info(
-        "Parsed PO Book: %d POs, %d total lines",
+        "Parsed PO Book: %d POs, %d total lines, %d cancelled vouchers skipped %s",
         len(all_orders), sum(len(po["lines"]) for po in all_orders),
+        len(cancelled), cancelled,
     )
 
     return all_orders

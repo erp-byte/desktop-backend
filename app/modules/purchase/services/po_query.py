@@ -4,7 +4,8 @@ WHERE-clause builder for the rich filter set:
     • Equality: transaction_no, entity, po_number, voucher_type,
       order_reference_no, supplier_id, vendor_supplier_name
     • ILIKE contains: po_number_contains, order_reference_no_contains,
-      vendor_supplier_name_contains, narration_contains
+      vendor_supplier_name_contains, narration_contains,
+      consignee_address_contains
     • Date range: po_date_from, po_date_to
     • Numeric ranges (_min/_max) on every monetary column
     • Visibility: include_deleted toggle
@@ -53,13 +54,14 @@ _ILIKE_FIELDS: dict[str, str] = {
     "order_reference_no_contains": "order_reference_no",
     "vendor_supplier_name_contains": "vendor_supplier_name",
     "narration_contains": "narration",
+    "consignee_address_contains": "consignee_address",
 }
 
 _SORTABLE_COLUMNS: frozenset[str] = frozenset({
     "po_date", "po_number", "vendor_supplier_name", "supplier_id",
     "gross_total", "total_amount", "transaction_no", "created_at",
     # Also-projected columns the PO list UI now offers as sort keys.
-    "voucher_type", "order_reference_no", "entity",
+    "voucher_type", "order_reference_no", "entity", "consignee_address",
 })
 
 # "Fully received" tolerance — received net weight must reach at least this
@@ -273,6 +275,7 @@ def header_row_to_listitem(row) -> dict:
         "order_reference_no": row["order_reference_no"],
         "narration": row["narration"],
         "vendor_supplier_name": row["vendor_supplier_name"],
+        "consignee_address": row["consignee_address"] if "consignee_address" in row.keys() else None,
         "supplier_id": row["supplier_id"] if "supplier_id" in row.keys() else None,
         "status": row["status"] if "status" in row.keys() else None,
         "gross_total": _f(row["gross_total"]),
