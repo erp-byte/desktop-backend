@@ -67,6 +67,11 @@ class _CloseConn(_InTx):
             return {"job_card_id": UPSTREAM, "next_job_card_id": DOWNSTREAM, "output_kind": "WIP",
                     "uom": "kg", "dispatched_to_next_kg": 0, "entity": "cfpl", "output_code": None,
                     "fg_sku_name": "Roasted Almonds 200g"}
+        if s.startswith("SELECT is_balanced, balance_difference_qty, total_input_qty FROM job_card_accounting_v2"):
+            # The balance lock now always reads the saved accounting (so an
+            # override is only recorded when it was really needed). Balanced
+            # here: these tests are about what the close unlocks.
+            return {"is_balanced": True, "balance_difference_qty": 0, "total_input_qty": 100}
         if s.startswith("UPDATE job_card_batch_v2"):
             return {"batch_id": 55, "job_card_id": UPSTREAM, "status": "closed"}
         if "INSERT INTO job_card_output_v2" in s:

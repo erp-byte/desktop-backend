@@ -56,8 +56,9 @@ def _session(**over) -> dict:
 class _Conn:
     """Answers the reads the outputs handler issues before the services run."""
 
-    def __init__(self, *, open_batches=(BATCH,)):
+    def __init__(self, *, open_batches=(BATCH,), floor_manager=False):
         self.open_batches = list(open_batches)
+        self.floor_manager = floor_manager
         self.calls: list[tuple[str, tuple]] = []
 
     async def fetch(self, sql, *args):
@@ -81,6 +82,9 @@ class _Conn:
 
     async def fetchval(self, sql, *args):
         self.calls.append((sql, args))
+        if "FROM auth_role" in sql:
+            # balance_override.can_override_balance: is the caller a floor manager?
+            return self.floor_manager
         return None
 
     async def execute(self, sql, *args):
@@ -245,12 +249,60 @@ def test_unbalanced_batch_saves_but_does_not_complete(client_with, spy):
     assert "close_batch" not in spy["order"]
 
 
-def test_admin_can_override_an_unbalanced_completion(client_with, spy):
+def test_admin_can_override_an_unbalanced_completion_with_a_reason(client_with, spy):
     res = client_with(_Conn()).post(URL, json=_body(
-        complete_batch=True, is_balanced=False, allow_unbalanced=True))
+        complete_batch=True, is_balanced=False, allow_unbalanced=True,
+        override_reason="Scale was recalibrated"))
     assert res.status_code == 200, res.text
     assert res.json()["completed"] is True
     assert spy["close_kwargs"]["allow_unbalanced"] is True
+    assert spy["close_kwargs"]["override_reason"] == "Scale was recalibrated"
+
+
+def test_an_override_without_a_reason_saves_but_does_not_complete(client_with, spy):
+    res = client_with(_Conn()).post(URL, json=_body(
+        complete_batch=True, is_balanced=False, allow_unbalanced=True, override_reason="  "))
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["completed"] is False
+    assert body["completion_blocked"]["error"] == "override_reason_required"
+    assert "close_batch" not in spy["order"]
+
+
+def test_a_floor_manager_can_override_with_a_reason(client_with, spy):
+    res = client_with(_Conn(floor_manager=True), _session(is_admin=False)).post(URL, json=_body(
+        complete_batch=True, is_balanced=False, allow_unbalanced=True,
+        override_reason="Recounted the boxes"))
+    assert res.status_code == 200, res.text
+    assert res.json()["completed"] is True
+    assert spy["close_kwargs"]["allow_unbalanced"] is True
+
+
+def test_a_floor_manager_is_told_the_override_is_there(client_with, spy):
+    res = client_with(_Conn(floor_manager=True), _session(is_admin=False)).post(URL, json=_body(
+        complete_batch=True, is_balanced=False, balance_difference_qty=0.42))
+    blocked = res.json()["completion_blocked"]
+    assert blocked["override_available"] is True
+    assert "off by 0.420 kg" in blocked["message"]
+    assert "admin or floor manager" in blocked["message"]
+
+
+def test_server_side_balance_refusal_keeps_the_save(client_with, spy):
+    """The screen said balanced but the saved accounting doesn't. close_batch
+    refuses before writing anything, so the save stands rather than the whole
+    request rolling back and losing what was typed."""
+    spy["close_result"] = {"error": "batch_unbalanced", "balance_difference_qty": 0.5,
+                           "allowed_difference_kg": 0.25,
+                           "message": "Batch 3 doesn't balance: it is off by 0.500 kg, "
+                                      "and 0.250 kg is allowed."}
+    res = client_with(_Conn()).post(URL, json=_body(complete_batch=True, is_balanced=True))
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["completed"] is False
+    assert body["completion_blocked"]["error"] == "unbalanced"
+    assert body["completion_blocked"]["allowed_difference_kg"] == 0.25
+    assert body["completion_blocked"]["message"].startswith("Output saved, but the batch was not completed.")
+    assert "record_output" in spy["order"]
 
 
 def test_a_non_admin_cannot_override_an_unbalanced_completion(client_with, spy):
