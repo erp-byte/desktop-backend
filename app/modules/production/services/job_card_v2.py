@@ -4319,7 +4319,9 @@ async def _derive_accounting_payload(conn, job_card_id: int) -> dict:
 async def complete_job_card(conn, *, job_card_id: int,
                              force: bool = False,
                              request_id: int | None = None,
-                             completed_by: str | None = None) -> dict:
+                             completed_by: str | None = None,
+                             override_allowed: bool = False,
+                             override_reason: str | None = None) -> dict:
     """Move a v2 JC from 'in_progress' to 'completed'.
 
     Side effects:
@@ -4338,9 +4340,17 @@ async def complete_job_card(conn, *, job_card_id: int,
         amendment service layer (B11); until B11 ships, the request_id
         is accepted as an audit-trail token only.
 
+        Or: `override_allowed` (the caller is an admin or a floor manager —
+        the route decides) plus an `override_reason` completes it anyway;
+        that is stamped as a forced close by `completed_by` and recorded
+        as a 'deviation' remark with how far off it was (balance_override).
+
     R13 closure gate:
         Refuses if any batch row for this JC is still 'open'. Batches must
         be closed (or cancelled) before /complete can run.
+
+    An open shift segment is ended here (as the Stop button would) rather
+    than refusing — the web has no shift controls, so it blocked people.
 
     NOTE: v2 does NOT auto-unlock the next stage on complete. The dispatch
     flow (POST /dispatch-to-next) handles that — handing off material to
@@ -4362,13 +4372,20 @@ async def complete_job_card(conn, *, job_card_id: int,
         return {"error": "invalid_status",
                 "message": f"Can only complete in_progress JCs (currently '{jc['status']}')"}
 
-    open_shifts = await conn.fetchval(
-        "SELECT COUNT(*) FROM job_card_shift_log_v2 WHERE job_card_id=$1 AND end_at IS NULL",
+    # Completing ends any shift segment still running (same roll-up as Stop).
+    open_shifts = await conn.fetch(
+        "SELECT log_id FROM job_card_shift_log_v2 WHERE job_card_id=$1 AND end_at IS NULL",
         job_card_id,
     )
+    for shift in open_shifts:
+        # No notes: stop_shift REPLACES the segment's notes when given any.
+        stopped = await stop_shift(conn, log_id=shift["log_id"])
+        if stopped.get("error") not in (None, "already_closed"):
+            return {"error": "open_shift",
+                    "message": "A shift on this job card is still running and couldn't be ended."}
     if open_shifts:
-        return {"error": "open_shift",
-                "message": "Stop the open shift segment before completing"}
+        jc = {**dict(jc), "total_time_min": await conn.fetchval(
+            "SELECT total_time_min FROM job_card_v2 WHERE job_card_id=$1", job_card_id)}
 
     # ── R13: refuse if any batch is still open.
     open_batch = await conn.fetchrow(
@@ -4545,16 +4562,55 @@ async def complete_job_card(conn, *, job_card_id: int,
             }
         override_valid = True
 
+    # Unbalanced and no approved amendment: say how far off, how much is
+    # allowed and who can complete it — or, for an admin / floor manager who
+    # typed a reason, complete it anyway and put the why on the card.
+    reason_override: str | None = None
+    unbalanced_note: str | None = None
     if not acct["is_balanced"] and not override_valid:
-        return {
-            "error": "unbalanced",
-            "balance_difference_qty": float(acct["balance_difference_qty"]),
-            "message": (
-                "Accounting is unbalanced. Resolve the variance OR file an "
-                "'unbalanced_close_override' amendment (R8 row 12) and "
-                "retry with force=true and the approved request_id."
-            ),
-        }
+        from app.modules.production.services import balance_override as bo
+        worst = await conn.fetchrow(
+            """
+            SELECT a.balance_difference_qty, a.total_input_qty, b.batch_number
+            FROM   job_card_accounting_v2 a
+            LEFT   JOIN job_card_batch_v2 b ON b.batch_id = a.batch_id
+            WHERE  a.job_card_id = $1 AND COALESCE(a.is_balanced, FALSE) = FALSE
+            ORDER  BY abs(COALESCE(a.balance_difference_qty, 0)) DESC
+            LIMIT  1
+            """,
+            job_card_id,
+        )
+        diff_src = (worst["balance_difference_qty"]
+                    if worst and worst["balance_difference_qty"] is not None
+                    else acct["balance_difference_qty"])
+        diff = float(diff_src or 0)
+        allowed = bo.allowed_difference_kg(
+            worst["total_input_qty"] if worst else None,
+            await bo.tolerance_for_job_card(conn, job_card_id),
+        )
+        batch_number = worst["batch_number"] if worst else None
+        what = f"Batch {batch_number}" if batch_number is not None else "This job card"
+        # Completing has no separate override flag: only a typed reason from an
+        # admin / floor manager is an override attempt. A plain COMPLETE gets
+        # the numbers; a reason that says nothing is asked for again.
+        if not override_allowed or not (override_reason or "").strip():
+            return {
+                "error": "unbalanced",
+                "balance_difference_qty": diff,
+                "allowed_difference_kg": round(allowed, 3),
+                "batch_number": batch_number,
+                "message": bo.unbalanced_message(diff, allowed, what=what),
+            }
+        reason_override = bo.clean_reason(override_reason)
+        if reason_override is None:
+            return {
+                "error": "override_reason_required",
+                "balance_difference_qty": diff,
+                "allowed_difference_kg": round(allowed, 3),
+                "message": "Type a reason for completing this job card although it doesn't balance.",
+            }
+        unbalanced_note = bo.override_remark(diff, allowed, reason_override, what="Job card")
+    forced = override_valid or reason_override is not None
 
     # Fallback total_time_min only when shift log didn't populate it.
     use_fallback = (jc["total_time_min"] is None or float(jc["total_time_min"]) == 0)
@@ -4579,10 +4635,14 @@ async def complete_job_card(conn, *, job_card_id: int,
         RETURNING status, end_time, total_time_min, force_closed
         """,
         job_card_id, use_fallback,
-        override_valid,
+        forced,
         request_id if override_valid else None,
-        completed_by if override_valid else None,
+        completed_by if forced else None,
     )
+    if unbalanced_note is not None:
+        from app.modules.production.services import balance_override as bo
+        await bo.record_override_remark(conn, job_card_id=job_card_id,
+                                        content=unbalanced_note, recorded_by=completed_by)
     return {
         "completed":      True,
         "job_card_id":    job_card_id,

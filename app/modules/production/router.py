@@ -6575,8 +6575,10 @@ class RecordOutputV2Request(BaseModel):
     is_balanced:            bool  | None = None
     balance_difference_qty: float | None = None
     closure_remarks:        str   | None = None
-    # Admin-only: complete even though the accounting is unbalanced.
+    # Complete even though the accounting is unbalanced: admins and floor
+    # managers only, and only with a typed reason (recorded on the card).
     allow_unbalanced:       bool         = False
+    override_reason:        str   | None = None
     # Operator-chosen partial dispatch. Removing the Close Batch button
     # must NOT remove this decision -- omitted means "the whole produced
     # qty flows to the next JC", which is the legacy behaviour and not
@@ -6975,16 +6977,24 @@ async def record_output_v2(
                 # everything the operator just typed, which is a worse
                 # outcome than an open batch. So: saved, not completed,
                 # and the UI says which half happened.
+                from app.modules.production.services import balance_override as _bo
+                may_override = await _bo.can_override_balance(conn, user)
+                reason = _bo.clean_reason(body.override_reason)
+                wants_override = bool(body.allow_unbalanced and may_override)
+                override = wants_override and reason is not None
                 unbalanced = body.is_balanced is False
-                if unbalanced and not (body.allow_unbalanced and user.is_admin):
+                if unbalanced and not override:
                     result["completed"] = False
                     result["completion_blocked"] = {
-                        "error": "unbalanced",
+                        "error": "override_reason_required" if wants_override else "unbalanced",
                         "balance_difference_qty": body.balance_difference_qty,
-                        "message": (
-                            "Output saved, but the batch was not completed: "
-                            "its accounting is unbalanced. Correct the "
-                            "figures, or ask an admin to override."
+                        "override_available": may_override,
+                        "message": "Output saved, but the batch was not completed: " + (
+                            "type a reason to complete it although it doesn't balance."
+                            if wants_override else
+                            f"it doesn't balance (off by {abs(body.balance_difference_qty or 0):.3f} kg). "
+                            "Correct the figures, or an admin or floor manager can "
+                            "complete it anyway with a reason."
                         ),
                     }
                 else:
@@ -7010,10 +7020,23 @@ async def record_output_v2(
                         closure_remarks=body.closure_remarks,
                         dispatch_qty_kg=body.dispatch_qty_kg,
                         notes=body.notes,
-                        allow_unbalanced=bool(body.allow_unbalanced and user.is_admin),
+                        allow_unbalanced=override,
+                        override_reason=reason,
                         closed_by=user.full_name or user.phone,
                     )
-                    if close_res.get("error"):
+                    if close_res.get("error") == "batch_unbalanced":
+                        # The saved accounting doesn't balance even though the
+                        # screen thought it did. Refused before any write, so
+                        # the save stands: saved, not completed (as above).
+                        result["completed"] = False
+                        result["completion_blocked"] = {
+                            **close_res,
+                            "error": "unbalanced",
+                            "override_available": may_override,
+                            "message": "Output saved, but the batch was not completed. "
+                                       + close_res.get("message", ""),
+                        }
+                    elif close_res.get("error"):
                         # A refused close must not silently look like a
                         # successful save: raising rolls the whole thing
                         # back, so the operator retries against a
@@ -7025,8 +7048,9 @@ async def record_output_v2(
                             else 400,
                             detail=close_res,
                         )
-                    result["completed"] = True
-                    result["batch_close"] = close_res
+                    else:
+                        result["completed"] = True
+                        result["batch_close"] = close_res
 
     # Structured envelopes so the frontend's friendlyApiError mapper can
     # decode the code and render a sentence ("Cannot save — an output qty
@@ -7109,9 +7133,11 @@ class BatchCloseRequest(BaseModel):
     is_balanced:            bool  | None = None
     balance_difference_qty: float | None = None
     closure_remarks:        str   | None = None
-    # Admin maker-checker override: close the batch even though its accounting
-    # is unbalanced. Only honoured for admins (enforced in the endpoint).
+    # Close the batch even though its accounting is unbalanced: admins and
+    # floor managers only, with a typed reason (enforced in the endpoint and
+    # recorded on the card).
     allow_unbalanced:       bool         = False
+    override_reason:        str   | None = None
     # Stage 3 final: per-batch partial dispatch.  When omitted, the
     # full produced_qty_kg goes to the next JC (legacy behaviour).
     # When supplied, only `dispatch_qty_kg` flows downstream and the
@@ -7175,8 +7201,16 @@ async def batch_close_v2(
     """R13: close a batch. In one txn: stamp batch row, write the output,
     auto-dispatch to next JC, unlock downstream if it was waiting."""
     from app.modules.production.services import job_card_batch_v2 as svc
+    from app.modules.production.services import balance_override as _bo
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
+        may_override = await _bo.can_override_balance(conn, user)
+        reason = _bo.clean_reason(body.override_reason)
+        if body.allow_unbalanced and may_override and reason is None:
+            raise HTTPException(status_code=400, detail={
+                "error": "override_reason_required",
+                "message": "Type a reason for closing this batch although it doesn't balance.",
+            })
         async with conn.transaction():
             result = await svc.close_batch(
                 conn,
@@ -7197,8 +7231,10 @@ async def batch_close_v2(
                 closure_remarks=body.closure_remarks,
                 dispatch_qty_kg=body.dispatch_qty_kg,
                 notes=body.notes,
-                # Override is admin-only — a non-admin's allow_unbalanced is ignored.
-                allow_unbalanced=(body.allow_unbalanced and bool(getattr(user, "is_admin", False))),
+                # Admins and floor managers, with a reason; anyone else's
+                # allow_unbalanced is ignored.
+                allow_unbalanced=bool(body.allow_unbalanced and may_override and reason),
+                override_reason=reason,
                 closed_by=user.full_name or user.phone,
             )
     _raise_if_locked(result)
@@ -7210,9 +7246,9 @@ async def batch_close_v2(
                                 "batch_date_taken", "batch_number_taken"):
         raise HTTPException(status_code=409, detail=result)
     if result.get("error") == "batch_unbalanced":
-        # 409 — the batch's accounting doesn't net out; the UI surfaces the
-        # variance + offers the admin override.
-        raise HTTPException(status_code=409, detail=result)
+        # 409 — the batch's accounting doesn't net out; the UI shows how far
+        # off and, for an admin / floor manager, offers the override.
+        raise HTTPException(status_code=409, detail={**result, "override_available": may_override})
     if result.get("error") in ("invalid_produced_qty", "yield_unreasonable"):
         raise HTTPException(status_code=400, detail=result.get("message", result["error"]))
     # The NEXT card this close auto-dispatched into and released — not job_card_id.
@@ -7623,6 +7659,9 @@ class CompleteJCV2Request(BaseModel):
     bom_amendment_request_v2 row.
     """
     force:      bool       = Field(default=False)
+    # Admins and floor managers: complete even though the accounting doesn't
+    # balance, with this reason (recorded as a remark on the card).
+    override_reason: str | None = None
     request_id: int | None = Field(
         default=None,
         description=(
@@ -7648,9 +7687,11 @@ async def complete_jc_v2(
         force=true + request_id.
     """
     from app.modules.production.services.job_card_v2 import complete_job_card
+    from app.modules.production.services import balance_override as _bo
     pool = request.app.state.db_pool
     body = body or CompleteJCV2Request()
     async with pool.acquire() as conn:
+        may_override = await _bo.can_override_balance(conn, user)
         async with conn.transaction():
             result = await complete_job_card(
                 conn,
@@ -7658,11 +7699,17 @@ async def complete_jc_v2(
                 force=body.force,
                 request_id=body.request_id,
                 completed_by=user.full_name or user.phone,
+                override_allowed=may_override,
+                override_reason=body.override_reason,
             )
     if result.get("error") == "job_card_not_found":
         raise HTTPException(status_code=404, detail="Job card not found")
     if result.get("error") == "no_accounting":
         raise HTTPException(status_code=400, detail=result["message"])
+    if result.get("error") == "override_reason_required":
+        raise HTTPException(status_code=400, detail=result)
+    if result.get("error") == "unbalanced":
+        raise HTTPException(status_code=409, detail={**result, "override_available": may_override})
     if result.get("error") == "accounting_save_failed":
         # Auto-derive ran but save_accounting refused (most likely a
         # locked JC). Surface enough detail for the operator to act.
