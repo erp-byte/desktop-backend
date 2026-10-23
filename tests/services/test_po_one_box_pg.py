@@ -289,3 +289,28 @@ def test_backfill_sql_agrees_with_the_backend_rule(db):
     assert got == want
     assert got["TR-2"] == "fully received" and got["TR-3"] == "partially received"
     assert got["TR-4"] == "pending" and got[TXN] == "partially received"   # 30 of 70 kg
+
+
+def _ims_box(box_id, net=None):
+    """A box copied from IMS (ims_boxes_to_erp): client_key 'ims:...', no stock."""
+    q(None, "INSERT INTO po_section (transaction_no, line_number, section_number, lot_number, box_count, client_key) "
+            "VALUES ($1, 1, 9, 'IMS-LOT', 1, 'ims:cfpl:inward:TR-OLD:1') ON CONFLICT DO NOTHING RETURNING 1", TXN)
+    q(None, "INSERT INTO po_box (box_id, transaction_no, line_number, section_number, box_number, net_weight, client_key) "
+            "VALUES ($1, $2, 1, 9, 1, $3, 'ims:cfpl:inward:box:' || $1) RETURNING 1", box_id, TXN, net)
+
+
+def test_a_box_copied_from_ims_never_books_stock(db):
+    """Its stock came into the ERP with the stock take: weighing it in Material
+    In, or correcting it, must not add a batch."""
+    _ims_box("77777777-5")
+    update(db, "77777777-5", gross_weight=10.5, net_weight=10)
+    assert q(db, "SELECT count(*) AS n FROM inventory_batch WHERE batch_id = '77777777-5'") == [{"n": 0}]
+    assert q(db, "SELECT net_weight FROM po_box WHERE box_id = '77777777-5'") == [{"net_weight": 10}]
+
+
+def test_a_new_box_does_not_continue_an_ims_id_series(db):
+    """An IMS save's other boxes, not copied, may still carry ids in that
+    series: a new ERP box must not take one of them."""
+    _ims_box("77777777-5", net=9)
+    box, _ = create(db, **DRAFT, box_number=1, client_key="new-1")
+    assert not box.box_id.startswith("77777777-")

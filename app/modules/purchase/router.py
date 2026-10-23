@@ -641,11 +641,13 @@ def _is_weighed(net_weight) -> bool:
 async def _book_missing_inward_batches(conn, header, transaction_no: str, box_ids: list[str]) -> None:
     """Create the batch for boxes of this PO that now carry a net weight but
     have no batch yet (they were saved before weighing). Boxes that already
-    have a batch are left as they are."""
+    have a batch are left as they are, and so are boxes copied from IMS
+    (client_key 'ims:...'): their stock came into the ERP with the stock take."""
     if not box_ids:
         return
+    not_ims = "AND (b.client_key IS NULL OR b.client_key NOT LIKE 'ims:%')" if await _client_keys(conn) else ""
     rows = await conn.fetch(
-        """
+        f"""
         SELECT b.box_id, b.lot_number, b.net_weight, l.sku_name,
                s.manufacturing_date, s.expiry_date
           FROM po_box b
@@ -658,6 +660,7 @@ async def _book_missing_inward_batches(conn, header, transaction_no: str, box_id
            AND b.box_id = ANY($2::text[])
            AND b.net_weight > 0
            AND NOT EXISTS (SELECT 1 FROM inventory_batch ib WHERE ib.batch_id = b.box_id)
+           {not_ims}
         """,
         transaction_no,
         box_ids,
@@ -993,10 +996,13 @@ async def _next_box_ids(conn, transaction_no: str, proposed: str | None) -> tupl
     transaction's existing 8-digit base (the client's proposed id seeds it for
     a PO's first boxes) and take the next counter GLOBALLY for that base --
     past the ids of deleted boxes too (box_edit_logs), because a deleted box's
-    printed label and stock batch still carry its id. Call under _BOX_LOCK_SQL."""
+    printed label and stock batch still carry its id. Boxes copied from IMS
+    (client_key 'ims:...') don't lend their base: an IMS save's other boxes,
+    not copied, still carry ids in that series. Call under _BOX_LOCK_SQL."""
     logged = await _box_log(conn)
+    not_ims = "AND (client_key IS NULL OR client_key NOT LIKE 'ims:%')" if await _client_keys(conn) else ""
     latest = await conn.fetchval(
-        "SELECT box_id FROM po_box WHERE transaction_no = $1 ORDER BY created_at DESC, box_id DESC LIMIT 1",
+        f"SELECT box_id FROM po_box WHERE transaction_no = $1 {not_ims} ORDER BY created_at DESC, box_id DESC LIMIT 1",
         transaction_no,
     )
     if not latest and logged:
@@ -1474,6 +1480,8 @@ _BOX_IN_USE: tuple[tuple[str, str, str], ...] = (
     ("jc_box_scan", "box_id", "a job card scan"),
     ("issue_note_line", "box_id", "an issue note"),
     ("material_document_line", "box_id", "a material document"),
+    ("cfpl_cold_stocks", "box_id", "cold storage stock"),
+    ("cdpl_cold_stocks", "box_id", "cold storage stock"),
 )
 
 
