@@ -24,10 +24,9 @@ import logging
 from datetime import date, datetime
 from decimal import Decimal
 
-from asyncpg.exceptions import CheckViolationError
-
 from app.core.helpers import insert_with_pk_retry, new_short_time_id  # noqa: F401
 from app.core.warehouse_scope import WAREHOUSE_NORM_ANY_SQL, WAREHOUSE_NORM_SQL
+from app.modules.production.services import job_card_v2, so_reservation
 from app.modules.production.services.job_card_v2 import (
     _resolve_sfg_seam_code,
     is_packing_stage,
@@ -275,40 +274,16 @@ async def create_plan(conn, payload: dict) -> dict:
                 )
             await insert_with_pk_retry(conn, _insert_step)
 
-        # ── Bump planned_qty on each linked so_fulfillment_v2 row ──────────
-        # When successful, pending_qty_kg / pending_qty_units on the
-        # fulfillment auto-decrement (they're GENERATED ALWAYS columns).
-        # The DB enforces non-negative pending via chk_pending_*_nonneg;
-        # if the user tried to over-allocate, that throws and we surface
-        # a friendly error.
-        fids = ln.get('linked_so_fulfillment_ids') or []
-        planned_kg    = float(ln.get('planned_qty_kg', 0) or 0)
-        planned_units = float(ln.get('planned_qty_units', 0) or 0)
-        if fids and (planned_kg > 0 or planned_units > 0):
-            try:
-                await conn.execute(
-                    """
-                    UPDATE so_fulfillment_v2
-                       SET planned_qty_kg    = planned_qty_kg    + $1,
-                           planned_qty_units = planned_qty_units + $2
-                     WHERE so_fulfillment_id = ANY($3)
-                    """,
-                    planned_kg, planned_units, fids,
-                )
-            except CheckViolationError as exc:
-                # chk_pending_kg_nonneg / chk_pending_units_nonneg fires
-                # when this allocation would push effective pending below
-                # zero. Roll the whole create_plan tx back via raising —
-                # the router wraps us in conn.transaction() so any prior
-                # inserts in this run get reverted automatically.
-                # constraint_name is set dynamically by asyncpg (not in its
-                # type stubs) — read via getattr so the type checker is happy
-                # and a missing attribute degrades to None instead of raising.
-                raise ValueError(
-                    f"Would over-allocate fulfillment {fids}: "
-                    f"requested {planned_kg} kg / {planned_units} pcs but "
-                    f"pending isn't enough. ({getattr(exc, 'constraint_name', None)})"
-                ) from exc
+        # ── Reserve the line's qty on its linked so_fulfillment_v2 rows ────
+        # pending_qty_kg / pending_qty_units on the fulfillment auto-decrement
+        # (GENERATED ALWAYS columns). Over-allocating raises OverAllocation (a
+        # ValueError): the router's transaction rolls the whole create back and
+        # answers 400 over_allocation. A line tied to several rows fills them in
+        # turn instead of taking its whole qty on each (so_reservation).
+        await so_reservation.reserve(
+            conn, ln.get('linked_so_fulfillment_ids') or [],
+            kg=ln.get('planned_qty_kg', 0), units=ln.get('planned_qty_units', 0),
+        )
 
     logger.info("Plan v2 created: plan_id=%d with %d line(s)", plan_id, len(line_ids))
     return {"plan_id": plan_id, "plan_line_ids": line_ids}
@@ -592,6 +567,11 @@ async def update_plan_line(conn, plan_line_id: int, fields: dict) -> dict:
 
     Zero/negative qty surfaces a ValueError so the router can map it to a
     clean 400 instead of bubbling the raw asyncpg CHECK violation.
+
+    A qty change moves the line's SO reservation by the same amount (it used to
+    change the line only, so SO Creation showed the wrong pending qty), raising
+    OverAllocation when the SO hasn't the extra. Refused on a cancelled /
+    executed plan, and below what the line's job cards already carry.
     """
     allowed = {'planned_qty_kg', 'planned_qty_units', 'area', 'deadline_date'}
     sets, params, idx = [], [], 1
@@ -604,6 +584,35 @@ async def update_plan_line(conn, plan_line_id: int, fields: dict) -> dict:
         params.append(v); idx += 1
     if not sets:
         return {"error": "no_change", "message": "No editable fields supplied"}
+
+    qty_keys = [k for k in ('planned_qty_kg', 'planned_qty_units') if fields.get(k) is not None]
+    before = None
+    if qty_keys:
+        before = await conn.fetchrow(
+            """
+            SELECT l.planned_qty_kg, l.planned_qty_units, l.linked_so_fulfillment_ids,
+                   p.status AS plan_status,
+                   (SELECT COALESCE(SUM(j.planned_qty_kg), 0) FROM job_card_v2 j
+                     WHERE j.plan_line_id = l.plan_line_id
+                       AND j.prev_job_card_id IS NULL AND j.deleted_at IS NULL) AS carded_kg
+              FROM production_plan_line_v2 l
+              JOIN production_plan_v2 p ON p.plan_id = l.plan_id
+             WHERE l.plan_line_id = $1
+               FOR UPDATE OF l
+            """,
+            plan_line_id,
+        )
+        if not before:
+            return {"error": "not_found"}
+        if before["plan_status"] in ('cancelled', 'executed'):
+            return {"error": "plan_closed",
+                    "message": f"This plan is {before['plan_status']}; its quantities can't change."}
+        carded = float(before["carded_kg"] or 0)
+        if 'planned_qty_kg' in qty_keys and float(fields['planned_qty_kg']) < carded - 0.001:
+            return {"error": "below_carded",
+                    "message": (f"{carded:g} kg of this article already has job cards, so its "
+                                "quantity can't go below that. Change the job cards first.")}
+
     params.append(plan_line_id)
     result = await conn.fetchrow(
         f"UPDATE production_plan_line_v2 SET {', '.join(sets)} "
@@ -612,6 +621,12 @@ async def update_plan_line(conn, plan_line_id: int, fields: dict) -> dict:
     )
     if not result:
         return {"error": "not_found"}
+    if before is not None:
+        await so_reservation.move(
+            conn, plan_line_id, before["linked_so_fulfillment_ids"],
+            delta_kg=float(result["planned_qty_kg"] or 0) - float(before["planned_qty_kg"] or 0),
+            delta_units=float(result["planned_qty_units"] or 0) - float(before["planned_qty_units"] or 0),
+        )
     return {"updated": True, "line": _serialize_row(result)}
 
 
@@ -644,11 +659,26 @@ async def approve_plan(conn, plan_id: int, approved_by: str) -> dict:
 
     Plan-approve is the SOLE entry point for job-card creation in v2 — the
     old `production_order → generate_job_cards` flow is bypassed entirely.
-    Re-approving an already-approved plan is a no-op for the JC fan-out
-    (the generator guards against duplicates).
+    Articles that already have job cards (e.g. from Create Job Card) are left
+    as they are; the rest get theirs.
+
+    Refused, before anything is approved, when an article still to be carded has
+    no process steps or a step with no floor (plan_incomplete, listing them):
+    approve used to skip the first quietly and copy the blank floor onto the
+    second's cards, and still say "Plan approved" (audit 2026-10-23).
     """
     if not approved_by:
         return {"error": "missing_approver", "message": "approved_by is required"}
+    plan = await conn.fetchrow(
+        "SELECT status FROM production_plan_v2 WHERE plan_id = $1 FOR UPDATE", plan_id,
+    )
+    if not plan or plan["status"] not in ('draft', 'approved'):
+        return {"error": "not_found_or_invalid_status"}
+    problems = await approve_problems(conn, plan_id)
+    if problems:
+        return {"error": "plan_incomplete", "message": incomplete_message(problems),
+                "problems": problems}
+
     result = await conn.fetchrow(
         """
         UPDATE production_plan_v2
@@ -665,24 +695,78 @@ async def approve_plan(conn, plan_id: int, approved_by: str) -> dict:
 
     # Generate job cards. Failure here rolls back the approval — the router
     # wraps us in a transaction.
-    from app.modules.production.services.job_card_v2 import create_job_cards_from_plan
-    jc_result = await create_job_cards_from_plan(conn, plan_id)
+    jc_result = await job_card_v2.create_job_cards_from_plan(conn, plan_id)
 
-    # The plan row IS approved (the UPDATE above succeeded), so `approved` stays
-    # true. But JC generation can soft-fail (most commonly job_cards_already_exist
-    # on an idempotent re-approve) and that used to be buried inside `job_cards`,
-    # making the envelope read like a clean success. Surface the outcome at the
-    # top level so callers can react without digging into the nested dict.
+    # The outcome at the top level, so the screen says what actually happened
+    # instead of a bare "Plan approved".
     job_cards_created = "error" not in jc_result
+    lines = jc_result.get("lines") or []
     envelope = {
         "approved": True,
         "job_cards_created": job_cards_created,
+        "job_card_count": sum(len(ln.get("job_card_ids") or []) for ln in lines),
+        "articles_carded": sum(1 for ln in lines if ln.get("job_card_ids")),
+        "articles_already_carded": sum(1 for ln in lines if ln.get("skipped") == "already_carded"),
         "plan": _serialize_row(result),
         "job_cards": jc_result,
     }
     if not job_cards_created:
         envelope["job_cards_error"] = jc_result["error"]
     return envelope
+
+
+async def approve_problems(conn, plan_id: int) -> list[dict]:
+    """The articles approve would card but can't: no process steps, a step with
+    no floor, or steps left by several job-card chains (an article carded in
+    parts and then cancelled keeps every chain's steps — one approve chain would
+    run them all in a row). Articles that have job cards aren't checked."""
+    rows = await conn.fetch(
+        """
+        SELECT l.plan_line_id, l.fg_sku_name,
+               (SELECT COUNT(*) FROM production_plan_step_v2 s
+                 WHERE s.plan_line_id = l.plan_line_id) AS step_count,
+               (SELECT COUNT(*) FROM production_plan_step_v2 s
+                 WHERE s.plan_line_id = l.plan_line_id AND s.stage = 'packaging') AS pack_steps,
+               (SELECT array_agg(s.process_name ORDER BY s.step_order)
+                  FROM production_plan_step_v2 s
+                 WHERE s.plan_line_id = l.plan_line_id
+                   AND (s.floor IS NULL OR btrim(s.floor) = '')) AS no_floor
+          FROM production_plan_line_v2 l
+         WHERE l.plan_id = $1
+           AND NOT EXISTS (SELECT 1 FROM job_card_v2 j
+                            WHERE j.plan_line_id = l.plan_line_id AND j.deleted_at IS NULL)
+         ORDER BY l.plan_line_id
+        """,
+        plan_id,
+    )
+    problems = []
+    for r in rows:
+        if not r["step_count"]:
+            problems.append({"plan_line_id": r["plan_line_id"], "fg_sku_name": r["fg_sku_name"],
+                             "problem": "no_steps"})
+        elif r["no_floor"]:
+            problems.append({"plan_line_id": r["plan_line_id"], "fg_sku_name": r["fg_sku_name"],
+                             "problem": "no_floor", "steps": list(r["no_floor"])})
+        elif (r["pack_steps"] or 0) > 1:
+            problems.append({"plan_line_id": r["plan_line_id"], "fg_sku_name": r["fg_sku_name"],
+                             "problem": "several_chains"})
+    return problems
+
+
+def incomplete_message(problems: list[dict], *, shown: int = 5) -> str:
+    parts = []
+    for p in problems[:shown]:
+        name = p.get("fg_sku_name") or f"Line {p.get('plan_line_id')}"
+        if p["problem"] == "no_steps":
+            parts.append(f"{name} has no process steps")
+        elif p["problem"] == "several_chains":
+            parts.append(f"{name} has steps from more than one earlier job card chain")
+        else:
+            parts.append(f"{name}: no floor for {', '.join(s or 'a step' for s in p['steps'])}")
+    more = len(problems) - shown
+    tail = f"; and {more} more" if more > 0 else ""
+    return ("These articles can't be carded yet: " + "; ".join(parts) + tail
+            + ". Set the floors on the plan's lines, or card the article with Create Job Card.")
 
 
 _SPLIT_MODES = ("per_line", "sku", "customer")
@@ -716,6 +800,7 @@ async def validate_process_merge(conn, plan_ids: list[int]) -> dict:
         """
         SELECT l.plan_line_id, l.plan_id, l.fg_sku_name, l.bom_id,
                l.planned_qty_kg, l.planned_qty_units,
+               p.status                 AS plan_status,
                lower(trim(p.warehouse)) AS factory,
                lower(trim(p.entity))    AS entity,
                -- RM is consumed at the FIRST step, so that step's floor is the
@@ -782,6 +867,9 @@ async def validate_process_merge(conn, plan_ids: list[int]) -> dict:
             # (unstarted) cards — the UI badges it so the operator knows.
             "carded": bool(r["jc_count"]),
         }
+        if r["plan_status"] == 'cancelled':
+            ineligible.append({**base, "reason": "Plan is cancelled"})
+            continue
         if r["jc_started"]:
             ineligible.append({**base, "reason": "Job cards already started"})
             continue
@@ -968,128 +1056,171 @@ async def split_plan(conn, plan_id: int, mode: str = "per_line") -> dict:
     }
 
 
-async def cancel_plan(conn, plan_id: int, reason: str = "") -> dict:
-    """Set plan status to cancelled and release any planned_qty back to the
-    linked so_fulfillment_v2 rows so the same qty can be re-planned.
+# Job card states a plan cancel takes with it: nothing has been made on them yet
+# (the states cancel_job_card accepts). A card further along has to be stopped or
+# finished on its own first (agreed 2026-10-24).
+_UNSTARTED_JC = ('locked', 'unlocked', 'assigned', 'material_received')
+
+
+def _card_list(cards, *, shown: int = 5) -> str:
+    named = [f"{c['job_card_number']} ({(c['status'] or '').replace('_', ' ')})"
+             for c in cards[:shown]]
+    more = len(cards) - shown
+    return ", ".join(named) + (f" and {more} more" if more > 0 else "")
+
+
+async def _cancel_plan_cards(conn, plan_id: int, *, reason: str, actor: str | None) -> dict:
+    """Cancel every job card of a plan that is being cancelled, or refuse.
+
+    Cancelling a plan used to leave its cards live, so the floors went on making
+    an order whose SO qty was already back to pending (audit 2026-10-23). Refused,
+    before anything is written, when a card has started (stop or finish it first)
+    or is part of a merged process run shared with other products. Otherwise every
+    card goes, whole chains at once (nothing to join around), keeping the same
+    snapshot a single cancel keeps.
     """
-    # Read line allocations BEFORE flipping the status so we know what to
-    # release. (We could read after — same data — but reading first lets
-    # the release UPDATE run inside the same transaction without races.)
-    lines = await conn.fetch(
+    cards = await conn.fetch(
         """
-        SELECT planned_qty_kg, planned_qty_units, linked_so_fulfillment_ids
-        FROM production_plan_line_v2
-        WHERE plan_id = $1
+        SELECT job_card_id, job_card_number, status, process_group_id
+          FROM job_card_v2
+         WHERE plan_id = $1 AND deleted_at IS NULL AND status <> 'cancelled'
+         ORDER BY plan_line_id, step_number
+           FOR UPDATE
         """,
         plan_id,
     )
-
-    result = await conn.fetchrow(
-        """
-        UPDATE production_plan_v2
-        SET status = 'cancelled'
-        WHERE plan_id = $1 AND status <> 'cancelled'
-        RETURNING *
-        """,
-        plan_id,
-    )
-    if not result:
-        return {"error": "not_found_or_already_cancelled"}
-
-    # Release planned counters. GREATEST(0, ...) is defensive — if some
-    # earlier bug or manual edit left a fulfillment with a lower planned
-    # counter than this line, we don't want negative numbers in the table.
-    for ln in lines:
-        fids = ln['linked_so_fulfillment_ids'] or []
-        if not fids:
-            continue
-        kg    = float(ln['planned_qty_kg']    or 0)
-        units = float(ln['planned_qty_units'] or 0)
-        if kg <= 0 and units <= 0:
-            continue
+    started = [c for c in cards if c["status"] not in _UNSTARTED_JC]
+    if started:
+        return {"error": "plan_has_started_cards",
+                "message": ("Work has started on this plan, so it can't be cancelled: "
+                            f"{_card_list(started)}. Stop or finish those job cards first."),
+                "job_cards": [{"job_card_id": c["job_card_id"],
+                               "job_card_number": c["job_card_number"],
+                               "status": c["status"]} for c in started]}
+    merged = [c for c in cards if c["process_group_id"] is not None]
+    if merged:
+        return {"error": "merged_run",
+                "message": (f"{_card_list(merged)} belong to a merged process run shared with "
+                            "other products, so this plan can't be cancelled on its own.")}
+    for c in cards:
+        snapshot = await job_card_v2.get_job_card(conn, c["job_card_id"])
         await conn.execute(
             """
-            UPDATE so_fulfillment_v2
-               SET planned_qty_kg    = GREATEST(0, planned_qty_kg    - $1),
-                   planned_qty_units = GREATEST(0, planned_qty_units - $2)
-             WHERE so_fulfillment_id = ANY($3)
+            UPDATE job_card_v2
+               SET status              = 'cancelled',
+                   deleted_at          = NOW(),
+                   deleted_by          = $2,
+                   cancellation_reason = $3,
+                   cancelled_snapshot  = $4::jsonb
+             WHERE job_card_id = $1
             """,
-            kg, units, fids,
+            c["job_card_id"], actor, reason,
+            json.dumps(snapshot, default=str, ensure_ascii=False),
         )
+    return {"job_cards_cancelled": len(cards)}
 
-    return {"cancelled": True, "plan": _serialize_row(result)}
 
-
-async def delete_plan(conn, plan_id: int, *, reason: str, deleted_by: str) -> dict:
-    """Hard-deactivate an APPROVED plan.
-
-    Differs from cancel_plan in three ways:
-      1. Only valid when the plan is currently `approved` (cancel_plan
-         allows draft and approved both — but the operator-facing UX maps
-         draft→Cancel and approved→Delete so the intent is clearer).
-      2. Tags the audit row with the `deleted_by` operator + reason. We
-         reuse the existing status='cancelled' enum value (no schema
-         change) but record the action in cancellation_reason so the
-         distinction stays in the row's history.
-      3. Caller is expected to fan out a notification email to all admin
-         users — that's the router's job since this service stays pure
-         and the mail helper lives in services/mail_service.
-
-    Returns:
-      {"deleted": True, "plan": {...serialized row...}}
-      on success; otherwise {"error": "not_found_or_invalid_status"}.
-
-    Plan-level approved → deleted is *destructive*: the job cards that
-    were auto-generated at approve-time are NOT cascaded automatically.
-    Callers (web replica) should explicitly warn the operator that this
-    step doesn't void downstream JCs — those still need to be cancelled
-    individually if the plan is being retracted for real.
-    """
-    # Read line allocations BEFORE flipping status so the planned-counter
-    # release runs against pre-delete data inside the same transaction.
+async def _release_plan_reservations(conn, plan_id: int) -> dict:
+    """Give back what each of the plan's lines holds on its SO rows. Lines tied
+    to several rows go first: their share of a row is worked out against the
+    other lines' qty while those still hold it."""
     lines = await conn.fetch(
         """
-        SELECT planned_qty_kg, planned_qty_units, linked_so_fulfillment_ids
-        FROM production_plan_line_v2
-        WHERE plan_id = $1
+        SELECT plan_line_id, planned_qty_kg, planned_qty_units, linked_so_fulfillment_ids
+          FROM production_plan_line_v2
+         WHERE plan_id = $1
         """,
         plan_id,
     )
+    lines = sorted(lines, key=lambda ln: len(ln["linked_so_fulfillment_ids"] or []) <= 1)
+    kg = units = 0.0
+    for ln in lines:
+        parts = await so_reservation.release(
+            conn, ln["plan_line_id"], ln["linked_so_fulfillment_ids"],
+            kg=ln["planned_qty_kg"], units=ln["planned_qty_units"],
+        )
+        k, u = so_reservation.total(parts)
+        kg, units = kg + k, units + u
+    return {"kg": round(kg, 3), "units": round(units, 3)}
 
+
+async def cancel_plan(conn, plan_id: int, reason: str = "", *,
+                      cancelled_by: str | None = None) -> dict:
+    """Cancel a plan: its job cards are cancelled with it and its lines give
+    their qty back to the linked so_fulfillment_v2 rows, so the same qty can be
+    re-planned. Refused when work has started on any card (_cancel_plan_cards).
+    The reason is kept on the plan.
+    """
+    reason = (reason or "").strip()
+    if not reason:
+        return {"error": "missing_reason", "message": "Say why the plan is being cancelled."}
+    plan = await conn.fetchrow(
+        "SELECT status FROM production_plan_v2 WHERE plan_id = $1 FOR UPDATE", plan_id,
+    )
+    if not plan or plan["status"] == 'cancelled':
+        return {"error": "not_found_or_already_cancelled"}
+    cards = await _cancel_plan_cards(conn, plan_id, reason=f"[PLAN_CANCEL] {reason}",
+                                     actor=cancelled_by)
+    if cards.get("error"):
+        return cards
+    released = await _release_plan_reservations(conn, plan_id)
     result = await conn.fetchrow(
         """
         UPDATE production_plan_v2
         SET status              = 'cancelled',
             cancellation_reason = $2
-        WHERE plan_id = $1 AND status = 'approved'
+        WHERE plan_id = $1
+        RETURNING *
+        """,
+        plan_id, f"[cancelled by {cancelled_by}] {reason}" if cancelled_by else reason,
+    )
+    return {"cancelled": True, "plan": _serialize_row(result),
+            "job_cards_cancelled": cards["job_cards_cancelled"], "released": released}
+
+
+async def delete_plan(conn, plan_id: int, *, reason: str, deleted_by: str) -> dict:
+    """Hard-deactivate an APPROVED plan.
+
+    Differs from cancel_plan in two ways:
+      1. Only valid when the plan is currently `approved` (the operator-facing
+         UX maps draft→Cancel and approved→Delete so the intent is clearer).
+      2. Tags the audit row with the `deleted_by` operator + reason. We
+         reuse the existing status='cancelled' enum value (no schema
+         change) but record the action in cancellation_reason so the
+         distinction stays in the row's history.
+    The caller fans out a notification email to all admin users — that's the
+    router's job since this service stays pure and the mail helper lives in
+    services/mail_service.
+
+    Like cancel_plan, the job cards go with the plan (they used to be left live
+    for someone to cancel one by one), refused when work has started on any;
+    the lines give their qty back to the linked so_fulfillment_v2 rows.
+
+    Returns {"deleted": True, "plan": {...}, "job_cards_cancelled", "released"}
+    on success; otherwise {"error": ...}.
+    """
+    plan = await conn.fetchrow(
+        "SELECT status FROM production_plan_v2 WHERE plan_id = $1 FOR UPDATE", plan_id,
+    )
+    if not plan or plan["status"] != 'approved':
+        return {"error": "not_found_or_invalid_status"}
+    cards = await _cancel_plan_cards(conn, plan_id, reason=f"[PLAN_DELETE] {reason}",
+                                     actor=deleted_by or None)
+    if cards.get("error"):
+        return cards
+    released = await _release_plan_reservations(conn, plan_id)
+    result = await conn.fetchrow(
+        """
+        UPDATE production_plan_v2
+        SET status              = 'cancelled',
+            cancellation_reason = $2
+        WHERE plan_id = $1
         RETURNING *
         """,
         plan_id, f"[deleted by {deleted_by or 'unknown'}] {reason}".strip(),
     )
-    if not result:
-        return {"error": "not_found_or_invalid_status"}
-
-    # Release planned counters back to so_fulfillment_v2. Same defensive
-    # GREATEST(0, ...) pattern cancel_plan uses.
-    for ln in lines:
-        fids = ln['linked_so_fulfillment_ids'] or []
-        if not fids:
-            continue
-        kg    = float(ln['planned_qty_kg']    or 0)
-        units = float(ln['planned_qty_units'] or 0)
-        if kg <= 0 and units <= 0:
-            continue
-        await conn.execute(
-            """
-            UPDATE so_fulfillment_v2
-               SET planned_qty_kg    = GREATEST(0, planned_qty_kg    - $1),
-                   planned_qty_units = GREATEST(0, planned_qty_units - $2)
-             WHERE so_fulfillment_id = ANY($3)
-            """,
-            kg, units, fids,
-        )
-
-    return {"deleted": True, "plan": _serialize_row(result)}
+    return {"deleted": True, "plan": _serialize_row(result),
+            "job_cards_cancelled": cards["job_cards_cancelled"], "released": released}
 
 
 # ---------------------------------------------------------------------------

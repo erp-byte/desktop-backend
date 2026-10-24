@@ -636,7 +636,7 @@ async def _apply_amendment(conn, amendment: dict) -> dict:
         # and downstream gates accept it.)
         return {"applied": True, "noop_reason": "consumed_at_byproducts_save"}
     if rt == 'plan_delete':
-        return await _apply_plan_delete(conn, payload)
+        return await _apply_plan_delete(conn, payload, reason=amendment.get("reason"))
     if rt == 'plan_field_change':
         return await _apply_plan_field_change(conn, payload)
     if rt == 'stop_process':
@@ -861,15 +861,13 @@ async def _apply_permanent_bom(conn, amendment: dict,
     }
 
 
-async def _apply_plan_delete(conn, payload: dict) -> dict:
+async def _apply_plan_delete(conn, payload: dict, reason: str | None = None) -> dict:
     """Cancel a production plan. H3:
       - SELECT ... FOR UPDATE locks the plan row for the txn so a
         racing approve can't flip status under us.
-      - Pre-checks for active child JCs (status NOT IN closed terminal
-        set) and refuses the cancel rather than orphaning live work.
-      - Inspects the UPDATE result and treats 0-rows-affected as an
-        error (silent no-op was masking already-cancelled/executed
-        plans as successful applies).
+      - Already cancelled / executed plans are refused, not a silent no-op.
+      - The cancel itself is plan_v2.cancel_plan's: refused rather than
+        orphaning started work; unstarted cards go with the plan.
     """
     plan_id = payload.get("plan_id")
     if plan_id is None:
@@ -893,52 +891,17 @@ async def _apply_plan_delete(conn, payload: dict) -> dict:
             ),
         }
 
-    # H3(b): refuse if any child JC is still alive.
-    active_jc = await conn.fetchval(
-        """
-        SELECT EXISTS (
-            SELECT 1 FROM job_card_v2
-            WHERE  plan_id = $1
-              AND  status NOT IN ('completed', 'cancelled', 'closed')
-        )
-        """,
-        plan_id,
-    )
-    if active_jc:
-        return {
-            "error": "plan_has_active_job_cards",
-            "plan_id": plan_id,
-            "message": (
-                "Cancel refused: this plan has at least one active job card. "
-                "Close or cancel the JCs first, then re-approve."
-            ),
-        }
-
-    # H3(c): inspect the UPDATE rowcount. asyncpg returns 'UPDATE N' as
-    # the command tag; 0 rows means a racer beat us between the
-    # SELECT FOR UPDATE and the UPDATE (shouldn't happen with the lock
-    # held, but defensive).
-    result = await conn.execute(
-        "UPDATE production_plan_v2 SET status='cancelled' "
-        "WHERE  plan_id=$1 AND status NOT IN ('cancelled','executed')",
-        plan_id,
-    )
-    affected = 0
-    try:
-        affected = int(result.rsplit(" ", 1)[-1])
-    except (ValueError, AttributeError):
-        affected = 0
-    if affected == 0:
-        return {
-            "error": "plan_cancel_noop",
-            "plan_id": plan_id,
-            "message": (
-                "UPDATE affected 0 rows; another transaction may have "
-                "changed the plan's status. Retry."
-            ),
-        }
+    # H3(b): the same cancel as the Cancel button (plan_v2.cancel_plan): refused
+    # when work has started on any card; otherwise the cards go with the plan
+    # and its lines give their SO qty back. This used to flip the status only,
+    # leaving the SO qty reserved by a plan that no longer existed.
+    from app.modules.production.services.plan_v2 import cancel_plan
+    result = await cancel_plan(conn, plan_id, reason or "Plan delete request approved")
+    if result.get("error"):
+        return {**result, "plan_id": plan_id}
     return {"applied": True, "applied_version": None,
-            "update_result": result}
+            "job_cards_cancelled": result["job_cards_cancelled"],
+            "released": result["released"]}
 
 
 async def _apply_plan_field_change(conn, payload: dict) -> dict:
@@ -1027,6 +990,13 @@ async def _apply_plan_field_change(conn, payload: dict) -> dict:
                 vals.append(v)
         if not sets:
             continue
+        before = None
+        if 'planned_qty_kg' in fields or 'planned_qty_units' in fields:
+            before = await conn.fetchrow(
+                "SELECT planned_qty_kg, planned_qty_units, linked_so_fulfillment_ids "
+                "FROM production_plan_line_v2 WHERE plan_line_id=$1 FOR UPDATE",
+                plan_line_id,
+            )
         vals.append(plan_line_id)
         await conn.execute(
             f"UPDATE production_plan_line_v2 SET {', '.join(sets)} "
@@ -1034,6 +1004,21 @@ async def _apply_plan_field_change(conn, payload: dict) -> dict:
             *vals,
         )
         lines_updated += 1
+        if before is not None:
+            # The SO reservation moves with the line's qty (so_reservation);
+            # it used to stay put, so SO Creation showed the wrong pending qty.
+            from app.modules.production.services import so_reservation
+            new_kg = fields.get('planned_qty_kg', before["planned_qty_kg"])
+            new_units = fields.get('planned_qty_units', before["planned_qty_units"])
+            try:
+                await so_reservation.move(
+                    conn, plan_line_id, before["linked_so_fulfillment_ids"],
+                    delta_kg=float(new_kg or 0) - float(before["planned_qty_kg"] or 0),
+                    delta_units=float(new_units or 0) - float(before["planned_qty_units"] or 0),
+                )
+            except so_reservation.OverAllocation as exc:
+                return {"error": "over_allocation", "plan_line_id": plan_line_id,
+                        "message": str(exc)}
 
         # Cascade — only push fields that exist on job_card_v2 too
         # (planned_qty_kg, planned_qty_units, deadline_date), and only

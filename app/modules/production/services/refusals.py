@@ -10,8 +10,12 @@ from __future__ import annotations
 
 from fastapi import HTTPException
 
-NOT_FOUND = frozenset({"line_not_found", "job_card_not_found", "no_job_cards"})
+NOT_FOUND = frozenset({
+    "line_not_found", "job_card_not_found", "no_job_cards", "not_found", "plan_not_found",
+    "not_found_or_already_cancelled", "not_found_or_invalid_status",
+})
 CONFLICT = frozenset({
+    "plan_has_started_cards", "plan_incomplete", "plan_closed", "below_carded",
     "job_cards_already_exist", "already_carded", "merge_conflict",
     "line_fully_carded", "exceeds_balance", "not_editable",
     "cannot_remove_terminal", "cannot_remove_started_midchain",
