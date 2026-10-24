@@ -143,17 +143,28 @@ def test_dispatching_notifies_the_next_card_it_unlocked(scheduled, monkeypatch):
                                      "qty_kg": 149.8, "how": "dispatch"}]
 
 
-@pytest.mark.parametrize("result", [
-    {"dispatched": True, "dispatch": DISPATCH, "unlocked_job_card_id": None},     # next card already open
-    {"error": "over_dispatch", "message": "too much"},                           # refused (comes back 200)
-])
-def test_a_dispatch_that_unlocked_nothing_notifies_nobody(scheduled, monkeypatch, result):
+def test_a_dispatch_that_unlocked_nothing_notifies_nobody(scheduled, monkeypatch):
     async def dispatch(conn, **kw):
-        return result
+        return {"dispatched": True, "dispatch": DISPATCH, "unlocked_job_card_id": None}  # next already open
 
     monkeypatch.setattr(jcv2, "dispatch_to_next", dispatch)
     asyncio.run(R.dispatch_to_next_v2(scheduled.request, UPSTREAM, R.DispatchToNextRequest(qty_kg=149.8),
                                       scheduled.tasks, user=USER))
+    assert scheduled.tasks.tasks == []
+
+
+def test_a_refused_dispatch_is_an_error_and_notifies_nobody(scheduled, monkeypatch):
+    """over_dispatch used to come back as a 200 and the screen said "Dispatched."
+    It is now a 409, raised inside the transaction (so it rolls back)."""
+    async def dispatch(conn, **kw):
+        return {"error": "over_dispatch", "message": "too much"}
+
+    monkeypatch.setattr(jcv2, "dispatch_to_next", dispatch)
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(R.dispatch_to_next_v2(scheduled.request, UPSTREAM, R.DispatchToNextRequest(qty_kg=149.8),
+                                          scheduled.tasks, user=USER))
+    assert exc.value.status_code == 409
+    assert exc.value.detail["error"] == "over_dispatch"
     assert scheduled.tasks.tasks == []
 
 

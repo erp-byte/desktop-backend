@@ -114,6 +114,29 @@ def test_closing_a_batch_when_the_next_card_was_already_open_reports_no_unlock(_
     assert result["unlocked_job_card_id"] is None
 
 
+
+class _CloseIntoCancelledConn(_CloseConn):
+    """The next card was cancelled (deleted_at set) before this close."""
+
+    async def fetchrow(self, sql, *args):
+        s = _norm(sql)
+        if "FROM job_card_v2" in s and s.startswith("SELECT job_card_id, next_job_card_id"):
+            row = await super().fetchrow(sql, *args)
+            return {**row, "next_live": False}
+        if "INSERT INTO job_card_partial_dispatch_v2" in s:
+            raise AssertionError("must not dispatch into a cancelled stage")
+        return await super().fetchrow(sql, *args)
+
+
+def test_closing_a_batch_never_feeds_a_cancelled_next_stage(_unlocked_upstream):
+    """Audit 2026-10-23: a cancelled middle stage still received material and a
+    batch close flipped it back to 'unlocked'. The batch still closes; the output
+    stays on this stage."""
+    result = _close(_CloseIntoCancelledConn(downstream_was_waiting=True))
+    assert result["closed"] is True
+    assert result["dispatch"] is None
+    assert result["downstream_unlocked"] is False
+
 # ── dispatch_to_next ────────────────────────────────────────────────────────
 
 class _DispatchConn(_InTx):
@@ -190,6 +213,8 @@ class _GroupConn(_InTx):
         return 100.0
 
     async def fetch(self, sql, *args):
+        if "job_card_partial_dispatch_v2" in sql:
+            return []        # what each member was already sent: nothing yet
         return [
             {"job_card_id": 8001, "plan_line_id": 1, "planned_qty_kg": 50, "planned_qty_units": None,
              "carried_qty_kg": 0, "status": "locked", "locked_reason": "awaiting_previous_stage"},
@@ -230,3 +255,20 @@ def test_a_head_that_was_already_running_is_left_alone():
     conn = _HeadConn()
     assert asyncio.run(jcv2._unlock_new_head(conn, 9101, "in_progress")) is None
     assert conn.executed == []
+
+
+class _DispatchIntoCancelledConn(_DispatchConn):
+    def __init__(self):
+        super().__init__("cancelled", None)
+        self.cards[DOWNSTREAM]["deleted_at"] = "2026-10-20"
+
+    async def fetchrow(self, sql, *args):
+        if "INSERT INTO job_card_partial_dispatch_v2" in _norm(sql):
+            raise AssertionError("must not dispatch into a cancelled stage")
+        return await super().fetchrow(sql, *args)
+
+
+def test_dispatch_into_a_cancelled_next_stage_is_refused():
+    result = _dispatch(_DispatchIntoCancelledConn())
+    assert result["error"] == "chain_broken"
+    assert "cancelled" in result["message"]

@@ -300,7 +300,10 @@ async def close_batch(conn, *, batch_id: int,
         """
         SELECT job_card_id, next_job_card_id, output_kind, uom,
                dispatched_to_next_kg,
-               entity, output_code, fg_sku_name
+               entity, output_code, fg_sku_name,
+               -- The next stage still live? A cancelled one must not be fed.
+               (SELECT n.deleted_at IS NULL FROM job_card_v2 n
+                 WHERE n.job_card_id = job_card_v2.next_job_card_id) AS next_live
         FROM   job_card_v2
         WHERE  job_card_id=$1 AND deleted_at IS NULL
         FOR    UPDATE
@@ -475,7 +478,11 @@ async def close_batch(conn, *, batch_id: int,
     dispatch_row = None
     downstream_unlocked = False
     wip_batch_id = None  # Slice 5: set when the dispatch materialises WIP stock
-    if jc["next_job_card_id"] is not None and effective_dispatch > 0:
+    # A cancelled next stage is skipped: the batch still closes and the output
+    # stays at this stage (it used to be dispatched into the dead card and the
+    # unlock below flipped that card back to 'unlocked').
+    next_live = jc.get("next_live") is not False
+    if jc["next_job_card_id"] is not None and next_live and effective_dispatch > 0:
         # Units mirror the qty ratio so downstream sees a coherent
         # pair (qty_kg, qty_units).  When the operator splits the
         # batch we proportionally split the units.
@@ -538,6 +545,7 @@ async def close_batch(conn, *, batch_id: int,
              WHERE job_card_id   = $1
                AND is_locked     = TRUE
                AND locked_reason = 'awaiting_previous_stage'
+               AND deleted_at IS NULL
             """,
             jc["next_job_card_id"],
         )
