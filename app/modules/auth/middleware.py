@@ -28,7 +28,7 @@ from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.core.middleware.request_context import AuthError
-from app.core.warehouse_scope import user_has_warehouse
+from app.core.warehouse_scope import user_has_floor, user_has_warehouse
 
 logger = logging.getLogger(__name__)
 
@@ -187,7 +187,7 @@ def require_permission(
                 403,
                 details={"warehouse": warehouse, "allowed_warehouses": user.allowed_warehouses},
             )
-        if floor and user.allowed_floors and floor not in user.allowed_floors:
+        if floor and user.allowed_floors and not user_has_floor(user.allowed_floors, floor):
             raise AuthError(
                 "forbidden",
                 f"User is not assigned to floor '{floor}'",

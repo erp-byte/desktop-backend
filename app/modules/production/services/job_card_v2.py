@@ -36,7 +36,10 @@ from decimal import Decimal
 from asyncpg.exceptions import CheckViolationError, UndefinedColumnError
 
 from app.core.helpers import insert_with_pk_retry, new_short_time_id
-from app.core.warehouse_scope import WAREHOUSE_NORM_ANY_SQL, WAREHOUSE_NORM_SQL
+from app.core.warehouse_scope import (
+    FLOOR_NORM_SQL, WAREHOUSE_NORM_ANY_SQL, WAREHOUSE_NORM_SQL, floor_scope_values,
+    normalise_floor,
+)
 from app.modules.production.services.output_calc import compute_output_row
 
 logger = logging.getLogger(__name__)
@@ -2578,21 +2581,29 @@ async def maybe_close_plan_from_jcs(conn, plan_id: int) -> bool:
 
 
 async def maybe_release_plan_from_jcs(conn, plan_id: int,
-                                      approved_by: str | None = None) -> bool:
+                                      approved_by: str | None = None, *,
+                                      may_approve: bool = True) -> str | None:
     """If EVERY line on this plan now has (non-deleted) job cards, flip a draft
     plan to 'approved'. The per-line Create-Job-Card wizard is the modern
     equivalent of the bulk Approve, so once all articles are carded via the
     wizard the plan should read as approved (released to the floor), not draft.
 
+    Only for someone who may approve plans (`may_approve` — plans › approve,
+    agreed 2026-10-24): carding is open to floor managers and team leaders,
+    who used to approve plans this way without the permission, unseen. For
+    anyone else the plan stays draft for a planner to approve.
+
     Idempotent — only acts on a plan still in 'draft'; stamps approved_by /
     approved_at like the Approve button does (COALESCE so a real approval is
-    never overwritten). Returns True when a transition happened.
+    never overwritten). Returns "approved" when it flipped the plan,
+    "awaits_approval" when every line is carded but the caller may not
+    approve, else None — so the screen can say which.
     """
     plan = await conn.fetchrow(
         "SELECT status FROM production_plan_v2 WHERE plan_id=$1", plan_id,
     )
     if not plan or plan["status"] != 'draft':
-        return False
+        return None
 
     # A line is "carded" for auto-approval only when it is FULLY carded — the
     # Σ of its chains' head-card qty (prev_job_card_id IS NULL) reaches its
@@ -2616,7 +2627,9 @@ async def maybe_release_plan_from_jcs(conn, plan_id: int,
         plan_id,
     )
     if not counts or counts["lines"] == 0 or counts["carded"] != counts["lines"]:
-        return False
+        return None
+    if not may_approve:
+        return "awaits_approval"
 
     await conn.execute(
         """
@@ -2629,7 +2642,7 @@ async def maybe_release_plan_from_jcs(conn, plan_id: int,
         plan_id, approved_by,
     )
     logger.info("plan_id=%d auto-transitioned 'draft'->'approved' (all lines carded via wizard)", plan_id)
-    return True
+    return "approved"
 
 
 async def consolidate_plan_lines_for_merge(conn, primary_line_id: int,
@@ -2948,11 +2961,14 @@ async def list_job_cards(
     elif user_scope_warehouses:
         conditions.append(WAREHOUSE_NORM_ANY_SQL("factory", f"${idx}"))
         params.append(list(user_scope_warehouses)); idx += 1
+    # Floors ignore case and outer spaces, like the screen and the notices: a
+    # card on "roasting area" is on the "Roasting Area" a grant names.
     if floor:
-        conditions.append(f"floor = ${idx}"); params.append(floor); idx += 1
+        conditions.append(f"{FLOOR_NORM_SQL('floor')} = ${idx}")
+        params.append(normalise_floor(floor)); idx += 1
     elif user_scope_floors:
-        conditions.append(f"floor = ANY(${idx}::text[])")
-        params.append(list(user_scope_floors)); idx += 1
+        conditions.append(f"{FLOOR_NORM_SQL('floor')} = ANY(${idx}::text[])")
+        params.append(floor_scope_values(user_scope_floors)); idx += 1
     if status:
         statuses = [s.strip() for s in status.split(',') if s.strip()]
         if statuses:
@@ -3291,11 +3307,14 @@ async def search_job_cards(
     elif user_scope_warehouses:
         conditions.append(WAREHOUSE_NORM_ANY_SQL("factory", f"${idx}"))
         params.append(list(user_scope_warehouses)); idx += 1
+    # Floors ignore case and outer spaces, like the screen and the notices: a
+    # card on "roasting area" is on the "Roasting Area" a grant names.
     if floor:
-        conditions.append(f"floor = ${idx}"); params.append(floor); idx += 1
+        conditions.append(f"{FLOOR_NORM_SQL('floor')} = ${idx}")
+        params.append(normalise_floor(floor)); idx += 1
     elif user_scope_floors:
-        conditions.append(f"floor = ANY(${idx}::text[])")
-        params.append(list(user_scope_floors)); idx += 1
+        conditions.append(f"{FLOOR_NORM_SQL('floor')} = ANY(${idx}::text[])")
+        params.append(floor_scope_values(user_scope_floors)); idx += 1
     if status:
         statuses = [s.strip() for s in status.split(',') if s.strip()]
         if statuses:

@@ -108,13 +108,22 @@ def _request():
 
 
 @pytest.mark.asyncio
-async def test_lowercased_floor_is_refused_for_an_assigned_user():
-    """What the wizard used to pre-fill: refused although the user has the floor."""
-    with pytest.raises(HTTPException) as exc:
+async def test_lowercased_floor_now_passes_for_an_assigned_user():
+    """What the wizard used to pre-fill was refused although the user has the
+    floor. Floor checks ignore case now (audit 2026-10-23), so it passes too —
+    the stored spelling is still what the group sends back (below)."""
+    with pytest.raises(_ReachedService):
         await R.create_merged_process_run_v2(_request(), _merge_body("roasting area"),
                                              BackgroundTasks(), user=FLOOR_USER)
+
+
+@pytest.mark.asyncio
+async def test_a_floor_the_user_is_not_assigned_is_still_refused():
+    with pytest.raises(HTTPException) as exc:
+        await R.create_merged_process_run_v2(_request(), _merge_body("Sorting Area"),
+                                             BackgroundTasks(), user=FLOOR_USER)
     assert exc.value.status_code == 403
-    assert "roasting area" in exc.value.detail
+    assert "Sorting Area" in exc.value.detail
 
 
 @pytest.mark.asyncio

@@ -25,7 +25,9 @@ from app.modules.production.services.response_filters import strip_cost_fields
 from app.modules.production.services import job_card_notify
 # Every route that unlocks one tells the unlocked card's people — see _notify_unlocked_job_cards.
 from app.modules.production.services import job_card_unlock_notify
-from app.core.warehouse_scope import user_has_warehouse
+from app.core.warehouse_scope import (
+    FLOOR_NORM_SQL, floor_scope_values, user_has_floor, user_has_warehouse,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +75,15 @@ def _actor_name(user: AuthUser) -> str:
     """
     return (user.full_name or user.email or user.phone
             or f"user:{user.user_id}")
+
+
+async def _may_approve_plans(conn, user) -> bool:
+    """Whether this user holds plans › approve (admins, planners) — so carding a
+    plan's last article may approve the plan too (maybe_release_plan_from_jcs)."""
+    if getattr(user, "is_admin", False):
+        return True
+    return await check_permission(conn, getattr(user, "role_ids", None) or [], False,
+                                  "production", "plans", "approve", "create")
 
 
 def _notify_new_job_cards(request: Request, background_tasks: BackgroundTasks,
@@ -213,7 +224,10 @@ class PlanV2Update(BaseModel):
 
 
 class PlanV2Approve(BaseModel):
-    approved_by: str
+    # Ignored: the approver is the logged-in user (_actor_name). The screen used
+    # to send `full_name || phone || "user"`, which is how "user" approved 54
+    # plans. Kept so older clients that still send it aren't refused.
+    approved_by: str = ""
 
 
 class PlanV2Cancel(BaseModel):
@@ -2235,13 +2249,13 @@ async def list_job_cards(
 
     # Floor handling: explicit param wins (after lock check); else apply lock.
     if floor:
-        if not is_admin and user_floors and floor not in user_floors:
+        if not is_admin and user_floors and not user_has_floor(user_floors, floor):
             raise HTTPException(status_code=403,
                                 detail=f"User is not assigned to floor '{floor}'")
         conditions.append(f"floor ILIKE ${idx}"); params.append(f"%{floor}%"); idx += 1
     elif not is_admin and user_floors:
-        conditions.append(f"floor = ANY(${idx}::text[])")
-        params.append(list(user_floors)); idx += 1
+        conditions.append(f"{FLOOR_NORM_SQL('floor')} = ANY(${idx}::text[])")
+        params.append(floor_scope_values(user_floors)); idx += 1
 
     if factory:
         if not is_admin and user_warehouses and factory not in user_warehouses:
@@ -4840,7 +4854,7 @@ async def approve_plan_v2(request: Request, plan_id: int, body: PlanV2Approve, b
     try:
         async with pool.acquire() as conn:
             async with conn.transaction():
-                result = raise_if_refused(await approve_plan(conn, plan_id, body.approved_by))
+                result = raise_if_refused(await approve_plan(conn, plan_id, _actor_name(user)))
     except ServiceRefusal as refusal:
         # plan_incomplete lists the articles with no steps / a step with no
         # floor — nothing was approved.
@@ -5071,7 +5085,7 @@ async def add_step_v2(
     if (body.floor
             and not user.is_admin
             and user.allowed_floors
-            and body.floor not in user.allowed_floors):
+            and not user_has_floor(user.allowed_floors, body.floor)):
         raise HTTPException(
             status_code=403,
             detail=f"User is not assigned to floor '{body.floor}'",
@@ -5131,7 +5145,7 @@ async def create_line_job_cards_v2(
     """
     floors = [s.floor for s in body.wip_steps] + [body.pkg_floor]
     if not user.is_admin and user.allowed_floors:
-        bad = sorted({f for f in floors if f and f not in user.allowed_floors})
+        bad = sorted({f for f in floors if f and not user_has_floor(user.allowed_floors, f)})
         if bad:
             raise HTTPException(
                 status_code=403,
@@ -5166,13 +5180,17 @@ async def create_line_job_cards_v2(
                     pkg_process=body.pkg_process,
                 ))
                 # If this create means EVERY article on the plan now has job
-                # cards, release the plan (draft -> approved). No-op on
-                # partial / already-approved plans.
+                # cards, release the plan (draft -> approved) — only for someone
+                # who may approve plans; otherwise it waits for a planner. No-op
+                # on partial / already-approved plans. The outcome goes back so
+                # the screen can say so (it used to happen unseen).
                 if result.get("plan_id"):
-                    await maybe_release_plan_from_jcs(
-                        conn, result["plan_id"],
-                        approved_by=(getattr(user, "full_name", None) or None),
+                    release = await maybe_release_plan_from_jcs(
+                        conn, result["plan_id"], approved_by=_actor_name(user),
+                        may_approve=await _may_approve_plans(conn, user),
                     )
+                    if release:
+                        result["plan_release"] = release
     except ServiceRefusal as refusal:
         # Raised inside the transaction: the merge / anything written before the
         # refusal rolled back. Every code is an error — never a 200 the screen
@@ -5246,7 +5264,7 @@ async def create_merged_process_run_v2(
     """
     floors = [s.floor for s in body.wip_steps] + [m.pkg_floor for m in body.per_member]
     if not user.is_admin and user.allowed_floors:
-        bad = sorted({f for f in floors if f and f not in user.allowed_floors})
+        bad = sorted({f for f in floors if f and not user_has_floor(user.allowed_floors, f)})
         if bad:
             raise HTTPException(status_code=403,
                                 detail=f"User is not assigned to floor(s): {', '.join(bad)}")
@@ -5269,13 +5287,20 @@ async def create_merged_process_run_v2(
                     created_by=(getattr(user, "full_name", None) or None),
                 ))
                 # A merged run can card lines across several plans — release any
-                # plan that is now fully carded (no-op otherwise).
+                # plan that is now fully carded (no-op otherwise), only for
+                # someone who may approve plans; the outcome per plan goes back.
                 plan_ids = [r["plan_id"] for r in await conn.fetch(
                     "SELECT DISTINCT plan_id FROM production_plan_line_v2 "
                     "WHERE plan_line_id = ANY($1::int[])", body.plan_line_ids)]
+                may_approve = await _may_approve_plans(conn, user)
+                released = {}
                 for pid in plan_ids:
-                    await maybe_release_plan_from_jcs(
-                        conn, pid, approved_by=(getattr(user, "full_name", None) or None))
+                    release = await maybe_release_plan_from_jcs(
+                        conn, pid, approved_by=_actor_name(user), may_approve=may_approve)
+                    if release:
+                        released[str(pid)] = release
+                if released:
+                    result["plan_release"] = released
     except ServiceRefusal as refusal:
         # The merge deletes the members' cards before building the run; a
         # refusal rolls that back (raised inside the transaction).
@@ -5341,7 +5366,7 @@ async def replace_line_job_cards_v2(
     floor-lock + transaction rules as the create endpoint."""
     floors = [s.floor for s in body.wip_steps] + [body.pkg_floor]
     if not user.is_admin and user.allowed_floors:
-        bad = sorted({f for f in floors if f and f not in user.allowed_floors})
+        bad = sorted({f for f in floors if f and not user_has_floor(user.allowed_floors, f)})
         if bad:
             raise HTTPException(
                 status_code=403,
@@ -5413,7 +5438,7 @@ async def apply_line_job_card_edits_v2(
     transaction as create/replace."""
     floors = [s.floor for s in body.steps] + [body.pkg_floor]
     if not user.is_admin and user.allowed_floors:
-        bad = sorted({f for f in floors if f and f not in user.allowed_floors})
+        bad = sorted({f for f in floors if f and not user_has_floor(user.allowed_floors, f)})
         if bad:
             raise HTTPException(
                 status_code=403,
@@ -5542,7 +5567,7 @@ async def update_step_v2(
     if (new_floor
             and not user.is_admin
             and user.allowed_floors
-            and new_floor not in user.allowed_floors):
+            and not user_has_floor(user.allowed_floors, new_floor)):
         raise HTTPException(
             status_code=403,
             detail=f"User is not assigned to floor '{new_floor}'",
@@ -5761,7 +5786,7 @@ async def list_job_cards_v2(
     if factory and not is_admin and user_warehouses and not user_has_warehouse(user_warehouses, factory):
         raise HTTPException(status_code=403,
                             detail=f"User is not assigned to factory '{factory}'")
-    if floor and not is_admin and user_floors and floor not in user_floors:
+    if floor and not is_admin and user_floors and not user_has_floor(user_floors, floor):
         raise HTTPException(status_code=403,
                             detail=f"User is not assigned to floor '{floor}'")
 
@@ -5828,7 +5853,7 @@ async def search_job_cards_v2(
     if factory and not is_admin and user_warehouses and not user_has_warehouse(user_warehouses, factory):
         raise HTTPException(status_code=403,
                             detail=f"User is not assigned to factory '{factory}'")
-    if floor and not is_admin and user_floors and floor not in user_floors:
+    if floor and not is_admin and user_floors and not user_has_floor(user_floors, floor):
         raise HTTPException(status_code=403,
                             detail=f"User is not assigned to floor '{floor}'")
 
@@ -5872,7 +5897,7 @@ async def sfg_inventory_v2(
         if allowed_ent and entity not in allowed_ent:
             raise HTTPException(status_code=403, detail="Entity outside your scope")
         allowed_fl = getattr(user, "allowed_floors", []) or []
-        if floor_id and allowed_fl and floor_id not in allowed_fl:
+        if floor_id and allowed_fl and not user_has_floor(allowed_fl, floor_id):
             raise HTTPException(status_code=403, detail="Floor outside your scope")
     from app.modules.production.services.inventory_service import get_available_batches
     pool = request.app.state.db_pool
@@ -6023,7 +6048,7 @@ async def get_job_card_v2(
     if not getattr(user, "is_admin", False):
         if user.allowed_warehouses and not user_has_warehouse(user.allowed_warehouses, result.get("factory")):
             raise HTTPException(status_code=403, detail="JC outside your factory scope")
-        if user.allowed_floors and result.get("floor") and result["floor"] not in user.allowed_floors:
+        if user.allowed_floors and result.get("floor") and not user_has_floor(user.allowed_floors, result["floor"]):
             raise HTTPException(status_code=403, detail="JC outside your floor scope")
     return strip_cost_fields(
         result,
@@ -6057,7 +6082,7 @@ async def job_card_chain_v2(
         if not getattr(user, "is_admin", False):
             if user.allowed_warehouses and not user_has_warehouse(user.allowed_warehouses, anchor["factory"]):
                 raise HTTPException(status_code=403, detail="JC outside your factory scope")
-            if user.allowed_floors and anchor["floor"] and anchor["floor"] not in user.allowed_floors:
+            if user.allowed_floors and anchor["floor"] and not user_has_floor(user.allowed_floors, anchor["floor"]):
                 raise HTTPException(status_code=403, detail="JC outside your floor scope")
 
         rows = await conn.fetch(
@@ -7382,103 +7407,102 @@ async def notify_qc_v2(
     body: NotifyQCRequest | None = None,
     user=Depends(require_permission("production", "job_cards", "quality", action="create")),
 ):
-    """Alert the QC team scoped to this JC's entity / factory / floor.
-    Allowed only when the JC is in status='completed'. Logs every
-    dispatch attempt to qc_notification_log_v2 regardless of hook
-    delivery outcome.
+    """Email the QC people covering this card that it needs a QC check.
+    Allowed only when the JC is in status='completed'.
+
+    QC is anyone holding qc_inspector or qc_manager among ALL their roles, with
+    an account that can sign in, whose granted places cover the card's factory
+    and floor (wa_notify.covering — the notices' rule). The old query read the
+    primary role only and its hook did nothing, so nobody was ever told while
+    the screen reported success (audit 2026-10-23). Every attempt is logged to
+    qc_notification_log_v2; when nobody was reached the answer is a 409 naming
+    why, never a success.
     """
-    from app.modules.production.services import qc_notify
+    from app.modules.production.services import qc_notify, wa_notify
     pool = request.app.state.db_pool
     body = body or NotifyQCRequest()
 
-    # B8 C2 fix: hook calls must NOT hold a Postgres transaction open
-    # (a live WhatsApp transport could take seconds per recipient and
-    # would otherwise pin connection-pool slots and row locks). We split
-    # the work into three phases:
-    #   1. Short txn: validate JC status, fetch recipients.
-    #   2. NO txn:    iterate recipients calling the (possibly slow) hook;
-    #                 collect outcomes in memory.
-    #   3. Short txn: write all log rows in a single tight loop.
+    # A short read only: the emails go out with no transaction open, and
+    # dispatch logs each one in its own tiny transaction (B8 C2).
     async with pool.acquire() as conn:
-        async with conn.transaction():
-            jc = await conn.fetchrow(
-                """
-                SELECT status, entity, factory, floor
-                FROM   job_card_v2
-                WHERE  job_card_id=$1 AND deleted_at IS NULL
-                """,
-                job_card_id,
+        jc = await conn.fetchrow(
+            """
+            SELECT status, entity, factory, floor, job_card_number,
+                   fg_sku_name, customer_name, process_name
+            FROM   job_card_v2
+            WHERE  job_card_id=$1 AND deleted_at IS NULL
+            """,
+            job_card_id,
+        )
+        if jc is None:
+            raise HTTPException(status_code=404, detail="Job card not found")
+        if jc["status"] != 'completed':
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error":  "invalid_status",
+                    "status": jc["status"],
+                    "message": (
+                        "notify-qc fires only on 'completed' JCs - "
+                        f"current status is '{jc['status']}'."
+                    ),
+                },
             )
-            if jc is None:
-                raise HTTPException(status_code=404, detail="Job card not found")
-            if jc["status"] != 'completed':
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "error":  "invalid_status",
-                        "status": jc["status"],
-                        "message": (
-                            "notify-qc fires only on 'completed' JCs - "
-                            f"current status is '{jc['status']}'."
-                        ),
-                    },
-                )
-            recipients = await conn.fetch(
-                """
-                SELECT u.user_id, u.phone, u.full_name
-                FROM   auth_user u
-                JOIN   auth_role r ON r.role_id = u.role_id
-                WHERE  r.role_name = 'qc_inspector'
-                  AND  u.is_active = TRUE
-                  AND  (
-                        SELECT TRUE FROM auth_role_permission rp
-                         WHERE  rp.role_id = u.role_id
-                           AND  (rp.allowed_entities   IS NULL
-                                 OR cardinality(rp.allowed_entities)   = 0
-                                 OR $1 = ANY(rp.allowed_entities))
-                           AND  (rp.allowed_warehouses IS NULL
-                                 OR cardinality(rp.allowed_warehouses) = 0
-                                 OR $2 = ANY(rp.allowed_warehouses))
-                           AND  (rp.allowed_floors     IS NULL
-                                 OR cardinality(rp.allowed_floors)     = 0
-                                 OR $3 IS NULL
-                                 OR $3 = ANY(rp.allowed_floors))
-                         LIMIT 1
-                  )
-                """,
-                jc["entity"], jc["factory"], jc["floor"],
-            )
+        holders = await wa_notify.role_holders(conn, qc_notify.QC_ROLES)
+    people = wa_notify.covering(holders, jc["factory"] or "", jc["floor"] or "")
+    card = {**dict(jc), "asked_by": _actor_name(user)}
+    place = " · ".join(x for x in (jc["factory"], jc["floor"]) if x) or "this place"
 
-    # If no recipients matched, log a single sentinel row (audit "we
-    # tried but nobody was scoped") and return the real dispatch result
-    # so the notification_id is observable. B8 H4 fix.
+    note = body.note
+    recipients = [{"user_id": h["user_id"], "full_name": h["name"],
+                   "email": h["email"], "phone": h["phone"]} for h in people]
     if not recipients:
-        async with pool.acquire() as conn:
-            base = (body.note or "")
-            suffix = " [no_qc_recipients_in_scope]"
-            trimmed = base[: max(0, 2000 - len(suffix))]
-            result = await qc_notify.dispatch(
-                conn,
-                job_card_id=job_card_id,
-                recipients=[{"user_id": None, "phone": None, "full_name": None}],
-                note=trimmed + suffix,
-                dispatched_by=user.user_id,
-            )
-        result.setdefault("warning", "no_qc_recipients_in_scope")
-        return result
-
-    # Dispatch acquires per-recipient mini-txns internally; do NOT wrap
-    # in an outer transaction here - the slow hook call must stay out
-    # of any open txn (B8 C2).
+        # Log one sentinel row: "we tried but nobody covers this place".
+        suffix = " [no_qc_recipients_in_scope]"
+        note = (note or "")[: max(0, 2000 - len(suffix))] + suffix
+        recipients = [{"user_id": None, "full_name": None, "email": None, "phone": None}]
     async with pool.acquire() as conn:
         result = await qc_notify.dispatch(
             conn,
             job_card_id=job_card_id,
-            recipients=[dict(r) for r in recipients],
-            note=body.note,
+            recipients=recipients,
+            note=note,
             dispatched_by=user.user_id,
+            card=card,
         )
-    return result
+
+    if not people:
+        raise HTTPException(status_code=409, detail={
+            "error": "qc_not_reached",
+            "message": (f"Nobody was told: no QC inspector or QC manager covers {place}. "
+                        "Ask an admin to give QC this factory and floor."),
+            **result,
+        })
+    reached = [o["name"] for o in result["outcomes"] if o["delivered"]]
+    missed = [_qc_miss(o) for o in result["outcomes"] if not o["delivered"]]
+    if not reached:
+        raise HTTPException(status_code=409, detail={
+            "error": "qc_not_reached",
+            "message": "Nobody was told: " + "; ".join(dict.fromkeys(missed)) + ".",
+            **result,
+        })
+    message = "Emailed " + ", ".join(reached) + "."
+    if missed:
+        message += " Not reached: " + "; ".join(dict.fromkeys(missed)) + "."
+    return {**result, "message": message}
+
+
+def _qc_miss(outcome: dict) -> str:
+    """Why one QC person wasn't reached, in words."""
+    who = outcome.get("name") or "a QC person"
+    reason = outcome.get("reason") or ""
+    if reason == "no_email":
+        return f"{who} has no email on file"
+    if reason == "email_off":
+        return "email is switched off on this server"
+    if reason == "send_failed":
+        return f"the email to {who} was not accepted"
+    return f"{who} ({reason or 'failed'})"
 
 
 # ─── Sign-off ───────────────────────────────────────────────────────────────
@@ -7486,20 +7510,28 @@ async def notify_qc_v2(
 class SignOffRequest(BaseModel):
     """POST /job-cards-v2/{id}/sign-off
 
-    `signed_by_name` lets the operator at the device record a sign-off
-    on behalf of someone else (e.g. the production head standing
-    nearby). When provided, it overrides the JWT-derived signer for
-    the persisted `signed_by` column. When omitted, the bearer-token
-    user is used — preserving the old behaviour for callers that don't
-    send the field.
-
-    `notes` is a free-form audit trail field, kept separate from
-    `signed_by_name` so the signer's name and any operational notes
-    are recorded in distinct columns.
+    The signer is always the logged-in user (_actor_name). `signed_by_name`
+    used to override it, so anyone could type any name, under any role, to
+    satisfy the close gate (audit 2026-10-23). Older clients still send it; it
+    is accepted and ignored. `notes` is a free-form audit field.
     """
     role:           str
     notes:          str | None = None
-    signed_by_name: str | None = None
+    signed_by_name: str | None = None   # ignored — see above
+
+
+# Who may give each sign-off (agreed 2026-10-24); admins may give any.
+# production_head is the one close_job_card requires: nobody holds that role,
+# and floor managers and admins are the people who have been signing it. QC must
+# also have the card's place in scope.
+SIGN_OFF_SIGNERS: dict[str, tuple[str, ...]] = {
+    "production_head": ("floor_manager",),
+    "qc_inspector":    ("qc_inspector", "qc_manager"),
+}
+_SIGN_OFF_WHO = {
+    "production_head": "a floor manager or an admin",
+    "qc_inspector":    "QC (a QC inspector or QC manager) or an admin",
+}
 
 
 @router.post("/job-cards-v2/{job_card_id}/sign-off")
@@ -7509,27 +7541,29 @@ async def sign_off_v2(
     body: SignOffRequest,
     user=Depends(require_permission("production", "job_cards", "sign_offs", action="create")),
 ):
-    """Record a per-role sign-off. UNIQUE (job_card_id, role) — re-signing
-    under the same role refreshes the row instead of erroring.
+    """Record a per-role sign-off as the logged-in user. UNIQUE (job_card_id,
+    role) — re-signing under the same role refreshes the row.
 
-    R12 access gate (qc_inspector role only):
-      * The calling user must hold the qc_inspector role.
-      * The caller's permission scope (allowed_entities / warehouses /
-        floors) must cover the JC's entity, factory, and floor. Wildcard
-        (empty list) scopes are treated as "all allowed".
-      * signed_by is force-stamped from the JWT identity - body's
-        signed_by_name is IGNORED on QC sign-offs to block front-end
-        spoofing. Other roles keep the typed-name override.
+    The role must be one of SIGN_OFF_SIGNERS and the user must hold one of its
+    roles among ALL their roles (the QC gate used to read the primary role only).
+    A QC sign-off also needs the user's scope (allowed_entities / warehouses /
+    floors) to cover the card; an empty list is "all allowed".
     """
     from app.modules.production.services.job_card_v2 import add_sign_off
+    from app.modules.production.services.roles import holds_role
+
+    signers = SIGN_OFF_SIGNERS.get(body.role)
+    if signers is None:
+        raise HTTPException(status_code=400, detail={
+            "error": "unknown_sign_off_role",
+            "message": (f"There is no '{body.role}' sign-off. "
+                        f"Sign as one of: {', '.join(SIGN_OFF_SIGNERS)}."),
+        })
+    is_admin = getattr(user, "is_admin", False)
     pool = request.app.state.db_pool
 
-    is_qc_sign_off = body.role == 'qc_inspector'
-
-    # B7 H2/H3 fix: ONE pool.acquire() and ONE transaction wrapping the
-    # scope check, the JC existence assertion (with deleted_at IS NULL AND
-    # FOR UPDATE), and the sign-off insert. Closes the race where a PATCH
-    # moves the JC out of scope between read and write.
+    # ONE transaction around the scope check, the card lookup (FOR UPDATE) and
+    # the insert, so a PATCH can't move the card out of scope in between.
     async with pool.acquire() as conn:
         async with conn.transaction():
             jc_scope = await conn.fetchrow(
@@ -7541,68 +7575,35 @@ async def sign_off_v2(
             if jc_scope is None:
                 raise HTTPException(status_code=404, detail="Job card not found")
 
-            if is_qc_sign_off:
-                # B7 C1 fix: admin users bypass the role gate (matches the
-                # admin-can-do-anything convention used elsewhere). For
-                # non-admin callers the role must be qc_inspector AND the
-                # caller's scope must cover the JC's location.
-                if not (getattr(user, "is_admin", False)
-                        or user.role_name == 'qc_inspector'):
-                    raise HTTPException(
-                        status_code=403,
-                        detail={
-                            "error": "qc_role_required",
-                            "message": (
-                                "Only admin or qc_inspector users can verify "
-                                "QC on a JC."
-                            ),
-                        },
-                    )
+            if not await holds_role(conn, user, *signers):
+                raise HTTPException(status_code=403, detail={
+                    "error": ("qc_role_required" if body.role == "qc_inspector"
+                              else "sign_off_role_required"),
+                    "message": f"Only {_SIGN_OFF_WHO[body.role]} can give this sign-off.",
+                })
 
-                def _in_scope(value, allowed: list[str]) -> bool:
-                    # Empty allowed list = wildcard (no restriction).
-                    return (not allowed) or (value in allowed)
-
-                # Warehouse needs tolerant matching ('A185' ≡ 'A-185'); the
-                # other two compare entity / floor literally.
-                def _wh_in_scope(value, allowed: list[str]) -> bool:
-                    return (not allowed) or user_has_warehouse(allowed, value)
-
-                if not (getattr(user, "is_admin", False)
-                        or (_in_scope(jc_scope["entity"],   user.allowed_entities)
-                            and _wh_in_scope(jc_scope["factory"], user.allowed_warehouses)
-                            and _in_scope(jc_scope["floor"],   user.allowed_floors))):
-                    # B7 L2: don't leak the user's full allowed list back.
-                    raise HTTPException(
-                        status_code=403,
-                        detail={
-                            "error": "qc_scope_mismatch",
-                            "jc_entity":   jc_scope["entity"],
-                            "jc_factory":  jc_scope["factory"],
-                            "jc_floor":    jc_scope["floor"],
-                            "message": (
-                                "Your QC scope does not cover this JC's entity, "
-                                "factory, or floor."
-                            ),
-                        },
-                    )
-                # Server-stamp the signer; ignore body.signed_by_name on QC.
-                signer = user.full_name or user.phone or f"user#{user.user_id}"
-            else:
-                # B7 H1: other roles also keep server-stamped signer when
-                # the caller is admin. Non-admin callers can still pass a
-                # typed name (e.g. signing on the production_head's behalf
-                # while they're at the device) - this matches the legacy
-                # behaviour and the framework expressly defers role-scoped
-                # enforcement for non-QC roles to a later workstream.
-                typed = (body.signed_by_name or "").strip()
-                signer = typed if typed else (user.full_name or user.phone or f"user#{user.user_id}")
+            if body.role == "qc_inspector" and not is_admin:
+                ents = user.allowed_entities or []
+                whs = user.allowed_warehouses or []
+                fls = user.allowed_floors or []
+                in_scope = ((not ents or jc_scope["entity"] in ents)
+                            and (not whs or user_has_warehouse(whs, jc_scope["factory"]))
+                            and (not fls or user_has_floor(fls, jc_scope["floor"])))
+                if not in_scope:
+                    # Don't leak the user's full allowed list back.
+                    raise HTTPException(status_code=403, detail={
+                        "error": "qc_scope_mismatch",
+                        "jc_entity":  jc_scope["entity"],
+                        "jc_factory": jc_scope["factory"],
+                        "jc_floor":   jc_scope["floor"],
+                        "message": "Your QC scope does not cover this JC's entity, factory, or floor.",
+                    })
 
             result = await add_sign_off(
                 conn,
                 job_card_id=job_card_id,
                 role=body.role,
-                signed_by=signer,
+                signed_by=_actor_name(user),
                 notes=body.notes,
             )
     if result.get("error"):
@@ -7613,8 +7614,12 @@ async def sign_off_v2(
 # ─── Lifecycle: start / complete / force-unlock / patch / cancel ──────────
 
 class ForceUnlockV2Request(BaseModel):
-    """PUT /job-cards-v2/{id}/force-unlock"""
-    authority: str       # operator / supervisor name
+    """PUT /job-cards-v2/{id}/force-unlock
+
+    The unlock is recorded under the logged-in user. `authority` used to be a
+    typed name stored as force_unlock_by; older clients still send it and it
+    is ignored."""
+    authority: str | None = None
     reason:    str
 
 
@@ -7782,7 +7787,7 @@ async def force_unlock_v2(
             result = await force_unlock(
                 conn,
                 job_card_id=job_card_id,
-                authority=body.authority,
+                authority=_actor_name(user),
                 reason=body.reason,
             )
     if result.get("error") == "job_card_not_found":
@@ -8482,7 +8487,7 @@ async def job_card_pdf_v2(
     if not getattr(user, "is_admin", False):
         if user.allowed_warehouses and not user_has_warehouse(user.allowed_warehouses, jc_data.get("factory")):
             raise HTTPException(status_code=403, detail="JC outside your factory scope")
-        if user.allowed_floors and jc_data.get("floor") and jc_data["floor"] not in user.allowed_floors:
+        if user.allowed_floors and jc_data.get("floor") and not user_has_floor(user.allowed_floors, jc_data["floor"]):
             raise HTTPException(status_code=403, detail="JC outside your floor scope")
     # H1: strip cost fields before the renderer reads them. Deep-copies
     # the dict so callers (including the v1 fallback below) see an

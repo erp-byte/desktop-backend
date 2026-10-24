@@ -506,11 +506,17 @@ async def create_user(request: Request, body: CreateUserRequest):
             )
         role_id = role_ids_all[0]
 
+        # Floors are checked and saved in their real spelling (floor_grants).
+        floors = body.allowed_floors
+        if floors:
+            from app.modules.auth.services.floor_grants import checked_floor_grants
+            floors = await checked_floor_grants(conn, floors) or None
+
         try:
             return await _create(
                 conn, body.phone, body.password, body.full_name,
                 role_id, body.email, body.entity,
-                body.allowed_warehouses, body.allowed_floors,
+                body.allowed_warehouses, floors,
                 body.allowed_entities,
                 must_change_password=body.must_change_password,
                 role_ids=role_ids_all,
@@ -752,6 +758,14 @@ async def replace_user_scope(request: Request, user_id: int, body: UserScopeRequ
     idx = 1
     sent = body.model_fields_set
 
+    # Floors are checked and saved in their real spelling (floor_grants) — they
+    # used to be saved exactly as sent.
+    floors_checked = None
+    if "floors" in sent and body.floors:
+        from app.modules.auth.services.floor_grants import checked_floor_grants
+        async with request.app.state.db_pool.acquire() as conn:
+            floors_checked = await checked_floor_grants(conn, body.floors, user_id=user_id)
+
     if "entities" in sent:
         entities_val = body.entities if body.entities else None
         # Write the array as the source of truth, and mirror the first
@@ -768,7 +782,7 @@ async def replace_user_scope(request: Request, user_id: int, body: UserScopeRequ
         updates.append(f'"allowed_warehouses" = ${idx}')
         params.append(wh); idx += 1
     if "floors" in sent:
-        fl = body.floors if body.floors else None
+        fl = floors_checked or None
         updates.append(f'"allowed_floors" = ${idx}')
         params.append(fl); idx += 1
 
