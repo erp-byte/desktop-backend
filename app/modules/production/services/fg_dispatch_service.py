@@ -47,20 +47,32 @@ async def _emails_for_roles(conn, roles) -> list[str]:
     return [r["email"] for r in rows if r["email"]]
 
 
-async def _packaging_jc(conn, plan_line_id: int):
-    """The packaging (Final-FG) job card of a plan line — output_kind='FG',
-    last in the chain. Returns None if the line has no FG job card yet."""
-    return await conn.fetchrow(
+async def _packaging_jcs(conn, plan_line_id: int) -> list:
+    """Every live packaging (Final-FG) job card of a plan line, oldest chain
+    first. An article carded in several partial chains has one per chain — the
+    old LIMIT 1 offered only one of them, and the other chain's finished goods
+    could never be dispatched. Empty if the line has no FG job card yet."""
+    return list(await conn.fetch(
         """
         SELECT j.job_card_id, j.job_card_number, j.plan_id, j.fg_sku_name,
                j.customer_name, j.factory, j.floor, j.entity, j.status, j.uom
         FROM job_card_v2 j
         WHERE j.plan_line_id = $1 AND j.output_kind = 'FG' AND j.deleted_at IS NULL
-        ORDER BY j.step_number DESC
-        LIMIT 1
+        ORDER BY j.created_at, j.job_card_id
         """,
         plan_line_id,
-    )
+    ))
+
+
+async def _batches_of_cards(conn, cards) -> list[dict]:
+    """The batches of every given packaging card, each tagged with its card so
+    two chains' "Batch 1" can be told apart."""
+    out: list[dict] = []
+    for jc in cards:
+        for b in await _batches_for_jc(conn, jc["job_card_id"]):
+            out.append({**b, "job_card_id": jc["job_card_id"],
+                        "job_card_number": jc["job_card_number"]})
+    return out
 
 
 async def _batches_for_jc(conn, job_card_id: int) -> list[dict]:
@@ -104,10 +116,10 @@ async def get_line_dispatch_info(conn, plan_line_id: int) -> dict:
     """Prefill payload for the Dispatch modal: the packaging job card header +
     its batches (default selection = packaging stage, never another WIP process)
     + the resolved recipient role labels."""
-    jc = await _packaging_jc(conn, plan_line_id)
-    if not jc:
+    cards = await _packaging_jcs(conn, plan_line_id)
+    if not cards:
         return {"exists": False, "message": "No packaging job card for this article yet."}
-    batches = await _batches_for_jc(conn, jc["job_card_id"])
+    jc = cards[0]   # header fields: the first chain (unchanged for one chain)
     return {
         "exists": True,
         "plan_id": jc["plan_id"],
@@ -120,8 +132,15 @@ async def get_line_dispatch_info(conn, plan_line_id: int) -> dict:
         "floor": jc["floor"],
         "uom": jc["uom"],
         "packaging_status": jc["status"],
-        "packaging_completed": jc["status"] in ("completed", "closed"),
-        "batches": batches,
+        "packaging_completed": all(c["status"] in ("completed", "closed") for c in cards),
+        # Every chain's packaging card, and every one of their batches (each
+        # tagged with its card).
+        "packaging_cards": [
+            {"job_card_id": c["job_card_id"], "job_card_number": c["job_card_number"],
+             "status": c["status"], "floor": c["floor"]}
+            for c in cards
+        ],
+        "batches": await _batches_of_cards(conn, cards),
         "to_roles": list(DISPATCH_TO_ROLES),
         "cc_roles": list(DISPATCH_CC_ROLES),
     }
@@ -174,14 +193,15 @@ async def dispatch_fg(conn, plan_line_id: int, *, batch_id: int, num_boxes=None,
     """Send the dispatch email (To: billing/candor_operations/store_head,
     CC: business_head/operations_head/inventory_manager/production_manager) and
     record it. Best-effort email (never raises); always records the row."""
-    jc = await _packaging_jc(conn, plan_line_id)
-    if not jc:
+    cards = await _packaging_jcs(conn, plan_line_id)
+    if not cards:
         return {"error": "no_packaging_jc", "message": "No packaging job card for this article."}
-    batches = await _batches_for_jc(conn, jc["job_card_id"])
-    batch = next((b for b in batches if b["batch_id"] == batch_id), None)
+    # The batch decides which chain's packaging card this dispatch is for.
+    batch = next((b for b in await _batches_of_cards(conn, cards) if b["batch_id"] == batch_id), None)
     if batch is None:
         return {"error": "batch_not_found",
-                "message": "Selected batch not found on the packaging job card."}
+                "message": "Selected batch not found on this article's packaging job cards."}
+    jc = next(c for c in cards if c["job_card_id"] == batch["job_card_id"])
 
     subject = (f"FG Dispatch — {jc['fg_sku_name']} "
                f"(JC {jc['job_card_number']}, batch {batch['batch_number']})")
@@ -201,8 +221,11 @@ async def dispatch_fg(conn, plan_line_id: int, *, batch_id: int, num_boxes=None,
         try:
             # _send is synchronous/blocking; run off the event loop. It is itself
             # best-effort (catches everything, no-op when SMTP_HOST is unset).
-            await asyncio.to_thread(mail_service._send, subject, body, to_emails, cc_emails)
-            email_sent = True
+            # _send returns True only when the SMTP server accepted the message
+            # (False when SMTP is off or the send failed) — record THAT, so the
+            # screen never says "emailed N people" when nothing went out.
+            email_sent = bool(await asyncio.to_thread(
+                mail_service._send, subject, body, to_emails, cc_emails))
         except Exception:
             logger.exception("FG dispatch email failed for plan_line_id=%s", plan_line_id)
 

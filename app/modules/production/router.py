@@ -5115,18 +5115,21 @@ async def create_line_job_cards_v2(
         create_job_cards_for_line, maybe_release_plan_from_jcs,
         consolidate_plan_lines_for_merge,
     )
+    from app.modules.production.services.refusals import (
+        ServiceRefusal, raise_if_refused, to_http,
+    )
     pool = request.app.state.db_pool
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            # Same-article merge: fold sibling same-SKU lines into this primary
-            # line first (union SO refs + sum qty + delete siblings), so the chain
-            # below is ONE set of job cards for the combined article referencing
-            # every merged SO. No-op when merge_plan_line_ids is empty.
-            result = await consolidate_plan_lines_for_merge(
-                conn, plan_line_id, body.merge_plan_line_ids,
-            )
-            if result is None:  # no merge requested, or merge succeeded
-                result = await create_job_cards_for_line(
+    try:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                # Same-article merge: fold sibling same-SKU lines into this primary
+                # line first (union SO refs + sum qty + delete siblings), so the chain
+                # below is ONE set of job cards for the combined article referencing
+                # every merged SO. No-op (None) when merge_plan_line_ids is empty.
+                raise_if_refused(await consolidate_plan_lines_for_merge(
+                    conn, plan_line_id, body.merge_plan_line_ids,
+                ))
+                result = raise_if_refused(await create_job_cards_for_line(
                     conn,
                     plan_line_id,
                     qty_kg=body.qty_kg,
@@ -5134,28 +5137,25 @@ async def create_line_job_cards_v2(
                     wip_steps=[s.model_dump() for s in body.wip_steps],
                     pkg_floor=body.pkg_floor,
                     pkg_process=body.pkg_process,
-                )
+                ))
                 # If this create means EVERY article on the plan now has job
-                # cards, release the plan (draft -> approved). No-op on error /
+                # cards, release the plan (draft -> approved). No-op on
                 # partial / already-approved plans.
-                if "error" not in result and result.get("plan_id"):
+                if result.get("plan_id"):
                     await maybe_release_plan_from_jcs(
                         conn, result["plan_id"],
                         approved_by=(getattr(user, "full_name", None) or None),
                     )
-    err = result.get("error")
-    if err == "line_not_found":
-        raise HTTPException(status_code=404, detail="Plan line not found")
-    if err == "job_cards_already_exist":
-        raise HTTPException(
-            status_code=409,
-            detail=(f"This article already has {result.get('count')} job card(s). "
-                    "Cancel them before recreating."),
-        )
-    if err in ("already_carded", "merge_conflict"):
-        raise HTTPException(status_code=409, detail=result.get("message"))
-    if err in ("invalid_qty", "no_wip_steps", "missing_pkg_floor"):
-        raise HTTPException(status_code=400, detail=result.get("message"))
+    except ServiceRefusal as refusal:
+        # Raised inside the transaction: the merge / anything written before the
+        # refusal rolled back. Every code is an error — never a 200 the screen
+        # reads as success ("Created undefined job cards").
+        raise to_http(refusal, messages={
+            "line_not_found": "Plan line not found",
+            "job_cards_already_exist": (
+                f"This article already has {refusal.result.get('count')} job card(s). "
+                "Cancel them before recreating."),
+        })
     # Committed: tell every floor on the new chain.
     _notify_new_job_cards(request, background_tasks, user, result.get("job_card_ids"))
     return result
@@ -5227,17 +5227,20 @@ async def create_merged_process_run_v2(
     from app.modules.production.services.job_card_v2 import (
         create_merged_process_run, maybe_release_plan_from_jcs,
     )
+    from app.modules.production.services.refusals import (
+        ServiceRefusal, raise_if_refused, to_http,
+    )
     pool = request.app.state.db_pool
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            result = await create_merged_process_run(
-                conn,
-                plan_line_ids=body.plan_line_ids,
-                wip_steps=[s.model_dump() for s in body.wip_steps],
-                per_member=[m.model_dump() for m in body.per_member],
-                created_by=(getattr(user, "full_name", None) or None),
-            )
-            if "error" not in result:
+    try:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                result = raise_if_refused(await create_merged_process_run(
+                    conn,
+                    plan_line_ids=body.plan_line_ids,
+                    wip_steps=[s.model_dump() for s in body.wip_steps],
+                    per_member=[m.model_dump() for m in body.per_member],
+                    created_by=(getattr(user, "full_name", None) or None),
+                ))
                 # A merged run can card lines across several plans — release any
                 # plan that is now fully carded (no-op otherwise).
                 plan_ids = [r["plan_id"] for r in await conn.fetch(
@@ -5246,16 +5249,10 @@ async def create_merged_process_run_v2(
                 for pid in plan_ids:
                     await maybe_release_plan_from_jcs(
                         conn, pid, approved_by=(getattr(user, "full_name", None) or None))
-    err = result.get("error")
-    if err in ("need_two_lines", "no_wip_steps", "bad_member", "member_mismatch",
-               "invalid_qty", "missing_pkg_floor", "exceeds_balance"):
-        raise HTTPException(status_code=400, detail=result.get("message"))
-    if err in ("line_not_found",):
-        raise HTTPException(status_code=404, detail=result.get("message"))
-    if err in ("not_a_group", "already_started", "no_common_rm", "bom_changes_on_merged_lines"):
-        raise HTTPException(status_code=409, detail=result.get("message"))
-    if err:
-        raise HTTPException(status_code=400, detail=result.get("message") or err)
+    except ServiceRefusal as refusal:
+        # The merge deletes the members' cards before building the run; a
+        # refusal rolls that back (raised inside the transaction).
+        raise to_http(refusal)
     # Committed: the shared process chain AND every member's packaging card.
     _notify_new_job_cards(request, background_tasks, user,
                           list(result.get("process_job_card_ids") or [])
@@ -5274,17 +5271,18 @@ async def dispatch_process_group_v2(
     card in its merged group (unlock + carry qty + materialise WIP per member).
     """
     from app.modules.production.services.job_card_v2 import dispatch_process_group
+    from app.modules.production.services.refusals import (
+        ServiceRefusal, raise_if_refused, to_http,
+    )
     pool = request.app.state.db_pool
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            result = await dispatch_process_group(
-                conn, process_job_card_id=process_job_card_id,
-                dispatched_by=(getattr(user, "full_name", None) or None))
-    err = result.get("error")
-    if err in ("job_card_not_found",):
-        raise HTTPException(status_code=404, detail=result.get("message") or err)
-    if err:
-        raise HTTPException(status_code=400, detail=result.get("message") or err)
+    try:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                result = raise_if_refused(await dispatch_process_group(
+                    conn, process_job_card_id=process_job_card_id,
+                    dispatched_by=(getattr(user, "full_name", None) or None)))
+    except ServiceRefusal as refusal:
+        raise to_http(refusal)
     # Each packaging card this fan-out released — not the process card itself.
     _notify_unlocked_job_cards(request, background_tasks, user, [
         {"job_card_id": r["packaging_job_card_id"], "from_job_card_id": process_job_card_id,
@@ -5324,25 +5322,27 @@ async def replace_line_job_cards_v2(
             )
 
     from app.modules.production.services.job_card_v2 import replace_job_cards_for_line
+    from app.modules.production.services.refusals import (
+        ServiceRefusal, raise_if_refused, to_http,
+    )
     pool = request.app.state.db_pool
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            result = await replace_job_cards_for_line(
-                conn,
-                plan_line_id,
-                qty_kg=body.qty_kg,
-                qty_units=body.qty_units,
-                wip_steps=[s.model_dump() for s in body.wip_steps],
-                pkg_floor=body.pkg_floor,
-                pkg_process=body.pkg_process,
-            )
-    err = result.get("error")
-    if err == "line_not_found":
-        raise HTTPException(status_code=404, detail="Plan line not found")
-    if err == "not_editable":
-        raise HTTPException(status_code=409, detail=result.get("message"))
-    if err in ("invalid_qty", "no_wip_steps", "missing_pkg_floor"):
-        raise HTTPException(status_code=400, detail=result.get("message"))
+    try:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                result = raise_if_refused(await replace_job_cards_for_line(
+                    conn,
+                    plan_line_id,
+                    qty_kg=body.qty_kg,
+                    qty_units=body.qty_units,
+                    wip_steps=[s.model_dump() for s in body.wip_steps],
+                    pkg_floor=body.pkg_floor,
+                    pkg_process=body.pkg_process,
+                ))
+    except ServiceRefusal as refusal:
+        # Replace deletes the old cards before recreating; a refusal from the
+        # recreate (e.g. exceeds_balance) must roll the delete back — raised
+        # inside the transaction it does. Never a 200 "Updated".
+        raise to_http(refusal, messages={"line_not_found": "Plan line not found"})
     # The replaced cards are gone; these are the ones this request created.
     _notify_new_job_cards(request, background_tasks, user, result.get("job_card_ids"))
     return result
@@ -5394,12 +5394,15 @@ async def apply_line_job_card_edits_v2(
             )
 
     from app.modules.production.services.job_card_v2 import apply_live_job_card_edits
+    from app.modules.production.services.refusals import (
+        ServiceRefusal, raise_if_refused, to_http,
+    )
     pool = request.app.state.db_pool
     actor = user.full_name or user.phone
     try:
         async with pool.acquire() as conn:
             async with conn.transaction():
-                result = await apply_live_job_card_edits(
+                result = raise_if_refused(await apply_live_job_card_edits(
                     conn,
                     plan_line_id,
                     qty_kg=body.qty_kg,
@@ -5410,21 +5413,17 @@ async def apply_line_job_card_edits_v2(
                     pkg_job_card_id=body.pkg_job_card_id,
                     user=actor,
                     remove_reasons=body.remove_reasons or {},
-                )
+                ))
     except ValueError as exc:
         # Over-allocation against so_fulfillment_v2 pending bounds (qty sync).
         raise HTTPException(
             status_code=400,
             detail={"error": "over_allocation", "message": str(exc)},
         )
-    err = result.get("error")
-    if err in ("no_job_cards", "job_card_not_found"):
-        raise HTTPException(status_code=404, detail=result.get("message") or "Not found")
-    if err in ("cannot_remove_terminal", "cannot_remove_started_midchain",
-               "cannot_reorder_started_region"):
-        raise HTTPException(status_code=409, detail=result.get("message"))
-    if err in ("invalid_qty", "no_wip_steps"):
-        raise HTTPException(status_code=400, detail=result.get("message"))
+    except ServiceRefusal as refusal:
+        # Inside the transaction: a refusal after the qty / SO sync rolls those
+        # back too. Every code is an error, never a 200.
+        raise to_http(refusal)
     # Only the processes this edit ADDED are new cards; the rest stayed in place.
     _notify_new_job_cards(request, background_tasks, user, result.get("created_job_card_ids"))
     # A locked card the edit left at the head was released: it can start now.
@@ -6418,21 +6417,25 @@ async def dispatch_to_next_v2(
     """Hand qty from this JC to its next_job_card_id partner. Auto-unlocks
     the downstream JC when it was waiting on the previous stage."""
     from app.modules.production.services.job_card_v2 import dispatch_to_next
+    from app.modules.production.services.refusals import (
+        ServiceRefusal, raise_if_refused, to_http,
+    )
     pool = request.app.state.db_pool
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            result = await dispatch_to_next(
-                conn,
-                job_card_id=job_card_id,
-                qty_kg=body.qty_kg,
-                qty_units=body.qty_units,
-                dispatched_by=user.full_name or user.phone,
-                notes=body.notes,
-            )
-    if result.get("error") == "job_card_not_found":
-        raise HTTPException(status_code=404, detail="Job card not found")
-    if result.get("error") in ("invalid_qty", "no_next_stage", "chain_broken"):
-        raise HTTPException(status_code=400, detail=result.get("message", result["error"]))
+    try:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                result = raise_if_refused(await dispatch_to_next(
+                    conn,
+                    job_card_id=job_card_id,
+                    qty_kg=body.qty_kg,
+                    qty_units=body.qty_units,
+                    dispatched_by=user.full_name or user.phone,
+                    notes=body.notes,
+                ))
+    except ServiceRefusal as refusal:
+        # over_dispatch / jc_terminal used to fall through as a 200 and the
+        # screen said "Dispatched.".
+        raise to_http(refusal, messages={"job_card_not_found": "Job card not found"})
     # The next card, if this dispatch is what released it.
     _notify_unlocked_job_cards(request, background_tasks, user, _unlock_from_dispatch(result))
     return result
@@ -7676,6 +7679,7 @@ class CompleteJCV2Request(BaseModel):
 async def complete_jc_v2(
     request: Request,
     job_card_id: int,
+    background_tasks: BackgroundTasks,
     body: CompleteJCV2Request | None = None,
     user=Depends(require_permission("production", "job_cards", "overview", action="complete")),
 ):
@@ -7721,6 +7725,11 @@ async def complete_jc_v2(
                                 "override_request_wrong_type",
                                 "override_request_not_approved"):
         raise HTTPException(status_code=409, detail=result)
+    # The stage(s) the send-on released (completing / closing sends the remaining
+    # output on, 2026-10-24) — tell their floor.
+    _notify_unlocked_job_cards(request, background_tasks, user, [
+        {"job_card_id": jid, "from_job_card_id": job_card_id, "how": "dispatch"}
+        for jid in result.get("unlocked_job_card_ids") or []])
     return result
 
 
@@ -7764,6 +7773,7 @@ async def stop_jc_v2(
     request: Request,
     job_card_id: int,
     body: StopJobCardV2Request,
+    background_tasks: BackgroundTasks,
     user=Depends(require_permission("production", "job_cards", "overview", action="complete")),
 ):
     """R1 Stop Process: mid-run cancel for JCs already receiving material
@@ -7775,20 +7785,28 @@ async def stop_jc_v2(
     endpoint executes once the request is approved.
     """
     from app.modules.production.services.job_card_v2 import stop_job_card
+    from app.modules.production.services.refusals import (
+        ServiceRefusal, raise_if_refused, to_http,
+    )
     pool = request.app.state.db_pool
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            result = await stop_job_card(
-                conn,
-                job_card_id=job_card_id,
-                reason=body.reason,
-                stopped_by=user.full_name or user.phone,
-                request_id=body.request_id,
-            )
-    if result.get("error") == "job_card_not_found":
-        raise HTTPException(status_code=404, detail="Job card not found")
-    if result.get("error") in ("invalid_status", "missing_reason"):
-        raise HTTPException(status_code=400, detail=result.get("message", result["error"]))
+    try:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                result = raise_if_refused(await stop_job_card(
+                    conn,
+                    job_card_id=job_card_id,
+                    reason=body.reason,
+                    stopped_by=user.full_name or user.phone,
+                    request_id=body.request_id,
+                ))
+    except ServiceRefusal as refusal:
+        # Inside the transaction: the send-on dispatch rolls back too. Never a 200.
+        raise to_http(refusal, messages={"job_card_not_found": "Job card not found"})
+    # The stage the stop released (sent its output on, or joined the chain to).
+    if result.get("unlocked_job_card_id"):
+        _notify_unlocked_job_cards(request, background_tasks, user, [
+            {"job_card_id": result["unlocked_job_card_id"], "from_job_card_id": job_card_id,
+             "how": "stage_stopped"}])
     return result
 
 
@@ -7830,6 +7848,7 @@ async def cancel_jc_v2(
     request: Request,
     job_card_id: int,
     body: CancelJobCardV2Request,
+    background_tasks: BackgroundTasks,
     user=Depends(require_permission("production", "job_cards", "overview", action="close")),
 ):
     """Soft-cancel a v2 JC. Allowed only before 'in_progress' — past that
@@ -7849,19 +7868,27 @@ async def cancel_jc_v2(
             },
         )
     from app.modules.production.services.job_card_v2 import cancel_job_card
+    from app.modules.production.services.refusals import (
+        ServiceRefusal, raise_if_refused, to_http,
+    )
     pool = request.app.state.db_pool
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            result = await cancel_job_card(
-                conn,
-                job_card_id=job_card_id,
-                reason=body.reason,
-                deleted_by=user.full_name or user.phone,
-            )
-    if result.get("error") == "job_card_not_found":
-        raise HTTPException(status_code=404, detail="Job card not found")
-    if result.get("error") in ("missing_reason", "invalid_status"):
-        raise HTTPException(status_code=400, detail=result["message"])
+    try:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                result = raise_if_refused(await cancel_job_card(
+                    conn,
+                    job_card_id=job_card_id,
+                    reason=body.reason,
+                    deleted_by=user.full_name or user.phone,
+                ))
+    except ServiceRefusal as refusal:
+        # merged_run / packaging_has_previous_stage are refusals too — never a 200.
+        raise to_http(refusal, messages={"job_card_not_found": "Job card not found"})
+    # The stage the join released (it is now first, or the stage before finished).
+    if result.get("unlocked_job_card_id"):
+        _notify_unlocked_job_cards(request, background_tasks, user, [
+            {"job_card_id": result["unlocked_job_card_id"], "from_job_card_id": job_card_id,
+             "how": "stage_cancelled"}])
     return result
 
 
@@ -7903,6 +7930,7 @@ async def backfill_indents_v2(
 async def close_job_card_v2(
     request: Request,
     job_card_id: int,
+    background_tasks: BackgroundTasks,
     body: CloseJobCardV2Request | None = None,
     user=Depends(require_permission("production", "job_cards", "overview", action="close")),
 ):
@@ -7928,6 +7956,7 @@ async def close_job_card_v2(
         async with conn.transaction():
             result = await close_job_card(
                 conn, job_card_id=job_card_id, allow_partial=allow_partial,
+                closed_by=user.full_name or user.phone,
             )
             if "error" not in result and result.get("plan_id") is not None:
                 try:
@@ -7947,6 +7976,11 @@ async def close_job_card_v2(
                             detail={"error": "missing_sign_offs", "missing": result["missing"]})
     if plan_closed:
         result["plan_auto_closed"] = True
+    # The stage(s) the send-on released (completing / closing sends the remaining
+    # output on, 2026-10-24) — tell their floor.
+    _notify_unlocked_job_cards(request, background_tasks, user, [
+        {"job_card_id": jid, "from_job_card_id": job_card_id, "how": "dispatch"}
+        for jid in result.get("unlocked_job_card_ids") or []])
     return result
 
 

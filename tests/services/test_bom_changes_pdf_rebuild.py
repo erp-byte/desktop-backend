@@ -171,6 +171,9 @@ class ScriptConn:
 
     async def fetchrow(self, sql, *a):
         s = self._s(sql, a)
+        if "AS heads, MAX(process_group_id) AS group_id" in s:
+            # line_edit_refusal (Edit is refused for several chains / a merged run).
+            return {"heads": len(self.heads), "group_id": None}
         if "FROM production_plan_line_v2 l JOIN production_plan_v2 p" in s:
             return {"bom_id": 9, "fg_sku_name": "FG", "customer_name": "C", "entity": "cfpl", "warehouse": "W202"}
         raise AssertionError(s)

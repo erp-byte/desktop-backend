@@ -184,6 +184,11 @@ def facts(card: dict[str, Any], source: Optional[dict[str, Any]], unlock: dict[s
     if unlock.get("how") == "force_unlock":
         reason = str(unlock.get("reason") or "").strip()
         notes.append(f"Force-unlocked: {reason}" if reason else "Force-unlocked")
+    # Cancelling / stopping a stage joins the chain around it (2026-10-24).
+    elif unlock.get("how") == "stage_cancelled":
+        notes.append("The stage before was cancelled")
+    elif unlock.get("how") == "stage_stopped":
+        notes.append("The stage before was stopped")
     if not floor:
         notes.append(NO_FLOOR_NOTE)
     who = str(unlocked_by or "").strip()

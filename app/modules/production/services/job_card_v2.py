@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -1081,6 +1082,41 @@ async def create_job_cards_from_plan(conn, plan_id: int) -> dict:
 # in docs/SO_Planning_Convergence_Remediation.md §4.
 # ---------------------------------------------------------------------------
 
+_CHAIN_SUFFIX_RE = re.compile(r"-B(\d+)$")
+
+
+def next_chain_no(job_card_numbers) -> int:
+    """The next partial chain's number on a line: past EVERY number ever used
+    there (cancelled cards included — job_card_number is UNIQUE across every row).
+    A number without a -B{n} suffix belongs to chain 1. 1 when never carded."""
+    used = [int(m.group(1)) if (m := _CHAIN_SUFFIX_RE.search(n or "")) else 1
+            for n in job_card_numbers]
+    return max(used) + 1 if used else 1
+
+
+async def reset_line_steps(conn, plan_line_id: int, *, first_chain: bool) -> int:
+    """Make room for a new chain's plan steps; returns the step_order to follow.
+
+    The FIRST live chain replaces the line's snapshot steps — but only those no
+    job card references: cancelled cards keep theirs (plan_step_id ... ON DELETE
+    RESTRICT), and deleting those failed the re-card after a cancel. A later
+    partial chain deletes nothing. New steps follow whatever remains.
+    """
+    if first_chain:
+        await conn.execute(
+            """
+            DELETE FROM production_plan_step_v2 s
+             WHERE s.plan_line_id = $1
+               AND NOT EXISTS (SELECT 1 FROM job_card_v2 j WHERE j.plan_step_id = s.step_id)
+            """,
+            plan_line_id,
+        )
+    return int(await conn.fetchval(
+        "SELECT COALESCE(MAX(step_order), 0) FROM production_plan_step_v2 "
+        "WHERE plan_line_id=$1", plan_line_id,
+    ) or 0)
+
+
 async def create_job_cards_for_line(
     conn,
     plan_line_id: int,
@@ -1240,17 +1276,14 @@ async def create_job_cards_for_line(
     # delete the existing steps — they're RESTRICT-referenced by the earlier
     # chain's cards — so it appends its own step rows with CONTINUED step_order
     # (uq_pps_v2_line_order is UNIQUE on (plan_line_id, step_order)).
-    chain_no = existing_heads + 1
-    if existing_heads == 0:
-        await conn.execute(
-            "DELETE FROM production_plan_step_v2 WHERE plan_line_id=$1", plan_line_id,
-        )
-        step_order_base = 0
-    else:
-        step_order_base = int(await conn.fetchval(
-            "SELECT COALESCE(MAX(step_order), 0) FROM production_plan_step_v2 "
-            "WHERE plan_line_id=$1", plan_line_id,
-        ) or 0)
+    # Chain number past every number ever used on the line, and steps that
+    # cancelled cards still reference kept — re-carding after a cancel used to
+    # fail on both (next_chain_no / reset_line_steps).
+    chain_no = next_chain_no([r["job_card_number"] for r in await conn.fetch(
+        "SELECT job_card_number FROM job_card_v2 WHERE plan_line_id = $1", plan_line_id,
+    )])
+    step_order_base = await reset_line_steps(conn, plan_line_id,
+                                             first_chain=existing_heads == 0)
     step_ids: list[int] = []
     for i, sp in enumerate(steps_spec):
         async def _insert_step(_order=step_order_base + i + 1, _sp=sp):
@@ -1825,6 +1858,44 @@ async def get_line_job_card_config(conn, plan_line_id: int) -> dict:
     }
 
 
+async def line_edit_refusal(conn, plan_line_id: int) -> dict | None:
+    """Why the Edit wizard must not touch this line's cards, or None.
+
+    Edit (replace / live edit) reads all of a line's live cards as ONE chain.
+      * Several partial chains: that mixed them, and a plain live-edit Save
+        merged them into one for good.
+      * A merged process run (process_group_id): that broke the run for its
+        other products.
+    Both are refused before anything changes (agreed 2026-10-24).
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT COUNT(*) FILTER (WHERE prev_job_card_id IS NULL) AS heads,
+               MAX(process_group_id)                            AS group_id
+        FROM   job_card_v2
+        WHERE  plan_line_id = $1 AND deleted_at IS NULL
+        """,
+        plan_line_id,
+    )
+    if row and row["group_id"] is not None:
+        return {
+            "error": "merged_run",
+            "process_group_id": row["group_id"],
+            "message": ("This article is part of a merged process run shared with other "
+                        "products. Editing it here would break the run for them, so Edit "
+                        "is blocked for it."),
+        }
+    heads = int(row["heads"] or 0) if row else 0
+    if heads > 1:
+        return {
+            "error": "multiple_chains",
+            "chains": heads,
+            "message": (f"This article was carded in {heads} separate chains. Editing here "
+                        "would mix them together, so Edit is blocked for this article."),
+        }
+    return None
+
+
 async def replace_job_cards_for_line(
     conn,
     plan_line_id: int,
@@ -1849,6 +1920,9 @@ async def replace_job_cards_for_line(
     await conn.execute(
         "SELECT 1 FROM production_plan_line_v2 WHERE plan_line_id = $1 FOR UPDATE", plan_line_id,
     )
+    refusal = await line_edit_refusal(conn, plan_line_id)
+    if refusal is not None:
+        return refusal
     existing = await conn.fetch(
         "SELECT job_card_id, status FROM job_card_v2 "
         "WHERE plan_line_id = $1 AND deleted_at IS NULL",
@@ -2102,6 +2176,9 @@ async def apply_live_job_card_edits(
     await conn.execute(
         "SELECT 1 FROM production_plan_line_v2 WHERE plan_line_id = $1 FOR UPDATE", plan_line_id,
     )
+    refusal = await line_edit_refusal(conn, plan_line_id)
+    if refusal is not None:
+        return refusal
     import json
     from app.modules.production.services import jc_bom_changes
     EDITABLE = _JC_EDITABLE_STATUSES        # ('locked', 'unlocked')
@@ -3496,6 +3573,15 @@ async def dispatch_to_next(conn, *, job_card_id: int, qty_kg: float,
                 "message": (f"Dispatching {qty_kg} would exceed produced output: "
                             f"{already} already dispatched of {produced} produced."),
                 "produced_kg": produced, "already_dispatched_kg": already}
+    # The next stage must still be live: a cancelled one used to receive the
+    # material (and its WIP stock) with nowhere for it to go.
+    nxt = await conn.fetchrow(
+        "SELECT status, locked_reason, deleted_at FROM job_card_v2 WHERE job_card_id=$1 FOR UPDATE",
+        src["next_job_card_id"],
+    )
+    if nxt is None or nxt.get("deleted_at") is not None or nxt["status"] == 'cancelled':
+        return {"error": "chain_broken",
+                "message": "The next stage of this job card was cancelled, so there is nowhere to send the material."}
 
     async def _insert_dispatch():
         return await conn.fetchrow(
@@ -3515,13 +3601,10 @@ async def dispatch_to_next(conn, *, job_card_id: int, qty_kg: float,
         "UPDATE job_card_v2 SET dispatched_to_next_kg = dispatched_to_next_kg + $1 WHERE job_card_id=$2",
         qty_kg, job_card_id,
     )
-    # The next card's state BEFORE the release below, so the caller learns whether
-    # this dispatch is what freed it (and the unlock notice goes to that card only).
-    nxt = await conn.fetchrow(
-        "SELECT status, locked_reason FROM job_card_v2 WHERE job_card_id=$1 FOR UPDATE",
-        src["next_job_card_id"],
-    )
-    unlocked_now = bool(nxt) and nxt["status"] == 'locked' and nxt["locked_reason"] == 'awaiting_previous_stage'
+    # The next card's state BEFORE the release below (read and locked above), so
+    # the caller learns whether this dispatch is what freed it (and the unlock
+    # notice goes to that card only).
+    unlocked_now = nxt["status"] == 'locked' and nxt["locked_reason"] == 'awaiting_previous_stage'
     await conn.execute(
         """
         UPDATE job_card_v2
@@ -3568,6 +3651,49 @@ async def dispatch_to_next(conn, *, job_card_id: int, qty_kg: float,
     return {"dispatched": True, "dispatch": _serialize(audit),
             "unlocked_job_card_id": src["next_job_card_id"] if unlocked_now else None,
             "wip_batch_id": wip_batch_id}
+
+
+_PACKAGING_FINISHED = ('completed', 'closed', 'cancelled')
+
+
+def share_out_process_output(*, produced: float, budget: float, consumers, sent: dict) -> dict:
+    """kg to send each member packaging card now, from a merged process run's
+    `budget` (produced minus already dispatched).
+
+    Each member's target is produced x its share (planned_qty_kg / total planned;
+    equal shares when nothing is planned). Open members are topped up to their
+    target minus what they were already `sent`; budget beyond that (e.g. a
+    finished member's share) goes to the open members by share; if the deficits
+    exceed the budget they are scaled down. Rounded to grams with the last member
+    taking the rounding, so the whole budget leaves the card. Finished
+    (completed / closed) members get nothing more. Agreed 2026-10-24.
+    """
+    consumers = list(consumers)
+    if not consumers or budget <= 0:
+        return {}
+    planned = {c["job_card_id"]: max(0.0, float(c["planned_qty_kg"] or 0)) for c in consumers}
+    total = sum(planned.values())
+    share = {cid: (p / total if total > 0 else 1.0 / len(consumers)) for cid, p in planned.items()}
+    open_ids = [c["job_card_id"] for c in consumers
+                if (c["status"] or "") not in _PACKAGING_FINISHED]
+    if not open_ids:
+        return {}
+    deficit = {cid: max(0.0, produced * share[cid] - float(sent.get(cid, 0) or 0)) for cid in open_ids}
+    owed = sum(deficit.values())
+    open_share = sum(share[cid] for cid in open_ids)
+    if owed >= budget and owed > 0:
+        raw = {cid: budget * deficit[cid] / owed for cid in open_ids}
+    else:
+        spare = budget - owed
+        raw = {cid: deficit[cid] + (spare * share[cid] / open_share if open_share > 0
+                                    else spare / len(open_ids))
+               for cid in open_ids}
+    alloc: dict = {}
+    for cid in open_ids[:-1]:
+        alloc[cid] = round(raw[cid], 3)
+    last = open_ids[-1]
+    alloc[last] = round(budget - sum(alloc.values()), 3)
+    return {cid: q for cid, q in alloc.items() if q > 0}
 
 
 async def dispatch_process_group(conn, *, process_job_card_id: int,
@@ -3636,24 +3762,35 @@ async def dispatch_process_group(conn, *, process_job_card_id: int,
         return {"error": "no_consumers",
                 "message": "No packaging cards hang off this process card."}
 
-    # Only feed consumers not yet fed. Split the remaining produced budget across
-    # their planned qty proportionally, capping cumulative dispatch at produced.
-    pending = [c for c in consumers if float(c["carried_qty_kg"] or 0) <= 0]
-    if not pending:
-        return {"dispatched": True, "process_group_id": src["process_group_id"],
-                "produced_kg": produced, "results": [],
-                "message": "All packaging cards already fed."}
-    demand  = sum(float(c["planned_qty_kg"] or 0) for c in pending)
+    # Share ALL the output across the members (share_out_process_output). The
+    # old rule fed each member once, capped at its plan, so output above the plan
+    # never moved and the card could never close (audit 2026-10-23).
     already = float(src["dispatched_to_next_kg"] or 0)
-    budget  = max(0.0, produced - already)
-    scale   = min(1.0, (budget / demand) if demand > 0 else 0.0)
+    budget  = round(max(0.0, produced - already), 3)
+    if budget < 0.001:
+        return {"error": "nothing_to_distribute",
+                "message": "Everything this card produced has already been sent to packaging."}
+    sent_rows = await conn.fetch(
+        "SELECT to_job_card_id, COALESCE(SUM(qty_kg), 0) AS sent_kg "
+        "FROM job_card_partial_dispatch_v2 WHERE from_job_card_id = $1 "
+        "GROUP BY to_job_card_id",
+        process_job_card_id,
+    )
+    sent = {r["to_job_card_id"]: float(r["sent_kg"] or 0) for r in sent_rows}
+    plan = share_out_process_output(produced=produced, budget=budget,
+                                    consumers=consumers, sent=sent)
+    if not plan:
+        return {"error": "no_open_packaging",
+                "message": (f"Every product's packaging card is already finished, so the "
+                            f"remaining {budget:.3f} kg can't be sent on.")}
 
     results: list[dict] = []
-    for c in pending:
-        want = round(float(c["planned_qty_kg"] or 0) * scale, 3)
-        if want <= 0:
+    for c in consumers:
+        want = plan.get(c["job_card_id"])
+        if not want:
             continue
-        cu = c["planned_qty_units"]
+        # The piece count goes with a member's first feed only; a top-up adds kg.
+        cu = c["planned_qty_units"] if not sent.get(c["job_card_id"]) else None
 
         async def _ins(_to=c["job_card_id"], _q=want, _u=cu):
             return await conn.fetchrow(
@@ -3702,8 +3839,11 @@ async def dispatch_process_group(conn, *, process_job_card_id: int,
             "unlocked": c["status"] == 'locked' and c["locked_reason"] == 'awaiting_previous_stage',
         })
 
+    sent_now = round(sum(r["qty_kg"] for r in results), 3)
     return {"dispatched": True, "process_group_id": src["process_group_id"],
             "produced_kg": produced, "results": results,
+            "dispatched_kg": sent_now,
+            "remaining_kg": round(max(0.0, budget - sent_now), 3),
             "unlocked_job_card_ids": [r["packaging_job_card_id"] for r in results if r["unlocked"]]}
 
 
@@ -4643,7 +4783,14 @@ async def complete_job_card(conn, *, job_card_id: int,
         from app.modules.production.services import balance_override as bo
         await bo.record_override_remark(conn, job_card_id=job_card_id,
                                         content=unbalanced_note, recorded_by=completed_by)
+    # The stage is done: what it produced but didn't dispatch goes on, so the next
+    # stage isn't left waiting (agreed 2026-10-24).
+    sent_on = await send_on_remaining_output(
+        conn, job_card_id, sent_by=completed_by,
+        why="Sent on automatically when the stage was completed")
     return {
+        "sent_on":        sent_on,
+        "unlocked_job_card_ids": (sent_on or {}).get("unlocked_job_card_ids", []),
         "completed":      True,
         "job_card_id":    job_card_id,
         "status":         row["status"],
@@ -4787,6 +4934,84 @@ async def patch_job_card(conn, *, job_card_id: int,
     return {"updated": True, "job_card": _serialize(row)}
 
 
+_CARD_FOR_CANCEL_SQL = """
+    SELECT job_card_id, status, prev_job_card_id, next_job_card_id, output_kind,
+           process_group_id, dispatched_to_next_kg
+    FROM   job_card_v2
+    WHERE  job_card_id = $1 AND deleted_at IS NULL
+"""
+
+
+async def _cancel_refusal(conn, card) -> dict | None:
+    """Why this stage can't be cancelled / stopped on its own, or None.
+
+      * A stage of a merged process run: the other products hang off the run.
+      * Packaging while an earlier stage is still live: joining the chain around
+        it would leave the chain without its packaging stage — cancel the
+        earlier stages first (front to back), then packaging is the last card.
+    """
+    if card["process_group_id"] is not None:
+        return {"error": "merged_run",
+                "message": ("This card is part of a merged process run shared with other "
+                            "products; cancelling one stage on its own would strand them.")}
+    if (card["output_kind"] or "").upper() == 'FG' and card["prev_job_card_id"] is not None:
+        prev = await conn.fetchrow(
+            "SELECT job_card_id FROM job_card_v2 WHERE job_card_id = $1 AND deleted_at IS NULL",
+            card["prev_job_card_id"],
+        )
+        if prev is not None:
+            return {"error": "packaging_has_previous_stage",
+                    "message": ("Packaging can only be cancelled once it is the last card left "
+                                "on its chain. Cancel the earlier stages first.")}
+    return None
+
+
+async def _join_chain_around(conn, card) -> int | None:
+    """Join the chain around a cancelled / stopped card (agreed 2026-10-24): the
+    stage before links straight to the stage after. Before, the next stage kept
+    waiting on the dead card forever ('awaiting_previous_stage').
+
+    The next stage is released when it becomes the first stage, or when the stage
+    before has already finished (it will dispatch no more); otherwise it waits for
+    that stage's dispatch, which now comes to it. Returns the released card's id.
+    """
+    prev = None
+    if card["prev_job_card_id"] is not None:
+        prev = await conn.fetchrow(
+            "SELECT job_card_id, status FROM job_card_v2 "
+            "WHERE job_card_id = $1 AND deleted_at IS NULL",
+            card["prev_job_card_id"],
+        )
+    nxt = None
+    if card["next_job_card_id"] is not None:
+        nxt = await conn.fetchrow(
+            "SELECT job_card_id, status, locked_reason FROM job_card_v2 "
+            "WHERE job_card_id = $1 AND deleted_at IS NULL FOR UPDATE",
+            card["next_job_card_id"],
+        )
+    if prev is not None:
+        await conn.execute(
+            "UPDATE job_card_v2 SET next_job_card_id = $2 WHERE job_card_id = $1",
+            prev["job_card_id"], nxt["job_card_id"] if nxt is not None else None,
+        )
+    if nxt is None:
+        return None
+    release = (nxt["status"] == 'locked' and nxt["locked_reason"] == 'awaiting_previous_stage'
+               and (prev is None or prev["status"] in ('completed', 'closed')))
+    await conn.execute(
+        """
+        UPDATE job_card_v2
+           SET prev_job_card_id = $2,
+               is_locked     = CASE WHEN $3::bool THEN FALSE ELSE is_locked END,
+               status        = CASE WHEN $3::bool THEN 'unlocked' ELSE status END,
+               locked_reason = CASE WHEN $3::bool THEN NULL ELSE locked_reason END
+         WHERE job_card_id = $1
+        """,
+        nxt["job_card_id"], prev["job_card_id"] if prev is not None else None, release,
+    )
+    return nxt["job_card_id"] if release else None
+
+
 async def cancel_job_card(conn, *, job_card_id: int,
                            reason: str, deleted_by: str | None = None) -> dict:
     """Soft-cancel a JC. Only permitted on JCs that haven't started yet
@@ -4800,25 +5025,24 @@ async def cancel_job_card(conn, *, job_card_id: int,
           linked tables are mutated afterwards.
         - status = 'cancelled', deleted_at = NOW()
         - cancellation_reason recorded
-        - the downstream JC (if it was waiting on this stage's handoff)
-          is unaffected; the operator can still complete normally by
-          ignoring the dispatch button on the cancelled card.
+        - the chain is joined around the cancelled card (_join_chain_around):
+          the stage before links to the stage after, which is released if it
+          is now the first stage or the stage before has finished. (It used
+          to keep waiting on the dead card forever.) Refused for packaging
+          with a live earlier stage, and for a merged process run's stage.
     """
     if not reason or not reason.strip():
         return {"error": "missing_reason", "message": "reason is required"}
 
-    jc = await conn.fetchrow(
-        """
-        SELECT status FROM job_card_v2
-        WHERE  job_card_id = $1 AND deleted_at IS NULL
-        """,
-        job_card_id,
-    )
+    jc = await conn.fetchrow(_CARD_FOR_CANCEL_SQL, job_card_id)
     if not jc:
         return {"error": "job_card_not_found"}
     if jc["status"] not in ('locked', 'unlocked', 'assigned', 'material_received'):
         return {"error": "invalid_status",
                 "message": f"Cannot cancel a JC in '{jc['status']}' — use close instead"}
+    refusal = await _cancel_refusal(conn, jc)
+    if refusal is not None:
+        return refusal
 
     # Build the cancellation snapshot before flipping status. We compose
     # it from the canonical detail builder so the JSONB blob matches what
@@ -4847,7 +5071,8 @@ async def cancel_job_card(conn, *, job_card_id: int,
         """,
         job_card_id, deleted_by, reason.strip(), snapshot_json,
     )
-    return {"cancelled": True, "job_card": _serialize(row)}
+    released = await _join_chain_around(conn, jc)
+    return {"cancelled": True, "job_card": _serialize(row), "unlocked_job_card_id": released}
 
 
 # ---------------------------------------------------------------------------
@@ -4886,14 +5111,7 @@ async def stop_job_card(conn, *, job_card_id: int,
     # overwrite each other's cancellation_reason. asyncpg passes the
     # row-lock through the wrapping conn.transaction(); the lock releases
     # when the txn commits/rolls back at the router layer.
-    jc = await conn.fetchrow(
-        """
-        SELECT status FROM job_card_v2
-        WHERE  job_card_id = $1 AND deleted_at IS NULL
-        FOR    UPDATE
-        """,
-        job_card_id,
-    )
+    jc = await conn.fetchrow(_CARD_FOR_CANCEL_SQL + " FOR UPDATE", job_card_id)
     if not jc:
         return {"error": "job_card_not_found"}
     if jc["status"] not in ('material_received', 'in_progress'):
@@ -4903,6 +5121,25 @@ async def stop_job_card(conn, *, job_card_id: int,
                     "applies only to 'material_received' or 'in_progress'. "
                     "Use cancel for pre-start; close for completed."
                 )}
+    refusal = await _cancel_refusal(conn, jc)
+    if refusal is not None:
+        return refusal
+
+    # What this stage produced but hasn't dispatched goes on to the next stage
+    # before the stage is cancelled (it can't be dispatched afterwards).
+    released: int | None = None
+    if jc["next_job_card_id"] is not None:
+        produced = float(await conn.fetchval(
+            "SELECT COALESCE(SUM(output_qty_kg), 0) FROM job_card_output_v2 "
+            "WHERE job_card_id = $1 AND deleted_at IS NULL",
+            job_card_id,
+        ) or 0)
+        left = round(produced - float(jc["dispatched_to_next_kg"] or 0), 3)
+        if left >= 0.001:
+            sent = await dispatch_to_next(conn, job_card_id=job_card_id, qty_kg=left,
+                                          dispatched_by=stopped_by,
+                                          notes="Sent on when the stage was stopped")
+            released = sent.get("unlocked_job_card_id")
 
     # Close any open shift segment so the partial-unique index
     # uq_jcsl_v2_one_open doesn't leave a dangling open row that future
@@ -4955,7 +5192,8 @@ async def stop_job_card(conn, *, job_card_id: int,
         """,
         job_card_id, stopped_by, reason.strip(), prefix,
     )
-    return {"stopped": True, "job_card": _serialize(row)}
+    released = await _join_chain_around(conn, jc) or released
+    return {"stopped": True, "job_card": _serialize(row), "unlocked_job_card_id": released}
 
 
 # ---------------------------------------------------------------------------
@@ -4972,8 +5210,50 @@ async def stop_job_card(conn, *, job_card_id: int,
 REQUIRED_SIGN_OFFS = ('production_head',)
 
 
+async def send_on_remaining_output(conn, job_card_id: int, *, sent_by: str | None,
+                                   why: str) -> dict | None:
+    """Send what this stage produced but hasn't dispatched on to the next stage
+    (agreed 2026-10-24). Completing / closing used to only change the status, so a
+    stage finished without a Dispatch left the next one locked for good. A merged
+    run's process card (no next card) shares it across its packaging cards.
+
+    None when there's nothing to send or nowhere to send it. A refused send (e.g.
+    the next stage was cancelled) is returned as-is with no unlocks, and does not
+    block the completion. Always `unlocked_job_card_ids` otherwise.
+    """
+    card = await conn.fetchrow(
+        "SELECT next_job_card_id, output_kind, dispatched_to_next_kg, process_group_id "
+        "FROM job_card_v2 WHERE job_card_id = $1 AND deleted_at IS NULL",
+        job_card_id,
+    )
+    if card is None or (card["output_kind"] or "").upper() == 'FG':
+        return None
+    produced = float(await conn.fetchval(
+        "SELECT COALESCE(SUM(output_qty_kg), 0) FROM job_card_output_v2 "
+        "WHERE job_card_id = $1 AND deleted_at IS NULL",
+        job_card_id,
+    ) or 0)
+    left = round(produced - float(card["dispatched_to_next_kg"] or 0), 3)
+    if left < 0.001:
+        return None
+    if card["next_job_card_id"] is not None:
+        sent = await dispatch_to_next(conn, job_card_id=job_card_id, qty_kg=left,
+                                      dispatched_by=sent_by, notes=why)
+        unlocked = [sent["unlocked_job_card_id"]] if sent.get("unlocked_job_card_id") else []
+    elif card["process_group_id"] is not None:
+        sent = await dispatch_process_group(conn, process_job_card_id=job_card_id,
+                                            dispatched_by=sent_by)
+        unlocked = list(sent.get("unlocked_job_card_ids") or [])
+    else:
+        return None
+    if sent.get("error"):
+        unlocked = []
+    return {**sent, "qty_kg": left, "unlocked_job_card_ids": unlocked}
+
+
 async def close_job_card(conn, *, job_card_id: int,
-                         allow_partial: bool = False) -> dict:
+                         allow_partial: bool = False,
+                         closed_by: str | None = None) -> dict:
     """Transition a v2 JC to status='closed'. Refuses when:
         - any required sign-off role is missing
         - any open shift segment exists
@@ -5018,6 +5298,12 @@ async def close_job_card(conn, *, job_card_id: int,
         if missing:
             return {"error": "missing_sign_offs", "missing": missing}
 
+    # Anything still not sent on goes to the next stage first — a closed card
+    # can't dispatch any more (agreed 2026-10-24).
+    sent_on = await send_on_remaining_output(
+        conn, job_card_id, sent_by=closed_by,
+        why="Sent on automatically when the stage was closed")
+
     closed = await conn.fetchrow(
         """
         UPDATE job_card_v2
@@ -5028,7 +5314,9 @@ async def close_job_card(conn, *, job_card_id: int,
         """,
         job_card_id,
     )
-    return {"closed": True, "job_card": _serialize(closed), "plan_id": jc["plan_id"]}
+    return {"closed": True, "job_card": _serialize(closed), "plan_id": jc["plan_id"],
+            "sent_on": sent_on,
+            "unlocked_job_card_ids": (sent_on or {}).get("unlocked_job_card_ids", [])}
 
 
 # ---------------------------------------------------------------------------

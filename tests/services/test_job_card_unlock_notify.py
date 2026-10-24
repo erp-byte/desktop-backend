@@ -293,3 +293,18 @@ def test_a_card_that_is_no_longer_there_is_reported_not_sent(channels):
 def test_no_unlocks_is_a_no_op(channels, monkeypatch):
     monkeypatch.setattr(U, "_settings", lambda: pytest.fail("settings are not needed for no cards"))
     assert _run([])["cards"] == []
+
+
+@pytest.mark.parametrize("how,note", [
+    ("stage_cancelled", "The stage before was cancelled"),
+    ("stage_stopped", "The stage before was stopped"),
+])
+def test_a_stage_released_by_a_cancel_or_stop_says_why(how, note):
+    """Cancelling / stopping a stage joins the chain around it and can release the
+    next stage (2026-10-24); the notice says why it can start."""
+    facts = U.facts({**DOWNSTREAM, "floor": "FG store"}, UPSTREAM,
+                    {"job_card_id": DOWNSTREAM["job_card_id"], "from_job_card_id": UPSTREAM["job_card_id"],
+                     "how": how},
+                    unlocked_by="Ravi K", when=NOW)
+    assert facts["note"] == note
+    assert facts["received"] == "-"
