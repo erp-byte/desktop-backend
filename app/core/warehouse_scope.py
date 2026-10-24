@@ -81,3 +81,32 @@ def WAREHOUSE_NORM_ANY_SQL(col_expr: str, param_placeholder: str) -> str:
         f"  FROM unnest({param_placeholder}::text[]) AS w"
         f")"
     )
+
+
+# ── Floors ───────────────────────────────────────────────────────────────────
+# Floors compare trimmed and upper-cased: the rule stock_take.place_scope and the
+# job-card notices (production/services/wa_notify) already apply. The job-card
+# routes used to compare the grant strings raw, so a card on "roasting area" was
+# closed to someone granted "Roasting Area" while the notice telling them about it
+# still went out, and its link opened "access denied" (audit 2026-10-23).
+
+def normalise_floor(value: str | None) -> str:
+    """'  roasting area ' -> 'ROASTING AREA'. '' for None/empty."""
+    return str(value or "").strip().upper()
+
+
+def user_has_floor(user_floors: Iterable[str] | None, floor: str | None) -> bool:
+    """True when ``floor`` is one of ``user_floors``, ignoring case and outer
+    spaces. Empty/None on either side returns False — callers that want the
+    "no grants = no limit" rule must check that themselves, as for warehouses."""
+    fl = normalise_floor(floor)
+    return bool(fl) and any(normalise_floor(f) == fl for f in (user_floors or []))
+
+
+def floor_scope_values(user_floors: Iterable[str] | None) -> list[str]:
+    """The grants as compared in SQL against FLOOR_NORM_SQL(column)."""
+    return sorted({normalise_floor(f) for f in (user_floors or []) if normalise_floor(f)})
+
+
+def FLOOR_NORM_SQL(expr: str) -> str:
+    return f"upper(btrim(coalesce({expr}, '')))"

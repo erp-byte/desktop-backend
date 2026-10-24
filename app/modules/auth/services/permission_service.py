@@ -2,7 +2,7 @@
 
 import logging
 
-from app.core.warehouse_scope import user_has_warehouse
+from app.core.warehouse_scope import user_has_floor, user_has_warehouse
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +75,8 @@ async def check_permission(conn, role_id, is_admin: bool,
                 if (warehouse and result['allowed_warehouses']
                         and not user_has_warehouse(result['allowed_warehouses'], warehouse)):
                     continue
-                if floor and result['allowed_floors'] and floor not in result['allowed_floors']:
+                if (floor and result['allowed_floors']
+                        and not user_has_floor(result['allowed_floors'], floor)):
                     continue
                 return True
             return False

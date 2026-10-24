@@ -679,12 +679,14 @@ async def approve_plan(conn, plan_id: int, approved_by: str) -> dict:
         return {"error": "plan_incomplete", "message": incomplete_message(problems),
                 "problems": problems}
 
+    # Approving an approved plan again (to card what's left) keeps the first
+    # approver and time; it used to overwrite them with whoever pressed last.
     result = await conn.fetchrow(
         """
         UPDATE production_plan_v2
         SET status      = 'approved',
-            approved_by = $2,
-            approved_at = NOW()
+            approved_by = COALESCE(approved_by, $2),
+            approved_at = COALESCE(approved_at, NOW())
         WHERE plan_id = $1 AND status IN ('draft','approved')
         RETURNING *
         """,

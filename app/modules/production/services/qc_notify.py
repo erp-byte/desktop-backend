@@ -1,17 +1,19 @@
 """R12 notify-QC dispatcher.
 
-A plug-in shaped service: today the dispatch is logged to
-qc_notification_log_v2 and the registered hook is a no-op. When the
-real transport (WhatsApp / push / email) is ready, the implementer
-swaps the registered hook for the live function - no router or schema
-change required.
+Every attempt is logged to qc_notification_log_v2, one row per recipient. The
+hook that does the sending is email_hook: one plain-text email per QC person
+through the production module's SMTP helper (mail_service._send). The hook
+used to be a no-op that nothing ever replaced, so "Notify QC" reached nobody
+while the screen reported it sent (audit 2026-10-23). A WhatsApp to QC would
+need its own template approved by Meta first; until then email is the channel
+(agreed 2026-10-24). Another transport can still be swapped in:
 
 Usage:
 
     # In your transport bootstrap (e.g. app.main on startup):
     from app.modules.production.services.qc_notify import register_qc_notify_hook
 
-    async def my_real_hook(*, job_card_id, recipients, note, dispatched_by):
+    async def my_real_hook(*, job_card_id, recipient, note, dispatched_by, card=None):
         # ... transport-specific send ...
         return {"delivered": True, "channel": "whatsapp", "ids": [...]}
 
@@ -29,12 +31,15 @@ Contract for hook return values:
 """
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 import traceback
 from typing import Any, Awaitable, Callable
 
 from app.core.helpers import insert_with_pk_retry, new_short_time_id
+from app.modules.production.services import mail_service
+from app.modules.production.services.wa_notify import current_settings
 
 logger = logging.getLogger(__name__)
 
@@ -42,15 +47,56 @@ logger = logging.getLogger(__name__)
 QCNotifyHook = Callable[..., Awaitable[dict]]
 
 
-async def _default_noop_hook(**_kwargs: Any) -> dict:
-    """The default hook: explicit no-op so the endpoint logs the
-    dispatch attempt and signals 'no transport wired yet' to the
-    caller. Replace via register_qc_notify_hook(...).
-    """
-    return {"delivered": False, "reason": "no_hook_registered"}
+#: Who "Notify QC" tells: anyone holding one of these among ALL their roles
+#: (the old query read the primary role only, and nobody's is qc_inspector).
+QC_ROLES = ("qc_inspector", "qc_manager")
 
 
-_HOOK: QCNotifyHook = _default_noop_hook
+def compose_email(card: dict, note: str | None, web_url: str) -> tuple[str, str]:
+    """(subject, plain-text body) asking QC to check one completed job card."""
+    from app.modules.production.services.job_card_notify import card_link
+    number = card.get("job_card_number") or f"#{card.get('job_card_id')}"
+    place = " · ".join(x for x in (card.get("factory"), card.get("floor")) if x) or "-"
+    subject = f"QC check needed: job card {number}"
+    body = "\n".join([
+        f"Job card {number} is completed and needs a QC check.",
+        "",
+        f"Product: {card.get('fg_sku_name') or '-'}",
+        f"Customer: {card.get('customer_name') or '-'}",
+        f"Step: {card.get('process_name') or '-'}",
+        f"Place: {place}",
+        f"Asked by: {card.get('asked_by') or '-'}",
+        f"Note: {(note or '').strip() or '-'}",
+        "",
+        f"Open it: {card_link(card, web_url)}",
+    ])
+    return subject, body
+
+
+async def email_hook(*, job_card_id: int, recipient: dict, note: str | None,
+                     dispatched_by: int | None, card: dict | None = None) -> dict:
+    """Email one QC person about one card. delivered=True only when the SMTP
+    server accepted it; otherwise the reason says why nobody was reached."""
+    email = (recipient.get("email") or "").strip()
+    if not email:
+        return {"delivered": False, "channel": "email", "reason": "no_email"}
+    settings = current_settings()
+    if not str(settings.SMTP_HOST or "").strip():
+        return {"delivered": False, "channel": "email", "reason": "email_off"}
+    card = dict(card or {}, job_card_id=job_card_id)
+    subject, body = compose_email(card, note, settings.WEB_APP_URL)
+    # _send is blocking; run it off the event loop. It swallows SMTP errors
+    # itself and returns whether the server accepted the message.
+    accepted = await asyncio.to_thread(
+        mail_service._send, subject, body, [email], [],
+        entity_type="JobCard", entity_id=str(job_card_id), event="qc_requested",
+        status=card.get("status"), actor=card.get("asked_by"))
+    if not accepted:
+        return {"delivered": False, "channel": "email", "reason": "send_failed", "to": email}
+    return {"delivered": True, "channel": "email", "to": email}
+
+
+_HOOK: QCNotifyHook = email_hook
 
 
 def register_qc_notify_hook(hook: QCNotifyHook) -> None:
@@ -72,7 +118,7 @@ def register_qc_notify_hook(hook: QCNotifyHook) -> None:
             "QC notify hook must be an async callable "
             f"(got {type(hook).__name__}, async={inspect.iscoroutinefunction(hook)})"
         )
-    if _HOOK is not _default_noop_hook:
+    if _HOOK is not email_hook:
         logger.warning(
             "Replacing existing QC notify hook %s with %s",
             getattr(_HOOK, "__name__", _HOOK),
@@ -90,14 +136,16 @@ def get_qc_notify_hook() -> QCNotifyHook:
 async def dispatch(conn, *, job_card_id: int,
                    recipients: list[dict],
                    note: str | None,
-                   dispatched_by: int | None) -> dict:
+                   dispatched_by: int | None,
+                   card: dict | None = None) -> dict:
     """Run the registered hook for each recipient and log every attempt to
     qc_notification_log_v2. Returns a roll-up of per-recipient outcomes.
 
     `recipients` is a list of dicts shaped like
-        {"user_id": int, "phone"?: str, "full_name"?: str}
-    so the future transports have the channel-specific addressables to
-    work with.
+        {"user_id": int, "email"?: str, "phone"?: str, "full_name"?: str}
+    so the transports have the channel-specific addressables to work with;
+    `card` (job card number, product, place, who asked) is handed to the hook
+    for the message.
 
     The log row's delivery_status is one of:
         'delivered' - hook said {"delivered": True}
@@ -121,6 +169,7 @@ async def dispatch(conn, *, job_card_id: int,
                 recipient=r_copy,
                 note=note,
                 dispatched_by=dispatched_by,
+                card=dict(card or {}),
             )
             if not isinstance(hook_result, dict):
                 hook_result = {
@@ -179,8 +228,10 @@ async def dispatch(conn, *, job_card_id: int,
             row = await insert_with_pk_retry(conn, _insert)
         outcomes.append({
             "recipient_user_id": recipient_user_id,
+            "name":              r_copy.get("full_name"),
             "notification_id":   row["notification_id"],
             "delivered":         delivered,
+            "channel":           channel,
             "reason":            hook_result.get("reason"),
         })
 
