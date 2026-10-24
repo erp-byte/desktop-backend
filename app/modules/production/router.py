@@ -4833,16 +4833,22 @@ async def update_plan_v2(request: Request, plan_id: int, body: PlanV2Update, use
 @router.post("/plans-v2/{plan_id}/approve")
 async def approve_plan_v2(request: Request, plan_id: int, body: PlanV2Approve, background_tasks: BackgroundTasks, user=Depends(require_permission("production", "plans", "approve", action="create"))):
     from app.modules.production.services.plan_v2 import approve_plan
+    from app.modules.production.services.refusals import (
+        ServiceRefusal, raise_if_refused, to_http,
+    )
     pool = request.app.state.db_pool
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            result = await approve_plan(conn, plan_id, body.approved_by)
-    if result.get("error") == "missing_approver":
-        raise HTTPException(status_code=400, detail=result.get("message"))
-    if result.get("error") == "not_found_or_invalid_status":
-        raise HTTPException(status_code=404, detail="Plan not found or status not approvable")
-    # Committed: tell the floors. A re-approve that generated nothing (the
-    # job_cards_already_exist guard) has no lines here, so it notifies nobody.
+    try:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                result = raise_if_refused(await approve_plan(conn, plan_id, body.approved_by))
+    except ServiceRefusal as refusal:
+        # plan_incomplete lists the articles with no steps / a step with no
+        # floor — nothing was approved.
+        raise to_http(refusal, messages={
+            "not_found_or_invalid_status": "Plan not found or status not approvable",
+        })
+    # Committed: tell the floors. Articles that already had cards are skipped,
+    # so a re-approve that generated nothing notifies nobody.
     _notify_new_job_cards(request, background_tasks, user,
                           [jid for line in (result.get("job_cards") or {}).get("lines") or []
                            for jid in line.get("job_card_ids") or []])
@@ -4884,32 +4890,45 @@ async def split_plan_v2(
     return result
 
 
+async def _refuse_outside_factory(conn, user, plan_id: int) -> None:
+    """403 for a non-admin acting on a plan outside their assigned factories."""
+    if getattr(user, "is_admin", False) or not getattr(user, "allowed_warehouses", None):
+        return
+    wh = await conn.fetchval(
+        "SELECT warehouse FROM production_plan_v2 WHERE plan_id = $1", plan_id,
+    )
+    if wh is not None and not user_has_warehouse(user.allowed_warehouses, wh):
+        raise HTTPException(status_code=403, detail="Plan outside your factory scope")
+
+
 @router.post("/plans-v2/{plan_id}/cancel")
 async def cancel_plan_v2(
     request: Request,
     plan_id: int,
     body: PlanV2Cancel,
-    user=Depends(require_permission("production", "plans", action="delete")),
+    user=Depends(require_permission("production", "plans", "cancel", action="create")),
 ):
-    """Cancel a v2 plan. **Admin-only** — the cancel_plan service releases
-    every line's planned_qty back to the linked so_fulfillment_v2 rows
-    (see plan_v2.cancel_plan), which is a destructive change to demand
-    allocation and must not be available to floor / shop roles."""
-    if not getattr(user, "is_admin", False):
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "error": "admin_only",
-                "message": "Only admin users can cancel a plan.",
-            },
-        )
+    """Cancel a v2 plan with its job cards, giving its SO qty back
+    (plan_v2.cancel_plan). Refused when work has started on any card.
+
+    Anyone whose role has plans › cancel — admins and planners — a non-admin
+    only within their own factory. It used to be admin-only while the screen
+    told planners to "cancel and create a new revision" (audit 2026-10-23)."""
     from app.modules.production.services.plan_v2 import cancel_plan
+    from app.modules.production.services.refusals import (
+        ServiceRefusal, raise_if_refused, to_http,
+    )
     pool = request.app.state.db_pool
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            result = await cancel_plan(conn, plan_id, body.reason)
-    if result.get("error") == "not_found_or_already_cancelled":
-        raise HTTPException(status_code=404, detail="Plan not found or already cancelled")
+    try:
+        async with pool.acquire() as conn:
+            await _refuse_outside_factory(conn, user, plan_id)
+            async with conn.transaction():
+                result = raise_if_refused(await cancel_plan(
+                    conn, plan_id, body.reason, cancelled_by=_actor_name(user)))
+    except ServiceRefusal as refusal:
+        raise to_http(refusal, messages={
+            "not_found_or_already_cancelled": "Plan not found or already cancelled",
+        })
     return result
 
 
@@ -4922,68 +4941,69 @@ async def delete_plan_v2(
 ):
     """Delete an APPROVED plan and notify every active admin by email.
 
-    Uses POST (not HTTP DELETE) so a body can carry the reason + actor.
-    Reuses the cancel-plan accounting (planned_qty release) under the hood
-    but only accepts approved plans — draft plans go through /cancel.
-    **Admin-only** — same rationale as /plans-v2/{id}/cancel (releases
-    planned_qty back to fulfillment, mass notification side-effect).
+    Uses POST (not HTTP DELETE) so a body can carry the reason.
+    Cancels the plan's job cards and gives its SO qty back like /cancel
+    (refused when work has started on any card), but only accepts approved
+    plans — draft plans go through /cancel. Anyone whose role has plans ›
+    delete — admins and planners — a non-admin only within their own
+    factory; every admin is emailed. The deleter is the logged-in user, not
+    the body's deleted_by (kept for old clients, ignored).
 
     Email is best-effort: a transient SMTP failure is logged and swallowed
     so the API still confirms the delete. `admin_email_count` in the
     response tells the caller how many admins were notified (0 means the
     admin list was empty or SMTP was disabled).
     """
-    if not getattr(user, "is_admin", False):
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "error": "admin_only",
-                "message": "Only admin users can delete an approved plan.",
-            },
-        )
     if not body.reason or not body.reason.strip():
         raise HTTPException(status_code=400, detail="reason is required")
 
     from app.modules.production.services.plan_v2 import delete_plan
     from app.modules.production.services.mail_service import send_plan_deletion_email
+    from app.modules.production.services.refusals import (
+        ServiceRefusal, raise_if_refused, to_http,
+    )
 
+    deleted_by = _actor_name(user)
     pool = request.app.state.db_pool
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            result = await delete_plan(
-                conn, plan_id,
-                reason=body.reason.strip(),
-                deleted_by=body.deleted_by,
-            )
-            if result.get("error") == "not_found_or_invalid_status":
-                raise HTTPException(
-                    status_code=404,
-                    detail="Plan not found or not in approved status",
-                )
-            # Fan out the admin notification INSIDE the same transaction so
-            # the email count is recorded before the response goes out.
-            # _send itself opens a separate SMTP socket — failures don't
-            # roll the transaction back (caught in the helper).
-            plan = result.get("plan") or {}
-            try:
-                admin_count = await send_plan_deletion_email(
-                    conn,
-                    plan_id=plan_id,
-                    plan_name=plan.get("plan_name"),
-                    warehouse=plan.get("warehouse"),
-                    entity=plan.get("entity"),
+    try:
+        async with pool.acquire() as conn:
+            await _refuse_outside_factory(conn, user, plan_id)
+            async with conn.transaction():
+                result = raise_if_refused(await delete_plan(
+                    conn, plan_id,
                     reason=body.reason.strip(),
-                    deleted_by=body.deleted_by,
-                )
-            except Exception:
-                logger.exception("[plan-delete] admin email fan-out failed (plan_id=%s)", plan_id)
-                admin_count = 0
+                    deleted_by=deleted_by,
+                ))
+                # Fan out the admin notification INSIDE the same transaction so
+                # the email count is recorded before the response goes out.
+                # _send itself opens a separate SMTP socket — failures don't
+                # roll the transaction back (caught in the helper).
+                plan = result.get("plan") or {}
+                try:
+                    admin_count = await send_plan_deletion_email(
+                        conn,
+                        plan_id=plan_id,
+                        plan_name=plan.get("plan_name"),
+                        warehouse=plan.get("warehouse"),
+                        entity=plan.get("entity"),
+                        reason=body.reason.strip(),
+                        deleted_by=deleted_by,
+                    )
+                except Exception:
+                    logger.exception("[plan-delete] admin email fan-out failed (plan_id=%s)", plan_id)
+                    admin_count = 0
+    except ServiceRefusal as refusal:
+        raise to_http(refusal, messages={
+            "not_found_or_invalid_status": "Plan not found or not in approved status",
+        })
 
     return {
         "deleted": True,
         "plan_id": plan_id,
         "status": plan.get("status"),
         "admin_email_count": admin_count,
+        "job_cards_cancelled": result.get("job_cards_cancelled"),
+        "released": result.get("released"),
     }
 
 
@@ -4999,18 +5019,25 @@ async def update_plan_line_v2(request: Request, plan_line_id: int, body: PlanLin
     surface as 400 with the column-constraint error.
     """
     from app.modules.production.services.plan_v2 import update_plan_line
+    from app.modules.production.services.refusals import (
+        ServiceRefusal, raise_if_refused, to_http,
+    )
+    from app.modules.production.services.so_reservation import OverAllocation
     pool = request.app.state.db_pool
     fields = {k: v for k, v in body.model_dump().items() if v is not None}
     if not fields:
         raise HTTPException(status_code=400, detail="No editable fields supplied")
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            try:
-                result = await update_plan_line(conn, plan_line_id, fields)
-            except ValueError as e:
-                raise HTTPException(status_code=400, detail=str(e))
-    if result.get("error") == "not_found":
-        raise HTTPException(status_code=404, detail="Plan line not found")
+    try:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                result = raise_if_refused(await update_plan_line(conn, plan_line_id, fields))
+    except ServiceRefusal as refusal:
+        raise to_http(refusal, messages={"not_found": "Plan line not found"})
+    except OverAllocation as e:
+        # The SO hasn't the extra qty to plan; the line change rolled back.
+        raise HTTPException(status_code=400, detail={"error": "over_allocation", "message": str(e)})
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     return result
 
 

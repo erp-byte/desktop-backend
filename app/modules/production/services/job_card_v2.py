@@ -876,8 +876,12 @@ async def _resolve_sfg_seam_code(conn, bom_id: int | None) -> str | None:
 async def create_job_cards_from_plan(conn, plan_id: int) -> dict:
     """Generate one job_card_v2 per (line × step) for the given plan.
 
-    Idempotent guard: if any JC already exists for plan_id, this refuses.
-    Re-generating requires cancelling the existing ones first.
+    Per line, not per plan: a line that already has job cards (made with Create
+    Job Card, or by an earlier approve) is skipped ("already_carded") and the
+    others still get theirs. It used to refuse the WHOLE plan when any card
+    existed, so approve made nothing for the uncarded articles and still said
+    "Plan approved". A line with no steps, or a step with no floor, is skipped
+    too — approve_plan refuses those before it gets here.
 
     Returns:
         {"plan_id": ..., "lines": [{"plan_line_id": ..., "job_card_ids": [...]}, ...]}
@@ -889,18 +893,14 @@ async def create_job_cards_from_plan(conn, plan_id: int) -> dict:
     if not plan:
         return {"error": "plan_not_found"}
 
-    existing = await conn.fetchval(
-        "SELECT COUNT(*) FROM job_card_v2 WHERE plan_id=$1 AND deleted_at IS NULL",
-        plan_id,
-    )
-    if existing and existing > 0:
-        return {"error": "job_cards_already_exist", "count": existing}
-
     line_rows = await conn.fetch(
         """
         SELECT plan_line_id, fg_sku_name, customer_name, bom_id,
-               planned_qty_kg, planned_qty_units
-        FROM production_plan_line_v2
+               planned_qty_kg, planned_qty_units,
+               EXISTS (SELECT 1 FROM job_card_v2 j
+                        WHERE j.plan_line_id = l.plan_line_id
+                          AND j.deleted_at IS NULL) AS carded
+        FROM production_plan_line_v2 l
         WHERE plan_id=$1
         ORDER BY plan_line_id
         """,
@@ -913,6 +913,13 @@ async def create_job_cards_from_plan(conn, plan_id: int) -> dict:
 
     for ln in line_rows:
         plan_line_id = ln["plan_line_id"]
+        if ln["carded"]:
+            result_lines.append({
+                "plan_line_id": plan_line_id,
+                "job_card_ids": [],
+                "skipped": "already_carded",
+            })
+            continue
 
         step_rows = await conn.fetch(
             """
@@ -928,6 +935,13 @@ async def create_job_cards_from_plan(conn, plan_id: int) -> dict:
                 "plan_line_id": plan_line_id,
                 "job_card_ids": [],
                 "skipped": "no_steps",
+            })
+            continue
+        if any(not (s["floor"] or "").strip() for s in step_rows):
+            result_lines.append({
+                "plan_line_id": plan_line_id,
+                "job_card_ids": [],
+                "skipped": "no_floor",
             })
             continue
 
@@ -1176,6 +1190,12 @@ async def create_job_cards_for_line(
     # its floor is required.
     if not pkg_floor or not str(pkg_floor).strip():
         return {"error": "missing_pkg_floor", "message": "A process floor is required"}
+    # Every process needs its floor too — a blank one made a card no floor sees.
+    no_floor = [(s.get("process") or "").strip() or "a process" for s in wip_steps
+                if not (s.get("floor") or "").strip()]
+    if no_floor:
+        return {"error": "missing_floor",
+                "message": f"Pick a floor for {', '.join(no_floor)}."}
 
     qu = None
     if qty_units not in (None, ""):
@@ -1189,7 +1209,7 @@ async def create_job_cards_for_line(
     line = await conn.fetchrow(
         """
         SELECT l.plan_line_id, l.plan_id, l.bom_id, l.fg_sku_name, l.customer_name,
-               l.planned_qty_kg, p.entity, p.warehouse
+               l.planned_qty_kg, p.entity, p.warehouse, p.status AS plan_status
         FROM   production_plan_line_v2 l
         JOIN   production_plan_v2 p ON p.plan_id = l.plan_id
         WHERE  l.plan_line_id = $1
@@ -1199,6 +1219,11 @@ async def create_job_cards_for_line(
     )
     if not line:
         return {"error": "line_not_found"}
+    if line["plan_status"] == 'cancelled':
+        # Its SO qty is already back to pending; cards would make an order
+        # nobody planned any more.
+        return {"error": "plan_closed",
+                "message": "This plan is cancelled; job cards can't be made on it."}
     # The FOR UPDATE above serializes concurrent partial-chain creates on the
     # SAME line: a second create blocks until the first commits, then reads the
     # updated carded total below — so two racing splits can't both pass the
@@ -1462,6 +1487,10 @@ async def create_merged_process_run(
         return {"error": "need_two_lines", "message": "Select at least two products to merge."}
     if not wip_steps:
         return {"error": "no_wip_steps", "message": "At least one shared process step is required."}
+    no_floor = [(s.get("process") or "").strip() or "a process" for s in wip_steps
+                if not (s.get("floor") or "").strip()]
+    if no_floor:
+        return {"error": "missing_floor", "message": f"Pick a floor for {', '.join(no_floor)}."}
     pm_by_line: dict[int, dict] = {}
     for m in (per_member or []):
         try:
@@ -1480,7 +1509,7 @@ async def create_merged_process_run(
                l.planned_qty_kg,
                lower(trim(p.warehouse)) AS factory,
                lower(trim(p.entity))    AS entity, p.entity AS entity_raw,
-               p.warehouse AS warehouse_raw,
+               p.warehouse AS warehouse_raw, p.status AS plan_status,
                (SELECT lower(trim(s.floor)) FROM production_plan_step_v2 s
                  WHERE s.plan_line_id = l.plan_line_id ORDER BY s.step_order LIMIT 1) AS floor1,
                (SELECT string_agg(DISTINCT lower(trim(bl.material_sku_name)), ' | '
@@ -1501,6 +1530,10 @@ async def create_merged_process_run(
     )
     if len(rows) != len(member_ids):
         return {"error": "line_not_found", "message": "One or more selected lines no longer exist."}
+    cancelled = sorted({r["plan_id"] for r in rows if r["plan_status"] == 'cancelled'})
+    if cancelled:
+        return {"error": "plan_closed",
+                "message": f"Plan {', '.join(map(str, cancelled))} is cancelled; its articles can't be merged."}
     by_line = {r["plan_line_id"]: r for r in rows}
     loc = {(r["factory"], r["entity"], r["floor1"]) for r in rows}
     if len(loc) != 1 or any(k is None for k in next(iter(loc))):
@@ -2057,21 +2090,17 @@ async def sync_so_from_qty_delta(conn, plan_line_id: int, *,
     if not fids:
         return {"synced": False, "reason": "no_linked_fulfillments"}
 
-    # ── Ledger: bump planned_qty on each linked fulfillment (mirror create_plan).
+    # ── Ledger: move what the line holds on its fulfillments by the change
+    # (so_reservation — a line tied to several splits it instead of putting the
+    # whole change on each). An increase the SO hasn't room for raises
+    # OverAllocation (a ValueError): roll back.
+    from app.modules.production.services import so_reservation
     try:
-        await conn.execute(
-            """UPDATE so_fulfillment_v2
-                  SET planned_qty_kg    = GREATEST(0, planned_qty_kg    + $1),
-                      planned_qty_units = GREATEST(0, planned_qty_units + $2)
-                WHERE so_fulfillment_id = ANY($3)""",
-            dk, du, fids,
-        )
-    except CheckViolationError as exc:
-        # chk_pending_*_nonneg — the increase would over-allocate. Roll back.
-        raise ValueError(
+        await so_reservation.move(conn, plan_line_id, fids, delta_kg=dk, delta_units=du)
+    except so_reservation.OverAllocation as exc:
+        raise so_reservation.OverAllocation(
             f"Qty change would over-allocate fulfillment(s) {fids}: pending isn't "
-            f"enough for {dk:+.3f} kg / {du:+.3f} pcs. "
-            f"({getattr(exc, 'constraint_name', None)})"
+            f"enough for {dk:+.3f} kg / {du:+.3f} pcs."
         ) from exc
 
     for fid in fids:
@@ -2620,12 +2649,9 @@ async def consolidate_plan_lines_for_merge(conn, primary_line_id: int,
     blocked by the job_card_v2 -> line RESTRICT FK).
 
     Reservations are deliberately NOT touched — they were made per-fulfillment at
-    plan-create and stay correct at rest.
-    # ponytail: cancel_plan/delete_plan/sync_so_from_qty_delta still subtract a
-    # line's FULL qty from every linked fulfillment (WHERE so_fulfillment_id =
-    # ANY(fids)), so a merged (multi-fid) line over-releases a fulfillment that is
-    # ALSO reserved by another plan. Pre-existing multi-fid ledger gap; fix by
-    # teaching those three loops to apportion per fulfillment.
+    plan-create and stay correct at rest. Giving them back later (cancel, delete,
+    a qty change) works out the merged line's share of each fulfillment
+    (so_reservation) instead of taking its full qty off every one.
 
     Returns None on success (or when merge_line_ids is empty), else {"error", ...}.
     MUST run inside an outer transaction.

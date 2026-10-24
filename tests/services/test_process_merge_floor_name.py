@@ -25,6 +25,7 @@ def _line(plan_line_id, floor_stored):
         "plan_line_id": plan_line_id, "plan_id": 900 + plan_line_id,
         "fg_sku_name": f"FG {plan_line_id}", "bom_id": 70 + plan_line_id,
         "planned_qty_kg": 100, "planned_qty_units": None,
+        "plan_status": "approved",
         "factory": "a-185", "entity": "cfpl",
         "floor1": floor_stored.strip().lower(),
         "rm_fingerprint": "sunflower seeds",
