@@ -281,6 +281,11 @@ async def close_batch(conn, *, batch_id: int,
             "message": "produced_qty_kg must be >= 0",
         }
 
+    # The card's box lock BEFORE the batch row, the order every box write takes
+    # them (sfg_box_service): the batch's box total read below can't change
+    # under this close, and a box write can't deadlock against it.
+    await conn.execute("SELECT pg_advisory_xact_lock($1)", resolved_jc_id)
+
     batch = await conn.fetchrow(
         "SELECT batch_id, job_card_id, batch_number, status, notes "
         "FROM   job_card_batch_v2 WHERE batch_id=$1 "
@@ -312,6 +317,20 @@ async def close_batch(conn, *, batch_id: int,
     )
     if jc is None:
         return {"error": "job_card_not_found"}
+
+    # FG kg comes from the batch's boxes once it has any (fg_from_boxes): the
+    # boxes are what was made, whatever figure the caller typed — this covers
+    # POST /batches/{id}/close as well as /outputs. The saved accounting must
+    # have balanced on that same figure, or the batch is saved again first.
+    from app.modules.production.services import fg_from_boxes as _fgb
+    if (jc["output_kind"] or "").upper() in _fgb.BOXING_KINDS:
+        boxed = await _fgb.live_boxes(conn, batch_id)
+        if boxed is not None:
+            stale = await _fgb.stale_accounting(conn, job_card_id=resolved_jc_id,
+                                                batch_id=batch_id, box_kg=boxed["kg"])
+            if stale is not None:
+                return stale
+            produced_qty_kg = boxed["kg"]
 
     # B9 H2: validate yield BEFORE destructive writes so the txn doesn't
     # roll back mid-flight on a typo.
@@ -738,6 +757,16 @@ async def cancel_batch(conn, *, batch_id: int,
                 "Batch has output / dispatch / shift rows attached - "
                 "cancel is only allowed on empty batches."
             ),
+        }
+    # Its boxes ARE its output (fg_from_boxes); a cancelled batch would strand
+    # them — there is no way to cancel a box.
+    from app.modules.production.services import fg_from_boxes as _fgb
+    boxed = await _fgb.live_boxes(conn, batch_id)
+    if boxed is not None:
+        return {
+            "error": "batch_has_attached_rows",
+            "message": (f"Batch has {boxed['boxes']} box(es) on Boxes printing — move them "
+                        "to another batch before cancelling it."),
         }
 
     row = await conn.fetchrow(
