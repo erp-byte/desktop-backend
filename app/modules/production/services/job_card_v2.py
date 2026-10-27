@@ -5254,6 +5254,22 @@ async def stop_job_card(conn, *, job_card_id: int,
 # to close the JC.
 REQUIRED_SIGN_OFFS = ('production_head',)
 
+# How the sign-off roles read on screen (the Sign-offs tab's own labels).
+SIGN_OFF_LABELS = {
+    'production_head': 'Production Head',
+    'floor_incharge': 'Floor In-charge',
+    'qc_inspector': 'QC Inspector',
+}
+
+
+def missing_sign_offs_message(missing) -> str:
+    """Close refused for want of sign-offs, in words: the raw code
+    "missing_sign_offs" is what operators used to see."""
+    names = [SIGN_OFF_LABELS.get(r, str(r).replace('_', ' ')) for r in missing or []]
+    who = ' and '.join(names) or 'A required sign-off'
+    return (f"{who} must sign off before this job card can be closed. "
+            "Sign it on the Sign-offs tab, then close.")
+
 
 async def send_on_remaining_output(conn, job_card_id: int, *, sent_by: str | None,
                                    why: str) -> dict | None:

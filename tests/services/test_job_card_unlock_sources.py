@@ -72,6 +72,8 @@ class _CloseConn(_InTx):
             # override is only recorded when it was really needed). Balanced
             # here: these tests are about what the close unlocks.
             return {"is_balanced": True, "balance_difference_qty": 0, "total_input_qty": 100}
+        if s.startswith("SELECT COUNT(*) AS boxes"):
+            return {"boxes": 0, "kg": 0}          # no boxes: FG is the typed figure
         if s.startswith("UPDATE job_card_batch_v2"):
             return {"batch_id": 55, "job_card_id": UPSTREAM, "status": "closed"}
         if "INSERT INTO job_card_output_v2" in s:

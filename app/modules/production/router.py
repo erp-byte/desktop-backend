@@ -6423,12 +6423,31 @@ async def save_accounting_summary_v2(
     """Save the summary balance row. Backend computes is_balanced and the
     loss percentages; returns the saved row + the residual difference."""
     from app.modules.production.services.jc_accounting_v2 import save_accounting
+    from app.modules.production.services import fg_from_boxes as _fgb
     pool = request.app.state.db_pool
+    fg_note = None
     async with pool.acquire() as conn:
         async with conn.transaction():
+            payload = body.model_dump()
+            if body.batch_id is not None:
+                owner = await conn.fetchval(
+                    "SELECT job_card_id FROM job_card_batch_v2 WHERE batch_id = $1",
+                    body.batch_id,
+                )
+                if owner is not None and owner != job_card_id:
+                    raise HTTPException(status_code=400, detail={
+                        "error": "batch_jc_mismatch",
+                        "message": "batch_id belongs to a different job card than the URL path.",
+                    })
+                # The balance is worked out on the batch's FG — the boxes', once
+                # it has any (fg_from_boxes), whatever output_qty was typed.
+                payload["output_qty"], fg_note = await _fgb.take_fg(
+                    conn, job_card_id=job_card_id, batch_id=body.batch_id,
+                    typed=payload.get("output_qty"), actor=user.full_name or user.phone,
+                )
             result = await save_accounting(
                 conn, job_card_id=job_card_id,
-                payload=body.model_dump(),
+                payload=payload,
                 saved_by=user.full_name or user.phone,
                 # Migration 049: tag the summary row with the batch the
                 # operator was looking at. None falls back to the legacy
@@ -6440,6 +6459,8 @@ async def save_accounting_summary_v2(
         raise HTTPException(status_code=404, detail="Job card not found")
     if result.get("error"):
         raise HTTPException(status_code=400, detail=result)
+    if fg_note is not None:
+        result["fg_from_boxes"] = fg_note
     return result
 
 
@@ -6664,6 +6685,24 @@ class RecordOutputV2Request(BaseModel):
         return self
 
 
+async def _fg_from_boxes_into(conn, job_card_id: int, batch_id: int | None,
+                              body: "RecordOutputV2Request", actor: str | None) -> dict | None:
+    """FG kg comes from the batch's boxes (fg_from_boxes). Put that figure into
+    the body — both spellings — before anything is written with it, and return
+    the note saying what it replaced (None when nothing was). A save carrying no
+    FG figure and no completion is left alone."""
+    if body.output_qty_kg is None and body.fg_actual_kg is None and not body.complete_batch:
+        return None
+    from app.modules.production.services import fg_from_boxes as _fgb
+    typed = body.output_qty_kg if body.output_qty_kg is not None else body.fg_actual_kg
+    kg, note = await _fgb.take_fg(conn, job_card_id=job_card_id, batch_id=batch_id,
+                                  typed=typed, actor=actor)
+    if kg is not None and kg != typed:
+        body.output_qty_kg = kg
+        body.fg_actual_kg = kg
+    return note
+
+
 @router.post("/job-cards-v2/{job_card_id}/outputs")
 async def record_output_v2(
     request: Request,
@@ -6719,6 +6758,8 @@ async def record_output_v2(
                 if problem:
                     raise HTTPException(status_code=400, detail=problem)
 
+            # What the boxes replaced of a typed FG kg, reported in the reply.
+            fg_note: dict | None = None
             # ── Stage 2: resolve batch_id ─────────────────────────────
             # When the caller doesn't pass an explicit batch_id, fall
             # back to "the JC's currently-open batch".  Exactly one
@@ -6736,6 +6777,8 @@ async def record_output_v2(
                 )
                 if len(open_rows) == 1:
                     resolved_batch_id = open_rows[0]["batch_id"]
+                    fg_note = await _fg_from_boxes_into(
+                        conn, job_card_id, resolved_batch_id, body, user.full_name or user.phone)
                 elif len(open_rows) == 0:
                     raise HTTPException(
                         status_code=400,
@@ -6782,6 +6825,10 @@ async def record_output_v2(
                                        "job card than the URL path.",
                         },
                     )
+                # FG from the boxes BEFORE the admin-override UPDATE below
+                # writes body.output_qty_kg onto a closed batch.
+                fg_note = await _fg_from_boxes_into(
+                    conn, job_card_id, resolved_batch_id, body, user.full_name or user.phone)
                 # Closed/cancelled batches reject writes by default.
                 # Admin override (Stage 3 polish) lets admins correct
                 # output post-close.  Non-admin senders of the override
@@ -7091,6 +7138,16 @@ async def record_output_v2(
                             "message": "Output saved, but the batch was not completed. "
                                        + close_res.get("message", ""),
                         }
+                    elif close_res.get("error") == "accounting_stale":
+                        # Boxes changed after the accounting was saved: the
+                        # save stands, the batch stays open until it is saved
+                        # again on the boxes (fg_from_boxes.stale_accounting).
+                        result["completed"] = False
+                        result["completion_blocked"] = {
+                            **close_res,
+                            "message": "Output saved, but the batch was not completed. "
+                                       + close_res.get("message", ""),
+                        }
                     elif close_res.get("error"):
                         # A refused close must not silently look like a
                         # successful save: raising rolls the whole thing
@@ -7148,6 +7205,9 @@ async def record_output_v2(
                 ),
             },
         )
+    if fg_note is not None:
+        # The client's typed FG was replaced by the boxes: say so, the save stands.
+        result["fg_from_boxes"] = fg_note
     # Completing the batch auto-dispatches: tell the NEXT card it released, not this one.
     _notify_unlocked_job_cards(request, background_tasks, user, _unlock_from_dispatch(result.get("batch_close")))
     return result
@@ -7304,6 +7364,10 @@ async def batch_close_v2(
         # 409 — the batch's accounting doesn't net out; the UI shows how far
         # off and, for an admin / floor manager, offers the override.
         raise HTTPException(status_code=409, detail={**result, "override_available": may_override})
+    if result.get("error") == "accounting_stale":
+        # The boxes changed after the accounting was saved (fg_from_boxes):
+        # save the batch again on the boxes, then close it.
+        raise HTTPException(status_code=409, detail=result)
     if result.get("error") in ("invalid_produced_qty", "yield_unreasonable"):
         raise HTTPException(status_code=400, detail=result.get("message", result["error"]))
     # The NEXT card this close auto-dispatched into and released — not job_card_id.
@@ -8004,8 +8068,10 @@ async def close_job_card_v2(
     if result.get("error") == "open_shift":
         raise HTTPException(status_code=400, detail=result["message"])
     if result.get("error") == "missing_sign_offs":
-        raise HTTPException(status_code=400,
-                            detail={"error": "missing_sign_offs", "missing": result["missing"]})
+        from app.modules.production.services.job_card_v2 import missing_sign_offs_message
+        raise HTTPException(status_code=400, detail={
+            "error": "missing_sign_offs", "missing": result["missing"],
+            "message": missing_sign_offs_message(result["missing"])})
     if plan_closed:
         result["plan_auto_closed"] = True
     # The stage(s) the send-on released (completing / closing sends the remaining
@@ -8593,6 +8659,7 @@ async def create_wip_boxes_endpoint(
             result = await create_wip_boxes(
                 conn, job_card_id, [b.model_dump() for b in body.boxes],
                 expected_net_kg=body.expected_net_kg,
+                created_by=(user.full_name or user.phone),
             )
     if "error" in result:
         code = 404 if result["error"] == "not_found" else 400
@@ -8609,7 +8676,8 @@ async def update_wip_boxes_endpoint(
     user=Depends(require_permission("production", "job_cards", "box_printing", action="create")),
 ):
     """Edit mutable fields (net/gross weight, batch link, count) of already-saved
-    SFG boxes. Only PRINTED boxes are editable; received/consumed ones are skipped."""
+    SFG boxes. PENDING and PRINTED boxes are editable; received/consumed ones are
+    skipped. A completed batch's boxes can raise its FG (fg_from_boxes)."""
     from app.modules.production.services.sfg_box_service import update_wip_boxes
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -9242,7 +9310,17 @@ async def create_box_scan(
             scanned_by=user.full_name or user.phone,
         )
     if result.get("error") == "duplicate_box":
-        raise HTTPException(status_code=409, detail=f"Duplicate box scanned — {result.get('box_id')} is already recorded.")
+        # A code with the message: the scanner shows its "already recorded" chip
+        # for this refusal only — every other 409 (ambiguous_box) is not a
+        # duplicate and used to be shown as one.
+        raise HTTPException(status_code=409, detail={
+            "error": "duplicate_box",
+            "message": svc.duplicate_box_message(result),
+            "box_id": result.get("box_id"),
+            "job_card_id": result.get("job_card_id"),
+            "job_card_number": result.get("job_card_number"),
+            "same_card": bool(result.get("same_card")),
+        })
     if result.get("error") == "job_card_not_found":
         raise HTTPException(status_code=404, detail="Job card not found")
     if result.get("error") == "sent_for_other_job_card":
@@ -9263,12 +9341,10 @@ async def create_box_scan(
     if result.get("error") == "ambiguous_box":
         # Not a 404: the box WAS found, in more than one table. Attaching an
         # arbitrary one could bind this job card to a different physical carton.
-        raise HTTPException(
-            status_code=409,
-            detail=(f"'{result.get('code')}' matches boxes in "
-                    f"{', '.join(t for t in result.get('tables') or [] if t)}. "
-                    "Scan the QR code so the transaction number can identify "
-                    "which box this is."))
+        raise HTTPException(status_code=409, detail={
+            "error": "ambiguous_box",
+            "message": svc.ambiguous_box_message(result),
+        })
     return result
 
 

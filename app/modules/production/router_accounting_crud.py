@@ -150,6 +150,7 @@ _STATUS = {
     "batch_not_open": 409,
     "batch_cancelled": 409,
     "job_card_closed": 409,
+    "batch_boxed": 409,
     "duplicate_line": 400,
     "invalid_line": 400,
     "summary_failed": 500,

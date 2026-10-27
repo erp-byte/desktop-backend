@@ -207,6 +207,25 @@ async def _resolve_box(conn, code: str, source_hint: str | None) -> dict | None:
     return None
 
 
+def duplicate_box_message(result: dict) -> str:
+    """The refusal for a box that is already recorded, naming where it is."""
+    box = result.get("box_id")
+    if result.get("same_card"):
+        return f"Box {box} is already recorded on this job card."
+    card = result.get("job_card_number") or result.get("job_card_id")
+    if card is None:
+        return f"Box {box} is already recorded on another job card."
+    return (f"Box {box} is already recorded on job card {card}. "
+            "Remove it there (✕ in its scanned boxes) to record it here.")
+
+
+def ambiguous_box_message(result: dict) -> str:
+    """The refusal for a typed or scanned id that matches boxes in several tables."""
+    tables = ", ".join(t for t in result.get("tables") or [] if t)
+    return (f"'{result.get('code')}' matches more than one box ({tables}). "
+            "Scan the QR sticker so its transaction number can tell which box this is.")
+
+
 async def scan_box(conn, *, job_card_id: int, code: str,
                    source_type: str | None = None,
                    article: str | None = None,
@@ -259,7 +278,20 @@ async def scan_box(conn, *, job_card_id: int, code: str,
         code,
     )
     if dup:
-        return {"error": "duplicate_box", "box_id": code}
+        # Say which card holds it: "already recorded" alone sent operators
+        # hunting through every job card for the row to remove.
+        holder = await conn.fetchrow(
+            "SELECT s.job_card_id, j.job_card_number "
+            "  FROM jc_box_scan s LEFT JOIN job_card_v2 j ON j.job_card_id = s.job_card_id "
+            " WHERE s.box_id = $1 OR s.sfg_box_id = $1 "
+            " ORDER BY s.scanned_at DESC NULLS LAST LIMIT 1",
+            code,
+        )
+        held_by = holder["job_card_id"] if holder else None
+        return {"error": "duplicate_box", "box_id": code,
+                "job_card_id": held_by,
+                "job_card_number": holder["job_card_number"] if holder else None,
+                "same_card": held_by == job_card_id}
 
     entered = (article or "").strip() or None
 

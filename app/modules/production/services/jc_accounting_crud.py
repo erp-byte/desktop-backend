@@ -829,6 +829,13 @@ async def _write(conn, *, job_card_id: int, plan_id: int, batch_id: int,
 
     stored_output = await _fetch_output(conn, job_card_id, batch_id)
     out_vals = _output_values(payload, jc)
+    # FG kg comes from the batch's boxes once it has any (fg_from_boxes),
+    # whatever output_qty_kg this record was sent with.
+    from app.modules.production.services import fg_from_boxes as _fgb
+    fg_kg, fg_note = await _fgb.take_fg(conn, job_card_id=job_card_id, batch_id=batch_id,
+                                        typed=out_vals["output_qty_kg"], actor=actor)
+    if fg_note is not None:
+        out_vals["output_qty_kg"] = _q(fg_kg)
 
     scalar_changes = []
     if stored_output is None:
@@ -893,6 +900,7 @@ async def _write(conn, *, job_card_id: int, plan_id: int, batch_id: int,
                               batch_id=batch_id)
     return {
         "created" if creating else "updated": True,
+        **({"fg_from_boxes": fg_note} if fg_note is not None else {}),
         "record": record,
         "changes": {
             "output": scalar_changes,
@@ -1003,6 +1011,18 @@ async def delete_record(conn, *, job_card_id: int, plan_id: int, batch_id: int,
                 "admin_override."
             ),
         }
+
+    # A completed batch's FG comes from its boxes and went on with them
+    # (fg_from_boxes): deleting its output would drop what was already sent.
+    if (guard.get("batch") or {}).get("status") == "closed":
+        from app.modules.production.services import fg_from_boxes as _fgb
+        if await _fgb.live_boxes(conn, batch_id) is not None:
+            return {
+                "error": "batch_boxed",
+                "batch_id": batch_id,
+                "message": ("This completed batch's FG kg comes from its boxes and was "
+                            "sent on with them; its accounting record can't be deleted."),
+            }
 
     existing = await _fetch_output(conn, job_card_id, batch_id)
     sections = await _fetch_sections(conn, job_card_id, batch_id)

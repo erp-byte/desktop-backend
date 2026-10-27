@@ -18,6 +18,7 @@ standalone and forward-compatible.
 import logging
 
 from app.core.helpers import insert_with_pk_retry, new_short_time_id
+from app.modules.production.services import fg_from_boxes as _fgb
 
 logger = logging.getLogger(__name__)
 
@@ -42,24 +43,6 @@ _NOT_PRODUCING_STATUSES = (
 )
 
 
-async def _batch_cap_kg(conn, batch_id: int) -> float | None:
-    """The accounting weight (kg) a batch's boxes must not exceed: the batch's
-    produced → input → planned quantity, first one that is set and > 0. Returns
-    None when the batch has no accounting weight yet (→ no cap enforced)."""
-    batch = await conn.fetchrow(
-        "SELECT produced_qty_kg, input_qty_kg, planned_qty_kg "
-        "FROM job_card_batch_v2 WHERE batch_id = $1",
-        batch_id,
-    )
-    if not batch:
-        return None
-    for f in ("produced_qty_kg", "input_qty_kg", "planned_qty_kg"):
-        v = batch[f]
-        if v is not None and float(v) > 0:
-            return float(v)
-    return None
-
-
 async def create_wip_boxes(
     conn,
     job_card_id: int,
@@ -68,6 +51,7 @@ async def create_wip_boxes(
     expected_net_kg: float | None = None,
     source_inventory_batch_id: str | None = None,
     parent_box_ids: list[str] | None = None,
+    created_by: str | None = None,
 ) -> dict:
     """Mint ``sfg_box`` rows for a WIP-stage JC's physical box split.
 
@@ -192,28 +176,31 @@ async def create_wip_boxes(
                 "message": f"Batch id(s) {sorted(missing)} are not batches of this job card",
             }
 
-    # Cap: a batch's total box net weight must not exceed its accounting weight.
-    # Sum the new boxes per batch, add the batch's existing box net, reject the
-    # whole call if any batch would overflow (WEIGHT_TOLERANCE_KG covers rounding).
+    # What each batch would hold after this call — its live boxes plus the new
+    # ones — judged by fg_from_boxes BEFORE anything is written. FG kg comes from
+    # the boxes: an open batch is bounded only by what it was opened with, and a
+    # completed one may have its FG raised out of its process loss (applied
+    # after the insert, below), so boxing after the save is no longer capped at
+    # the saved FG + 0.5 kg.
     add_by_batch: dict[int, float] = {}
     for row in clean:
         if row[4] is not None:
             add_by_batch[row[4]] = add_by_batch.get(row[4], 0.0) + row[0]
+    totals_after: dict[int, float] = {}
     for bid, add_net in add_by_batch.items():
-        cap = await _batch_cap_kg(conn, bid)
-        if cap is None:
-            continue
+        # A cancelled box holds nothing.
         existing = await conn.fetchval(
             "SELECT COALESCE(SUM(net_weight), 0) FROM sfg_box "
-            "WHERE batch_id = $1 AND item_type = 'sfg'", bid,
+            "WHERE batch_id = $1 AND item_type = 'sfg' AND status IS DISTINCT FROM $2",
+            bid, _BOX_CANCELLED_STATUS,
         ) or 0
-        total = round(float(existing) + add_net, 3)
-        if total > cap + WEIGHT_TOLERANCE_KG:
-            return {
-                "error": "batch_over_capacity",
-                "message": f"Boxes for this batch would total {total} kg, over the "
-                           f"batch's accounting {cap} kg.",
-            }
+        totals_after[bid] = round(float(existing) + add_net, 3)
+    refusal, raises = await _fgb.check_box_change(
+        conn, job_card_id=job_card_id, totals_after=totals_after,
+        moved_out_of=set(), tolerance_kg=WEIGHT_TOLERANCE_KG,
+    )
+    if refusal:
+        return refusal
 
     total_net = round(sum(row[0] for row in clean), 3)
     if expected_net_kg is not None:
@@ -288,6 +275,10 @@ async def create_wip_boxes(
         row = await insert_with_pk_retry(conn, _insert, max_retries=5)
         created.append(dict(row))
 
+    # A completed batch whose boxes now weigh more than its FG: FG follows them.
+    fg_raised = await _fgb.apply_raises(conn, job_card_id=job_card_id, raises=raises,
+                                        actor=created_by)
+
     logger.info(
         "SFG boxes: JC %s split into %d box(es), Σ=%.3f kg (%s)",
         job_card_id, len(clean), total_net, sfg_code,
@@ -298,6 +289,7 @@ async def create_wip_boxes(
         "total_net_kg": total_net,
         "box_ids": [r["box_id"] for r in created],
         "created": created,
+        "fg_raised": fg_raised,
     }
 
 
@@ -598,6 +590,11 @@ async def update_wip_boxes(conn, job_card_id: int, updates: list[dict],
     if not updates:
         return {"error": "no_boxes", "message": "No boxes to update"}
 
+    # Same per-job-card lock as create_wip_boxes: an edit can raise a completed
+    # batch's FG (fg_from_boxes), so it must not interleave with a create on the
+    # same card that is working out the same batch's total.
+    await conn.execute("SELECT pg_advisory_xact_lock($1)", job_card_id)
+
     # Validate every row up front (same rules as create) so a bad payload fails
     # before any row is written. clean = (carton_id, nw, gw, batch_code, units, batch_id, mark_printed).
     clean: list[tuple[str, float, float | None, str | None, int | None, int | None, bool]] = []
@@ -666,38 +663,44 @@ async def update_wip_boxes(conn, job_card_id: int, updates: list[dict],
     # concurrent status flip can't desync this check from the UPDATE (one txn).
     payload_ids = [row[0] for row in clean]
     upd_rows = await conn.fetch(
-        "SELECT carton_id FROM sfg_box "
+        "SELECT carton_id, batch_id FROM sfg_box "
         "WHERE job_card_id = $1 AND item_type = 'sfg' "
         "AND status IN ('PENDING', 'PRINTED') AND carton_id = ANY($2::text[]) "
         "FOR UPDATE",
         job_card_id, payload_ids,
     )
     updatable = {r["carton_id"] for r in upd_rows}
+    current_batch = {r["carton_id"]: r["batch_id"] for r in upd_rows}
 
-    # Cap: after these edits, each batch a box will land in must stay within its
-    # accounting weight. base = net of that batch's boxes NOT being moved by this
-    # update; add = Σ new net of updatable boxes targeting it. (Boxes moving OUT
-    # only reduce a batch, so checking target batches bounds the maximum.)
+    # What each batch a box lands in would hold after these edits: base = its
+    # live boxes NOT touched by this update, plus the new net of the touched
+    # boxes going to it. Judged by fg_from_boxes before anything is written —
+    # including a box leaving a completed batch, which is refused.
     target_add: dict[int, float] = {}
+    moved_out_of: set[int] = set()
     for row in clean:
-        if row[5] is not None and row[0] in updatable:
-            target_add[row[5]] = target_add.get(row[5], 0.0) + row[1]
-    for bid, add_net in target_add.items():
-        cap = await _batch_cap_kg(conn, bid)
-        if cap is None:
+        if row[0] not in updatable:
             continue
+        if row[5] is not None:
+            target_add[row[5]] = target_add.get(row[5], 0.0) + row[1]
+        old_bid = current_batch.get(row[0])
+        if old_bid is not None and old_bid != row[5]:
+            moved_out_of.add(old_bid)
+    totals_after: dict[int, float] = {}
+    for bid, add_net in target_add.items():
         base = await conn.fetchval(
             "SELECT COALESCE(SUM(net_weight), 0) FROM sfg_box "
-            "WHERE batch_id = $1 AND item_type = 'sfg' AND carton_id != ALL($2::text[])",
-            bid, list(updatable),
+            "WHERE batch_id = $1 AND item_type = 'sfg' AND carton_id != ALL($2::text[]) "
+            "AND status IS DISTINCT FROM $3",
+            bid, list(updatable), _BOX_CANCELLED_STATUS,
         ) or 0
-        total = round(float(base) + add_net, 3)
-        if total > cap + WEIGHT_TOLERANCE_KG:
-            return {
-                "error": "batch_over_capacity",
-                "message": f"Boxes for this batch would total {total} kg, over the "
-                           f"batch's accounting {cap} kg.",
-            }
+        totals_after[bid] = round(float(base) + add_net, 3)
+    refusal, raises = await _fgb.check_box_change(
+        conn, job_card_id=job_card_id, totals_after=totals_after,
+        moved_out_of=moved_out_of, tolerance_kg=WEIGHT_TOLERANCE_KG,
+    )
+    if refusal:
+        return refusal
 
     from app.modules.production.services.amendment_service import log_jc_field_changes
 
@@ -747,11 +750,16 @@ async def update_wip_boxes(conn, job_card_id: int, updates: list[dict],
                            "batch_code": row["batch_code"], "units": row["units"]},
                 )
 
+    # A completed batch whose boxes now weigh more than its FG: FG follows them.
+    fg_raised = await _fgb.apply_raises(conn, job_card_id=job_card_id, raises=raises,
+                                        actor=changed_by)
+
     logger.info(
         "SFG boxes: JC %s updated %d box(es), skipped %d",
         job_card_id, len(updated), len(skipped),
     )
-    return {"job_card_id": job_card_id, "updated": updated, "skipped": skipped}
+    return {"job_card_id": job_card_id, "updated": updated, "skipped": skipped,
+            "fg_raised": fg_raised}
 
 
 # ══════════════════════════════════════════════════════════════════════════
