@@ -556,6 +556,11 @@ SQL_FILES = [
     # backend now applies (services/receipt_match.py), adding 'fully received'.
     # Data only; idempotent; safe before or after the deploy.
     DB_DIR / "132_po_receiving_status_backfill.sql",
+    # 136 creates the debtors_collection role and the debtors_collection.{view, call,
+    # edit, export, upload, delete} permissions: the role gets the first four, admin
+    # roles all six. Checked by the web app's /api/collections Route Handlers, not by
+    # this backend, so it may run before or after either deploys. Idempotent.
+    DB_DIR / "136_debtors_collection_role.sql",
 ]
 
 # ── Optional: drop the v1 legacy job-card stack (TEST / Supabase DB ONLY) ──────
