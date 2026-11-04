@@ -151,6 +151,7 @@ def _build_filters(
     verified: Optional[bool] = None,
     include_drafts: bool = False,
     place_scope: Optional[dict[str, list[str]]] = None,
+    item_keys: Any = None,
 ) -> tuple[list[str], list[Any], dict[str, Any]]:
     """WHERE fragments + positional params + an echo of what was applied.
 
@@ -214,6 +215,13 @@ def _build_filters(
         if value:
             add(tmpl, [v.upper().strip() for v in value], key, value)
 
+    keys = _as_list(item_keys)
+    if keys:
+        # Exact articles, on the identity every stock read joins on. Unlike
+        # `search` this never widens to a category or a floor that merely
+        # contains the text.
+        add("UPPER(BTRIM(item_name)) = ANY(${n}::text[])", [k.upper() for k in keys], "itemKeys", keys)
+
     if entered_by:
         add("UPPER(COALESCE(entered_by, '')) LIKE ${n} ESCAPE '\\'", _like(entered_by), "enteredBy", entered_by)
 
@@ -251,7 +259,7 @@ def _build_txn_filters(
         warehouse    -> warehouse        item_type   -> material_type
         floor_name   -> location         category    -> item_category
         stock_type   -> stock_type       subcategory -> item_subcategory
-        search       -> item name / category / sub-category
+        item_keys    -> item_name        search      -> item name / category / sub-category
 
     Entry-only filters have NO counterpart and are deliberately not applied:
     entered_by, verified, include_drafts (a ledger row is never a draft), and the
@@ -287,6 +295,7 @@ def _build_txn_filters(
         (_as_list(filters.get("category")), "UPPER(BTRIM(item_category)) = ANY(${n}::text[])"),
         (_as_list(filters.get("subcategory")), "UPPER(BTRIM(item_subcategory)) = ANY(${n}::text[])"),
         (_as_list(filters.get("stock_type")), "UPPER(COALESCE(stock_type, 'Fresh Stock')) = ANY(${n}::text[])"),
+        (_as_list(filters.get("item_keys")), "UPPER(BTRIM(item_name)) = ANY(${n}::text[])"),
     ):
         if value:
             add(tmpl, [v.upper().strip() for v in value])

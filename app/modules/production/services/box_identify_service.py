@@ -12,8 +12,19 @@ the last 8 digits of epoch-ms, so the base repeats about every 27.7 hours, and
 A sequential per-table `LIMIT 1` therefore returns whichever table happened to be
 probed first — a *different physical box* than the one scanned, reported as
 `found: True`. So we UNION ALL the candidate branches, ORDER BY an explicit
-priority, and take LIMIT 2 so a genuine multi-match is detected and logged rather
+priority, and take LIMIT 3 so a genuine multi-match is detected and logged rather
 than silently resolved. One round trip instead of ten.
+
+ONE CARTON IN TWO TABLES: A CUSTOMER RETURN IN COLD STOCK
+---------------------------------------------------------
+A customer return to a cold store has its carton in two tables: its box in
+{p}_rtv_boxes and its cold-stock row, made from that box (IMS did, and the ERP's
+customer_returns.cold_stock_service does now), with the same box_id and the CR
+number as transaction_no and as inward_transaction_no. That pair is one physical
+carton, so the cold-stock row is dropped from the hits (_one_carton) instead of
+making every scan of a cold return's label ambiguous. Only that pair: a cold-stock
+row is dropped only when the scan also hit the box of the return it names. That is
+why LIMIT is 3: with the pair taking two rows, a third table's hit is still seen.
 
 WHY COLUMNS ARE VALIDATED BEFORE THE QUERY IS BUILT
 ---------------------------------------------------
@@ -101,6 +112,8 @@ _SPECS = [
         "desc": "item_description", "lot": "lot_no",
         "net": "weight_kg", "gross": None,
         "status": None, "count": None, "entity": "prefix",
+        # The customer return a row was made from (see the module doc: _one_carton).
+        "return_of": "inward_transaction_no",
     },
     {
         # The return id lives on the HEADER (rtv_id, "CR-…"); the box row has no
@@ -112,7 +125,10 @@ _SPECS = [
         "box": "box_id", "txn": "h.rtv_id",
         "desc": "article_description", "lot": "lot_number",
         "net": "net_weight", "gross": "gross_weight",
-        "status": None, "count": None, "entity": "prefix",
+        # The RETURN's status (Pending / On Hold / Approved / Submitted / Rejected):
+        # the scanners refuse a carton of a return that isn't approved
+        # (customer_returns approval_service.carton_refusal).
+        "status": "h.status", "count": None, "entity": "prefix",
     },
     {
         "key": "interunit_transfer_boxes", "split": False, "table": "interunit_transfer_boxes",
@@ -237,17 +253,19 @@ def _tables_for(spec: dict) -> list[tuple[str, str | None, str | None]]:
 
 
 # ── planning (pure — no DB, so it is directly unit-testable) ──────────────────
-def _qualify(name: str | None, cols: frozenset[str], alias: str) -> str:
+def _qualify(name: str | None, cols: frozenset[str], alias: str,
+             jcols: frozenset[str] | None = None) -> str:
     """`b.col` when the column exists, a typed NULL placeholder when it does not.
 
     Projecting NULL rather than dropping the branch keeps every arm of the UNION
     the same width — the branch has already passed its `need` check, so what is
-    missing here is optional enrichment, not identity.
+    missing here is optional enrichment, not identity. A join column (`h.col`)
+    is checked against the join table's columns, `jcols`.
     """
     if not name:
         return "NULL"
     if "." in name:                # already qualified (e.g. h.rtv_id)
-        return name
+        return name if jcols is None or name.split(".", 1)[1] in jcols else "NULL"
     return f"{alias}.{name}" if name in cols else "NULL"
 
 
@@ -302,8 +320,8 @@ def _plan(available: dict[str, frozenset[str]], *, with_txn: bool,
             prio += 1
             b, j = "b", "h"
 
-            def col(name, _cols=cols, _b=b):
-                return _qualify(name, _cols, _b)
+            def col(name, _cols=cols, _b=b, _jcols=jcols):
+                return _qualify(name, _cols, _b, _jcols)
 
             # box-id predicate: include the alternate identity columns that
             # actually exist, so a relabelled box still resolves.
@@ -334,6 +352,7 @@ def _plan(available: dict[str, frozenset[str]], *, with_txn: bool,
                 f"{col(spec.get('status'))}::text AS status, "
                 f"{col(spec.get('job_card'))}::text AS job_card_number, "
                 f"{ent_expr}::text AS company, "
+                f"{col(spec.get('return_of'))}::text AS _return_of, "
                 f"'{table}'::text AS _src, {prio}::int AS _prio "
                 f"FROM {frm} WHERE {where}"
             )
@@ -342,7 +361,7 @@ def _plan(available: dict[str, frozenset[str]], *, with_txn: bool,
     if not branches:
         return "", []
     sql = ("SELECT * FROM (" + " UNION ALL ".join(branches) +
-           ") u ORDER BY _prio, box_id LIMIT 2")
+           ") u ORDER BY _prio, box_id LIMIT 3")
     return sql, sources
 
 
@@ -429,6 +448,15 @@ def _result(row: dict, matched_by: str, *, ambiguous_with=None) -> dict:
     return out
 
 
+def _one_carton(rows: list[dict]) -> list[dict]:
+    """The hits without a cold-stock row made from a customer return's box that the
+    scan also hit: the label and that row are one carton (module doc)."""
+    returns = {(r.get("box_id"), r.get("transaction_no")) for r in rows
+               if str(r.get("_src") or "").endswith("_rtv_boxes")}
+    return [r for r in rows
+            if not (r.get("_return_of") and (r.get("box_id"), r["_return_of"]) in returns)]
+
+
 async def _run(conn, sql: str, *args) -> list[dict]:
     """Execute a planned query.
 
@@ -464,7 +492,7 @@ async def identify_box(conn, value: str) -> dict:
         bi, tx = str(bi).strip(), str(tx).strip()
         avail = await _available(conn, with_txn=True)
         sql, _ = _plan(avail, with_txn=True, hint=_hinted_first(tx))
-        rows = await _run(conn, sql, bi, tx) if sql else []
+        rows = _one_carton(await _run(conn, sql, bi, tx)) if sql else []
         if rows:
             extra = [r["_src"] for r in rows[1:]]
             if extra:
@@ -486,6 +514,15 @@ async def identify_box(conn, value: str) -> dict:
     return {"found": False, "box_id": box_id}
 
 
+async def box_id_taken(conn, box_id: str) -> bool:
+    """Whether any box table already holds this id (the box-id pass over every
+    branch). A module minting a new label id asks this first, so its scan can't land
+    on another module's carton."""
+    avail = await _available(conn, with_txn=False)
+    sql, _ = _plan(avail, with_txn=False)
+    return bool(sql) and bool(await _run(conn, sql, box_id))
+
+
 async def _search_by_id(conn, box_id: str, *, hint: str | None = None) -> dict | None:
     """Box id alone, across every branch including sfg_box's carton_id.
 
@@ -497,7 +534,7 @@ async def _search_by_id(conn, box_id: str, *, hint: str | None = None) -> dict |
     sql, _ = _plan(avail, with_txn=False, hint=hint)
     if not sql:
         return None
-    rows = await _run(conn, sql, box_id)
+    rows = _one_carton(await _run(conn, sql, box_id))
     if not rows:
         return None
     extra = [r["_src"] for r in rows[1:]]

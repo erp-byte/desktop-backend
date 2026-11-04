@@ -169,10 +169,13 @@ FEATURES: dict[str, dict[str, str]] = {
 # Only where the group name alone is genuinely ambiguous.
 TAG_DESCRIPTIONS: dict[str, str] = {
     "Transfer - Pending Stock (In Transit)":
-        "Boxes dispatched but not yet received — deducted from the source, not yet posted "
-        "to the destination.",
+        "Boxes dispatched but not yet received: a copy of each box made at dispatch. "
+        "Record only — no stock is deducted from the source or posted to the destination; "
+        "receiving a transfer only clears its copies.",
     "Transfer - Inner Cold":
-        "Lot re-labelling inside one cold store. Does not move stock between units.",
+        "Lot re-labelling (or a location change) inside one cold store: the one transfer that "
+        "edits cold-stock rows, in place; deleting the challan undoes it. Does not move stock "
+        "between units — that is an inter-unit transfer.",
     "Job Work - Material Out":
         "Material dispatched to a third party for processing, against a delivery challan. "
         "Creating one DELETES the scanned boxes from cold storage.",

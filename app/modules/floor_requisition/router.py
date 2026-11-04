@@ -1,6 +1,7 @@
 """/api/v1/floor-requisitions/* — the floor asks store for material.
 
     GET  /api/v1/floor-requisitions                          list (view)
+    GET  /api/v1/floor-requisitions/availability?article=    live Fresh Stock per place (view)
     POST /api/v1/floor-requisitions                          raise (create)
     POST /api/v1/floor-requisitions/{requisition_id}/issue   store issues (issue)
     POST /api/v1/floor-requisitions/{requisition_id}/receive floor confirms (receive)
@@ -33,6 +34,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, R
 from pydantic import BaseModel, Field
 
 from app.modules.auth.middleware import AuthUser, require_permission
+from app.modules.floor_requisition.services import availability_service
 from app.modules.floor_requisition.services import box_service as box_svc
 from app.modules.floor_requisition.services import notify_service
 from app.modules.floor_requisition.services import requisition_service as svc
@@ -102,6 +104,20 @@ async def list_floor_requisitions(
         return await svc.list_requisitions(
             conn, user, status=status, warehouse=warehouse, floor=floor_name,
             job_card_id=job_card_id, search=search, page=page, page_size=page_size)
+
+
+@router.get("/availability")
+async def floor_availability(
+    request: Request,
+    article: list[str] = Query(..., description="Article name; repeat for each article"),
+    user: AuthUser = Depends(_perm("view")),
+) -> dict[str, Any]:
+    """Each article's live Fresh Stock at every place it is above zero, within the
+    caller's Stock Take read scope. For the store to see, before it issues, where
+    the material actually is — the request's own figure covers only its floor."""
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await availability_service.floor_availability(conn, user, article)
 
 
 @router.post("")

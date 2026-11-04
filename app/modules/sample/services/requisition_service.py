@@ -11,6 +11,7 @@ and the PRIMARY KEY since migration 057. It is the sole surfaced identifier.
 from __future__ import annotations
 
 import logging
+from datetime import date, datetime, timedelta, timezone
 
 import asyncpg
 from fastapi import HTTPException
@@ -52,6 +53,41 @@ OPEN_STATUSES_EDITABLE_DATE = (
     "DRAFT", "SUBMITTED", "BH_APPROVED", "ON_HOLD",
     "IN_PRODUCTION", "PACKING", "READY_FOR_DISPATCH", "PARTIALLY_CONVERTED",
 )
+
+
+def _ist_today() -> date:
+    """Today in IST — the day the overdue reminder scan compares against. Fixed +05:30,
+    as in dispatch_reminder_service (no tzdata dependency on Windows)."""
+    return datetime.now(timezone(timedelta(hours=5, minutes=30))).date()
+
+
+def _assert_dispatch_date_not_past(value, *, current=None) -> None:
+    """Refuse an expected dispatch date before today. A request raised already overdue is
+    chased from its first day (18670297 was raised on 10-Oct dated 27-Aug).
+
+    `current` is the stored date on an edit: the edit form sends every field back, so an
+    old request's unchanged September date must not block editing its description.
+    """
+    def _as_date(v):
+        if v is None or isinstance(v, date) and not isinstance(v, datetime):
+            return v
+        if isinstance(v, datetime):
+            return v.date()
+        try:
+            return date.fromisoformat(str(v)[:10])
+        except ValueError:
+            raise HTTPException(422, detail={"error": "bad_date",
+                                             "message": "expected_dispatch_date must be YYYY-MM-DD",
+                                             "details": {"expected_dispatch_date": str(v)}})
+    new = _as_date(value)
+    if new is None or new == _as_date(current):
+        return
+    today = _ist_today()
+    if new < today:
+        raise HTTPException(422, detail={
+            "error": "dispatch_date_in_past",
+            "message": "Expected dispatch date can't be before today",
+            "details": {"expected_dispatch_date": str(new), "today": str(today)}})
 
 
 def _assert_transition(current: str, target: str) -> None:
@@ -101,6 +137,7 @@ async def create_requisition(conn, *, payload: dict, user) -> dict:
         raise HTTPException(422, detail={"error": "invalid_warehouse",
                                          "message": f"warehouse must be one of {WAREHOUSES}",
                                          "details": {"warehouse": warehouse}})
+    _assert_dispatch_date_not_past(payload.get("expected_dispatch_date"))
 
     articles = payload.get("articles") or []
 
@@ -374,14 +411,19 @@ def _display_status_case(has_bh: bool) -> str:
           -- The gate pass closes a request whatever the ledger says, and it is the ONLY
           -- route to Dispatched for the types that never raise a dev job card.
           WHEN sr.status IN ('GATE_PASS_ISSUED', 'CLOSED')  THEN 'DISPATCHED'
-          -- Complete only when every part shipped in ONE unit that matches the header's
-          -- kg. uom_kinds > 1 means the sum is meaningless, so it can only ever be
-          -- Partial — a wrong "Dispatched" closes a request that is still owed stock.
-          -- The 1g tolerance stops a rounding remainder pinning it at Partial forever.
+          -- Complete when either:
+          --  * everything ASKED for shipped: the kg across ALL target articles (want.qty;
+          --    sr.quantity only mirrors target #1), in ONE unit — uom_kinds > 1 makes the
+          --    sum meaningless, so it can only ever be Partial. The 1g tolerance stops a
+          --    rounding remainder pinning it at Partial forever; or
+          --  * everything MADE shipped: every developed article's output is out (outs).
+          --    NPD adds and drops variants on the card, so the kg made can differ from
+          --    the kg asked for, and the card's own balance is the better answer then.
           WHEN COALESCE(disp.qty_any, 0) > 0
-           AND COALESCE(disp.uom_kinds, 0) <= 1
-           AND sr.quantity IS NOT NULL AND sr.quantity > 0
-           AND COALESCE(disp.qty_kg, 0) >= sr.quantity - 0.001
+           AND (COALESCE(outs.all_out, FALSE)
+                OR (COALESCE(disp.uom_kinds, 0) <= 1
+                    AND COALESCE(want.qty, sr.quantity) > 0
+                    AND COALESCE(disp.qty_kg, 0) >= COALESCE(want.qty, sr.quantity) - 0.001))
                                                             THEN 'DISPATCHED'
           WHEN COALESCE(disp.qty_any, 0) > 0                THEN 'PARTIAL'
           ELSE 'IN_PROCESS'
@@ -394,6 +436,53 @@ _DISP_CTE_ABSENT = """
         SELECT NULL::bigint AS req_id, NULL::numeric AS qty_any,
                NULL::numeric AS qty_kg, NULL::bigint AS uom_kinds
          WHERE FALSE"""
+
+# The kg asked for, across every target article (080). Absent → the header mirror.
+_WANT_CTE = """
+        SELECT requisition_id AS req_id, SUM(quantity) AS qty
+          FROM sample_requisition_npd_targets GROUP BY 1"""
+_WANT_CTE_ABSENT = """
+        SELECT NULL::bigint AS req_id, NULL::numeric AS qty WHERE FALSE"""
+
+# Whether every live dev job card raised from the request is CLOSED and has shipped all it
+# made: each article with an output (082/083 — dispatch is per article and in that
+# article's own unit, so the comparison is like for like), or, for a single-product card
+# with no article rows, the card's output against its ledger (or the pre-078 mirror).
+_OUTS_CTE = """
+        SELECT jc.source_requisition_id AS req_id,
+               bool_and(jc.status = 'CLOSED' AND CASE
+                 WHEN EXISTS (SELECT 1 FROM npd_dev_job_card_articles a WHERE a.dev_jc_id = jc.id)
+                 THEN COALESCE((
+                        SELECT bool_and(COALESCE((SELECT SUM(x.qty) FROM npd_dev_dispatch x
+                                                   WHERE x.article_id = a.article_id), 0)
+                                        >= a.output_qty - 0.0005)
+                          FROM npd_dev_job_card_articles a
+                         WHERE a.dev_jc_id = jc.id AND a.output_qty > 0), FALSE)
+                 ELSE COALESCE(jc.output_qty, 0) > 0
+                  AND GREATEST(COALESCE((SELECT SUM(x.qty) FROM npd_dev_dispatch x
+                                          WHERE x.dev_jc_id = jc.id), 0),
+                               COALESCE(jc.dispatch_qty, 0)) >= jc.output_qty - 0.0005
+               END) AS all_out
+          FROM npd_dev_job_cards jc
+         WHERE jc.source_requisition_id IS NOT NULL AND jc.status <> 'CANCELLED'
+         GROUP BY 1"""
+_OUTS_CTE_ABSENT = """
+        SELECT NULL::bigint AS req_id, NULL::boolean AS all_out WHERE FALSE"""
+
+
+def _bucket_ctes(ledger_cols: set[str], has_targets: bool) -> str:
+    """The three CTEs the display-status CASE reads, each a shape-compatible empty
+    stand-in when its hand-applied migration is missing. The per-article rule needs
+    083's npd_dev_dispatch.article_id (and so 082's article table)."""
+    outs = _OUTS_CTE if "article_id" in ledger_cols else _OUTS_CTE_ABSENT
+    want = _WANT_CTE if has_targets else _WANT_CTE_ABSENT
+    return f"disp AS ({_disp_cte(ledger_cols)}\n        ), want AS ({want}\n        ), outs AS ({outs}\n        )"
+
+
+_BUCKET_JOINS = """
+          LEFT JOIN disp ON disp.req_id = sr.id
+          LEFT JOIN want ON want.req_id = sr.id
+          LEFT JOIN outs ON outs.req_id = sr.id"""
 
 
 def _disp_cte(cols: set[str]) -> str:
@@ -418,19 +507,67 @@ def _disp_cte(cols: set[str]) -> str:
          GROUP BY 1"""
 
 
-async def _schema_probe(conn) -> tuple[set[str], bool]:
-    """(npd_dev_dispatch columns, whether 086's bh_signoff_state exists).
+async def _schema_probe(conn) -> tuple[set[str], bool, bool]:
+    """(npd_dev_dispatch columns, whether 086's bh_signoff_state exists, whether 080's
+    target-article table exists).
 
-    ONE round trip for both. The queue is paged and re-fetched on every filter change, so
-    a second probe here is a second probe per keystroke.
+    ONE round trip for all three. The queue is paged and re-fetched on every filter
+    change, so a second probe here is a second probe per keystroke.
     """
     rows = await conn.fetch(
         "SELECT table_name, column_name FROM information_schema.columns "
         " WHERE table_name = 'npd_dev_dispatch' "
-        "    OR (table_name = 'sample_requisitions' AND column_name = 'bh_signoff_state')")
+        "    OR (table_name = 'sample_requisitions' AND column_name = 'bh_signoff_state')"
+        "    OR (table_name = 'sample_requisition_npd_targets' AND column_name = 'quantity')")
     disp = {r["column_name"] for r in rows if r["table_name"] == "npd_dev_dispatch"}
     has_bh = any(r["table_name"] == "sample_requisitions" for r in rows)
-    return disp, has_bh
+    has_targets = any(r["table_name"] == "sample_requisition_npd_targets" for r in rows)
+    return disp, has_bh, has_targets
+
+
+async def _bucket_for(conn, req_id: int):
+    """One request's lifecycle status and display bucket — the same SQL the queue uses, so
+    an automatic close can never disagree with what the queue shows."""
+    ledger_cols, has_bh, has_targets = await _schema_probe(conn)
+    return await conn.fetchrow(
+        f"""
+        WITH {_bucket_ctes(ledger_cols, has_targets)}
+        SELECT sr.status, {_display_status_case(has_bh)}
+          FROM sample_requisitions sr{_BUCKET_JOINS}
+         WHERE sr.id = $1
+        """, req_id)
+
+
+# The open statuses an NPD request sits in while its sample is developed and shipped.
+# A dispatch from its dev job card is what finishes it: NPD requests never go through the
+# gate pass, so TRANSITIONS has no edge to CLOSED from these and this is the only way out.
+_AUTO_CLOSE_FROM = ("BH_APPROVED", "IN_PRODUCTION", "PACKING", "READY_FOR_DISPATCH")
+
+
+async def close_if_fully_dispatched(conn, req_id: int, *, user, remarks: str) -> bool:
+    """Close the request when the queue would call it Dispatched. Returns whether it closed.
+
+    Called after every dev-job-card dispatch and when a card is linked to a request.
+    Before this nothing closed an NPD request: they all sat at BH_APPROVED, read as
+    "In process", and the overdue reminder chased them every day after the sample left.
+    The UPDATE re-checks the status, so a request cancelled in between is left alone.
+    """
+    row = await _bucket_for(conn, req_id)
+    if not row or row["display_status"] != "DISPATCHED" or row["status"] not in _AUTO_CLOSE_FROM:
+        return False
+    res = await conn.execute(
+        """UPDATE sample_requisitions
+              SET status = 'CLOSED', updated_at = NOW(), updated_by = $2
+            WHERE id = $1 AND status = ANY($3::text[])""",
+        req_id, user.user_id, list(_AUTO_CLOSE_FROM))
+    if res != "UPDATE 1":
+        return False
+    await audit_service.write_audit(
+        conn, req_id, audit_service.EV_STATUS_CHANGE,
+        old_value={"status": row["status"]}, new_value={"status": "CLOSED"},
+        actor_user_id=user.user_id, actor_role=getattr(user, "role_name", None),
+        remarks=remarks)
+    return True
 
 
 async def list_requisitions(conn, *, status: str | None = None,
@@ -460,21 +597,18 @@ async def list_requisitions(conn, *, status: str | None = None,
     show (see DISPLAY_STATUSES) — and `display_statuses` filters on it. Both live in SQL so
     the filter is a WHERE and LIMIT/OFFSET still page over the rows the caller asked for.
     """
-    ledger_cols, has_bh = await _schema_probe(conn)
-    disp_cte = _disp_cte(ledger_cols)
+    ledger_cols, has_bh, has_targets = await _schema_probe(conn)
     status_case = _display_status_case(has_bh)
     rows = await conn.fetch(
         f"""
-        WITH disp AS ({disp_cte}
-        ), base AS (
+        WITH {_bucket_ctes(ledger_cols, has_targets)}, base AS (
         SELECT sr.*,
                (SELECT a.remarks FROM sample_approvals a
                  WHERE a.requisition_id = sr.id AND a.action = 'HOLD'
                  ORDER BY a.actioned_at DESC NULLS LAST, a.sequence_no DESC
                  LIMIT 1) AS hold_reason,
                {status_case}
-          FROM sample_requisitions sr
-          LEFT JOIN disp ON disp.req_id = sr.id
+          FROM sample_requisitions sr{_BUCKET_JOINS}
          WHERE sr.deleted_at IS NULL
           AND ($1::text   IS NULL OR sr.status = $1)
           AND ($2::text   IS NULL OR sr.sample_type = $2)
@@ -676,6 +810,8 @@ async def update_requisition(conn, req_id: int, *, payload: dict, user) -> dict:
             "error": "not_editable",
             "message": "Only DRAFT, SUBMITTED or BH_REJECTED requisitions can be edited",
             "details": {"status": req["status"]}})
+    _assert_dispatch_date_not_past(payload.get("expected_dispatch_date"),
+                                   current=req.get("expected_dispatch_date"))
     new_warehouse = payload.get("warehouse")
     if new_warehouse is not None and new_warehouse not in WAREHOUSES:
         raise HTTPException(422, detail={"error": "invalid_warehouse",

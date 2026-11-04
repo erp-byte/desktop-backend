@@ -23,6 +23,7 @@ _DIFFABLE_HEADER_FIELDS: tuple[str, ...] = (
     "order_reference_no",
     "narration",
     "vendor_supplier_name",
+    "consignee_address",
     "supplier_id",
     "gross_total",
     "total_amount",

@@ -6,9 +6,10 @@ Ported from `transfer_backend_reference/.../transfer_dashboard_server.py`
 The reference loads ALL transfer-line records once and does every KPI / filter /
 aggregation client-side. We keep that contract but add server-side warehouse
 scoping (a user locked to A185 must only see rows where A185 is the source or
-destination) — consistent with the other transfer list endpoints. `scope` is the
-list returned by `permissions.scope_warehouses(user)`; empty means unrestricted
-(admins / unscoped users see everything).
+destination, in any spelling, or for a cold dispatch one of the cold units its
+boxes came from) — consistent with the other transfer list endpoints. `scope` is
+the list returned by `permissions.scope_warehouses(user)`; empty means
+unrestricted (admins / unscoped users see everything).
 
 Porting notes:
   * `:named` / `.format()` params → positional `$N`.
@@ -19,9 +20,12 @@ Porting notes:
 from __future__ import annotations
 
 from datetime import date
-from typing import Any, Optional
+from typing import Optional
 
 from fastapi import HTTPException
+
+from app.core.sites import scope_keys
+from app.modules.transfer.services.query_service import site_scope_sql
 
 # Only include transfers with actual line items (mirrors reference LINE_FILTER).
 LINE_FILTER = (
@@ -41,19 +45,12 @@ def _parse_date(s: str) -> date:
         raise HTTPException(400, f"Invalid date '{s}'. Use YYYY-MM-DD.")
 
 
-def _norm_wh(w: Any) -> str:
-    """lower-case + drop hyphens so 'A-185'/'A185' compare equal — matches the
-    REPLACE(LOWER(col),'-','') applied to the DB column."""
-    return str(w).strip().lower().replace("-", "")
-
-
-def _scope_clause(scope: Optional[list], param_idx: int) -> str:
-    """SQL fragment restricting to rows whose from_site OR to_site is in `scope`.
-    `h` is assumed to be the header alias. Empty/None scope → always-true."""
-    return (
-        f"(REPLACE(LOWER(COALESCE(h.from_site,'')),'-','') = ANY(${param_idx}::text[]) "
-        f"OR REPLACE(LOWER(COALESCE(h.to_site,'')),'-','') = ANY(${param_idx}::text[]))"
-    )
+def _scope_clause(param_idx: int) -> str:
+    """SQL fragment restricting to rows whose from_site OR to_site, or a unit of whose
+    from_cold_unit, is a site of the scope bound at `param_idx` (bind
+    sites.scope_keys(scope) there, so every spelling of a site matches). `h` is
+    assumed to be the header alias."""
+    return site_scope_sql(f"${param_idx}", sites=("h.from_site", "h.to_site"), units=("h.from_cold_unit",))
 
 
 async def get_all_data(
@@ -66,12 +63,13 @@ async def get_all_data(
     `from_date`/`to_date` (ISO YYYY-MM-DD) bound `stock_trf_date` so the client
     can load a recent window by default and widen on demand — both omitted means
     all-time."""
-    norm_scope = [_norm_wh(w) for w in (scope or []) if str(w).strip()]
     where = [LINE_FILTER]
     args: list = []
-    if norm_scope:
-        args.append(norm_scope)
-        where.append(_scope_clause(norm_scope, len(args)))
+    if scope:
+        # Bound even when the grants give no key (a blank grant): then nothing matches,
+        # as every other list scopes it — a scope never widens to everything.
+        args.append(scope_keys(scope))
+        where.append(_scope_clause(len(args)))
     if from_date:
         args.append(_parse_date(from_date))
         where.append(f"h.stock_trf_date >= ${len(args)}")
@@ -209,12 +207,13 @@ async def get_all_data(
 async def get_filter_options(conn, *, scope: Optional[list] = None) -> dict:
     """Distinct values for the filter chips. Scoped to `scope` (so a locked user
     only sees chip values that actually appear in their visible rows)."""
-    norm_scope = [_norm_wh(w) for w in (scope or []) if str(w).strip()]
+    keys = scope_keys(scope) if scope else None
 
     def _scoped(base_where: str) -> tuple[str, list]:
-        """Append the scope clause + return (where_sql, args)."""
-        if norm_scope:
-            return f"{base_where} AND {_scope_clause(norm_scope, 1)}", [norm_scope]
+        """Append the scope clause + return (where_sql, args). A scope whose grants give
+        no key (a blank grant) matches nothing, as in get_all_data."""
+        if keys is not None:
+            return f"{base_where} AND {_scope_clause(1)}", [keys]
         return base_where, []
 
     result: dict[str, list] = {}

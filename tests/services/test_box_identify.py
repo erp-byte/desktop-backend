@@ -130,14 +130,26 @@ def test_empty_schema_plans_nothing_rather_than_broken_sql():
     assert sources == []
 
 
-def test_plan_asks_for_two_rows_so_ambiguity_is_detectable():
-    """LIMIT 2, not 1. The second row is never returned to the caller — it exists
-    only so a multi-table match can be reported instead of silently resolved.
+def test_plan_asks_for_three_rows_so_ambiguity_is_detectable():
+    """LIMIT 3, not 1. The rows after the first are never returned to the caller —
+    they exist only so a multi-table match can be reported instead of silently
+    resolved. Three, not two: a customer return's box and its cold-stock row are one
+    carton and take two rows (_one_carton), and a third table's hit must still show.
     A fake connection hands back whatever it likes regardless of the LIMIT, so
     this has to be asserted on the SQL itself or the property is untested."""
     sql, _ = svc._plan(_full_schema(), with_txn=True)
-    assert sql.rstrip().endswith("LIMIT 2")
+    assert sql.rstrip().endswith("LIMIT 3")
     assert "ORDER BY _prio" in sql, "an unordered LIMIT picks an arbitrary box"
+
+
+def test_cold_stock_rows_say_which_return_they_were_made_from():
+    schema = _full_schema()
+    schema["cfpl_cold_stocks"] |= {"inward_transaction_no"}
+    arms = _arms(svc._plan(schema, with_txn=True)[0])
+    assert "b.inward_transaction_no::text AS _return_of" in arms["cfpl_cold_stocks"]
+    # absent on cdpl here: a NULL, not a dropped branch; never on another table
+    assert "NULL::text AS _return_of" in arms["cdpl_cold_stocks"]
+    assert "NULL::text AS _return_of" in arms["cfpl_rtv_boxes"]
 
 
 def test_every_branch_projects_the_same_columns():
@@ -157,6 +169,17 @@ def test_rtv_branch_joins_header_for_the_transaction_number():
     assert "JOIN cfpl_rtv_header h ON b.header_id = h.id" in sql
     # The document number comes off the header, never off the box row.
     assert "h.rtv_id::text AS transaction_no" in sql
+
+
+def test_rtv_branch_carries_the_return_s_status_from_the_header():
+    """The scanners refuse a carton of a return that isn't approved, so the box
+    carries its RETURN's status (the box row has none)."""
+    schema = _full_schema()
+    schema["cfpl_rtv_header"] |= {"status"}
+    arms = _arms(svc._plan(schema, with_txn=False)[0])
+    assert "h.status::text AS status" in arms["cfpl_rtv_boxes"]
+    # a header without the column: NULL, never a statement that fails at PREPARE
+    assert "NULL::text AS status" in arms["cdpl_rtv_boxes"]
 
 
 def test_rtv_branch_needs_both_tables():
@@ -344,6 +367,51 @@ def test_two_matches_are_reported_ambiguous_not_silently_resolved():
     assert out["table"] == "cfpl_boxes_v2"
     assert out["ambiguous"] is True
     assert out["also_in"] == ["cfpl_cold_stocks"]
+
+
+_CR_BOX = {"box_id": "31415926-1", "transaction_no": "CR-20261029101500", "item_description": "Almond",
+           "lot_number": "L1", "net_weight": 25.0, "gross_weight": None, "count": None, "status": None,
+           "job_card_number": None, "company": "cfpl", "_return_of": None}
+
+
+def _cold_copy(**over):
+    """The cold-stock row a cold return's box was copied into."""
+    return {**_CR_BOX, "_src": "cfpl_cold_stocks", "_prio": 3,
+            "_return_of": _CR_BOX["transaction_no"], **over}
+
+
+@pytest.mark.parametrize("scan", ['{"tx":"CR-20261029101500","bi":"31415926-1"}', "31415926-1"],
+                         ids=["label QR", "box id alone"])
+@pytest.mark.parametrize("cold_first", [False, True], ids=["return box first", "cold row first"])
+def test_a_cold_return_s_box_and_its_cold_stock_row_are_one_carton(scan, cold_first):
+    """Not ambiguous: the cold-stock row was made from this very box. Whichever the
+    query lists first, the scan reports the return's box and nothing else."""
+    rows = [dict(_CR_BOX, _src="cfpl_rtv_boxes", _prio=4), _cold_copy()]
+    out = _run(svc.identify_box(_Conn(_full_schema(), rows=rows[::-1] if cold_first else rows), scan))
+    assert out["found"] is True and out["table"] == "cfpl_rtv_boxes"
+    assert "ambiguous" not in out
+
+
+def test_a_third_table_still_makes_a_cold_return_s_carton_ambiguous():
+    rows = [dict(_CR_BOX, _src="cfpl_rtv_boxes", _prio=4), _cold_copy(),
+            dict(_CR_BOX, _src="po_box", _prio=13)]
+    out = _run(svc.identify_box(_Conn(_full_schema(), rows=rows), "31415926-1"))
+    assert out["table"] == "cfpl_rtv_boxes"
+    assert out["ambiguous"] is True and out["also_in"] == ["po_box"]
+
+
+@pytest.mark.parametrize("other", [{"_return_of": "CR-20250101000000"}, {"_return_of": None},
+                                   {"box_id": "31415926-2"}],
+                         ids=["another return's row", "a row made from no return", "another box"])
+def test_a_cold_stock_row_not_made_from_the_scanned_box_stays_ambiguous(other):
+    rows = [dict(_CR_BOX, _src="cfpl_rtv_boxes", _prio=4), _cold_copy(**other)]
+    out = _run(svc.identify_box(_Conn(_full_schema(), rows=rows), "31415926-1"))
+    assert out["ambiguous"] is True and out["also_in"] == ["cfpl_cold_stocks"]
+
+
+def test_a_cold_stock_row_alone_is_still_found():
+    out = _run(svc.identify_box(_Conn(_full_schema(), rows=[_cold_copy()]), "31415926-1"))
+    assert out["found"] is True and out["table"] == "cfpl_cold_stocks" and "ambiguous" not in out
 
 
 def test_no_match_returns_not_found_with_the_scanned_id():

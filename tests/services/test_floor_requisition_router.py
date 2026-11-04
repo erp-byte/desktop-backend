@@ -20,6 +20,7 @@ from app.modules.floor_requisition.services import requisition_service as svc
 
 EXPECTED = {
     "/api/v1/floor-requisitions": {"GET": "view", "POST": "create"},
+    "/api/v1/floor-requisitions/availability": {"GET": "view"},
     "/api/v1/floor-requisitions/{requisition_id}/issue": {"POST": "issue"},
     "/api/v1/floor-requisitions/{requisition_id}/receive": {"POST": "receive"},
     "/api/v1/floor-requisitions/{requisition_id}/cancel": {"POST": "cancel"},

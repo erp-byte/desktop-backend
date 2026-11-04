@@ -17,12 +17,20 @@ truth for this PO".
 from __future__ import annotations
 
 import logging
-from datetime import date as date_type, datetime, timezone
+from datetime import date as date_type, datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from app.modules.purchase.services import po_event_log
 
 logger = logging.getLogger(__name__)
+
+# Transaction numbers read as India time, like IMS's inward numbers.
+_IST = ZoneInfo("Asia/Kolkata")
+
+# Held until the PO's transaction commits, so two concurrent commits can't
+# mint the same transaction_no.
+_MINT_LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtext('po_header.transaction_no'))"
 
 
 _HEADER_COLUMNS: tuple[str, ...] = (
@@ -33,6 +41,7 @@ _HEADER_COLUMNS: tuple[str, ...] = (
     "order_reference_no",
     "narration",
     "vendor_supplier_name",
+    "consignee_address",
     "supplier_id",
     "gross_total",
     "total_amount",
@@ -79,10 +88,19 @@ def _coerce_date(v: Any) -> date_type | None:
         return None
 
 
-def _txn_no(po_idx: int, base: datetime) -> str:
-    """Generate a stable transaction_no for newly-inserted POs.
-    Uses base time + 1-second offset per PO so batches don't collide."""
-    return f"TR-{base.strftime('%Y%m%d%H%M%S')}-{po_idx + 1:03d}"
+async def _mint_txn_no(conn, start: datetime, taken: set[str]) -> str:
+    """The first free TR-YYYYMMDDHHMMSS (IST) at or after `start`: not on any PO
+    and not handed out earlier in this batch. No suffix — a batch counts up one
+    second per PO instead. The caller holds _MINT_LOCK_SQL."""
+    t = start.astimezone(_IST)
+    while True:
+        cand = f"TR-{t.strftime('%Y%m%d%H%M%S')}"
+        if cand not in taken and not await conn.fetchval(
+            "SELECT 1 FROM po_header WHERE transaction_no = $1", cand
+        ):
+            taken.add(cand)
+            return cand
+        t += timedelta(seconds=1)
 
 
 async def _insert_po(conn, *, transaction_no: str, entity: str,
@@ -99,7 +117,7 @@ async def _insert_po(conn, *, transaction_no: str, entity: str,
             gross_total, total_amount, sgst_amount, cgst_amount, igst_amount,
             round_off, freight_transport_local, apmc_tax, packing_charges,
             freight_transport_charges, loading_unloading_charges,
-            other_charges_non_gst
+            other_charges_non_gst, consignee_address
         )
         VALUES (
             $1, $2, $3, $4, $5,
@@ -107,7 +125,7 @@ async def _insert_po(conn, *, transaction_no: str, entity: str,
             $10, $11, $12, $13, $14,
             $15, $16, $17, $18,
             $19, $20,
-            $21
+            $21, $22
         )
         """,
         transaction_no, entity, h.get("po_date"), h.get("voucher_type"), h.get("po_number"),
@@ -118,7 +136,7 @@ async def _insert_po(conn, *, transaction_no: str, entity: str,
         h.get("round_off"), h.get("freight_transport_local"), h.get("apmc_tax"),
         h.get("packing_charges"),
         h.get("freight_transport_charges"), h.get("loading_unloading_charges"),
-        h.get("other_charges_non_gst"),
+        h.get("other_charges_non_gst"), h.get("consignee_address"),
     )
     await _insert_lines(conn, transaction_no, lines)
 
@@ -149,7 +167,8 @@ async def _update_po(conn, *, transaction_no: str, entity: str,
             packing_charges               = COALESCE($17, packing_charges),
             freight_transport_charges     = COALESCE($18, freight_transport_charges),
             loading_unloading_charges     = COALESCE($19, loading_unloading_charges),
-            other_charges_non_gst         = COALESCE($20, other_charges_non_gst)
+            other_charges_non_gst         = COALESCE($20, other_charges_non_gst),
+            consignee_address             = COALESCE($22, consignee_address)
          WHERE transaction_no = $1
            AND entity = $21
            AND deleted_at IS NULL
@@ -165,6 +184,7 @@ async def _update_po(conn, *, transaction_no: str, entity: str,
         h.get("freight_transport_charges"), h.get("loading_unloading_charges"),
         h.get("other_charges_non_gst"),
         entity,
+        h.get("consignee_address"),
     )
     # Replace lines wholesale
     await conn.execute("DELETE FROM po_line WHERE transaction_no = $1", transaction_no)
@@ -219,6 +239,7 @@ async def commit(
     pydantic config means we can't catch these at the validation layer.
     """
     base_time = datetime.now(timezone.utc)
+    taken: set[str] = set()  # transaction numbers minted in this batch
     out = {
         "created": [], "updated": [], "skipped_duplicates": [],
         "skipped_missing": [], "errors": [],
@@ -288,11 +309,12 @@ async def commit(
                         if mode == "update_only":
                             out["skipped_missing"].append(provided_txn or duplicate_key)
                             continue
-                        # Use the preview's txn_no if it looks fresh, otherwise mint a new one
-                        if provided_txn and not provided_txn.startswith("TXN-PREVIEW-"):
-                            txn_no = provided_txn
-                        else:
-                            txn_no = _txn_no(po_idx, base_time)
+                        # Always mint (the preview's number is a placeholder), so
+                        # every new PO gets a plain TR-YYYYMMDDHHMMSS.
+                        await conn.execute(_MINT_LOCK_SQL)
+                        txn_no = await _mint_txn_no(
+                            conn, base_time + timedelta(seconds=po_idx), taken,
+                        )
                         await _insert_po(
                             conn, transaction_no=txn_no, entity=entity,
                             header=header, lines=lines,

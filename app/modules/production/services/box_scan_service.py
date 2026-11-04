@@ -28,6 +28,7 @@ free Box #, from the per-job-card counter Stores and the WIP boxes share.
 from __future__ import annotations
 
 from app.core.helpers import insert_with_pk_retry, new_short_time_id
+from app.modules.customer_returns.services.approval_service import carton_refusal
 from app.modules.production.services.box_identify_service import identify_box
 
 
@@ -219,7 +220,8 @@ async def scan_box(conn, *, job_card_id: int, code: str,
     warehouse / cold tables. When it resolves anywhere, the article + weights
     are auto-filled (a client-supplied value still wins). When it resolves
     NOWHERE, the box is still stored using the operator-entered ``article``
-    (required) + weights/count, so any physical box can be recorded.
+    (required) + weights/count, so any physical box can be recorded. A customer
+    return's carton is refused until its return is approved (return_not_approved).
 
     Stores' record (floor_requisition_box) is read before all of that. The
     returned scan carries ``stores``: Stores' reference when the box was sent for
@@ -283,6 +285,12 @@ async def scan_box(conn, *, job_card_id: int, code: str,
             }
         if ident.get("found"):
             b = ident.get("box") or {}
+            if str(ident.get("table") or "").endswith("_rtv_boxes"):
+                # A customer return's carton is issued only once the return is approved.
+                refusal = carton_refusal(b.get("transaction_no"), b.get("status"), code)
+                if refusal:
+                    return {"error": "return_not_approved", "code": code, "message": refusal,
+                            "rtv_id": b.get("transaction_no"), "status": b.get("status")}
             is_sfg = ident.get("table") == "sfg_box"
             box = {
                 "source_type":    "sfg" if is_sfg else "po",

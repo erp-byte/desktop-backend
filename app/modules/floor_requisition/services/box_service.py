@@ -7,7 +7,8 @@ A box joins a request (floor_requisition_box, app/db/113) one of two ways:
     po_line for the article) by box_id — and by transaction_no when the label
     carries one — then the universal identify over the legacy warehouse / cold
     tables (production/services/box_identify_service.py). A label's tx decides
-    the order: a PO label ({"tx","bi"}) is tried against po_box first.
+    the order: a PO label ({"tx","bi"}) is tried against po_box first. A
+    customer return's carton is refused until its return is approved.
   * printed — it has no sticker. Manual print mints it in sfg_box as item_type
     'rm' (id "<8-digit time>-<per-job-card counter>", as create_wip_boxes does)
     and the browser prints Material-In's sticker, QR {"tx": request no, "bi": id}.
@@ -38,6 +39,7 @@ from typing import Any, Optional
 from app.core.helpers import insert_with_pk_retry, new_short_time_id
 from app.modules.floor_requisition import rules
 from app.modules.floor_requisition.services.requisition_service import RequisitionError, _load
+from app.modules.customer_returns.services.approval_service import carton_refusal
 from app.modules.production.services.box_identify_service import identify_box
 
 MAX_PRINT = 500
@@ -260,6 +262,12 @@ async def resolve_box(conn, raw: str) -> dict[str, Any]:
         raise _ambiguous(code, [ident.get("table"), *(ident.get("also_in") or [])])
     if ident.get("found"):
         b = ident.get("box") or {}
+        if str(ident.get("table") or "").endswith("_rtv_boxes"):
+            # A customer return's carton goes out only once the return is approved.
+            refusal = carton_refusal(b.get("transaction_no"), b.get("status"), code)
+            if refusal:
+                raise RequisitionError(409, "return_not_approved", refusal, box_code=code,
+                                       rtv_id=b.get("transaction_no"), status=b.get("status"))
         return {"box_code": code, "box_table": ident.get("table") or "unknown",
                 "transaction_no": b.get("transaction_no"), "article": b.get("item_description"),
                 "lot_number": b.get("lot_number"), "net_weight": b.get("net_weight"),

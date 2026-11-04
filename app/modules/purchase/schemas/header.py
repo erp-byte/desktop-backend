@@ -16,6 +16,7 @@ class POHeaderOut(BaseModel):
     order_reference_no: str | None = None
     narration: str | None = None
     vendor_supplier_name: str | None = None
+    consignee_address: str | None = None
     gross_total: Decimal3 = None
     total_amount: Decimal3 = None
     sgst_amount: Decimal3 = None

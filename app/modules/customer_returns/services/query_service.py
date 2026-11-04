@@ -3,12 +3,17 @@ and the async get_cr/list_crs functions.
 """
 from __future__ import annotations
 
-from datetime import date, datetime
+import hashlib
+import json
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
 
+from app.core.sites import scope_keys
+from app.core.warehouse_scope import WAREHOUSE_NORM_ANY_SQL
 from app.modules.customer_returns.tables import cr_table_names
 
 # _rtv_header carries every header column the module reads (extra id/approved_* are
@@ -62,6 +67,13 @@ def _like_escape(term: str) -> str:
     return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def _factory_unit_clause(n: int) -> str:
+    """The factory_unit filter as a site (app.core.sites): bind scope_keys(factory_unit)
+    at $n, so ?factory_unit=Savla D-39 also finds returns stored 'D-39' or 'Old Savla',
+    and 'A185' those stored 'A-185' or 'Warehouse A185'."""
+    return WAREHOUSE_NORM_ANY_SQL("h.factory_unit", f"${n}")
+
+
 def _convert_date(s: Optional[str]) -> Optional[date]:
     """Parse a DD-MM-YYYY filter string; 400 on bad format; None passes through."""
     if not s:
@@ -76,10 +88,84 @@ def _convert_date(s: Optional[str]) -> Optional[date]:
         )
 
 
+# ── IST ─────────────────────────────────────────────────────────────────────
+# The warehouse works to Asia/Kolkata, so every CR date is an IST date. The legacy
+# _rtv_* columns are `timestamp without time zone` holding UTC (IMS and the ERP
+# both write NOW() in a UTC session), so asyncpg hands them back naive; a
+# timestamptz column comes back aware; IMS wrote approved_at as utcnow() TEXT.
+# _ist() turns any of them into one aware IST datetime, which the API serialises
+# with its offset ("2026-10-19T02:00:00+05:30") — never an offset-less UTC clock
+# face that a browser would read as its own local time.
+IST = ZoneInfo("Asia/Kolkata")
+
+
+def _ist(v: Any) -> Any:
+    """A stored timestamp as an aware IST datetime. Naive means UTC; text is read as
+    ISO-8601 (IMS's 'YYYY-MM-DD HH:MM:SS' included) and returned as is when it isn't
+    one; a bare date is that IST calendar day; None stays None."""
+    if v is None:
+        return None
+    if isinstance(v, str):
+        try:
+            v = datetime.fromisoformat(v.strip())
+        except ValueError:
+            return v
+    if isinstance(v, datetime):
+        if v.utcoffset() is None:
+            v = v.replace(tzinfo=timezone.utc)
+        return v.astimezone(IST)
+    if isinstance(v, date):
+        return datetime(v.year, v.month, v.day, tzinfo=IST)
+    return v
+
+
+def _ist_text(v: Any) -> Any:
+    """_ist() for a str-typed field: the ISO-8601 string with its +05:30 offset
+    (unreadable text and None pass through)."""
+    t = _ist(v)
+    return t.isoformat() if isinstance(t, datetime) else t
+
+
+def _ist_day_start_utc(d: date) -> datetime:
+    """The IST midnight that opens calendar day d, as the naive UTC instant the
+    _rtv_* columns are compared with (19 Oct 2026 -> 2026-10-18 18:30)."""
+    return datetime(d.year, d.month, d.day, tzinfo=IST).astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _day_bound(value: str, d: date, *, days: int = 0) -> datetime:
+    """_ist_day_start_utc(d + days) for the filter string `value`. Two DD-MM-YYYY
+    days parse but have no such bound in Python's datetime range (IST midnight on
+    01-01-0001 is in year 0 UTC; the day after 31-12-9999 is in year 10000): they
+    are a 400 like a malformed date, not an OverflowError's 500."""
+    try:
+        return _ist_day_start_utc(d + timedelta(days=days))
+    except OverflowError:
+        raise HTTPException(
+            400,
+            detail={"error": "invalid_date", "message": "date out of range",
+                    "details": {"value": value}},
+        )
+
+
+def _add_date_filters(clauses: list, args: list, from_date: Optional[str],
+                      to_date: Optional[str]) -> None:
+    """from_date / to_date (DD-MM-YYYY) are IST calendar days, both inclusive. The
+    bounds are bound as naive UTC: right for the naive-UTC _rtv_* columns, and for a
+    timestamptz column too (Postgres reads the bound in the session TimeZone, UTC).
+    A NULL rtv_date matches neither bound, so such rows stay out of a dated list."""
+    df = _convert_date(from_date)
+    if df:
+        args.append(_day_bound(from_date, df)); clauses.append(f"h.rtv_date >= ${len(args)}::timestamp")
+    dt = _convert_date(to_date)
+    if dt:
+        args.append(_day_bound(to_date, dt, days=1))
+        clauses.append(f"h.rtv_date < ${len(args)}::timestamp")
+
+
 def _map_header_row(r: dict) -> dict:
-    return {
+    out = {
         "rtv_id": r.get("rtv_id"),
-        "rtv_date": r.get("rtv_date"),
+        "rtv_date": _ist(r.get("rtv_date")),
         "factory_unit": r.get("factory_unit") or "",
         "customer": r.get("customer") or "",
         "invoice_number": r.get("invoice_number"),
@@ -96,9 +182,14 @@ def _map_header_row(r: dict) -> dict:
         "inward_manager": r.get("inward_manager"),
         "status": r.get("status") or "Pending",
         "created_by": r.get("created_by"),
-        "created_ts": r.get("created_ts"),
-        "updated_at": r.get("updated_at"),
+        "created_ts": _ist(r.get("created_ts")),
+        "updated_at": _ist(r.get("updated_at")),
     }
+    # approved_at is not in HEADER_COLS; a read that does select it gets it in IST
+    # as text, since IMS stored it as TEXT (a value that won't parse stays as stored).
+    if "approved_at" in r:
+        out["approved_at"] = _ist_text(r["approved_at"])
+    return out
 
 
 def _map_line_row(r: dict) -> dict:
@@ -120,8 +211,8 @@ def _map_line_row(r: dict) -> dict:
         "item_mark": r.get("item_mark"),
         "spl_remarks": r.get("spl_remarks"),
         "vakkal": r.get("vakkal"),
-        "created_at": r.get("created_at"),
-        "updated_at": r.get("updated_at"),
+        "created_at": _ist(r.get("created_at")),
+        "updated_at": _ist(r.get("updated_at")),
     }
 
 
@@ -140,8 +231,8 @@ def _map_box_row(r: dict) -> dict:
         "net_weight": _num_str(r.get("net_weight")),
         "gross_weight": _num_str(r.get("gross_weight")),
         "count": r.get("count"),
-        "created_at": r.get("created_at"),
-        "updated_at": r.get("updated_at"),
+        "created_at": _ist(r.get("created_at")),
+        "updated_at": _ist(r.get("updated_at")),
     }
 
 
@@ -185,6 +276,11 @@ async def _fetch_lines(conn, tables: dict, cr_id: str) -> list:
     return [_map_line_row(dict(r)) for r in rows]
 
 
+async def fetch_lines(conn, company: str, cr_id: str) -> list:
+    """The return's lines, as get_cr reads them."""
+    return await _fetch_lines(conn, cr_table_names(company), cr_id)
+
+
 async def _fetch_boxes(conn, tables: dict, cr_id: str) -> list:
     rows = await conn.fetch(
         f"SELECT {_RTV_BOX_SELECT} FROM {tables['boxes']} b "
@@ -193,6 +289,97 @@ async def _fetch_boxes(conn, tables: dict, cr_id: str) -> list:
         cr_id,
     )
     return [_map_box_row(dict(r)) for r in rows]
+
+
+# The fingerprint of a return's box set: every box's identity, label and values, in a
+# fixed order. A page sends back the one it loaded with each box print and save
+# (box_service), so a save made from an out-of-date page is refused instead of putting
+# back old values or dropping boxes printed since. Computed by SQL from the stored
+# columns, so the read here and the check there always agree.
+_BOX_VERSION_SQL = """
+    SELECT md5(COALESCE(string_agg(concat_ws('|',
+               COALESCE(article_description, '-'), box_number::text, COALESCE(box_id, '-'),
+               COALESCE(net_weight::text, '-'), COALESCE(gross_weight::text, '-'),
+               COALESCE(count::text, '-'), COALESCE(lot_number, '-'), COALESCE(item_mark, '-'),
+               COALESCE(spl_remarks, '-'), COALESCE(vakkal, '-'),
+               COALESCE(conversion::text, '-'), COALESCE(uom::text, '-')),
+             E'\n' ORDER BY article_description, box_number, id), ''))
+      FROM {boxes} WHERE header_id = {header}
+"""
+
+
+async def box_version(conn, tables: dict, header_id: int) -> str:
+    return await conn.fetchval(_BOX_VERSION_SQL.format(boxes=tables["boxes"], header="$1"), header_id)
+
+
+async def box_version_for(conn, tables: dict, cr_id: str) -> str:
+    return await conn.fetchval(
+        _BOX_VERSION_SQL.format(boxes=tables["boxes"],
+                                header=f"(SELECT id FROM {tables['header']} WHERE rtv_id = $1)"),
+        cr_id)
+
+
+# The figures an approver decides on, and their fingerprint: the return's customer,
+# factory unit, invoice and challan, and each line's article, unit, quantity, rate,
+# value and net weight — what the approval mail, the WhatsApp card and the review
+# page show. Every approval link and card carries the fingerprint it was sent with,
+# and a decision is refused once the return's figures no longer match it
+# (approval_service). Remarks, transport details and boxes are not figures: changing
+# them leaves a request valid. Computed from the return as get_cr reads it (numbers
+# as values, so 40 and 40.000 are one figure; lines in article order), so the mail
+# built from a read and the check made at decision time always agree.
+_FIGURE_FIELDS = ("customer", "factory_unit", "invoice_number", "challan_no")
+_LINE_TEXT = ("item_description", "uom")
+_LINE_NUMBERS = ("qty", "rate", "value", "net_weight")
+
+
+def _figure_text(v) -> str:
+    return " ".join(str(v).split()) if v is not None else ""
+
+
+def _figure_number(v) -> str:
+    s = _figure_text(v) or "0"
+    try:
+        return format(Decimal(s).normalize(), "f")
+    except ArithmeticError:
+        return s
+
+
+def figures_version(detail: dict) -> str:
+    """The fingerprint of a return's figures (above), from its header fields and lines."""
+    lines = sorted(
+        [[_figure_text(line.get(f)) for f in _LINE_TEXT] + [_figure_number(line.get(f)) for f in _LINE_NUMBERS]
+         for line in detail.get("lines") or []])
+    payload = [[_figure_text(detail.get(f)) for f in _FIGURE_FIELDS], lines]
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False).encode()).hexdigest()[:16]
+
+
+async def read_figures(conn, tables: dict, cr_id: str, *, for_update: bool = False) -> str | None:
+    """The fingerprint of the return's figures as stored now; None when it is absent.
+    for_update holds its header row until the caller's transaction ends, so an edit
+    can't change the figures between this read and what the caller does with it."""
+    hdr = await conn.fetchrow(
+        f"SELECT {', '.join(_FIGURE_FIELDS)} FROM {tables['header']} WHERE rtv_id = $1"
+        + (" FOR UPDATE" if for_update else ""), cr_id)
+    if hdr is None:
+        return None
+    return figures_version({**dict(hdr), "lines": await _fetch_lines(conn, tables, cr_id)})
+
+
+def box_lock_key(company: str, cr_id: str) -> str:
+    """Advisory-lock key serializing all box writes for one CR. Restores the
+    atomicity the natural-key ON CONFLICT gave on the module's own tables — the
+    legacy _rtv_boxes has no (header_id, article, box_number) unique constraint
+    (adding one could reject a valid IMS row), so concurrent box writes for the
+    same CR are serialized with pg_advisory_xact_lock instead. The approval of a
+    cold return takes it too, before its status UPDATE, so its cold-stock copy
+    (cold_stock_service) sees every box printed before it and none half-written."""
+    return f"crbox:{(company or '').strip().upper()}:{cr_id}"
+
+
+async def lock_box_writes(conn, company: str, cr_id: str) -> None:
+    """Hold the CR's box lock until the caller's transaction ends (re-entrant)."""
+    await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", box_lock_key(company, cr_id))
 
 
 async def get_cr(conn, company: str, cr_id: str) -> dict:
@@ -210,6 +397,8 @@ async def get_cr(conn, company: str, cr_id: str) -> dict:
     result = _map_header_row(dict(hdr))
     result["lines"] = await _fetch_lines(conn, tables, cr_id)
     result["boxes"] = await _fetch_boxes(conn, tables, cr_id)
+    result["box_version"] = await box_version_for(conn, tables, cr_id)
+    result["figures_version"] = figures_version(result)
     return result
 
 
@@ -235,16 +424,11 @@ async def list_crs(conn, *, company: str, page: int, per_page: int,
     if status:
         args.append(status); clauses.append(f"h.status = ${len(args)}")
     if factory_unit:
-        args.append(factory_unit); clauses.append(f"h.factory_unit = ${len(args)}")
+        args.append(scope_keys(factory_unit)); clauses.append(_factory_unit_clause(len(args)))
     if customer:
         args.append(f"%{_like_escape(customer)}%")
         clauses.append(f"h.customer ILIKE ${len(args)} ESCAPE '\\'")
-    df = _convert_date(from_date)
-    if df:
-        args.append(df); clauses.append(f"h.rtv_date >= ${len(args)}")
-    dt = _convert_date(to_date)
-    if dt:
-        args.append(dt); clauses.append(f"h.rtv_date < (${len(args)}::date + 1)")
+    _add_date_filters(clauses, args, from_date, to_date)
     where = " AND ".join(clauses)
 
     total = await conn.fetchval(
@@ -301,10 +485,11 @@ EXPORT_COLUMNS = [
 
 
 def _export_row(r: dict) -> dict:
-    """Flatten one joined header/line/box record into the 33-col export dict."""
+    """Flatten one joined header/line/box record into the 33-col export dict. RTV Date
+    and Created At are aware IST datetimes (export_xlsx writes them as IST dates)."""
     return {
         "RTV ID": r.get("rtv_id") or "",
-        "RTV Date": str(r.get("rtv_date") or ""),
+        "RTV Date": _ist(r.get("rtv_date")) or "",
         "Factory Unit": r.get("factory_unit") or "",
         "Customer": r.get("customer") or "",
         "Invoice Number": r.get("invoice_number") or "",
@@ -316,7 +501,7 @@ def _export_row(r: dict) -> dict:
         "Remark": r.get("remark") or "",
         "Status": r.get("status") or "",
         "Created By": r.get("created_by") or "",
-        "Created At": str(r.get("created_ts") or ""),
+        "Created At": _ist(r.get("created_ts")) or "",
         "Material Type": r.get("material_type") or "",
         "Item Category": r.get("item_category") or "",
         "Sub Category": r.get("sub_category") or "",
@@ -350,16 +535,11 @@ async def export_cr_records(conn, *, company: str, status=None, customer=None,
     if status:
         args.append(status); clauses.append(f"h.status = ${len(args)}")
     if factory_unit:
-        args.append(factory_unit); clauses.append(f"h.factory_unit = ${len(args)}")
+        args.append(scope_keys(factory_unit)); clauses.append(_factory_unit_clause(len(args)))
     if customer:
         args.append(f"%{_like_escape(customer)}%")
         clauses.append(f"h.customer ILIKE ${len(args)} ESCAPE '\\'")
-    df = _convert_date(from_date)
-    if df:
-        args.append(df); clauses.append(f"h.rtv_date >= ${len(args)}")
-    dt = _convert_date(to_date)
-    if dt:
-        args.append(dt); clauses.append(f"h.rtv_date < (${len(args)}::date + 1)")
+    _add_date_filters(clauses, args, from_date, to_date)
     where = " AND ".join(clauses)
 
     col = _SORTABLE.get(sort_by, "created_ts")

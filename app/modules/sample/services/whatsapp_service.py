@@ -1501,6 +1501,16 @@ async def handle_inbound(conn, *, from_phone: str, text: str, context_id: str | 
     if fr_res is not None:
         return fr_res
 
+    # ── TRANSFER REQUEST Accept / Reject (store) and Approve / Reject (inventory manager):
+    #    a tap with a trq:<action>:<id> payload or quoting a transfer-request notice, and the
+    #    reject reason typed after a Reject tap. Early, like the floor-requisition taps: the
+    #    labels are verbs the NPD / promote flows read too. None when the message is not a
+    #    transfer-request reply. ──
+    from app.modules.transfer.services import request_wa_reply as _trq  # lazy: avoid cycle
+    trq_res = await _trq.handle_reply(conn, wa, body, context_id, raw)
+    if trq_res is not None:
+        return trq_res
+
     # ── CUSTOMER-RETURNS head approval (context.id → wa_return_message) — resolved FIRST,
     #    since the BU-Head approver is neither an npd_team reviewer nor a promote approver.
     #    Returns None when the tap isn't a customer-return message, so the flows below run. ──
@@ -1897,6 +1907,10 @@ def is_erp_or_visitor_message(m: dict) -> bool:
     if is_visitor_approval_payload(p):
         return True
     if p.lower() in _ERP_VERBS:
+        return True
+    # A transfer-request button (trq:<action>:<id>, transfer/services/request_notify): an
+    # answer to the ERP's own notice, never part of a maintenance conversation.
+    if p.lower().startswith("trq:"):
         return True
     if (m.get("type") or "") == "text":
         words = ((m.get("text") or {}).get("body") or "").strip().split(maxsplit=1)

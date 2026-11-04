@@ -4,6 +4,16 @@ Aligned with SAP MM: Movement types, Material Documents, FIFO/FEFO, QC_HOLD filt
 import json
 from datetime import datetime, timezone, timedelta, date as date_type
 
+from app.core.sites import is_cold_site, scope_keys
+from app.core.warehouse_scope import WAREHOUSE_NORM_ANY_SQL
+
+
+def _is_cold_storage(lot: dict) -> bool:
+    """A batch held in cold storage: its warehouse is a cold site (app.core.sites, any
+    spelling: 'Rishi', 'Supreme', 'Savla D-34'), or its floor is a cold floor ('cold'
+    in the floor id, as before). A warehouse floor such as 'A185 Cold' is not cold."""
+    return is_cold_site(lot.get("warehouse")) or "cold" in (lot.get("floor_id") or "").lower()
+
 
 def _gen_isn(seq_val: int) -> str:
     d = datetime.now(timezone.utc).strftime("%Y%m%d")
@@ -25,9 +35,12 @@ async def get_lots(conn, *, item_description, warehouse=None, job_card_id=None,
     idx = 2
 
     if warehouse:
-        conditions.append(f"(ib.floor_id ILIKE ${idx} OR ib.warehouse_id ILIKE ${idx})")
-        params.append(f"%{warehouse}%")
-        idx += 1
+        # The floor or warehouse text as before, or the warehouse as a site in any
+        # spelling: 'W-202' also finds batches booked at 'W202'.
+        conditions.append(f"(ib.floor_id ILIKE ${idx} OR ib.warehouse_id ILIKE ${idx} "
+                          f"OR {WAREHOUSE_NORM_ANY_SQL('ib.warehouse_id', f'${idx + 1}')})")
+        params += [f"%{warehouse}%", scope_keys(warehouse)]
+        idx += 2
 
     if entity:
         conditions.append(f"ib.entity = ${idx}")
@@ -45,8 +58,6 @@ async def get_lots(conn, *, item_description, warehouse=None, job_card_id=None,
                ib.transaction_no AS tr_number, ib.entity,
                ib.expiry_date,
                CASE WHEN ib.batch_id LIKE 'LEGACY-%' THEN TRUE ELSE FALSE END AS is_legacy,
-               CASE WHEN LOWER(ib.floor_id) LIKE '%cold%' OR LOWER(ib.warehouse_id) LIKE '%cold%'
-                    THEN TRUE ELSE FALSE END AS is_cold_storage,
                lb.blocked_for_so, lb.blocked_by_user AS blocked_by,
                lb.blocked_at, lb.skip_reason AS block_reason
         FROM inventory_batch ib
@@ -62,6 +73,7 @@ async def get_lots(conn, *, item_description, warehouse=None, job_card_id=None,
     today = date_type.today()
     for r in rows:
         lot = dict(r)
+        lot["is_cold_storage"] = _is_cold_storage(lot)
         # Shelf life warning (SAP: min remaining shelf life check)
         if lot.get("expiry_date"):
             exp = lot["expiry_date"] if isinstance(lot["expiry_date"], date_type) else None
@@ -91,9 +103,13 @@ async def get_lots_other_warehouses(conn, *, item_description, exclude_warehouse
     idx = 2
 
     if exclude_warehouse:
-        conditions.append(f"ib.floor_id NOT ILIKE ${idx} AND ib.warehouse_id NOT ILIKE ${idx}")
-        params.append(f"%{exclude_warehouse}%")
-        idx += 1
+        # Every batch get_lots(warehouse=exclude_warehouse) would list is left out, in any
+        # spelling of the site; a batch with no floor or warehouse recorded stays listed.
+        conditions.append(f"NOT (COALESCE(ib.floor_id, '') ILIKE ${idx} "
+                          f"OR COALESCE(ib.warehouse_id, '') ILIKE ${idx} "
+                          f"OR {WAREHOUSE_NORM_ANY_SQL('ib.warehouse_id', f'${idx + 1}')})")
+        params += [f"%{exclude_warehouse}%", scope_keys(exclude_warehouse)]
+        idx += 2
 
     if entity:
         conditions.append(f"ib.entity = ${idx}")
@@ -105,14 +121,13 @@ async def get_lots_other_warehouses(conn, *, item_description, exclude_warehouse
     rows = await conn.fetch(f"""
         SELECT ib.batch_id, ib.sku_name AS item_description,
                ib.lot_number, ib.inward_date, ib.current_qty_kg AS net_wt,
-               ib.status, ib.floor_id, ib.warehouse_id AS warehouse,
-               CASE WHEN LOWER(ib.floor_id) LIKE '%cold%' OR LOWER(ib.warehouse_id) LIKE '%cold%' THEN TRUE ELSE FALSE END AS is_cold_storage
+               ib.status, ib.floor_id, ib.warehouse_id AS warehouse
         FROM inventory_batch ib
         WHERE {where}
         ORDER BY ib.inward_date ASC
     """, *params)
 
-    return {"lots": [dict(r) for r in rows]}
+    return {"lots": [{**dict(r), "is_cold_storage": _is_cold_storage(dict(r))} for r in rows]}
 
 
 # ── FIFO skip recording ──

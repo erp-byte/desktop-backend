@@ -8,8 +8,8 @@ This DB holds the interunit_* transfer tables but NOT the source-inventory table
 (boxes_v2 / bulk_entry / cold_stocks live in the separate warehouse_db). So the
 test uses a SYNTHETIC box: it exercises the real interunit_transfers_* writes +
 the pending park's graceful no-source branch (each source table is guarded by
-_table_exists). Real deduction is the same verified code backfill uses and only
-fires where the source tables exist (production).
+_table_exists). Where the source tables exist (production) the same park copies the
+box's stock row into the pending row and leaves it there: dispatch is record only.
 
 Run:  PYTHONPATH=. .venv/bin/python tests/services/test_create_transfer_rollback.py
 """

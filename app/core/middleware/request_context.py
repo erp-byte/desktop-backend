@@ -190,11 +190,20 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException) 
     )
 
 
+def _json_safe_errors(errors) -> list:
+    """exc.errors() with only values JSON can carry. Pydantic puts the exception a model
+    or field validator raised (a ValueError) in ctx['error'], and serialising it would
+    turn the 422 into a 500; such values are given as their text."""
+    plain = (str, int, float, bool, type(None))
+    return [{**e, "ctx": {k: v if isinstance(v, plain) else str(v) for k, v in e["ctx"].items()}}
+            if e.get("ctx") else e for e in errors]
+
+
 async def validation_exception_handler(
     request: Request, exc: RequestValidationError
 ) -> JSONResponse:
     rid = _request_id(request)
-    errors = exc.errors()
+    errors = _json_safe_errors(exc.errors())
     logger.warning(
         "422 validation failed: %s %s (request_id=%s) errors=%s body=%r",
         request.method,

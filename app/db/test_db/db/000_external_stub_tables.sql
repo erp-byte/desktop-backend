@@ -56,11 +56,17 @@ CREATE TABLE IF NOT EXISTS vendor_document (
 );
 
 -- ── transfer / inter-unit (IMS) module ──────────────────────────────────────
+-- The columns IMS reads and writes, and GET /api/v1/transfer/dropdowns/warehouse-sites
+-- selects (id, site_code, site_name, is_active); a DB built from the old stub
+-- (site_code, site_name, active) gets the two missing ones added.
 CREATE TABLE IF NOT EXISTS warehouse_sites (
-    site_code  TEXT PRIMARY KEY,
+    id         BIGSERIAL PRIMARY KEY,
+    site_code  TEXT NOT NULL UNIQUE,
     site_name  TEXT,
-    active     BOOLEAN
+    is_active  BOOLEAN DEFAULT TRUE
 );
+ALTER TABLE warehouse_sites ADD COLUMN IF NOT EXISTS id BIGSERIAL;
+ALTER TABLE warehouse_sites ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE;
 CREATE TABLE IF NOT EXISTS transfer_requests (
     id           BIGINT PRIMARY KEY,
     request_no   TEXT,

@@ -31,9 +31,11 @@ async def main() -> None:
         assert r1["box_id"].endswith("-1") and r1["box_id"].count("-") == 1, r1["box_id"]
         first_box_id = r1["box_id"]
 
-        # 2) re-upsert same box → box_id preserved, COALESCE keeps lot when None passed
+        # 2) re-upsert same box, naming its label → box_id preserved, COALESCE keeps lot
+        # when None passed (a reprint that doesn't name the label is refused: box_changed)
         r2 = await box_service.upsert_box(conn, "CFPL", cr_id, schemas.CRBoxUpsertRequest(
-            article_description="ALMOND W-320", box_number=1, net_weight=Decimal("24.500")))
+            article_description="ALMOND W-320", box_number=1, box_id=first_box_id,
+            net_weight=Decimal("24.500"), base_version=r1["box_version"]))
         assert r2["status"] == "updated" and r2["box_id"] == first_box_id
         got = await query_service.get_cr(conn, "CFPL", cr_id)
         b = next(x for x in got["boxes"] if x["box_number"] == 1)

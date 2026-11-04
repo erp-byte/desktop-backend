@@ -1086,6 +1086,20 @@ async def update_dev_job_card_details(
             conn, dev_jc_id, payload=body.model_dump(exclude_unset=True), user=user)
 
 
+@router.post("/npd-dev-job-cards/{dev_jc_id}/link-request")
+async def link_dev_job_card_request(
+    request: Request,
+    dev_jc_id: int,
+    body: schemas.DevJobCardLinkRequest,
+    user: AuthUser = Depends(require_permission("sample", "npd", action="edit")),
+):
+    """Tie a card made from the menu (not from a request's Develop) to its request."""
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await npd_dev_service.link_to_requisition(
+            conn, dev_jc_id, requisition_id=body.requisition_id, user=user)
+
+
 @router.post("/npd-dev-job-cards/{dev_jc_id}/start")
 async def start_dev_job_card(
     request: Request,

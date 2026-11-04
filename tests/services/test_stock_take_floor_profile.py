@@ -16,7 +16,7 @@ import pytest
 
 from app.modules.stock_take import floors as F
 
-TS = (Path(__file__).resolve().parents[3] / "web_replica" / "src" / "lib" / "admin-api.ts")
+TS = (Path(__file__).resolve().parents[3] / "frontend" / "src" / "lib" / "admin-api.ts")
 
 
 def _parse_ts_map() -> dict[str, list[str]]:
@@ -43,7 +43,7 @@ def _parse_ts_map() -> dict[str, list[str]]:
 @pytest.fixture(scope="module")
 def ts_map() -> dict[str, list[str]]:
     if not TS.exists():
-        pytest.skip("web_replica is not checked out next to server_replica")
+        pytest.skip("the frontend is not checked out next to the backend")
     return _parse_ts_map()
 
 

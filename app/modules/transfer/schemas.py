@@ -13,6 +13,22 @@ from typing import Any, List, Optional
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.core.sites import canonical_site, same_site, site_key
+
+
+def _refuse_bad_route(from_warehouse: str, to_warehouse: str) -> None:
+    """From and To must both be given, and be two sites: a blank one (or one with no
+    letter or digit in it) names no site, and two spellings of one site ('A185' /
+    'Warehouse A185', 'Supreme' / 'Supreme Cold') are the same site (app.core.sites)."""
+    missing = [leg for leg, site in (("From", from_warehouse), ("To", to_warehouse)) if not site_key(site)]
+    if len(missing) == 2:
+        raise ValueError("From warehouse and to warehouse are required")
+    if missing:
+        raise ValueError(f"{missing[0]} warehouse is required")
+    if same_site(from_warehouse, to_warehouse):
+        raise ValueError(
+            f"From warehouse and to warehouse must be different (both are {canonical_site(from_warehouse)})")
+
 
 # ── Common ──────────────────────────────────────────────────────────────────
 class DeleteResponse(BaseModel):
@@ -51,6 +67,8 @@ class PendingBoxAcknowledge(BaseModel):
 class FinalizeTransferIn(BaseModel):
     box_condition: Optional[str] = "Good"
     condition_remarks: Optional[str] = None
+    # Accepted for older clients and ignored: a receipt is record only and never
+    # inserts cold-stock rows (the reference's legacy fallback did).
     cold_storage_items: Optional[List[dict]] = None
 
 
@@ -93,8 +111,7 @@ class FormDataCreate(BaseModel):
 
     @model_validator(mode="after")
     def warehouses_must_differ(self):
-        if self.from_warehouse and self.to_warehouse and self.from_warehouse == self.to_warehouse:
-            raise ValueError("From warehouse and to warehouse must be different")
+        _refuse_bad_route(self.from_warehouse, self.to_warehouse)
         return self
 
 
@@ -136,6 +153,19 @@ class RequestCreate(BaseModel):
     article_data: List[ArticleDataCreate] = Field(..., min_length=1)
     computed_fields: Optional[ComputedFields] = None
     validation_rules: Optional[dict] = None
+
+
+# ── Request decisions ─────────────────────────────────────────────────────────
+# Body of /requests/{id}/store-reject and /requests/{id}/reject. The service trims
+# the reason and refuses a blank one.
+class RequestReject(BaseModel):
+    reason: str
+
+
+# Body of /requests/{id}/store-hold and /requests/{id}/hold: as a reject, the reason
+# is trimmed and a blank one refused.
+class RequestHold(BaseModel):
+    reason: str
 
 
 # ── Dropdowns (doc 05) ────────────────────────────────────────────────────────
@@ -197,6 +227,25 @@ class RequestResponse(BaseModel):
     created_ts: Optional[datetime] = None
     rejected_ts: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    # The supplying store's answer ('Accepted' | 'Rejected') and the inventory
+    # manager's decision ('Approved' | 'Rejected'); None = not answered / decided.
+    store_decision: Optional[str] = None
+    store_decided_by: Optional[str] = None
+    store_decided_at: Optional[datetime] = None
+    store_reject_reason: Optional[str] = None
+    manager_decision: Optional[str] = None
+    manager_decided_by: Optional[str] = None
+    manager_decided_at: Optional[datetime] = None
+    manager_reject_reason: Optional[str] = None
+    # Holds (migration 127): store_decision 'Held' keeps a request 'Pending', and
+    # manager_decision 'Held' makes it 'On Hold'. The reasons stay once the request moves on.
+    store_hold_reason: Optional[str] = None
+    manager_hold_reason: Optional[str] = None
+    # The request's newest transfer (by created_ts, then id); None without one. The scan
+    # screen resumes it while it is Dispatch / Partial.
+    transfer_id: Optional[int] = None
+    transfer_challan_no: Optional[str] = None
+    transfer_status: Optional[str] = None
 
 
 class RequestWithLines(RequestResponse):
@@ -230,8 +279,7 @@ class TransferHeaderCreate(BaseModel):
 
     @model_validator(mode="after")
     def warehouses_must_differ(self):
-        if self.from_warehouse and self.to_warehouse and self.from_warehouse == self.to_warehouse:
-            raise ValueError("From warehouse and to warehouse must be different")
+        _refuse_bad_route(self.from_warehouse, self.to_warehouse)
         return self
 
 
@@ -292,6 +340,85 @@ class TransferCreate(BaseModel):
     lines: List[TransferLineCreate] = Field(..., min_length=1)
     boxes: Optional[List[BoxCreate]] = None
     request_id: Optional[int] = None
+
+
+# ── Scan & send: save on scan (scan_service) ─────────────────────────────────
+# POST /requests/{id}/scan saves one scanned box: the first creates the request's
+# transfer with the header below, each later one is added to it (the header is then
+# not used). Route, lines and reason are always the request's.
+class ScanHeader(BaseModel):
+    challan_no: Optional[str] = None
+    stock_trf_date: Optional[str] = None      # DD-MM-YYYY; none: today
+    vehicle_no: Optional[str] = None          # all three required (non-blank) on the first scan
+    driver_name: Optional[str] = None
+    approved_by: Optional[str] = None
+
+
+class ScanBox(BaseModel):
+    header: ScanHeader
+    box: BoxCreate
+
+
+class ScannedBox(BaseModel):
+    """A box of a transfer as it is stored."""
+    box_number: int
+    box_id: str
+    transaction_no: str
+    article: str
+    lot_number: Optional[str] = None
+    batch_number: Optional[str] = None
+    net_weight: str
+    gross_weight: str
+
+
+class ScanResult(BaseModel):
+    transfer_id: int
+    challan_no: str
+    status: str                 # Dispatch / Partial
+    box_count: int              # its real boxes
+    created: bool               # this scan created the transfer
+    box: ScannedBox
+
+
+class BoxKey(BaseModel):
+    box_id: str
+    transaction_no: str
+
+
+class RemoveBoxes(BaseModel):
+    """Exactly one of: the boxes to remove, or all: true."""
+    boxes: Optional[List[BoxKey]] = None
+    all: Optional[bool] = None
+
+
+class RemoveBoxesResult(BaseModel):
+    """cancelled: the last box went, so did the transfer; request_status is the request's
+    status then ("Approved"). Otherwise the transfer as it now is."""
+    cancelled: bool
+    request_status: Optional[str] = None
+    transfer_id: Optional[int] = None
+    status: Optional[str] = None
+    box_count: Optional[int] = None
+
+
+class BoxWeights(BaseModel):
+    box_id: str
+    transaction_no: str
+    net_weight: float = Field(allow_inf_nan=False)
+    gross_weight: float = Field(allow_inf_nan=False)
+
+
+class TransportUpdate(BaseModel):
+    vehicle_no: Optional[str] = None            # each required (non-blank)
+    driver_name: Optional[str] = None
+    approved_by: Optional[str] = None
+
+
+class TransportResult(BaseModel):
+    transfer_id: int
+    vehicle_no: str
+    driver_name: str
+    approved_by: str
 
 
 # ── Transfers (OUT) ──────────────────────────────────────────────────────────
@@ -427,6 +554,9 @@ class TransferInHeaderResponse(BaseModel):
     status: str
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    # The transfer-out's cold units ('Rishi, Savla D-39'), so the Transfer In tab can
+    # filter a cold dispatch by the unit its boxes came from.
+    from_cold_unit: Optional[str] = None
 
 
 class TransferInDetail(TransferInHeaderResponse):
@@ -471,9 +601,13 @@ class PendingTransferRecord(BaseModel):
 
 
 # ── Inner cold transfer create (doc 11) ───────────────────────────────────────
-# Relabel a lot (old_lot → new_lot) and/or relocate boxes within cold storage.
+# Relabel a lot (old_lot → new_lot) and/or correct the location of boxes, inside one
+# cold store (header.from_warehouse; inner_cold_service).
 class InnerTransferLine(BaseModel):
     stock_record_id: Optional[int] = None
+    # 'cfpl' / 'cdpl': whose cold table stock_record_id is in (the cold search row's
+    # company). Without it the id is looked up in both tables.
+    company: Optional[str] = None
     item_category: Optional[str] = None
     item_description: Optional[str] = None
     net_weight: Optional[float] = None

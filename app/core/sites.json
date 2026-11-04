@@ -1,0 +1,140 @@
+{
+  "about": [
+    "The one site table, read by backend app/core/sites.py and frontend src/lib/sites.ts. The two copies (backend app/core/sites.json, frontend src/lib/sites.json) must stay byte-identical: backend tests/services/test_sites.py fails when they differ.",
+    "Every lookup goes by site key: upper case, with every character other than A-Z and 0-9 dropped. 'W-202', 'w 202' and 'W202' are one spelling, so aliases lists only the spellings that differ by more than case, spaces or punctuation. No key may belong to two sites.",
+    "canonical: the name the ERP stores and compares. kind: warehouse, cold or unknown. company: cfpl or cdpl for a cold store (the company whose cold_stocks table holds its rows), else null. grant_code: the code the admin screen grants (auth_user.allowed_warehouses), null when the site cannot be granted. display: the name printed on the delivery challan. address: the challan address, empty when not known. destination: whether pickers offer the site as a transfer To.",
+    "'Cold Storage' is the legacy cold From of the old direct form and of IMS: a site of its own, cold in kind, never the same site as any store and never a To. 'Savla Bond' is a cold store of its own, not Savla D-39. Bare 'Savla' is deliberately absent: it does not say which Savla store."
+  ],
+  "sites": [
+    {
+      "canonical": "W202",
+      "kind": "warehouse",
+      "company": null,
+      "grant_code": "W202",
+      "display": "Warehouse W202",
+      "address": "W-202, MIDC TTC Industrial area, Khairane, Navi Mumbai, Maharashtra 400710",
+      "destination": true,
+      "aliases": []
+    },
+    {
+      "canonical": "A185",
+      "kind": "warehouse",
+      "company": null,
+      "grant_code": "A185",
+      "display": "Warehouse A185",
+      "address": "A-185, MIDC TTC Industrial area, Khairane, Navi Mumbai, Maharashtra 400709",
+      "destination": true,
+      "aliases": ["A185 Cold"]
+    },
+    {
+      "canonical": "A101",
+      "kind": "warehouse",
+      "company": null,
+      "grant_code": "A101",
+      "display": "Warehouse A101",
+      "address": "A-101, MIDC TTC Industrial area, Khairane, Navi Mumbai, Maharashtra 400709",
+      "destination": true,
+      "aliases": []
+    },
+    {
+      "canonical": "A68",
+      "kind": "warehouse",
+      "company": null,
+      "grant_code": "A68",
+      "display": "Warehouse A68",
+      "address": "A-68, MIDC TTC Industrial area, Khairane, Navi Mumbai, Maharashtra 400709",
+      "destination": true,
+      "aliases": []
+    },
+    {
+      "canonical": "F53",
+      "kind": "warehouse",
+      "company": null,
+      "grant_code": "F53",
+      "display": "Warehouse F53",
+      "address": "F53, APMC Masala Market, Sector 19, Vashi, Navi Mumbai, Maharashtra 400703",
+      "destination": true,
+      "aliases": ["APMC F53"]
+    },
+    {
+      "canonical": "Rishi",
+      "kind": "cold",
+      "company": "cdpl",
+      "grant_code": "Rishi",
+      "display": "Rishi Cold Storage",
+      "address": "Rishi, MIDC TTC Industrial area, Khairane, Navi Mumbai, Maharashtra 400709",
+      "destination": true,
+      "aliases": ["Rishi Cold", "Rishi Cold Storage Pvt Ltd"]
+    },
+    {
+      "canonical": "Savla D-39",
+      "kind": "cold",
+      "company": "cfpl",
+      "grant_code": "D-39",
+      "display": "Savla D-39 Cold Storage",
+      "address": "Savla D-39, MIDC TTC Industrial area, Khairane, Navi Mumbai, Maharashtra 400709",
+      "destination": true,
+      "aliases": ["Savla D-39 Cold", "Old Savla", "Savla D-34"]
+    },
+    {
+      "canonical": "Savla D-514",
+      "kind": "cold",
+      "company": "cfpl",
+      "grant_code": "D-514",
+      "display": "Savla D-514 Cold Storage",
+      "address": "Savla D-514, MIDC TTC Industrial area, Khairane, Navi Mumbai, Maharashtra 400709",
+      "destination": true,
+      "aliases": ["Savla D-514 Cold", "New Savla"]
+    },
+    {
+      "canonical": "Savla Bond",
+      "kind": "cold",
+      "company": "cfpl",
+      "grant_code": "Savla Bond",
+      "display": "Savla Bond",
+      "address": "",
+      "destination": true,
+      "aliases": []
+    },
+    {
+      "canonical": "Supreme",
+      "kind": "cold",
+      "company": "cdpl",
+      "grant_code": "Supreme",
+      "display": "Supreme Cold Storage",
+      "address": "MIDC, Turbhe, Navi Mumbai",
+      "destination": true,
+      "aliases": ["Supreme Cold"]
+    },
+    {
+      "canonical": "Eskimo",
+      "kind": "cold",
+      "company": "cdpl",
+      "grant_code": "Eskimo",
+      "display": "Eskimo Cold Storage",
+      "address": "Eskimo Ice Mfg. Co. Pvt. Ltd., Plot No. A-824/1, Khairne MIDC, Thane-Belapur Road, Navi Mumbai, Maharashtra 400710",
+      "destination": true,
+      "aliases": ["Eskimo Cold"]
+    },
+    {
+      "canonical": "Cold Storage",
+      "kind": "cold",
+      "company": null,
+      "grant_code": null,
+      "display": "Cold Storage",
+      "address": "MIDC TTC Industrial area, Khairane, Navi Mumbai",
+      "destination": false,
+      "aliases": []
+    },
+    {
+      "canonical": "Dev Int",
+      "kind": "unknown",
+      "company": null,
+      "grant_code": null,
+      "display": "Dev Int",
+      "address": "",
+      "destination": false,
+      "aliases": []
+    }
+  ]
+}

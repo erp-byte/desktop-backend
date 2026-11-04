@@ -153,12 +153,14 @@ def test_scan_asks_only_for_open_requisitions_with_a_date():
     sql = conn.queries[0]
     assert "expected_dispatch_date IS NOT NULL" in sql
     assert "deleted_at IS NULL" in sql
+    # The requisition status filter: every open status, and none of the five non-chased
+    # ones. Read from that clause alone — the query also names the job card's 'CLOSED'.
+    status_clause = sql[sql.index("sr.status IN ("):].split(")", 1)[0]
     for st in svc.OPEN_STATUSES:
-        assert st in sql
-    # The five non-chased statuses must not be selectable.
+        assert st in status_clause
     for st in ("INTERNALLY_DISPATCHED", "GATE_PASS_ISSUED", "CLOSED",
                "BH_REJECTED", "CANCELLED"):
-        assert st not in sql
+        assert st not in status_clause
 
 
 def test_scan_passes_the_ist_day_as_the_comparison_date():

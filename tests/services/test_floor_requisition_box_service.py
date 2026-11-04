@@ -233,6 +233,31 @@ def test_the_wider_identify_is_the_last_step(monkeypatch):
                    "gross_weight": None, "count": None}
 
 
+def _return_box(status):
+    return _identify({"found": True, "table": "cdpl_rtv_boxes", "box": {
+        "box_id": "31415926-1", "transaction_no": "CR-20261030111500", "item_description": "Almonds",
+        "lot_number": "L1", "net_weight": 25.0, "gross_weight": 25.6, "count": None, "status": status}})
+
+
+@pytest.mark.parametrize("status, says", [
+    ("Rejected", "which was rejected"), ("Pending", "which is Pending and not approved yet"),
+    ("On Hold", "which is On Hold and not approved yet"), (None, "which is Pending and not approved yet")])
+def test_a_customer_return_s_carton_is_not_sent_until_the_return_is_approved(monkeypatch, status, says):
+    monkeypatch.setattr(bs, "identify_box", _return_box(status))
+    with pytest.raises(svc.RequisitionError) as e:
+        run(bs.resolve_box(FakeConn(), "31415926-1"))
+    assert _refusal(e) == (409, "return_not_approved")
+    assert "CR-20261030111500" in e.value.message and says in e.value.message
+    assert e.value.details["rtv_id"] == "CR-20261030111500" and e.value.details["box_code"] == "31415926-1"
+
+
+@pytest.mark.parametrize("status", ["Approved", "Submitted", " Approved "])
+def test_an_approved_return_s_carton_is_sent(monkeypatch, status):
+    monkeypatch.setattr(bs, "identify_box", _return_box(status))
+    box = run(bs.resolve_box(FakeConn(), "31415926-1"))
+    assert box["box_table"] == "cdpl_rtv_boxes" and box["transaction_no"] == "CR-20261030111500"
+
+
 def test_identify_ambiguity_is_refused(monkeypatch):
     monkeypatch.setattr(bs, "identify_box", _identify(
         {"found": True, "ambiguous": True, "table": "po_box", "also_in": ["cfpl_boxes_v2"], "box": {}}))

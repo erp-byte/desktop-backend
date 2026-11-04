@@ -411,18 +411,20 @@ async def get_dev_job_card(conn, dev_jc_id: int) -> dict:
     # defensively: samples/ migrations are hand-applied, so 085 may not be in yet and a
     # bare SELECT of them would break the whole card view.
     jc["source_requestor_name"] = None
+    jc["source_request_id"] = None   # the request's visible number (source_requisition_id is the row id)
     jc["source_sales_poc_name"] = jc["source_sales_poc_email"] = None
     if jc.get("source_requisition_id"):
         has_poc = await conn.fetchval(
             "SELECT 1 FROM information_schema.columns "
             "WHERE table_name = 'sample_requisitions' AND column_name = 'sales_poc_user_id'")
         src = await conn.fetchrow(
-            f"""SELECT r.requestor_team, u.full_name AS requestor_full_name
+            f"""SELECT r.request_id, r.requestor_team, u.full_name AS requestor_full_name
                        {', r.sales_poc_name, r.sales_poc_email' if has_poc else ''}
                   FROM sample_requisitions r
                   LEFT JOIN auth_user u ON u.user_id = r.requestor_user_id
                  WHERE r.id = $1""", jc["source_requisition_id"])
         if src:
+            jc["source_request_id"] = src["request_id"]
             jc["source_requestor_name"] = src["requestor_full_name"] or src["requestor_team"]
             if has_poc:
                 jc["source_sales_poc_name"] = src["sales_poc_name"]
@@ -1227,6 +1229,19 @@ async def dispatch_dev_sample(conn, dev_jc_id: int, *, recipient: str | None, qt
                           dispatch_qty = $3, dispatch_mat_doc_id = $4, updated_at = NOW()
                     WHERE id = $5""",
                 user.user_id, recipient, q, res["mat_doc_id"], dev_jc_id)
+        # This part may be the one that finishes the request it was developed for. Its own
+        # savepoint: a failure to close must never undo the goods issue just recorded.
+        if jc.get("source_requisition_id"):
+            from app.modules.sample.services import requisition_service as rs
+            try:
+                async with conn.transaction():
+                    await rs.close_if_fully_dispatched(
+                        conn, jc["source_requisition_id"], user=user,
+                        remarks=(f"Closed automatically: everything has been dispatched "
+                                 f"(development job card {dev_jc_id}, outpass {dev_jc_id}-{seq})"))
+            except Exception:  # noqa: BLE001
+                logger.exception("Auto-close of requisition %s after dispatch %s failed",
+                                 jc["source_requisition_id"], dispatch_id)
     # Close this dispatch out in the job card's mail trail, AFTER commit — the dispatch
     # summary plus a link to THIS partial out's Delivery Challan + Gate Pass. Threads into
     # the source requisition's trail when the card came from one. Best-effort: a mail
@@ -1240,6 +1255,74 @@ async def dispatch_dev_sample(conn, dev_jc_id: int, *, recipient: str | None, qt
             actor_name=getattr(user, "full_name", None))
     except Exception:  # noqa: BLE001
         logger.exception("Dispatch DC email failed for dev JC %s", dev_jc_id)
+    return await get_dev_job_card(conn, dev_jc_id)
+
+
+async def link_to_requisition(conn, dev_jc_id: int, *, requisition_id: int, user) -> dict:
+    """Tie a card made from the "Development job card" menu to the request it was for.
+
+    Only the request's Develop button used to set the link, and nothing could set it
+    afterwards, so 63 of 98 cards had none: their requests never saw the card's result,
+    never closed, and the overdue reminder chased them (33461896 was developed as card
+    34302860 and still got 176 reminders). Linking does what Develop + close would have:
+    the card's source, the request's back-link, and — for a card already closed — its
+    confirmed dispatch date and promoted BOM, never overwriting values the request has.
+    A card already dispatched may complete the request there and then.
+    """
+    from app.modules.sample.services import audit_service
+    from app.modules.sample.services import requisition_service as rs
+    await npd_auth.require_npd_authorized(conn, user, "AUTHOR")
+    jc = await _fetch(conn, dev_jc_id)
+    if jc["status"] == "CANCELLED":
+        raise HTTPException(409, detail={"error": "wrong_status",
+                                         "message": "A cancelled job card can't be linked to a request",
+                                         "details": {"status": jc["status"]}})
+    if jc.get("source_requisition_id"):
+        raise HTTPException(409, detail={"error": "already_linked",
+                                         "message": "This job card is already linked to a request",
+                                         "details": {"source_requisition_id": jc["source_requisition_id"]}})
+    req = await conn.fetchrow(
+        "SELECT id, request_id, sample_type, status, deleted_at, linked_dev_jc_id "
+        "  FROM sample_requisitions WHERE id = $1", requisition_id)
+    if not req or req["deleted_at"]:
+        raise HTTPException(404, detail={"error": "not_found",
+                                         "message": f"Request {requisition_id} not found",
+                                         "details": {"requisition_id": requisition_id}})
+    if req["sample_type"] not in ("NPD", "TRIAL"):
+        raise HTTPException(422, detail={"error": "not_npd_request",
+                                         "message": "Only an NPD or customer-trial request can be linked to a job card",
+                                         "details": {"sample_type": req["sample_type"]}})
+    if req["status"] not in rs.OPEN_STATUSES_EDITABLE_DATE:
+        raise HTTPException(409, detail={"error": "request_finished",
+                                         "message": f"Request {req['request_id']} is {req['status']} — only an open request can be linked",
+                                         "details": {"status": req["status"]}})
+    closed = jc["status"] == "CLOSED"
+    async with conn.transaction():
+        res = await conn.execute(
+            "UPDATE npd_dev_job_cards SET source_requisition_id = $2, updated_at = NOW() "
+            " WHERE id = $1 AND source_requisition_id IS NULL", dev_jc_id, requisition_id)
+        if res != "UPDATE 1":
+            raise HTTPException(409, detail={"error": "already_linked",
+                                             "message": "This job card was linked to a request a moment ago",
+                                             "details": {"id": dev_jc_id}})
+        await conn.execute(
+            """UPDATE sample_requisitions
+                  SET linked_dev_jc_id = COALESCE(linked_dev_jc_id, $1),
+                      confirmed_dispatch_date = CASE WHEN $3 THEN COALESCE(confirmed_dispatch_date, $4)
+                                                     ELSE confirmed_dispatch_date END,
+                      base_bom_id = CASE WHEN $3 THEN COALESCE(base_bom_id, $5) ELSE base_bom_id END,
+                      updated_at = NOW(), updated_by = $6
+                WHERE id = $2""",
+            dev_jc_id, requisition_id, closed, jc.get("confirmed_dispatch_date"),
+            jc.get("promoted_bom_id"), user.user_id)
+        await audit_service.write_audit(
+            conn, requisition_id, audit_service.EV_NPD,
+            new_value={"linked_dev_jc_id": dev_jc_id},
+            actor_user_id=user.user_id, actor_role=getattr(user, "role_name", None),
+            remarks=f"Development job card {dev_jc_id} linked to this request")
+        await rs.close_if_fully_dispatched(
+            conn, requisition_id, user=user,
+            remarks=f"Closed automatically: everything has been dispatched (development job card {dev_jc_id})")
     return await get_dev_job_card(conn, dev_jc_id)
 
 

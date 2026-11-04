@@ -26,8 +26,8 @@ async def main() -> None:
 
         # header update
         upd = await create_service.update_cr(conn, "CFPL", cr_id,
-                                             schemas.CRHeaderUpdate(remark="edited", status="Submitted"))
-        assert upd["remark"] == "edited" and upd["status"] == "Submitted"
+                                             schemas.CRHeaderUpdate(remark="edited"))
+        assert upd["remark"] == "edited" and upd["status"] == "Pending"  # PUT never sets status
 
         # empty update -> 400
         try:

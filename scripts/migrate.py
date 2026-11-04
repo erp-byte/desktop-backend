@@ -535,6 +535,102 @@ SQL_FILES = [
     # stores role. Grants nothing new; runs last so file order cannot matter.
     # Idempotent.
     DB_DIR / "117_store_head_role.sql",
+    # 121 adds the store's and the inventory manager's decision columns to
+    # interunit_transfer_requests (to_regclass-guarded: the transfer tables are
+    # managed outside this repo) and the transfer.requests.accept / .approve
+    # permissions, granted to store_head and to inventory_manager /
+    # inventory_manager_substitute. MUST run BEFORE the backend deploys: every
+    # transfer request read selects the columns. MUST follow 117 (store_head).
+    # Numbered 121 because the frontend refers to migrations 119 and 120, which
+    # are not in this repo. Idempotent.
+    DB_DIR / "121_transfer_request_decisions.sql",
+    # 122 drops NOT NULL from interunit_transfers_header.reason_code
+    # (to_regclass-guarded, as 121). A dispatch from a transfer request is locked
+    # to the request as approved and writes reason_code = NULL (the request's
+    # reason text goes in remark). MUST run BEFORE the backend deploys: until it
+    # has, every dispatch from a request fails the NOT NULL. Idempotent.
+    DB_DIR / "122_transfer_reason_optional.sql",
+    # 123 indexes interunit_transfer_boxes (box_id, transaction_no)
+    # (to_regclass-guarded, as 121). The transfer re-use guard reads that table
+    # by box_id on every box scan and dispatch, and the cold box pick skips the
+    # boxes on it. Not needed before the backend deploys (only speed); plain
+    # CREATE INDEX, so writes to the table wait while it builds. Idempotent.
+    DB_DIR / "123_interunit_transfer_boxes_box_index.sql",
+    # 124 creates inner_cold_transfer_changes: one row per cold-stock row an inner
+    # cold transfer changed or inserted, with its values before and after, which the
+    # challan's delete restores (it undoes the challan, or refuses when a row has
+    # been changed since). Also creates inner_cold_transfer when missing (IMS made
+    # it at runtime). MUST run BEFORE the backend deploys: inner cold transfers are
+    # refused (503) until the table exists. Idempotent.
+    DB_DIR / "124_inner_cold_transfer_changes.sql",
+    # 125 indexes interunit_transfer_boxes (btrim(box_id), btrim(transaction_no))
+    # (to_regclass-guarded, as 121). The box history read (R3) matches box ids
+    # trimmed, as IMS stored them untrimmed; 123's plain index does not serve
+    # that. Not needed before the backend deploys (only speed); plain CREATE
+    # INDEX, so writes to the table wait while it builds. Idempotent.
+    DB_DIR / "125_interunit_transfer_boxes_trimmed_index.sql",
+    # 126 creates transfer_request_wa_message (each WhatsApp transfer-request notice
+    # sent with Accept / Reject or Approve / Reject buttons, so a tap quoting it is
+    # matched) and transfer_request_wa_pending (a Reject tap waiting for its reason).
+    # Not needed before the backend deploys: without them the notices still go and
+    # the buttons work by their payloads; a WhatsApp Reject asks to use the ERP.
+    # Idempotent.
+    DB_DIR / "126_transfer_request_notifications.sql",
+    # 127 adds store_hold_reason / manager_hold_reason to interunit_transfer_requests
+    # (to_regclass-guarded, as 121): the store may hold a Pending request (it stays
+    # Pending, store_decision 'Held') and an inventory manager an Accepted one (status
+    # 'On Hold'). Also widens 126's transfer_request_wa_pending action check to the
+    # holds. MUST run BEFORE the backend deploys: every transfer request read selects
+    # the columns. MUST follow 121 and 126. Idempotent.
+    DB_DIR / "127_transfer_request_holds.sql",
+    # 128 adds po_box_request_key: POST /purchase/{txn}/boxes records each section
+    # payload's browser key and skips a payload it has already applied, so a retry
+    # after a lost reply doesn't add the boxes twice. The backend skips the check
+    # while the table is missing, so it may run before or after the deploy. Idempotent.
+    DB_DIR / "128_po_box_request_key.sql",
+    # 129 gives po_event_log the columns the PO audit writer inserts (actor_role,
+    # reason, payload) and makes actor_user_id TEXT; RDS had an older shape, so
+    # every PO audit insert failed. Safe before or after the deploy. Idempotent.
+    DB_DIR / "129_po_event_log_columns.sql",
+    # 130 adds po_header.consignee_address, read from the PO Book upload's
+    # "Consignee Address" column. The PO commit writes it, so apply BEFORE the
+    # deploy. Idempotent.
+    DB_DIR / "130_po_header_consignee_address.sql",
+    # 131 adds client_key to po_section and po_box, so Material In can save one box
+    # at a time without a retry adding it twice. The backend skips the key lookups
+    # while the columns are missing, so it may run before or after the deploy.
+    DB_DIR / "131_po_box_client_keys.sql",
+    # 132 recomputes po_header.status for POs with boxes by the receipt rule the
+    # backend now applies (services/receipt_match.py), adding 'fully received'.
+    # Data only; idempotent; safe before or after the deploy.
+    DB_DIR / "132_po_receiving_status_backfill.sql",
+    # 133 lists the customer_returns permissions every Customer Returns write now
+    # checks (create / edit / delete / boxes), so the admin screen can grant them.
+    # Catalog only, no grants: admins pass on their flag and everyone else is refused
+    # with or without it. Safe before or after the deploy. Idempotent.
+    DB_DIR / "133_customer_returns_permissions.sql",
+    # 134 adds cr_deletion_log, the record of every deleted customer return. Until it
+    # exists the backend logs the same record instead, so it may run before or after
+    # the deploy. Idempotent.
+    DB_DIR / "134_cr_deletion_log.sql",
+    # 135 adds cr_cold_stock_rows, the cold-stock rows the ERP makes from approved
+    # cold-store returns. Until it exists nothing is put in cold stock (a warning is
+    # logged), so run it before the deploy. Idempotent.
+    DB_DIR / "135_cr_cold_stock_rows.sql",
+    # 136 creates the debtors_collection role and the debtors_collection.{view, call,
+    # edit, export, upload, delete} permissions: the role gets the first four, admin
+    # roles all six. Checked by the web app's /api/collections Route Handlers, not by
+    # this backend, so it may run before or after either deploys. Idempotent.
+    DB_DIR / "136_debtors_collection_role.sql",
+    # 137 adds cr_approval_log (each customer-return approval request sent, and each
+    # save that changed its figures) and wa_return_message.figures. Until it exists
+    # requests are not recorded and WhatsApp cards carry no fingerprint, so run it
+    # before the deploy. Idempotent.
+    DB_DIR / "137_cr_approval_log.sql",
+    # 138 gives the debtors_collection role the whole module: upload and delete on top
+    # of what 136 granted. MUST follow 136. Checked by the web app's /api/collections
+    # Route Handlers, so it may run before or after either deploys. Idempotent.
+    DB_DIR / "138_debtors_collection_full_access.sql",
 ]
 
 # ── Optional: drop the v1 legacy job-card stack (TEST / Supabase DB ONLY) ──────

@@ -9,16 +9,14 @@ Spec gates:
     • Records the action in po_event_log.
     • Returns dependent_records counts (dock_arrivals, grns, po_boxes).
 
-`dock_arrivals` table doesn't exist in the current schema — `_safe_count`
-returns 0 if the table is missing. `grn` and `po_box` exist.
+`grn` and `dock_arrival` don't exist in the current schema — `_optional_count`
+returns 0 for a missing table. `po_box` must exist.
 """
 
 from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-
-import asyncpg
 
 from app.core.middleware.request_context import AuthError
 from app.modules.purchase.services import po_event_log
@@ -40,16 +38,18 @@ async def _required_count(conn, sql: str, *params) -> int:
     return int(n or 0)
 
 
-async def _optional_count(conn, sql: str, *params) -> int:
-    """COUNT(*) on a table that may not exist yet (e.g. dock_arrival).
-    Returns 0 ONLY if the table is missing (UndefinedTableError); any
-    other failure propagates."""
-    try:
-        n = await conn.fetchval(sql, *params)
-        return int(n or 0)
-    except asyncpg.UndefinedTableError as e:
-        logger.info("po_delete._optional_count: missing table — %s", e)
+async def _optional_count(conn, table: str, sql: str, *params) -> int:
+    """COUNT(*) on a table that may not exist yet (grn, dock_arrival).
+    Returns 0 ONLY if the table is missing; any other failure propagates.
+
+    Checks with to_regclass instead of catching UndefinedTableError: the
+    count runs inside soft_delete's transaction, and a failed statement
+    aborts it, so every later query (and the UPDATE) would fail too."""
+    if not await conn.fetchval("SELECT to_regclass($1)", f"public.{table}"):
+        logger.info("po_delete._optional_count: missing table %s — counting 0", table)
         return 0
+    n = await conn.fetchval(sql, *params)
+    return int(n or 0)
 
 
 async def soft_delete(
@@ -86,21 +86,23 @@ async def soft_delete(
 
             entity = row["entity"]
 
-            # Dependent counts. po_box and grn are required tables (real
-            # errors propagate); dock_arrival isn't created yet so a missing
-            # table is silently treated as 0.
+            # Dependent counts. po_box is a required table (real errors
+            # propagate); grn and dock_arrival aren't created yet, so a
+            # missing table counts as 0.
             box_count = await _required_count(
                 conn,
                 "SELECT COUNT(*) FROM po_box WHERE transaction_no = $1",
                 transaction_no,
             )
-            grn_count = await _required_count(
+            grn_count = await _optional_count(
                 conn,
+                "grn",
                 "SELECT COUNT(*) FROM grn WHERE transaction_no = $1",
                 transaction_no,
             )
             dock_count = await _optional_count(
                 conn,
+                "dock_arrival",
                 "SELECT COUNT(*) FROM dock_arrival WHERE transaction_no = $1",
                 transaction_no,
             )

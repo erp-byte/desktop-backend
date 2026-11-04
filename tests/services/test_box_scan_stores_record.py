@@ -330,3 +330,53 @@ def test_the_route_hands_back_the_scan_with_stores_reference(monkeypatch):
     user = SimpleNamespace(full_name="Floor Fay", phone=None)
     out = asyncio.run(PR.create_box_scan(request, JC, PR.BoxScanRequest(code="9568129-1"), user=user))
     assert out == {"scanned": True, "scan": {"sfg_box_id": "9568129-1", "stores": PRINTED_REF}}
+
+
+# ── a customer return's carton: issued only once the return is approved ──────
+CR_ID = "CR-20261030111500"
+
+
+def _return_carton(monkeypatch, status):
+    async def fake(conn, value):
+        return {"found": True, "table": "cfpl_rtv_boxes", "matched_by": "box_id_only", "box": {
+            "box_id": value, "transaction_no": CR_ID, "item_description": "Almonds", "lot_number": "L1",
+            "net_weight": 25.0, "gross_weight": 25.6, "count": None, "status": status}}
+    monkeypatch.setattr(bss, "identify_box", fake)
+
+
+@pytest.mark.parametrize("status, says", [("Rejected", "which was rejected"),
+                                          ("Pending", "which is Pending and not approved yet"),
+                                          ("On Hold", "which is On Hold and not approved yet")])
+def test_a_carton_of_a_return_not_approved_is_refused_and_nothing_is_written(monkeypatch, status, says):
+    _return_carton(monkeypatch, status)
+    conn = FakeConn()
+    out = scan(conn, code="31415926-1")
+    assert out["error"] == "return_not_approved" and out["rtv_id"] == CR_ID and out["status"] == status
+    assert out["message"].startswith(f"Box 31415926-1 is on customer return {CR_ID}, ") and says in out["message"]
+    assert not conn.ran("INSERT")
+
+
+@pytest.mark.parametrize("status", ["Approved", "Submitted"])
+def test_a_carton_of_an_approved_return_is_recorded(monkeypatch, status):
+    _return_carton(monkeypatch, status)
+    conn = FakeConn()
+    out = scan(conn, code="31415926-1")
+    assert "error" not in out
+    (insert,) = conn.ran("INSERT INTO jc_box_scan")
+    assert conn.calls[insert][2][2:5] == (CR_ID, "31415926-1", "Almonds")
+
+
+def test_the_route_turns_a_return_refusal_into_a_422_with_its_message(monkeypatch):
+    async def refuse(conn, **kw):
+        return {"error": "return_not_approved", "code": "31415926-1", "rtv_id": CR_ID, "status": "Rejected",
+                "message": f"Box 31415926-1 is on customer return {CR_ID}, which was rejected, so it can't be issued."}
+
+    monkeypatch.setattr(bss, "scan_box", refuse)
+    pool = SimpleNamespace(acquire=lambda: _Ctx(object()))
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(db_pool=pool)))
+    user = SimpleNamespace(full_name="Floor Fay", phone=None)
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(PR.create_box_scan(request, JC, PR.BoxScanRequest(code="31415926-1"), user=user))
+    # 422, not 409: the Raw Material tab shows every 409 as the "Duplicate box" chip.
+    assert e.value.status_code == 422
+    assert e.value.detail == f"Box 31415926-1 is on customer return {CR_ID}, which was rejected, so it can't be issued."

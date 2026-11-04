@@ -12,8 +12,10 @@ def build_where_clause(
     *,
     search, entity, vendor, customer, date_from, date_to,
     status, warehouse, item_category, sub_category, item_type,
+    hidden_sites=None,
 ) -> tuple[str, list]:
-    """Build a WHERE clause and params list from filter values."""
+    """Build a WHERE clause and params list from filter values. `hidden_sites`:
+    site keys whose POs the user may not see (po_site_scope.hidden_sites_for)."""
     conditions = []
     params: list = []
     param_idx = 0
@@ -29,6 +31,7 @@ def build_where_clause(
         conditions.append(
             f"(h.transaction_no ILIKE ${param_idx}"
             f" OR h.vendor_supplier_name ILIKE ${param_idx}"
+            f" OR h.consignee_address ILIKE ${param_idx}"
             f" OR h.customer_party_name ILIKE ${param_idx}"
             f" OR h.po_number ILIKE ${param_idx}"
             f" OR h.invoice_number ILIKE ${param_idx})"
@@ -97,6 +100,15 @@ def build_where_clause(
                 f" WHERE pl.transaction_no = h.transaction_no"
                 f" AND pl.{col} IN ({', '.join(placeholders)}))"
             )
+
+    if hidden_sites:
+        from app.modules.purchase.services.consignee_site import CONSIGNEE_SITE_KEY_SQL
+        param_idx += 1
+        conditions.append(
+            f"NOT COALESCE({CONSIGNEE_SITE_KEY_SQL.replace('consignee_address', 'h.consignee_address')}"
+            f" = ANY(${param_idx}::text[]), FALSE)"
+        )
+        params.append(list(hidden_sites))
 
     where_clause = (" AND ".join(conditions)) if conditions else "TRUE"
     return where_clause, params
@@ -207,6 +219,7 @@ def build_po_detail(header, lines, sections_by_line, boxes_by_line_section, sect
         "order_reference_no": h.get("order_reference_no"),
         "narration": h.get("narration"),
         "vendor_supplier_name": h.get("vendor_supplier_name"),
+        "consignee_address": h.get("consignee_address"),
         "gross_total": _float_or_none(h.get("gross_total")),
         "total_amount": _float_or_none(h.get("total_amount")),
         "sgst_amount": _float_or_none(h.get("sgst_amount")),

@@ -32,6 +32,8 @@ from app.modules.amendment_router import router as amendment_router
 from app.modules.vendor.router import router as vendor_router
 from app.modules.sample.router import router as sample_router
 from app.modules.transfer.router import router as transfer_router
+from app.modules.transfer.request_email_router import router as transfer_request_email_router
+from app.modules.transfer.services import request_notify as transfer_request_notify
 from app.modules.cold_storage.router import router as cold_storage_router
 from app.modules.lookups_router import router as lookups_router
 from app.modules.qc.router import router as qc_router
@@ -112,6 +114,9 @@ async def lifespan(fastapi_app: FastAPI):
 
     pool = await create_pool(settings)
     fastapi_app.state.db_pool = pool
+    # Transfer request notices are sent after the action commits, as a background task
+    # that reads and records on this pool (services/request_notify.py).
+    transfer_request_notify.bind_pool(pool)
 
     await _wait_for_db(pool)
     master_items = await load_master_items(pool)
@@ -179,6 +184,7 @@ app.include_router(amendment_router)
 app.include_router(vendor_router)
 app.include_router(sample_router)
 app.include_router(transfer_router)
+app.include_router(transfer_request_email_router)
 app.include_router(cold_storage_router)
 app.include_router(lookups_router)
 app.include_router(qc_router)

@@ -11,6 +11,12 @@ Porting notes:
   * DB columns `from_site`/`to_site`/`reason_code` map to API
     `from_warehouse`/`to_warehouse`/`reason_description`, exactly as the
     reference mappers did.
+
+Sites are compared as sites (app.core.sites): a list filter or a user's warehouse
+scope matches every spelling of each site ('D-39' finds rows stored 'Savla D-39'
+or 'Old Savla', 'A185' rows stored 'Warehouse A185'), by binding
+sites.scope_keys(...) into site_scope_sql; a detail read of a row outside the
+user's scope is 404 (permissions.in_scope).
 """
 from __future__ import annotations
 
@@ -20,22 +26,28 @@ from typing import Any, Optional
 
 from fastapi import HTTPException
 
-# Canonical cold sub-unit aliases (mirrors interunit_tools._COLD_UNIT_ALIASES).
-_COLD_UNIT_ALIASES: dict[str, set[str]] = {
-    "Savla D-39":   {"d-39", "d39", "savla d-39", "savla d39", "savla-d-39"},
-    "Savla D-514":  {"d-514", "d514", "savla d-514", "savla d514", "savla-d-514"},
-    "Rishi":        {"rishi", "rishi cold"},
-    "Supreme Cold": {"supreme", "supreme cold"},
-}
-_COLD_UNIT_BY_ALIAS: dict[str, str] = {
-    a: canon for canon, aliases in _COLD_UNIT_ALIASES.items() for a in aliases
-}
+from app.core.sites import canonical_site, cold_company, scope_keys
+from app.core.warehouse_scope import WAREHOUSE_NORM_ANY_SQL
+from app.modules.transfer import permissions
 
 
 def _normalize_cold_unit(raw: Optional[str]) -> Optional[str]:
-    if not raw:
-        return None
-    return _COLD_UNIT_BY_ALIAS.get(raw.strip().lower())
+    """The canonical name of the cold store `raw` names ('D-39' -> 'Savla D-39',
+    'Supreme Cold' -> 'Supreme', 'ESKIMO' -> 'Eskimo'); None for anything else: a
+    warehouse, the legacy 'Cold Storage' label (no one store) or an unknown name such
+    as bare 'Savla'. The rule create_service writes from_cold_unit by."""
+    return canonical_site(raw) if cold_company(raw) else None
+
+
+def site_scope_sql(param: str, *, sites=(), units=()) -> str:
+    """SQL that is true when a column of `sites` (one site each) or one unit of a column
+    of `units` (a comma list of cold units, as from_cold_unit holds 'Rishi, Savla D-39')
+    names a site bound at `param`. Bind sites.scope_keys(...) there, so every spelling
+    of each site matches: 'D-39' also finds 'Savla D-39' and 'Old Savla'."""
+    parts = [WAREHOUSE_NORM_ANY_SQL(col, param) for col in sites]
+    parts += [f"EXISTS (SELECT 1 FROM unnest(string_to_array({col}, ',')) AS cu(unit) "
+              f"WHERE {WAREHOUSE_NORM_ANY_SQL('cu.unit', param)})" for col in units]
+    return "(" + " OR ".join(parts) + ")"
 
 
 def _convert_date(date_str: str):
@@ -60,13 +72,6 @@ def _json(val: Any) -> Optional[dict]:
 
 def _s(val: Any, default: str = "0") -> str:
     return str(val) if val is not None else default
-
-
-def _norm_wh(w: Any) -> str:
-    """Normalize a warehouse code for scope matching: lower-case + drop hyphens
-    so 'A-185'/'A185' and 'W-202'/'W202' compare equal (the auth_user scope
-    column stores both formats). No collisions among the real codes."""
-    return str(w).strip().lower().replace("-", "")
 
 
 def _total_pages(total: int, per_page: int) -> int:
@@ -108,7 +113,30 @@ def _map_request_header(r: dict) -> dict:
         "created_ts": r.get("created_ts"),
         "rejected_ts": r.get("rejected_ts"),
         "updated_at": r.get("updated_at"),
+        "store_decision": r.get("store_decision"),
+        "store_decided_by": r.get("store_decided_by"),
+        "store_decided_at": r.get("store_decided_at"),
+        "store_reject_reason": r.get("store_reject_reason"),
+        "manager_decision": r.get("manager_decision"),
+        "manager_decided_by": r.get("manager_decided_by"),
+        "manager_decided_at": r.get("manager_decided_at"),
+        "manager_reject_reason": r.get("manager_reject_reason"),
+        "store_hold_reason": r.get("store_hold_reason"),
+        "manager_hold_reason": r.get("manager_hold_reason"),
+        # The request's newest transfer (newest_transfers); filled by get / list.
+        "transfer_id": r.get("transfer_id"),
+        "transfer_challan_no": r.get("transfer_challan_no"),
+        "transfer_status": r.get("transfer_status"),
     }
+
+
+def _with_transfer(item: dict, transfer: dict | None) -> dict:
+    """A mapped request with its newest transfer's id, challan and status (all None
+    without one)."""
+    item["transfer_id"] = transfer["id"] if transfer else None
+    item["transfer_challan_no"] = transfer["challan_no"] if transfer else None
+    item["transfer_status"] = transfer["status"] if transfer else None
+    return item
 
 
 def _map_transfer_line(r: dict) -> dict:
@@ -192,6 +220,8 @@ def _map_transfer_in_header(r: dict) -> dict:
         "status": r.get("status") or "Received",
         "created_at": r.get("created_at"),
         "updated_at": r.get("updated_at"),
+        # The cold units the transfer's boxes came from (the list and the read join it in).
+        "from_cold_unit": r.get("from_cold_unit") or None,
     }
     if r.get("from_warehouse"):
         result["from_warehouse"] = r["from_warehouse"]
@@ -235,28 +265,54 @@ def _map_transfer_in_box(r: dict) -> dict:
 
 
 # ── Requests ──────────────────────────────────────────────────────────────
+async def newest_transfers(conn, request_ids) -> dict:
+    """{request id: its newest transfer} for the given requests: of the
+    interunit_transfers_header rows with that request_id, the one created last (by
+    created_ts — a row without one is the oldest — then by id), as a dict; a request
+    without a transfer is left out. Read only, one query. The request reads (get / list)
+    show it, and the scan screen saves its boxes to it (scan_service)."""
+    ids = list(dict.fromkeys(request_ids))
+    if not ids:
+        return {}
+    rows = await conn.fetch(
+        """
+        SELECT id, challan_no, status, request_id, stock_trf_date, from_site, to_site, remark,
+               vehicle_no, driver_name, approved_by, created_by, created_ts
+        FROM interunit_transfers_header
+        WHERE request_id = ANY($1::bigint[])
+        """,
+        ids,
+    )
+    def newness(t):
+        return (t["created_ts"] is not None, t["created_ts"], t["id"])
+    out: dict = {}
+    for t in map(dict, rows):
+        held = out.get(t["request_id"])
+        if held is None or newness(t) > newness(held):
+            out[t["request_id"]] = t
+    return out
+
+
 async def list_requests(conn, *, page, per_page, status=None,
                         from_warehouse=None, to_warehouse=None, scope=None) -> dict:
     # `scope` = the caller's allowed warehouses (empty/None = unrestricted). When
     # set, only requests where one of those is the source OR destination are
-    # returned. from_warehouse/to_warehouse are optional explicit narrowing.
+    # returned. from_warehouse/to_warehouse are optional explicit narrowing. Each
+    # matches every spelling of its sites (site_scope_sql).
     clauses = ["r.status != 'Deleted'"]
     args: list = []
     if status:
         args.append(status)
         clauses.append(f"r.status = ${len(args)}")
     if from_warehouse:
-        args.append(from_warehouse.upper())
-        clauses.append(f"r.from_site = ${len(args)}")
+        args.append(scope_keys(from_warehouse))
+        clauses.append(site_scope_sql(f"${len(args)}", sites=("r.from_site",)))
     if to_warehouse:
-        args.append(to_warehouse.upper())
-        clauses.append(f"r.to_site = ${len(args)}")
+        args.append(scope_keys(to_warehouse))
+        clauses.append(site_scope_sql(f"${len(args)}", sites=("r.to_site",)))
     if scope:
-        args.append([_norm_wh(w) for w in scope])
-        n = len(args)
-        clauses.append(
-            f"(REPLACE(LOWER(r.from_site),'-','') = ANY(${n}::text[]) "
-            f"OR REPLACE(LOWER(r.to_site),'-','') = ANY(${n}::text[]))")
+        args.append(scope_keys(scope))
+        clauses.append(site_scope_sql(f"${len(args)}", sites=("r.from_site", "r.to_site")))
 
     where = "WHERE " + " AND ".join(clauses)
     total = await conn.fetchval(
@@ -267,7 +323,10 @@ async def list_requests(conn, *, page, per_page, status=None,
         f"""
         SELECT id, request_no, request_date, from_site, to_site,
                reason_code, remarks, status, reject_reason,
-               created_by, created_ts, rejected_ts, updated_at
+               created_by, created_ts, rejected_ts, updated_at,
+               store_decision, store_decided_by, store_decided_at, store_reject_reason,
+               manager_decision, manager_decided_by, manager_decided_at, manager_reject_reason,
+               store_hold_reason, manager_hold_reason
         FROM interunit_transfer_requests r
         {where}
         ORDER BY r.created_ts DESC
@@ -296,8 +355,10 @@ async def list_requests(conn, *, page, per_page, status=None,
         for lr in line_rows:
             d = dict(lr)
             by_req.setdefault(d["request_id"], []).append(_map_request_line(d))
+        transfers = await newest_transfers(conn, request_ids)
         for item in result:
             item["lines"] = by_req.get(item["id"], [])
+            _with_transfer(item, transfers.get(item["id"]))
 
     return {
         "records": result,
@@ -308,18 +369,24 @@ async def list_requests(conn, *, page, per_page, status=None,
     }
 
 
-async def get_request(conn, request_id: int) -> dict:
+async def get_request(conn, request_id: int, *, scope=None) -> dict:
+    """One request with its lines and newest transfer. With `scope` (the reader's
+    warehouses, permissions.scope_warehouses), a request neither from nor to one of them
+    is 404, as if it did not exist."""
     row = await conn.fetchrow(
         """
         SELECT id, request_no, request_date, from_site, to_site,
                reason_code, remarks, status, reject_reason,
-               created_by, created_ts, rejected_ts, updated_at
+               created_by, created_ts, rejected_ts, updated_at,
+               store_decision, store_decided_by, store_decided_at, store_reject_reason,
+               manager_decision, manager_decided_by, manager_decided_at, manager_reject_reason,
+               store_hold_reason, manager_hold_reason
         FROM interunit_transfer_requests
         WHERE id = $1
         """,
         request_id,
     )
-    if not row:
+    if not row or not permissions.in_scope(scope, row["from_site"], row["to_site"]):
         raise HTTPException(404, "Request not found")
     result = _map_request_header(dict(row))
     line_rows = await conn.fetch(
@@ -334,7 +401,7 @@ async def get_request(conn, request_id: int) -> dict:
         request_id,
     )
     result["lines"] = [_map_request_line(dict(r)) for r in line_rows]
-    return result
+    return _with_transfer(result, (await newest_transfers(conn, [request_id])).get(request_id))
 
 
 # ── Transfers (OUT) ───────────────────────────────────────────────────────
@@ -350,16 +417,13 @@ async def list_transfers(conn, *, page, per_page, status=None, from_site=None,
         args.append(status)
         clauses.append(f"h.status = ${len(args)}")
     if from_site:
-        cu_canon = _normalize_cold_unit(from_site)
-        if cu_canon:
-            args.append(f"%{cu_canon}%")
-            clauses.append(f"h.from_site ILIKE 'cold%' AND h.from_cold_unit ILIKE ${len(args)}")
-        else:
-            args.append(from_site)
-            clauses.append(f"h.from_site = ${len(args)}")
+        # Sent from that site, or (a cold dispatch) with boxes from that cold unit; any
+        # spelling of either ('Supreme' also finds from_cold_unit 'Supreme Cold').
+        args.append(scope_keys(from_site))
+        clauses.append(site_scope_sql(f"${len(args)}", sites=("h.from_site",), units=("h.from_cold_unit",)))
     if to_site:
-        args.append(to_site)
-        clauses.append(f"h.to_site = ${len(args)}")
+        args.append(scope_keys(to_site))
+        clauses.append(site_scope_sql(f"${len(args)}", sites=("h.to_site",)))
     if from_date:
         args.append(_convert_date(from_date))
         clauses.append(f"h.stock_trf_date >= ${len(args)}")
@@ -370,12 +434,11 @@ async def list_transfers(conn, *, page, per_page, status=None, from_site=None,
         args.append(challan_no)
         clauses.append(f"h.challan_no = ${len(args)}")
     if scope:
-        args.append([_norm_wh(w) for w in scope])
-        n = len(args)
-        clauses.append(
-            f"(REPLACE(LOWER(h.from_site),'-','') = ANY(${n}::text[]) "
-            f"OR REPLACE(LOWER(h.to_site),'-','') = ANY(${n}::text[]) "
-            f"OR REPLACE(LOWER(h.from_cold_unit),'-','') = ANY(${n}::text[]))")
+        # From or To one of the caller's sites, or with boxes from one of them (each unit
+        # of from_cold_unit, which can name several: 'Rishi, Savla D-39').
+        args.append(scope_keys(scope))
+        clauses.append(site_scope_sql(f"${len(args)}", sites=("h.from_site", "h.to_site"),
+                                      units=("h.from_cold_unit",)))
 
     where = " AND ".join(clauses)
     if sort_by not in _VALID_TRANSFER_SORT:
@@ -448,6 +511,9 @@ async def list_transfers(conn, *, page, per_page, status=None, from_site=None,
 
 
 async def _fetch_transfer_boxes(conn, header_id: int) -> list:
+    # Each box with its own in-transit row on THIS transfer (box_id AND transaction_no,
+    # trimmed): a box_id alone is not unique, and another transfer's row is not this
+    # box's source. source_unit is the snapshot's unit as a canonical site name.
     rows = await conn.fetch(
         """
         SELECT itb.id, itb.header_id, itb.transfer_line_id, itb.box_number,
@@ -455,25 +521,45 @@ async def _fetch_transfer_boxes(conn, header_id: int) -> list:
                itb.transaction_no, itb.net_weight, itb.gross_weight,
                itb.created_at, itb.updated_at,
                pts.cold_storage_data->>'storage_location' AS source_storage,
-               CASE
-                 WHEN LOWER(pts.cold_storage_data->>'unit') IN ('d-39','d39','savla d-39','savla d39','savla-d-39') THEN 'Savla D-39'
-                 WHEN LOWER(pts.cold_storage_data->>'unit') IN ('d-514','d514','savla d-514','savla d514','savla-d-514') THEN 'Savla D-514'
-                 WHEN LOWER(pts.cold_storage_data->>'unit') IN ('rishi','rishi cold') THEN 'Rishi'
-                 WHEN LOWER(pts.cold_storage_data->>'unit') IN ('supreme','supreme cold') THEN 'Supreme Cold'
-                 ELSE pts.cold_storage_data->>'unit'
-               END AS source_unit
+               pts.cold_storage_data->>'unit' AS source_unit
         FROM interunit_transfer_boxes itb
         LEFT JOIN pending_transfer_stock pts
-            ON pts.box_id = itb.box_id AND pts.status = 'In Transit'
+            ON pts.transfer_out_id = itb.header_id
+           AND btrim(pts.box_id) = btrim(itb.box_id)
+           AND btrim(pts.transaction_no) = btrim(itb.transaction_no)
+           AND pts.status = 'In Transit'
         WHERE itb.header_id = $1
         ORDER BY itb.box_number
         """,
         header_id,
     )
-    return [_map_box(dict(r)) for r in rows]
+    return [_map_box({**dict(r), "source_unit": canonical_site(r["source_unit"])}) for r in rows]
 
 
-async def get_transfer(conn, transfer_id: int) -> dict:
+async def transfer_sites(conn, transfer_id: int) -> dict | None:
+    """The stored From, To and cold units of a transfer ({from_site, to_site,
+    from_cold_unit}), for the profile lock and the read scope; None when there is no
+    such transfer. Read only."""
+    row = await conn.fetchrow(
+        "SELECT from_site, to_site, from_cold_unit FROM interunit_transfers_header WHERE id = $1",
+        transfer_id)
+    return dict(row) if row else None
+
+
+async def receipt_to_site(conn, transfer_in_id: int) -> str | None:
+    """The To site of the transfer a receipt (GRN) is for; None when there is no such
+    receipt or transfer. Read only."""
+    return await conn.fetchval(
+        "SELECT t.to_site FROM interunit_transfer_in_header ih "
+        "JOIN interunit_transfers_header t ON t.id = ih.transfer_out_id WHERE ih.id = $1",
+        transfer_in_id)
+
+
+async def get_transfer(conn, transfer_id: int, *, scope=None) -> dict:
+    """One transfer with its lines, boxes and receipts. With `scope` (the reader's
+    warehouses, permissions.scope_warehouses), a transfer whose From, To and cold units
+    are none of them is 404, as if it did not exist: the From's store, the To's (the
+    receive screen) and a cold unit's still read it (the challan, the hover cards)."""
     row = await conn.fetchrow(
         """
         SELECT h.id, h.challan_no, h.stock_trf_date, h.from_site, h.to_site,
@@ -487,7 +573,7 @@ async def get_transfer(conn, transfer_id: int) -> dict:
         """,
         transfer_id,
     )
-    if not row:
+    if not row or not permissions.in_scope(scope, row["from_site"], row["to_site"], row["from_cold_unit"]):
         raise HTTPException(404, "Transfer not found")
 
     result = _map_transfer_header(dict(row))
@@ -525,14 +611,18 @@ async def get_transfer(conn, transfer_id: int) -> dict:
     result["lines"] = [_map_transfer_line(dict(r)) for r in line_rows]
     result["boxes"] = await _fetch_transfer_boxes(conn, transfer_id)
 
-    # Per-lot dominant sub-cold attribution (mirrors interunit_tools.get_transfer).
+    # Per-lot dominant sub-cold attribution (mirrors interunit_tools.get_transfer): the
+    # cold store most of the lot's cold rows and cold snapshots name, by canonical name
+    # (_normalize_cold_unit; a tie goes to the name first in order). The database counts
+    # each raw unit spelling; the spellings are folded into stores here.
     try:
         lot_numbers = sorted({(b.get("lot_number") or "").strip() for b in result["boxes"]} - {""})
         lot_origin_unit: dict[str, str] = {}
         if lot_numbers:
             origin_rows = await conn.fetch(
                 """
-                WITH lot_sources AS (
+                SELECT lot_no, raw_u, COUNT(*) AS n
+                FROM (
                     SELECT lot_no, unit AS raw_u FROM cfpl_cold_stocks WHERE lot_no = ANY($1::text[])
                     UNION ALL
                     SELECT lot_no, unit AS raw_u FROM cdpl_cold_stocks WHERE lot_no = ANY($1::text[])
@@ -540,32 +630,20 @@ async def get_transfer(conn, transfer_id: int) -> dict:
                     SELECT lot_no, cold_storage_data->>'unit' AS raw_u
                     FROM pending_transfer_stock
                     WHERE lot_no = ANY($1::text[]) AND cold_storage_data IS NOT NULL
-                ),
-                normalized AS (
-                    SELECT lot_no,
-                        CASE
-                            WHEN LOWER(raw_u) IN ('d-39','d39','savla d-39','savla d39','savla-d-39') THEN 'Savla D-39'
-                            WHEN LOWER(raw_u) IN ('d-514','d514','savla d-514','savla d514','savla-d-514') THEN 'Savla D-514'
-                            WHEN LOWER(raw_u) IN ('rishi','rishi cold') THEN 'Rishi'
-                            WHEN LOWER(raw_u) IN ('supreme','supreme cold') THEN 'Supreme Cold'
-                            ELSE NULL
-                        END AS unit
-                    FROM lot_sources
-                    WHERE raw_u IS NOT NULL
-                ),
-                counted AS (
-                    SELECT lot_no, unit, COUNT(*) AS n,
-                           ROW_NUMBER() OVER (PARTITION BY lot_no ORDER BY COUNT(*) DESC, unit) AS rk
-                    FROM normalized
-                    WHERE unit IS NOT NULL
-                    GROUP BY lot_no, unit
-                )
-                SELECT lot_no, unit FROM counted WHERE rk = 1
+                ) lot_sources
+                WHERE raw_u IS NOT NULL
+                GROUP BY lot_no, raw_u
                 """,
                 lot_numbers,
             )
+            counts: dict[str, dict[str, int]] = {}
             for orow in origin_rows:
-                lot_origin_unit[orow["lot_no"]] = orow["unit"]
+                unit = _normalize_cold_unit(orow["raw_u"])
+                if unit:
+                    per_lot = counts.setdefault(orow["lot_no"], {})
+                    per_lot[unit] = per_lot.get(unit, 0) + int(orow["n"] or 0)
+            lot_origin_unit = {lot: min(per_lot, key=lambda u: (-per_lot[u], u))
+                               for lot, per_lot in counts.items()}
         for b in result["boxes"]:
             lot = (b.get("lot_number") or "").strip()
             b["lot_origin_unit"] = lot_origin_unit.get(lot)
@@ -613,8 +691,8 @@ async def list_transfer_ins(conn, *, page, per_page, receiving_warehouse=None,
     clauses = ["1=1"]
     args: list = []
     if receiving_warehouse:
-        args.append(receiving_warehouse.upper())
-        clauses.append(f"h.receiving_warehouse = ${len(args)}")
+        args.append(scope_keys(receiving_warehouse))
+        clauses.append(site_scope_sql(f"${len(args)}", sites=("h.receiving_warehouse",)))
     if from_date:
         args.append(_convert_date(from_date))
         clauses.append(f"h.grn_date >= ${len(args)}")
@@ -622,19 +700,18 @@ async def list_transfer_ins(conn, *, page, per_page, receiving_warehouse=None,
         args.append(_convert_date(to_date))
         clauses.append(f"h.grn_date <= ${len(args)}")
     if scope:
-        # Scoped on the receiving warehouse OR the source transfer-out site.
-        args.append([_norm_wh(w) for w in scope])
-        n = len(args)
-        clauses.append(
-            f"(REPLACE(LOWER(h.receiving_warehouse),'-','') = ANY(${n}::text[]) "
-            f"OR REPLACE(LOWER(t.from_site),'-','') = ANY(${n}::text[]))")
+        # Scoped on the receiving warehouse, or the transfer-out's From, To or cold units
+        # (as list_transfers scopes the transfer itself).
+        args.append(scope_keys(scope))
+        clauses.append(site_scope_sql(f"${len(args)}", sites=("h.receiving_warehouse", "t.from_site", "t.to_site"),
+                                      units=("t.from_cold_unit",)))
 
     where = " AND ".join(clauses)
     if sort_by not in _VALID_TRANSFER_IN_SORT:
         sort_by = "created_at"
     direction = "DESC" if str(sort_order).lower() == "desc" else "ASC"
 
-    # The join to the source header lets the scope clause reference t.from_site;
+    # The join to the source header lets the scope clause reference its sites;
     # it's a 1:1 FK so the COUNT is unaffected when no scope is applied.
     total = await conn.fetchval(
         f"SELECT COUNT(*) FROM interunit_transfer_in_header h "
@@ -649,12 +726,12 @@ async def list_transfer_ins(conn, *, page, per_page, receiving_warehouse=None,
             h.box_condition, h.condition_remarks, h.status,
             h.created_at, h.updated_at,
             COUNT(b.id) AS total_boxes_scanned,
-            t.from_site AS from_warehouse
+            t.from_site AS from_warehouse, t.from_cold_unit
         FROM interunit_transfer_in_header h
         LEFT JOIN interunit_transfer_in_boxes b ON h.id = b.header_id
         LEFT JOIN interunit_transfers_header t ON h.transfer_out_id = t.id
         WHERE {where}
-        GROUP BY h.id, t.from_site
+        GROUP BY h.id, t.from_site, t.from_cold_unit
         ORDER BY h.{sort_by} {direction}
         LIMIT ${len(args) + 1} OFFSET ${len(args) + 2}
         """,
@@ -677,21 +754,25 @@ async def list_transfer_ins(conn, *, page, per_page, receiving_warehouse=None,
     }
 
 
-async def get_transfer_in(conn, transfer_in_id: int) -> dict:
+async def get_transfer_in(conn, transfer_in_id: int, *, scope=None) -> dict:
+    """One receipt (GRN) with its boxes. With `scope` (permissions.scope_warehouses), a
+    receipt whose receiving warehouse and transfer-out From, To and cold units are none
+    of the reader's sites is 404, as list_transfer_ins leaves it out."""
     row = await conn.fetchrow(
         """
         SELECT h.id, h.transfer_out_id, h.transfer_out_no, h.grn_number,
                h.grn_date, h.receiving_warehouse, h.received_by, h.received_at,
                h.box_condition, h.condition_remarks, h.status,
                h.inward_transaction_no, h.created_at, h.updated_at,
-               t.from_site AS from_warehouse
+               t.from_site AS from_warehouse, t.to_site AS transfer_to_site, t.from_cold_unit
         FROM interunit_transfer_in_header h
         LEFT JOIN interunit_transfers_header t ON h.transfer_out_id = t.id
         WHERE h.id = $1
         """,
         transfer_in_id,
     )
-    if not row:
+    if not row or not permissions.in_scope(scope, row["receiving_warehouse"], row["from_warehouse"],
+                                           row["transfer_to_site"], row["from_cold_unit"]):
         raise HTTPException(404, "Transfer IN not found")
 
     box_rows = await conn.fetch(

@@ -25,7 +25,8 @@ from app.modules.production.services.response_filters import strip_cost_fields
 from app.modules.production.services import job_card_notify
 # Every route that unlocks one tells the unlocked card's people — see _notify_unlocked_job_cards.
 from app.modules.production.services import job_card_unlock_notify
-from app.core.warehouse_scope import user_has_warehouse
+from app.core.sites import scope_keys
+from app.core.warehouse_scope import WAREHOUSE_NORM_ANY_SQL, WAREHOUSE_NORM_SQL, user_has_warehouse
 
 logger = logging.getLogger(__name__)
 
@@ -2243,14 +2244,17 @@ async def list_job_cards(
         conditions.append(f"floor = ANY(${idx}::text[])")
         params.append(list(user_floors)); idx += 1
 
+    # Factories compare as sites (app.core.sites), as job_card_v2 compares them: a lock
+    # of 'A185' covers cards stored 'A-185', and ?factory=A185 finds them too.
     if factory:
-        if not is_admin and user_warehouses and factory not in user_warehouses:
+        if not is_admin and user_warehouses and not user_has_warehouse(user_warehouses, factory):
             raise HTTPException(status_code=403,
                                 detail=f"User is not assigned to factory '{factory}'")
-        conditions.append(f"factory ILIKE ${idx}"); params.append(f"%{factory}%"); idx += 1
+        conditions.append(f"(factory ILIKE ${idx} OR {WAREHOUSE_NORM_ANY_SQL('factory', f'${idx + 1}')})")
+        params += [f"%{factory}%", scope_keys(factory)]; idx += 2
     elif not is_admin and user_warehouses:
-        conditions.append(f"factory = ANY(${idx}::text[])")
-        params.append(list(user_warehouses)); idx += 1
+        conditions.append(WAREHOUSE_NORM_ANY_SQL("factory", f"${idx}"))
+        params.append(scope_keys(user_warehouses)); idx += 1
     if stage:
         conditions.append(f"stage = ${idx}"); params.append(stage); idx += 1
     if search:
@@ -7357,8 +7361,11 @@ async def notify_qc_v2(
                         ),
                     },
                 )
+            # A role's warehouse scope names the JC's factory when one of its entries is a
+            # spelling of that site ($2: the keys of every spelling, app.core.sites):
+            # a role scoped 'W202' is notified for factory 'W-202'.
             recipients = await conn.fetch(
-                """
+                f"""
                 SELECT u.user_id, u.phone, u.full_name
                 FROM   auth_user u
                 JOIN   auth_role r ON r.role_id = u.role_id
@@ -7372,7 +7379,8 @@ async def notify_qc_v2(
                                  OR $1 = ANY(rp.allowed_entities))
                            AND  (rp.allowed_warehouses IS NULL
                                  OR cardinality(rp.allowed_warehouses) = 0
-                                 OR $2 = ANY(rp.allowed_warehouses))
+                                 OR EXISTS (SELECT 1 FROM unnest(rp.allowed_warehouses) AS aw
+                                            WHERE {WAREHOUSE_NORM_SQL('aw')} = ANY($2::text[])))
                            AND  (rp.allowed_floors     IS NULL
                                  OR cardinality(rp.allowed_floors)     = 0
                                  OR $3 IS NULL
@@ -7380,7 +7388,7 @@ async def notify_qc_v2(
                          LIMIT 1
                   )
                 """,
-                jc["entity"], jc["factory"], jc["floor"],
+                jc["entity"], scope_keys(jc["factory"]), jc["floor"],
             )
 
     # If no recipients matched, log a single sentinel row (audit "we
@@ -9139,6 +9147,9 @@ async def create_box_scan(
             status_code=422,
             detail=(f"Box {result.get('box_id')} was sent by Stores for job card {job_card} "
                     f"(request #{result.get('requisition_id')}). Scan it on that job card."))
+    if result.get("error") == "return_not_approved":
+        # 422, not 409, as above. The message names the return and its status.
+        raise HTTPException(status_code=422, detail=result.get("message"))
     if result.get("error") == "article_required":
         # A code, not just text: the Raw Material tab has no article field (Manual
         # print replaces it) and tells the operator to print a sticker instead.

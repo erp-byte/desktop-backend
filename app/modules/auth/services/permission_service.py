@@ -2,6 +2,8 @@
 
 import logging
 
+from app.core.warehouse_scope import user_has_warehouse
+
 logger = logging.getLogger(__name__)
 
 
@@ -21,6 +23,9 @@ async def check_permission(conn, role_id, is_admin: bool,
     - Falls back to (module, NULL, NULL, action) if sub_module not found
 
     Scope restrictions (entity, warehouse, floor) are checked after permission match.
+    A role's warehouse scope is compared as sites, like the user lock in
+    auth/middleware.py (warehouse_scope.user_has_warehouse): a role scoped 'W-202'
+    covers ?warehouse=W202, and one scoped 'D-39' covers 'Savla D-39'.
     """
 
     # Admin bypasses all checks
@@ -67,7 +72,8 @@ async def check_permission(conn, role_id, is_admin: bool,
             for result in results:
                 if entity and result['allowed_entities'] and entity not in result['allowed_entities']:
                     continue
-                if warehouse and result['allowed_warehouses'] and warehouse not in result['allowed_warehouses']:
+                if (warehouse and result['allowed_warehouses']
+                        and not user_has_warehouse(result['allowed_warehouses'], warehouse)):
                     continue
                 if floor and result['allowed_floors'] and floor not in result['allowed_floors']:
                     continue
