@@ -36,7 +36,7 @@ from typing import Any, Optional, Sequence
 import asyncpg
 
 from .. import floors as _floors
-from .business_day import ENTRIES_TABLE, ENTRY_DAY, TXN_DAY
+from .business_day import ENTRIES_TABLE, ENTRY_DAY, TXN_DAY, VERIFIED_DAY
 
 log = logging.getLogger(__name__)
 
@@ -487,11 +487,16 @@ def _stock_sql(*, as_of: Optional[str], adjusted_only: bool, by_place: bool,
              ),
              -- Sign-off for the line as a whole. BOOL_AND, not MAX: one
              -- unverified row behind a figure means the figure is not signed.
+             -- It lasts one IST day: the NEWEST signature must be from the day
+             -- being viewed. Not every signature: Verify leaves rows already
+             -- signed alone, so a line signed today still has older ones.
              verif AS (
                  SELECT UPPER(BTRIM(item_name))                AS k_item,
                         COALESCE(stock_type, 'Fresh Stock')    AS k_stock,
-                        BOOL_AND(COALESCE(verified, FALSE))    AS verified,
-                        MAX(verified_by)                       AS verified_by,
+                        BOOL_AND(COALESCE(verified, FALSE))
+                            AND MAX(%(verified_day)s) = %(refday)s AS verified,
+                        (ARRAY_AGG(verified_by ORDER BY verified_at DESC NULLS LAST))[1]
+                                                               AS verified_by,
                         MAX(verified_at)                       AS verified_at
                    FROM scoped_signed
                   GROUP BY 1, 2
@@ -579,7 +584,7 @@ def _stock_sql(*, as_of: Optional[str], adjusted_only: bool, by_place: bool,
            "where_all": where_all, "daycap_all": date_clause_all,
            "adjonly": adj_only, "wh_key": WAREHOUSE_KEY,
            "entries": ENTRIES_TABLE, "entry_day": ENTRY_DAY, "refday": ref_day,
-           **keys}
+           "verified_day": VERIFIED_DAY, **keys}
 
     return {
         "ctes": ctes,

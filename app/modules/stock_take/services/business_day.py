@@ -59,3 +59,6 @@ LEGACY_ENTRY_DAY = "((created_at AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Kolkata'
 
 #: IST calendar day of a `stocktake_transactions` row (timestamptz).
 TXN_DAY = "(created_at AT TIME ZONE 'Asia/Kolkata')::date"
+
+#: IST calendar day a `new_stock_entries` row was signed off (timestamptz).
+VERIFIED_DAY = "(verified_at AT TIME ZONE 'Asia/Kolkata')::date"

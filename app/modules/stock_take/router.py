@@ -689,6 +689,9 @@ async def verify_stock_lines(
     Adjusting the same article again clears the sign-off — write_back_entry's
     upsert resets verified/verified_by/verified_at, so a figure that moved after
     being checked goes back to needing a check with nothing to remember.
+
+    The line's tick also lasts only the IST day it was given. That is read from
+    the signatures rather than reset by a job; see `verif` in latest_stock_service.
     """
     day = None
     if body.day:

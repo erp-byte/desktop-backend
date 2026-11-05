@@ -25,7 +25,7 @@ from typing import Any, Optional, Sequence
 import asyncpg
 
 from .. import floors as _floors
-from .business_day import BUSINESS_TZ, ENTRIES_TABLE, ENTRY_DAY, TXN_DAY
+from .business_day import BUSINESS_TZ, ENTRIES_TABLE, ENTRY_DAY, TXN_DAY, VERIFIED_DAY
 
 log = logging.getLogger(__name__)
 
@@ -846,6 +846,12 @@ async def verify_entries(
     rather than a re-stamp with a new name and time, so a second click cannot
     quietly rewrite who signed a figure off.
 
+    A LINE'S TICK LASTS ONE IST DAY (see `verif` in latest_stock_service), so a
+    line signed on an earlier day shows Verify with no row left to move. Naming
+    that article re-signs its newest row and leaves the older signatures alone.
+    Once any row is signed today this does nothing, so the rule above still holds
+    within the day. A bulk sign-off names no article and never re-signs.
+
     IT REVERSES NOW. `verified=False` withdraws the sign-off, clearing the name
     and time with it -- leaving the name of whoever last signed a row that is no
     longer signed reads as an accusation. Before per-transaction verification the
@@ -895,6 +901,9 @@ async def verify_entries(
             params.append(stock_type)
             conds.append(f"COALESCE(stock_type, 'Fresh Stock') = ${len(params)}")
 
+    returning = f"""RETURNING id, item_name, warehouse, floor_name, stock_type,
+                  total_quantity, total_weight, verified_by, verified_at,
+                  {ENTRY_DAY} AS day"""
     rows = await conn.fetch(
         f"""
         UPDATE {ENTRIES_TABLE}
@@ -903,12 +912,31 @@ async def verify_entries(
                verified_at = CASE WHEN $2 THEN now() ELSE NULL END,
                updated_at  = now()
          WHERE {' AND '.join(conds)}
-        RETURNING id, item_name, warehouse, floor_name, stock_type,
-                  total_quantity, total_weight, verified_by, verified_at,
-                  {ENTRY_DAY} AS day
+        {returning}
         """,
         *params,
     )
+
+    if verified and item_name and day is None and not entry_ids:
+        # The same line minus the state condition. Drafts are left out because the
+        # screen's tick does not read them, so a signature there would not show.
+        line = " AND ".join([*conds[1:], "(status IS NULL OR status != 'draft')"])
+        rows += await conn.fetch(
+            f"""
+            UPDATE {ENTRIES_TABLE}
+               SET verified    = $2,
+                   verified_by = $1,
+                   verified_at = now(),
+                   updated_at  = now()
+             WHERE id = (SELECT id FROM {ENTRIES_TABLE} WHERE {line}
+                          ORDER BY created_at DESC, id DESC LIMIT 1)
+               AND NOT EXISTS (SELECT 1 FROM {ENTRIES_TABLE} WHERE {line}
+                                  AND COALESCE(verified, FALSE)
+                                  AND {VERIFIED_DAY} = (now() AT TIME ZONE 'Asia/Kolkata')::date)
+            {returning}
+            """,
+            *params,
+        )
 
     # RULE 2. Signing the line off signs off every posting behind it, and taking
     # the signature back off takes theirs off too -- otherwise un-verifying a
