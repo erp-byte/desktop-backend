@@ -42,6 +42,11 @@ class _Conn:
     def transaction(self):
         return _Ctx(self, on_exit=lambda ok: setattr(self, "committed", ok))
 
+    async def fetchval(self, sql, *args):
+        # The line's plan factory, read by the chain edit before it writes.
+        assert sql == R._LINE_FACTORY_SQL, sql
+        return None
+
 
 class _WatchedTasks(BackgroundTasks):
     """Records whether the transaction had committed when the notice was scheduled."""

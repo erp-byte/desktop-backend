@@ -31,6 +31,10 @@ def test_a_refusal_raises():
     ("line_fully_carded", 409), ("exceeds_balance", 409), ("not_editable", 409),
     ("jc_terminal", 409), ("over_dispatch", 409), ("chain_broken", 409),
     ("invalid_qty", 400), ("no_wip_steps", 400), ("missing_pkg_floor", 400),
+    # Edit Job Card (one-card chains, validate-then-write; 2026-10-27).
+    ("terminal_mismatch", 409), ("unknown_job_card", 409), ("cannot_add_before_released", 409),
+    ("cannot_remove_started_first", 409), ("card_finished", 409), ("chain_finished", 409),
+    ("rebuild_blocked", 409), ("plan_closed", 409), ("missing_floor", 400),
     ("something_new", 400),     # anything unknown is still an error, never a 200
 ])
 def test_every_code_gets_an_error_status(code, status):

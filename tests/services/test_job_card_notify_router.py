@@ -40,6 +40,12 @@ class _Conn:
     async def fetch(self, sql, *args):
         return []
 
+    async def fetchval(self, sql, *args):
+        # The line's plan factory (chain routes, add step): none known here, so
+        # any floor name is accepted.
+        assert sql == R._LINE_FACTORY_SQL, sql
+        return None
+
     async def execute(self, sql, *args):
         return "UPDATE 0"
 
@@ -248,13 +254,14 @@ def test_a_live_edit_reports_the_ids_it_created():
     chain — without that the route could not tell a new card from an untouched one."""
     from tests.services.test_bom_changes_pdf_rebuild import ScriptConn, card
 
-    conn = ScriptConn([card(1, 1, "unlocked"), card(2, 2, "locked"), card(3, 3, "locked")], heads=[1])
+    # Added in front of packing, which still waits for the stage before it.
+    conn = ScriptConn([card(1, 1, "in_progress"), card(2, 2, "locked"), card(3, 3, "locked")], heads=[1])
     out = asyncio.run(jcv2.apply_live_job_card_edits(
         conn, 70, qty_kg=100, pkg_floor="F2", user="Planner Pat",
-        steps=[{"job_card_id": None, "process": "Cleaning", "floor": "F1"},
-               {"job_card_id": 1, "process": "P1", "floor": "F1"},
-               {"job_card_id": 2, "process": "P2", "floor": "F1"}]))
-    assert out["job_card_ids"] == [900, 1, 2, 3] and out["created_job_card_ids"] == [900]
+        steps=[{"job_card_id": 1, "process": "P1", "floor": "F1"},
+               {"job_card_id": 2, "process": "P2", "floor": "F1"},
+               {"job_card_id": None, "process": "Cleaning", "floor": "F1"}]))
+    assert out["job_card_ids"] == [1, 2, 900, 3] and out["created_job_card_ids"] == [900]
 
 
 _ON_LINE = {"job_card_id": 601, "plan_step_id": 41, "step_number": 1, "status": "unlocked",

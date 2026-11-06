@@ -50,7 +50,10 @@ from decimal import Decimal
 from asyncpg.exceptions import UniqueViolationError
 
 from app.core.helpers import insert_with_pk_retry, ist_now_text, new_short_time_id
-from app.modules.production.services.job_card_v2 import assert_not_locked
+from app.modules.production.services.job_card_v2 import (
+    SEND_ON_EPS_KG, assert_not_locked, kg_left_to_send, output_below_dispatched_refusal,
+    output_of_other_batches_kg,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +61,41 @@ logger = logging.getLogger(__name__)
 # produced_qty_kg=1) cannot overflow the NUMERIC(6,3) column on
 # job_card_output_v2.yield_pct (max storable value 999.999).
 _YIELD_PCT_MAX = 999.999
+
+# Card statuses a batch can no longer be opened / completed on. A completed
+# card has sent its output on; a closed one can't send any more, so a batch
+# completed on it would dispatch past its close. An admin may still open one on
+# a completed card, to add a batch that was forgotten: completing it sends on
+# only what is left to send (close_batch, kg_left_to_send), and Close JC waits
+# for it (close_job_card refuses an open batch).
+NO_NEW_BATCH = ('completed', 'closed', 'cancelled')
+NO_NEW_BATCH_FOR_ADMIN = ('closed', 'cancelled')
+NO_BATCH_CLOSE = ('closed', 'cancelled')
+
+
+def finished_card_refusal(job_card_id: int, status: str | None, *, closing: bool,
+                          is_admin: bool = False) -> dict | None:
+    """Refusal for opening (closing=False) or completing (closing=True) a batch
+    on a card that is already past it; None when the card's status allows it.
+    `is_admin` lets an admin open a batch on a completed card."""
+    if closing:
+        refused = NO_BATCH_CLOSE
+    else:
+        refused = NO_NEW_BATCH_FOR_ADMIN if is_admin else NO_NEW_BATCH
+    if status not in refused:
+        return None
+    if closing:
+        message = (f"Job card {job_card_id} is {status}, so its batches can't be completed "
+                   "any more and nothing more can be sent on from it. Cancel the open "
+                   "batch if it isn't needed.")
+    elif status == 'completed':
+        message = (f"Job card {job_card_id} is completed, so a new batch can't be opened on "
+                   "it. Plan any further production on a new job card, or ask an admin to "
+                   "add a batch that was missed.")
+    else:
+        message = (f"Job card {job_card_id} is {status}, so a new batch can't be opened on "
+                   "it. Plan any further production on a new job card.")
+    return {"error": "job_card_finished", "status": status, "message": message}
 
 
 def _serialize(row) -> dict:
@@ -82,9 +120,14 @@ async def open_batch(conn, *, job_card_id: int,
                      input_qty_kg: float | None = None,
                      batch_label: str | None = None,
                      notes: str | None = None,
-                     reuse_if_open: bool = False) -> dict:
+                     reuse_if_open: bool = False,
+                     is_admin: bool = False) -> dict:
     """Allocate a new batch row. batch_number = max + 1; batch_date defaults
     to today. Returns {"opened": True, "batch": <row>} or an error dict.
+
+    Refused (job_card_finished) on a completed, closed or cancelled card; an
+    admin (`is_admin`) may still open one on a completed card, to add a batch
+    that was forgotten (finished_card_refusal).
 
     `reuse_if_open` (opt-in): when the JC already has an open batch, return
     it instead of stacking another (returns {"opened": False, "reused": True,
@@ -111,13 +154,16 @@ async def open_batch(conn, *, job_card_id: int,
         return lock_err
 
     jc = await conn.fetchrow(
-        "SELECT job_card_id FROM job_card_v2 "
+        "SELECT job_card_id, status FROM job_card_v2 "
         "WHERE  job_card_id=$1 AND deleted_at IS NULL "
         "FOR    UPDATE",
         job_card_id,
     )
     if jc is None:
         return {"error": "job_card_not_found"}
+    finished = finished_card_refusal(job_card_id, jc["status"], closing=False, is_admin=is_admin)
+    if finished is not None:
+        return finished
 
     # Idempotent auto-open (opt-in). Runs under the FOR UPDATE above, so
     # concurrent STARTs serialize on the JC row: the second sees the first's
@@ -303,7 +349,7 @@ async def close_batch(conn, *, batch_id: int,
 
     jc = await conn.fetchrow(
         """
-        SELECT job_card_id, next_job_card_id, output_kind, uom,
+        SELECT job_card_id, next_job_card_id, output_kind, uom, status,
                dispatched_to_next_kg,
                entity, output_code, fg_sku_name,
                -- The next stage still live? A cancelled one must not be fed.
@@ -317,6 +363,9 @@ async def close_batch(conn, *, batch_id: int,
     )
     if jc is None:
         return {"error": "job_card_not_found"}
+    finished = finished_card_refusal(resolved_jc_id, jc["status"], closing=True)
+    if finished is not None:
+        return finished
 
     # FG kg comes from the batch's boxes once it has any (fg_from_boxes): the
     # boxes are what was made, whatever figure the caller typed — this covers
@@ -365,6 +414,18 @@ async def close_batch(conn, *, batch_id: int,
     )
     if refusal is not None:
         return refusal
+
+    # What the card already sent on (a Dispatch while this batch was open): its
+    # output can't drop below that, and the auto-dispatch below sends only what
+    # is left, so the same kg can't go twice.
+    dispatched = float(jc["dispatched_to_next_kg"] or 0)
+    other_kg: float | None = None
+    if dispatched > SEND_ON_EPS_KG:
+        other_kg = await output_of_other_batches_kg(conn, resolved_jc_id, batch_id)
+        below = output_below_dispatched_refusal(resolved_jc_id, dispatched=dispatched,
+                                                other_kg=other_kg, batch_kg=produced_qty_kg)
+        if below is not None:
+            return below
 
     # ── 1. Close the batch row. Notes APPEND, not replace.
     # Stage 2: also writes the per-batch accounting summary + IST
@@ -489,10 +550,17 @@ async def close_batch(conn, *, batch_id: int,
     # that.  The remainder stays at this JC's stage and can be
     # dispatched later via /dispatch-to-next or a subsequent batch's
     # close.  Legacy callers (None) keep the full-amount auto-dispatch.
+    # Either way no more than the card's output minus what it already
+    # sent on (kg_left_to_send) goes.
     if dispatch_qty_kg is None:
         effective_dispatch = produced_qty_kg
     else:
         effective_dispatch = max(0.0, min(float(dispatch_qty_kg), produced_qty_kg))
+    already_sent = False
+    if other_kg is not None:
+        left = kg_left_to_send(other_kg + produced_qty_kg, dispatched)
+        if left < effective_dispatch - SEND_ON_EPS_KG:
+            already_sent, effective_dispatch = True, left
 
     dispatch_row = None
     downstream_unlocked = False
@@ -514,13 +582,15 @@ async def close_batch(conn, *, batch_id: int,
         else:
             effective_dispatch_units = output_qty_units
 
-        note_suffix = (
-            f"Partial dispatch ({effective_dispatch:.3f} of "
-            f"{produced_qty_kg:.3f} kg)"
-            if dispatch_qty_kg is not None
-               and effective_dispatch != produced_qty_kg
-            else f"Auto-dispatch on batch {batch['batch_number']} close"
-        )
+        if already_sent:
+            note_suffix = (f"Auto-dispatch on batch {batch['batch_number']} close "
+                           f"({effective_dispatch:.3f} of {produced_qty_kg:.3f} kg; the rest "
+                           "was already sent on)")
+        elif dispatch_qty_kg is not None and effective_dispatch != produced_qty_kg:
+            note_suffix = (f"Partial dispatch ({effective_dispatch:.3f} of "
+                           f"{produced_qty_kg:.3f} kg)")
+        else:
+            note_suffix = f"Auto-dispatch on batch {batch['batch_number']} close"
 
         # Migration 019 dropped BIGSERIAL on dispatch_id — ids are now
         # app-supplied via new_short_time_id() with the same PK-retry

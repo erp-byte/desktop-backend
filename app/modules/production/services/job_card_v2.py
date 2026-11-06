@@ -33,14 +33,17 @@ import re
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from asyncpg.exceptions import CheckViolationError, UndefinedColumnError
+from asyncpg.exceptions import CheckViolationError, ForeignKeyViolationError, UndefinedColumnError
 
 from app.core.helpers import insert_with_pk_retry, new_short_time_id
 from app.core.warehouse_scope import (
     FLOOR_NORM_SQL, WAREHOUSE_NORM_ANY_SQL, WAREHOUSE_NORM_SQL, floor_scope_values,
     normalise_floor,
 )
+from app.modules.production.services.chain_floors import FloorGate
+from app.modules.production.services.fg_from_boxes import SAME_KG
 from app.modules.production.services.output_calc import compute_output_row
+from app.modules.production.services.refusals import ServiceRefusal, raise_if_refused
 
 logger = logging.getLogger(__name__)
 
@@ -1111,6 +1114,18 @@ def next_chain_no(job_card_numbers) -> int:
     return max(used) + 1 if used else 1
 
 
+_ADD_SUFFIX_RE = re.compile(r"-ADD(\d+)$")
+
+
+def next_add_no(job_card_numbers) -> int:
+    """The number of the next process a live edit adds to a line (…-ADD{n}): past
+    every -ADD number ever used there, cancelled cards included. It used to be the
+    new card's position, which an earlier added (or removed) card could already
+    hold — a UNIQUE violation, so a 500."""
+    used = [int(m.group(1)) for n in job_card_numbers if (m := _ADD_SUFFIX_RE.search(n or ""))]
+    return max(used, default=0) + 1
+
+
 async def reset_line_steps(conn, plan_line_id: int, *, first_chain: bool) -> int:
     """Make room for a new chain's plan steps; returns the step_order to follow.
 
@@ -1445,6 +1460,23 @@ async def create_job_cards_for_line(
     }
 
 
+def _scaled_units(planned_units, planned_kg, qty_kg) -> float | None:
+    """A plan line's planned pieces for `qty_kg` of it: as planned when that is
+    the planned kg, else scaled and rounded to whole pieces (the Merge-process
+    wizard's lib/job-card-sfg memberPieces). None when the line plans no pieces,
+    has no kg to scale by, or it rounds to none."""
+    try:
+        pu, pk, qk = float(planned_units), float(planned_kg), float(qty_kg)
+    except (TypeError, ValueError):
+        return None
+    if pu <= 0 or pk <= 0 or qk <= 0:
+        return None
+    if abs(qk - pk) < 0.0005:
+        return pu
+    n = int(pu * qk / pk + 0.5)
+    return float(n) if n > 0 else None
+
+
 async def create_merged_process_run(
     conn,
     *,
@@ -1452,9 +1484,15 @@ async def create_merged_process_run(
     wip_steps: list[dict],
     per_member: list[dict],
     created_by: str | None = None,
+    floor_gate: FloorGate | None = None,
 ) -> dict:
     """Cross-product process merge: build ONE shared PROCESS chain (summed qty,
     producing a shared SFG) whose output feeds each product's OWN packaging card.
+
+    floor_gate (the route's, services/chain_floors): every floor is checked
+    against the plan's factory and stored in its declared spelling, and the
+    floors the run touches — compared with the members' cards it rebuilds — must
+    be the user's, before those cards are deleted.
 
     The member lines must share (factory, entity, stage-1 floor, RM-article set)
     and be uncarded — RE-VALIDATED here against the DB, never trusted from the
@@ -1509,7 +1547,7 @@ async def create_merged_process_run(
     rows = await conn.fetch(
         """
         SELECT l.plan_line_id, l.plan_id, l.bom_id, l.fg_sku_name, l.customer_name,
-               l.planned_qty_kg,
+               l.planned_qty_kg, l.planned_qty_units,
                lower(trim(p.warehouse)) AS factory,
                lower(trim(p.entity))    AS entity, p.entity AS entity_raw,
                p.warehouse AS warehouse_raw, p.status AS plan_status,
@@ -1523,7 +1561,10 @@ async def create_merged_process_run(
                -- their (unstarted) cards. Only STARTED chains are refused.
                (SELECT COUNT(*) FROM job_card_v2 j
                  WHERE j.plan_line_id = l.plan_line_id AND j.deleted_at IS NULL
-                   AND j.status NOT IN ('locked','unlocked')) AS jc_started
+                   AND j.status NOT IN ('locked','unlocked')) AS jc_started,
+               -- Any card, cancelled ones too: the DELETE below takes them all.
+               EXISTS (SELECT 1 FROM job_card_v2 j
+                        WHERE j.plan_line_id = l.plan_line_id) AS has_cards
         FROM production_plan_line_v2 l
         JOIN production_plan_v2 p ON p.plan_id = l.plan_id
         WHERE l.plan_line_id = ANY($1::int[])
@@ -1553,6 +1594,18 @@ async def create_merged_process_run(
         return {"error": "already_started",
                 "message": (f"Lines have already-started job cards: {started}. Only "
                             "un-started chains can be merged.")}
+    # The rebuild below deletes every card of the members, as Edit's rebuild does
+    # (rebuild_refusal): one the floor asked material for, or a BOM amendment
+    # names, can't be deleted (a raw 500), and a cancelled card would take its
+    # recorded work with it. Such a product is refused before anything is written.
+    for plid in member_ids:
+        if not by_line[plid]["has_cards"]:
+            continue
+        blocked = await rebuild_refusal(conn, plid)
+        if blocked is not None:
+            article = by_line[plid]["fg_sku_name"] or f"Line {plid}"
+            return {"error": "rebuild_blocked", "plan_line_id": plid, "reason": blocked["reason"],
+                    "message": f"{article}: {blocked['reason']} Leave it out of the merge."}
     # BOM changes (spec 2i): a removal carried into a shared process run would
     # apply to every member's share, so the merge waits until they are undone.
     from app.modules.production.services import jc_bom_changes
@@ -1584,9 +1637,25 @@ async def create_merged_process_run(
         member_qty[plid] = qk
         u = m.get("qty_units")
         member_units[plid] = float(u) if u not in (None, "") and _fq(u) > 0 else None
+        if member_units[plid] is None:
+            # No pieces sent: the line's planned pieces for this kg, so the
+            # packaging card still carries a pieces target.
+            member_units[plid] = _scaled_units(by_line[plid]["planned_qty_units"], planned, qk)
     merged_qty = round(sum(member_qty.values()), 3)
     if merged_qty <= 0:
         return {"error": "invalid_qty", "message": "Merged quantity must be greater than 0."}
+
+    # ---- floors: the run against the member cards it rebuilds -------------
+    gate = floor_gate or FloorGate()
+    old_floors = [r["floor"] for r in await conn.fetch(
+        "SELECT floor FROM job_card_v2 WHERE plan_line_id = ANY($1::int[]) AND deleted_at IS NULL",
+        member_ids)]
+    floors, refusal = gate.check_chain(
+        old_floors, [s.get("floor") for s in wip_steps] + [pm_by_line[p]["pkg_floor"] for p in member_ids])
+    if refusal:
+        return refusal
+    wip_steps = [{**s, "floor": f} for s, f in zip(wip_steps, floors)]
+    pkg_floor_of = dict(zip(member_ids, floors[len(wip_steps):]))
 
     primary = by_line[member_ids[0]]
     primary_line_id = primary["plan_line_id"]
@@ -1663,9 +1732,22 @@ async def create_merged_process_run(
     # lines): hard-delete every member's cards first — matching
     # replace_job_cards_for_line — so the plan_step_id RESTRICT FK releases
     # before the steps are replaced. The `started` guard above guarantees no
-    # running card is touched.
-    await conn.execute(
-        "DELETE FROM job_card_v2 WHERE plan_line_id = ANY($1::int[])", member_ids)
+    # running card is touched, and rebuild_refusal that none is cancelled (the
+    # DELETE is unfiltered on purpose: a cancelled card left behind would hold
+    # its plan step against the step DELETE below).
+    try:
+        await conn.execute(
+            "DELETE FROM job_card_v2 WHERE plan_line_id = ANY($1::int[])", member_ids)
+    except ForeignKeyViolationError as exc:
+        # Something came to point at a card after rebuild_refusal looked (a
+        # requisition raised meanwhile). The transaction is aborted, so no
+        # re-read: a 409, rolled back, rather than a raw 500.
+        raise ServiceRefusal({
+            "error": "rebuild_blocked",
+            "message": ("The floor has just started using the job cards of one of these "
+                        "products, so they can't be merged. Open Merge process again to see "
+                        "which products can still be merged."),
+        }) from exc
 
     # ---- build the shared PROCESS chain on the primary line --------------
     await conn.execute("DELETE FROM production_plan_step_v2 WHERE plan_line_id=$1", primary_line_id)
@@ -1677,7 +1759,7 @@ async def create_merged_process_run(
         is_first = idx == 0
         is_last  = idx == n_wip - 1
         proc = (s.get("process") or "").strip() or "Process"
-        floor = (s.get("floor") or "").strip() or None
+        floor = s.get("floor") or None          # as check_chain spelled it above
         stage = _stage_for(proc)
         # Last process step is the SFG producer feeding every packaging; earlier
         # steps follow the normal declared-SFG-or-plain-WIP rule.
@@ -1731,7 +1813,7 @@ async def create_merged_process_run(
     for plid in member_ids:
         r = by_line[plid]
         m = pm_by_line[plid]
-        pkg_floor = str(m["pkg_floor"]).strip()
+        pkg_floor = pkg_floor_of[plid]
         pkg_proc  = (str(m.get("pkg_process") or "").strip() or "Packaging")
         # The primary line's steps were already replaced above (process steps
         # 1..n_wip); its packaging is simply the next step_order. Non-primary
@@ -1790,15 +1872,54 @@ async def create_merged_process_run(
 # real work and must not be deleted/replaced.
 _JC_EDITABLE_STATUSES = ('locked', 'unlocked')
 
+# What Edit reads a card holds, as extra columns of a SELECT FROM job_card_v2:
+# the kg it received from the stage before, whether it has output recorded, and
+# whether the floor has asked for material for it ({requisition}: FALSE before
+# migration 111, see _card_holdings_sql). A cancelled requisition doesn't count:
+# cancelling it is what lets the edit go ahead (the row stays, as history).
+# rebuild_refusal counts every row (_REQUISITION_ON_CARD), as its DELETE must.
+_CARD_HOLDINGS_COLS = """
+       carried_qty_kg,
+       EXISTS (SELECT 1 FROM job_card_output_v2 o
+                WHERE o.job_card_id = job_card_v2.job_card_id
+                  AND o.deleted_at IS NULL) AS has_output,
+       {requisition} AS has_requisition"""
+_REQUISITION_ON_THIS_CARD = ("EXISTS (SELECT 1 FROM floor_requisition r "
+                             "WHERE r.job_card_id = job_card_v2.job_card_id "
+                             "AND r.status <> 'cancelled')")
+
+
+async def _card_holdings_sql(conn) -> str:
+    """_CARD_HOLDINGS_COLS for this database (floor_requisition may not exist yet)."""
+    has_requisitions = await conn.fetchval(
+        "SELECT to_regclass('public.floor_requisition') IS NOT NULL")
+    return _CARD_HOLDINGS_COLS.format(
+        requisition=_REQUISITION_ON_THIS_CARD if has_requisitions else "FALSE")
+
+
+def _holds_material(r) -> bool:
+    """The card has material on it: kg received from the stage before, or output
+    recorded. Cancelling it would leave that on a dead card."""
+    return float(r["carried_qty_kg"] or 0) > SEND_ON_EPS_KG or bool(r["has_output"])
+
 
 async def get_line_job_card_config(conn, plan_line_id: int) -> dict:
     """Reconstruct the Create-Job-Card wizard payload from a line's EXISTING
     job cards, so the Edit flow can prefill the modal.
 
-    Returns {exists, editable, started, qty_kg, qty_units, wip_steps[], pkg_floor}.
+    Returns {exists, editable, started, rebuild_blocked, qty_kg, qty_units,
+    wip_steps[], pkg_*}.
     `exists=False` when the line has no job cards (caller shows Create, not Edit).
-    `editable=False` when any card has progressed beyond locked/unlocked.
-    The last card in the chain is Packaging; the rest are the WIP processes.
+    `editable=False` when any card has progressed beyond locked/unlocked, or when
+    the un-started cards can't be rebuilt (`rebuild_blocked` says why) — either
+    way Edit changes them in place (apply-edits).
+    The last card in the chain is Packaging; the rest are the WIP processes. A
+    one-card chain (raw material straight to finished goods) has wip_steps [] and
+    its card as pkg_*. qty_* is the chain's (_chain_qty_row), which a live edit
+    diffs against. Each existing WIP step says whether its card `holds_material`
+    (received from the stage before, or has output: a later stage can't be
+    removed then) and `has_requisition` (the floor asked for material for it: the
+    first stage can't be removed then) — the live edit's own refusals.
     """
     # Canonical SFG for this line's FG (design §5.4) — used to auto-fill the
     # SFG output field in the Create/Edit Job-Card modal (stays editable).
@@ -1818,10 +1939,11 @@ async def get_line_job_card_config(conn, plan_line_id: int) -> dict:
         meta["entity"] if meta else None,
     )
 
+    holdings = await _card_holdings_sql(conn)
     rows = await conn.fetch(
-        """
+        f"""
         SELECT job_card_id, step_number, process_name, floor, output_code,
-               planned_qty_kg, planned_qty_units, status
+               planned_qty_kg, planned_qty_units, status,{holdings}
         FROM job_card_v2
         WHERE plan_line_id = $1 AND deleted_at IS NULL
         ORDER BY step_number
@@ -1861,9 +1983,10 @@ async def get_line_job_card_config(conn, plan_line_id: int) -> dict:
         return out
 
     started = any(r["status"] not in _JC_EDITABLE_STATUSES for r in rows)
+    rebuild = None if started else await rebuild_refusal(conn, plan_line_id)
     wip_rows = rows[:-1]          # every stage except the terminating Packaging
     pkg_row  = rows[-1]
-    first    = rows[0]
+    qty_row  = _chain_qty_row(rows)
     return {
         "exists": True,
         "canonical_sfg": canonical_sfg,
@@ -1871,10 +1994,11 @@ async def get_line_job_card_config(conn, plan_line_id: int) -> dict:
         # via the delete+recreate path). The live-edit path (apply-edits) works
         # even when started=True — the frontend uses per-step `started` to gate
         # which actions are allowed.
-        "editable": not started,
+        "editable": not started and rebuild is None,
         "started": started,
-        "qty_kg": float(first["planned_qty_kg"]) if first["planned_qty_kg"] is not None else None,
-        "qty_units": float(first["planned_qty_units"]) if first["planned_qty_units"] is not None else None,
+        "rebuild_blocked": rebuild["reason"] if rebuild else None,
+        "qty_kg": float(qty_row["planned_qty_kg"]) if qty_row["planned_qty_kg"] is not None else None,
+        "qty_units": float(qty_row["planned_qty_units"]) if qty_row["planned_qty_units"] is not None else None,
         "wip_steps": [
             {
                 "job_card_id": r["job_card_id"],
@@ -1883,6 +2007,8 @@ async def get_line_job_card_config(conn, plan_line_id: int) -> dict:
                 "sfg_output": r["output_code"],
                 "status": r["status"],
                 "started": r["status"] not in _JC_EDITABLE_STATUSES,
+                "holds_material": _holds_material(r),
+                "has_requisition": bool(r["has_requisition"]),
             }
             for r in wip_rows
         ],
@@ -1932,6 +2058,60 @@ async def line_edit_refusal(conn, plan_line_id: int) -> dict | None:
     return None
 
 
+# Cancelled cards on the line, and the first live card that the floor has asked
+# material for (migration 111) or a BOM amendment names: rows that point at it,
+# so it can't be deleted. {requisition} is FALSE before migration 111.
+_REBUILD_BLOCKERS_SQL = """
+    SELECT COUNT(*) FILTER (WHERE j.deleted_at IS NOT NULL) AS cancelled,
+           (ARRAY_AGG(j.process_name || ' (job card ' || j.job_card_number || ')'
+                      ORDER BY j.step_number)
+                FILTER (WHERE j.deleted_at IS NULL AND {requisition}))[1] AS requested_on,
+           (ARRAY_AGG(j.process_name || ' (job card ' || j.job_card_number || ')'
+                      ORDER BY j.step_number)
+                FILTER (WHERE j.deleted_at IS NULL AND EXISTS (
+                    SELECT 1 FROM bom_amendment_request_v2 a
+                     WHERE a.job_card_id = j.job_card_id)))[1] AS amended_on
+      FROM job_card_v2 j
+     WHERE j.plan_line_id = $1
+"""
+_REQUISITION_ON_CARD = "EXISTS (SELECT 1 FROM floor_requisition r WHERE r.job_card_id = j.job_card_id)"
+
+
+async def rebuild_refusal(conn, plan_line_id: int) -> dict | None:
+    """Why Edit must not delete and rebuild this line's un-started cards, or None.
+
+      * The floor has asked for material for one of them, or a BOM amendment
+        names one: the delete failed on their foreign key — a raw 500, and Edit
+        was broken for the article.
+      * The line has cancelled cards: the delete took them too, with the work
+        recorded on them (batches, outputs, the cancel snapshot).
+    Either way Edit changes the cards in place instead (apply_live_job_card_edits;
+    the config's editable=False sends the pop-up there). `reason` is the first
+    sentence of `message`, for the pop-up.
+    """
+    has_requisitions = await conn.fetchval(
+        "SELECT to_regclass('public.floor_requisition') IS NOT NULL")
+    row = await conn.fetchrow(
+        _REBUILD_BLOCKERS_SQL.format(requisition=_REQUISITION_ON_CARD if has_requisitions else "FALSE"),
+        plan_line_id,
+    )
+    if row is None:
+        return None
+    if row["requested_on"]:
+        reason = (f"The floor has already asked for material for {row['requested_on']}, "
+                  "so this chain can't be rebuilt.")
+    elif row["amended_on"]:
+        reason = (f"A BOM amendment has been raised on {row['amended_on']}, "
+                  "so this chain can't be rebuilt.")
+    elif row["cancelled"]:
+        reason = ("This article has cancelled job cards whose records are kept, "
+                  "so its chain can't be rebuilt.")
+    else:
+        return None
+    return {"error": "rebuild_blocked", "reason": reason,
+            "message": f"{reason} Edit it as a running chain instead: close this and open Edit again."}
+
+
 async def replace_job_cards_for_line(
     conn,
     plan_line_id: int,
@@ -1941,15 +2121,24 @@ async def replace_job_cards_for_line(
     wip_steps: list[dict],
     pkg_floor: str,
     pkg_process: str = "Packaging",
+    floor_gate: FloorGate | None = None,
 ) -> dict:
     """Edit a line's job cards by REPLACING them: delete the current chain and
     recreate it from the wizard's inputs. Only valid while the chain is still
     fresh (every card locked/unlocked); refuses once any stage has started so
     in-progress work is never destroyed.
 
+    floor_gate (the route's, services/chain_floors): the new chain is compared
+    with the one it deletes as multisets of floors, so only floors that gain or
+    lose a card are checked against the user's — before the delete. A floor the
+    chain already had keeps its stored spelling; a new one is checked against
+    the factory's floors and stored in the declared spelling.
+
     Deleting the cards cascades their RM/PM indents (FK ON DELETE CASCADE); the
-    plan_step rows are then rebuilt by create_job_cards_for_line. MUST run inside
-    an outer transaction.
+    plan_step rows are then rebuilt by create_job_cards_for_line. Only live cards
+    are deleted, and only when rebuild_refusal finds nothing pointing at them and
+    no cancelled card whose history the delete would take. MUST run inside an
+    outer transaction.
     """
     # Lock-order rule (spec 2c): the plan line row before any card row -- the
     # BOM-change endpoints and Save Output lock it first too.
@@ -1960,22 +2149,35 @@ async def replace_job_cards_for_line(
     if refusal is not None:
         return refusal
     existing = await conn.fetch(
-        "SELECT job_card_id, status FROM job_card_v2 "
+        "SELECT job_card_id, status, floor FROM job_card_v2 "
         "WHERE plan_line_id = $1 AND deleted_at IS NULL",
         plan_line_id,
     )
+    if existing and any(r["status"] not in _JC_EDITABLE_STATUSES for r in existing):
+        return {
+            "error": "not_editable",
+            "message": "These job cards have already started — they can't be edited.",
+        }
+    if existing:
+        refusal = await rebuild_refusal(conn, plan_line_id)
+        if refusal is not None:
+            return refusal
+
+    gate = floor_gate or FloorGate()
+    floors, refusal = gate.check_chain(
+        [r["floor"] for r in existing],
+        [s.get("floor") for s in wip_steps] + [pkg_floor])
+    if refusal:
+        return refusal
+    wip_steps = [{**s, "floor": f} for s, f in zip(wip_steps, floors)]
+    pkg_floor = floors[-1]
+
     if not existing:
         # Nothing to replace — fall through to a plain create.
         return await create_job_cards_for_line(
             conn, plan_line_id, qty_kg=qty_kg, qty_units=qty_units,
             wip_steps=wip_steps, pkg_floor=pkg_floor, pkg_process=pkg_process,
         )
-
-    if any(r["status"] not in _JC_EDITABLE_STATUSES for r in existing):
-        return {
-            "error": "not_editable",
-            "message": "These job cards have already started — they can't be edited.",
-        }
 
     # The first cards of the live chains, read before they are deleted: only
     # their BOM changes carry over (a cancelled chain's changes stay put).
@@ -1984,9 +2186,20 @@ async def replace_job_cards_for_line(
 
     # Drop the whole chain in one statement (indents cascade; the bidirectional
     # prev/next self-FK is satisfied because the entire referenced set goes too).
-    await conn.execute(
-        "DELETE FROM job_card_v2 WHERE plan_line_id = $1", plan_line_id,
-    )
+    try:
+        await conn.execute(
+            "DELETE FROM job_card_v2 WHERE plan_line_id = $1 AND deleted_at IS NULL", plan_line_id,
+        )
+    except ForeignKeyViolationError as exc:
+        # Something came to point at a card after rebuild_refusal looked (a
+        # requisition raised meanwhile). The transaction is aborted, so no
+        # re-read: the same 409, rolled back, rather than a raw 500.
+        raise ServiceRefusal({
+            "error": "rebuild_blocked",
+            "message": ("The floor has just started using these job cards, so this chain can't "
+                        "be rebuilt. Edit it as a running chain instead: close this and open "
+                        "Edit again."),
+        }) from exc
     # Recreate from the new inputs (its per-line guard now passes — no JC remains).
     result = await create_job_cards_for_line(
         conn, plan_line_id, qty_kg=qty_kg, qty_units=qty_units,
@@ -2014,8 +2227,21 @@ async def replace_job_cards_for_line(
 # linked SO (ledger + so_line) via sync_so_from_qty_delta. Every action is logged
 # to job_card_edit_log_v2.
 
-# Pre-start statuses (chain still freely replaceable).
+# Finished statuses: nothing on such a card changes any more.
 _LIVE_TERMINAL = ('completed', 'closed', 'cancelled')
+
+
+def _chain_qty_row(rows):
+    """The card whose planned qty is the chain's: the first one not finished. A
+    live edit sets every unfinished card to the new qty and leaves a finished one
+    at the qty it was made at, so after stage 1 finished the first card was stale
+    — Edit prefilled the old qty and re-saving the same total moved the SO again.
+    The last card when every card has finished."""
+    return next((r for r in rows if r["status"] not in _LIVE_TERMINAL), rows[-1])
+
+
+def _card_label(r) -> str:
+    return f"{r['process_name']} (job card {r['job_card_number']})"
 
 
 async def _force_record_and_cancel_jc(conn, *, job_card_id: int,
@@ -2162,8 +2388,9 @@ async def sync_so_from_qty_delta(conn, plan_line_id: int, *,
 
 async def _unlock_new_head(conn, head_id: int, status: str | None) -> int | None:
     """Release a card that a chain edit left at the head while still locked
-    (nothing upstream remains to unlock it). Returns its id when it was released,
-    so the edit can tell its floor; None when the head was not locked."""
+    (nothing upstream remains to unlock it) — or behind a stage that has finished.
+    Returns its id when it was released, so the edit can tell its floor; None
+    when the card was not locked."""
     if status != 'locked':
         return None
     await conn.execute(
@@ -2184,40 +2411,107 @@ async def apply_live_job_card_edits(
     pkg_job_card_id: int | None = None,
     user: str | None = None,
     remove_reasons: dict | None = None,
+    floor_gate: FloorGate | None = None,
 ) -> dict:
-    """Constrained live edit of a STARTED job-card chain. `steps` are the desired
-    WIP processes in order; existing ones carry job_card_id, new ones have
-    job_card_id=None. Any existing WIP JC absent from `steps` is a removal.
-    Packaging stays the terminal stage. MUST run inside an outer transaction.
+    """Constrained live edit of a job-card chain that has started (or whose cards
+    can't be rebuilt, rebuild_refusal). `steps` are the desired WIP processes in
+    order — every card but the last; existing ones carry job_card_id, new ones
+    have job_card_id=None. Any existing WIP JC absent from `steps` is a removal.
+    The last card stays the terminal stage: a one-card chain (raw material
+    straight to finished goods) has no WIP, so its `steps` are []. MUST run inside
+    an outer transaction.
+
+    Validate, then write: every refusal is returned before the first write, with
+    the plan row (FOR KEY SHARE), the plan line and then the line's cards locked
+    in step order (dispatch takes cards in that order; stop and cancel lock the
+    line first, so they wait for the edit), so no check goes stale
+    before its write. A refusal that could still come later (the removal
+    backstop) is raised, so no caller can commit half an edit.
+
+    floor_gate (the route's, services/chain_floors) checks only the floors the
+    edit touches, diffed by job_card_id against the saved cards, before anything
+    is written: an added step's floor, a moved card's old and new floor, the
+    floor of every removed card. A floor sent unchanged (ignoring case) keeps its
+    stored value, so a quantity-only edit checks no floor.
 
     Rules (the started cards form a contiguous prefix — stage 1 starts first):
-      * floor change: allowed on any non-terminal card (incl. in-progress);
-      * qty change: allowed anytime, synced to the SO (ledger + so_line);
-      * add process: only in the un-started tail (after the started prefix);
-      * remove process: terminal cards can't be removed; a started card can only
-        be removed if it's the latest running stage (no started downstream); the
-        removed card is force-recorded (snapshot) then cancelled.
+      * not on a cancelled or executed plan;
+      * floor change: allowed on any card not finished (incl. in-progress); a
+        completed/closed card can't move;
+      * qty change: allowed while any card is unfinished, synced to the SO (ledger
+        + so_line); the plan line moves by the same amount, so on a part chain the
+        rest of the line stays as it was;
+      * process name: only on cards nobody has started (a started card keeps it);
+      * add process: only in front of a card still waiting for the stage before
+        it ('locked') — one that has received material, or a released first card,
+        can't get a new stage before it;
+      * remove process: terminal cards can't be removed; a started card is
+        refused (Stop process sends on what it made first) — an 'assigned' one
+        has drawn nothing and is removed like an unlocked one; a card holding
+        material (received from the stage before, or output) is refused — it
+        would be left on a cancelled card; the first card can't stop being
+        first while the floor has a live (not cancelled) requisition on it. The
+        removed card is force-recorded (snapshot) then cancelled;
+      * after the relink a card waiting for the stage before whose new previous
+        stage has finished is released (as _join_chain_around does), and a first
+        card nobody has drawn on (locked / unlocked / assigned) gets its RM / PM
+        list again when it is new or the qty changed (_materialise_indents is
+        stage 1 only, at create).
     """
+    # ════ validate: reads and refusals only ══════════════════════════════
+    # The plan row first: an added card's INSERT needs it (its plan_id foreign
+    # key takes FOR KEY SHARE), and Cancel / Delete / Approve plan take it FOR
+    # UPDATE before the plan's lines and cards. Taken only at that INSERT — after
+    # every card was locked — an add and a Cancel plan deadlocked.
+    await conn.execute(
+        """SELECT 1 FROM production_plan_v2
+            WHERE plan_id = (SELECT plan_id FROM production_plan_line_v2 WHERE plan_line_id = $1)
+              FOR KEY SHARE""",
+        plan_line_id,
+    )
     # Lock-order rule (spec 2c): the plan line row before any card row -- the
     # BOM-change endpoints and Save Output lock it first too.
-    await conn.execute(
-        "SELECT 1 FROM production_plan_line_v2 WHERE plan_line_id = $1 FOR UPDATE", plan_line_id,
+    line = await conn.fetchrow(
+        """SELECT l.planned_qty_kg, l.planned_qty_units, l.bom_id, l.fg_sku_name,
+                  l.customer_name, p.status AS plan_status, p.entity, p.warehouse
+             FROM production_plan_line_v2 l
+             JOIN production_plan_v2 p ON p.plan_id = l.plan_id
+            WHERE l.plan_line_id = $1
+              FOR UPDATE OF l""",
+        plan_line_id,
     )
+    if line is None:
+        return {"error": "line_not_found", "message": "This plan line no longer exists."}
+    article = line["fg_sku_name"] or "this article"
+    if line["plan_status"] == 'cancelled':
+        return {"error": "plan_closed",
+                "message": f"This plan is cancelled, so the job cards of {article} can't be edited."}
+    if line["plan_status"] == 'executed':
+        return {"error": "plan_closed",
+                "message": (f"This plan is executed — its job cards are closed — so those of "
+                            f"{article} can't be changed. Plan any more of it on a new plan.")}
     refusal = await line_edit_refusal(conn, plan_line_id)
     if refusal is not None:
         return refusal
     import json
     from app.modules.production.services import jc_bom_changes
     EDITABLE = _JC_EDITABLE_STATUSES        # ('locked', 'unlocked')
+    # Nothing drawn on it yet: an 'assigned' card has its team, no material.
+    UNDRAWN = EDITABLE + ('assigned',)
     remove_reasons = remove_reasons or {}
     actor = user or None
 
+    # What each card holds is read on the locked rows: a dispatch into a card
+    # waits for this edit, so a removal can't miss material on its way in.
+    holdings = await _card_holdings_sql(conn)
     rows = await conn.fetch(
-        """SELECT job_card_id, step_number, process_name, stage, floor, status,
-                  planned_qty_kg, planned_qty_units, output_code, plan_step_id, plan_id
+        f"""SELECT job_card_id, job_card_number, step_number, process_name, stage, floor,
+                  status, planned_qty_kg, planned_qty_units, output_code, plan_step_id, plan_id,
+                  {holdings}
            FROM job_card_v2
            WHERE plan_line_id=$1 AND deleted_at IS NULL
-           ORDER BY step_number""",
+           ORDER BY step_number
+           FOR UPDATE""",
         plan_line_id,
     )
     if not rows:
@@ -2228,9 +2522,30 @@ async def apply_live_job_card_edits(
     pkg_row = rows[-1]
     existing_by_id = {r["job_card_id"]: r for r in rows}
 
+    # The screen names the card it shows last; another one means its packing row
+    # was removed (the row before it would be sent as packaging, and the server
+    # would cancel that stage and rename packing after it).
+    if pkg_job_card_id is not None and int(pkg_job_card_id) != pkg_row["job_card_id"]:
+        return {"error": "terminal_mismatch", "pkg_job_card_id": pkg_row["job_card_id"],
+                "message": (f"{_card_label(pkg_row)} must stay the last process — it makes the "
+                            "finished goods. Close this and open Edit again.")}
+
     submitted = list(steps or [])
-    submitted_id_set = {s.get("job_card_id") for s in submitted if s.get("job_card_id")}
     wip_ids_order = [r["job_card_id"] for r in wip_rows]
+    sent_ids = [s.get("job_card_id") for s in submitted if s.get("job_card_id")]
+    stray = sorted({j for j in sent_ids if j not in wip_ids_order or sent_ids.count(j) > 1})
+    if stray:
+        # Another line's card, a cancelled one, packing sent as a process, or one
+        # sent twice: the screen is out of date.
+        return {"error": "unknown_job_card", "job_card_ids": stray,
+                "message": ("These processes have changed since this screen was opened. Close it "
+                            "and open Edit again to see the job cards as they are now.")}
+    no_floor = [(s.get("process") or "").strip() or "the new process"
+                for s in submitted if not s.get("job_card_id") and not str(s.get("floor") or "").strip()]
+    if no_floor:
+        return {"error": "missing_floor", "message": f"Pick a floor for {', '.join(no_floor)}."}
+
+    submitted_id_set = set(sent_ids)
     removed_ids = [jid for jid in wip_ids_order if jid not in submitted_id_set]
 
     # Started prefix = contiguous run of started (non-EDITABLE) WIP cards.
@@ -2241,15 +2556,39 @@ async def apply_live_job_card_edits(
         started_prefix_ids.append(r["job_card_id"])
 
     # ── validate removals ────────────────────────────────────────────────
+    # Cancelling a card here sends nothing on and moves nothing it received, so
+    # a card with material on it is not removed (its material would be left on a
+    # dead card, and the next stage waited for good on a stage that had already
+    # sent everything on). Stop process sends on what was made first.
+    first = rows[0]
     for jid in removed_ids:
         r = existing_by_id[jid]
         if r["status"] in _LIVE_TERMINAL:
             return {"error": "cannot_remove_terminal",
                     "message": f"Process '{r['process_name']}' is {r['status']} and can't be removed."}
-        if started_prefix_ids and jid in started_prefix_ids and jid != started_prefix_ids[-1]:
-            return {"error": "cannot_remove_started_midchain",
-                    "message": (f"Process '{r['process_name']}' has started and has started "
-                                "downstream stages — only the latest running stage can be removed.")}
+        if jid == first["job_card_id"]:
+            # An 'assigned' first card (its team set, nothing drawn) goes like an
+            # unlocked one: Stop process refuses it and Cancel is admin-only.
+            if r["status"] not in UNDRAWN:
+                return {"error": "cannot_remove_started_first", "job_card_id": jid,
+                        "message": (f"{r['process_name']} is the first stage and has started. Use Stop "
+                                    f"process on {r['job_card_number']} — it sends on what was made "
+                                    "first.")}
+            # A requisition on it: checked with the new first card below.
+        elif r["status"] not in UNDRAWN:
+            return {"error": "cannot_remove_started_midchain", "job_card_id": jid,
+                    "message": (f"{_card_label(r)} has already started. Use Stop process on it — it "
+                                "sends on what was made first.")}
+        # A first card can hold material too: it became stage 1 when the stage
+        # before it was cancelled, after that stage sent it some.
+        if _holds_material(r):
+            carried = round(float(r["carried_qty_kg"] or 0), 3)
+            what = (f"has already received {carried:g} kg from the stage before"
+                    if carried > SEND_ON_EPS_KG else "already has output recorded on it")
+            return {"error": "cannot_remove_holding_material", "job_card_id": jid,
+                    "message": (f"{_card_label(r)} {what}, so it can't be removed: that material "
+                                "would be left on a cancelled card. Run that material through "
+                                f"{r['process_name']} first.")}
 
     # ── validate the started region stays the leading prefix, in order ────
     surviving_started = [jid for jid in started_prefix_ids if jid not in removed_ids]
@@ -2258,18 +2597,90 @@ async def apply_live_job_card_edits(
         return {"error": "cannot_reorder_started_region",
                 "message": "Started processes must stay first and in order; only the un-started tail can change."}
 
-    # The chain's first card before the edit: BOM changes are stored against it,
-    # and removing stage 1 or adding a step in front of it gives the chain a new
-    # one (spec 2i -- the changes carry over, see after the relink).
-    old_heads = await jc_bom_changes.chain_heads(conn, [r["job_card_id"] for r in rows])
+    # ── a new process only in front of a card still waiting for its input ──
+    # The card after it must still be 'locked': one released by a dispatch already
+    # holds its material, and the new card ahead of it would never be released —
+    # or, on a started one-card chain, would start drawing raw material beside
+    # it. A released first card is out on its floor as stage 1 (the refusal says
+    # so; it has received nothing).
+    final_ids = [s.get("job_card_id") or None for s in submitted] + [pkg_row["job_card_id"]]
+    for pos, jid in enumerate(final_ids[:-1]):
+        nxt = final_ids[pos + 1]
+        if jid is None and nxt is not None and existing_by_id[nxt]["status"] != 'locked':
+            r = existing_by_id[nxt]
+            if nxt == first["job_card_id"] and r["status"] in ('unlocked', 'assigned'):
+                # Released as stage 1 but nothing drawn: it had received nothing.
+                return {"error": "cannot_add_before_released", "job_card_id": nxt,
+                        "message": (f"{_card_label(r)} is the chain's first stage and is already "
+                                    "released to its floor, so a process can't be added before it "
+                                    "here. Ask an admin to cancel that job card, then create the "
+                                    "job cards again with the new process.")}
+            return {"error": "cannot_add_before_released", "job_card_id": nxt,
+                    "message": (f"{r['process_name']} (job card {r['job_card_number']}) has already "
+                                "received material — a process can't be added before it.")}
 
-    audit: list[tuple] = []   # (action, job_card_id, before, after, reason)
+    # ── the first card stays first while the floor has asked material for it ──
+    # Its requisition (and anything issued on it) would stay on a card that is
+    # cancelled, or is no longer the stage the RM goes to. Only a requisition
+    # still 'raised' can be cancelled (requisition_service.cancel_requisition);
+    # once store has issued on it, only an admin's Cancel JC takes the card.
+    if final_ids[0] != first["job_card_id"] and first["has_requisition"]:
+        why = ("so it can't be removed. Cancel that requisition if store hasn't issued on it "
+               "yet, or ask an admin to cancel the job card."
+               if first["job_card_id"] in removed_ids else
+               "so no process can go before it. Cancel that requisition if store hasn't issued "
+               "on it yet, or leave it as the first stage.")
+        return {"error": "first_stage_requested", "job_card_id": first["job_card_id"],
+                "message": f"The floor has already asked for material for {_card_label(first)}, {why}"}
 
-    # ── qty change + SO sync (computed against current, before structural ops)
-    base_kg = wip_rows[0]["planned_qty_kg"] if wip_rows else pkg_row["planned_qty_kg"]
-    base_units = wip_rows[0]["planned_qty_units"] if wip_rows else pkg_row["planned_qty_units"]
-    cur_kg = float(base_kg) if base_kg is not None else 0.0
-    cur_units = float(base_units) if base_units is not None else None
+    # ── floors this edit touches, checked before anything is written ──────
+    gate = floor_gate or FloorGate()
+    touched: list[str | None] = [existing_by_id[jid]["floor"] for jid in removed_ids]
+    unknown: list[str] = []
+    finished_moved: list = []
+
+    def _settle_floor(sent, card):
+        """The floor to store for one row: the card's own when it is unchanged
+        (blank, or the same ignoring case), else the declared spelling — touching
+        it and the floor the card leaves. A finished card can't move."""
+        name = str(sent or "").strip()
+        if card is not None and (not name or normalise_floor(name) == normalise_floor(card["floor"])):
+            return card["floor"]
+        if card is not None and card["status"] in _LIVE_TERMINAL:
+            finished_moved.append(card)
+            return card["floor"]
+        spelled = gate.spell(name)
+        if spelled is None:
+            unknown.append(name)
+            return name
+        touched.extend([spelled] + ([card["floor"]] if card is not None else []))
+        return spelled or None
+
+    floor_for: dict[int, str | None] = {}
+    new_floor_at: dict[int, str | None] = {}
+    for pos, s in enumerate(submitted):
+        card = existing_by_id.get(s.get("job_card_id")) if s.get("job_card_id") else None
+        floor = _settle_floor(s.get("floor"), card)
+        if card is not None:
+            floor_for[card["job_card_id"]] = floor
+        else:
+            new_floor_at[pos] = floor
+    pkg_floor_to = _settle_floor(pkg_floor, pkg_row)
+    if finished_moved:
+        r = finished_moved[0]
+        return {"error": "card_finished", "job_card_id": r["job_card_id"],
+                "message": (f"{_card_label(r)} is {r['status']}, so it stays on {r['floor']}. "
+                            "Put its floor back to save the other changes.")}
+    if unknown:
+        return gate.unknown(list(dict.fromkeys(unknown)))
+    refusal = gate.refusal(touched)
+    if refusal:
+        return refusal
+
+    # ── qty: the chain's own, the change, and what the plan line becomes ───
+    qty_row = _chain_qty_row(rows)
+    cur_kg = float(qty_row["planned_qty_kg"]) if qty_row["planned_qty_kg"] is not None else 0.0
+    cur_units = float(qty_row["planned_qty_units"]) if qty_row["planned_qty_units"] is not None else None
     try:
         new_kg = float(qty_kg)
     except (TypeError, ValueError):
@@ -2284,10 +2695,50 @@ async def apply_live_job_card_edits(
         except (TypeError, ValueError):
             eff_units = None
 
+    # NUMERIC(…,3) columns: a change below one step is no change.
+    delta_kg = round(new_kg - cur_kg, 3)
+    delta_units = round((eff_units if eff_units is not None else (cur_units or 0)) - (cur_units or 0), 3)
+    qty_changed = abs(delta_kg) >= 0.0005 or abs(delta_units) >= 0.0005
+    if qty_changed:
+        if all(r["status"] in _LIVE_TERMINAL for r in rows):
+            return {"error": "chain_finished",
+                    "message": (f"Every stage of {article} has finished, so its quantity can't "
+                                "change now. Plan any more of it as a new job card.")}
+        # The line moves by the chain's change, never to the chain's qty: on a
+        # part chain (225 of a 450 kg line) setting it to 230 made the other 220 kg
+        # vanish from the plan while the SO still held them.
+        line_kg = round(float(line["planned_qty_kg"] or 0) + delta_kg, 3)
+        line_units = round(float(line["planned_qty_units"] or 0) + delta_units, 3)
+        if line_kg <= 0 or (abs(delta_units) >= 0.0005 and line_units <= 0):
+            return {"error": "invalid_qty",
+                    "message": (f"{article} is planned at {float(line['planned_qty_kg'] or 0):g} kg "
+                                f"/ {float(line['planned_qty_units'] or 0):g} units; this change "
+                                "would take it to nothing. Enter a smaller change.")}
+
+    # ── ADD numbers past every one the line ever used (cancelled cards too) ──
+    add_no = 0
+    if any(not s.get("job_card_id") for s in submitted):
+        add_no = next_add_no([r["job_card_number"] for r in await conn.fetch(
+            "SELECT job_card_number FROM job_card_v2 WHERE plan_line_id = $1", plan_line_id,
+        )])
+
+    # The chain's first card before the edit: BOM changes are stored against it,
+    # and removing stage 1 or adding a step in front of it gives the chain a new
+    # one (spec 2i -- the changes carry over, see after the relink).
+    old_heads = await jc_bom_changes.chain_heads(conn, [r["job_card_id"] for r in rows])
+
+    # ════ write: nothing below refuses (the removal backstop raises) ═════
+    audit: list[tuple] = []   # (action, job_card_id, before, after, reason)
+
+    # ── qty change + SO sync (computed against current, before structural ops)
     so_sync = {"synced": False}
-    delta_kg = new_kg - cur_kg
-    delta_units = ((eff_units if eff_units is not None else (cur_units or 0)) - (cur_units or 0))
-    if abs(delta_kg) > 1e-9 or abs(delta_units) > 1e-9:
+    if qty_changed:
+        # The SO first: an increase it has no room for raises OverAllocation (a
+        # ValueError) before this edit has written anything.
+        so_sync = await sync_so_from_qty_delta(
+            conn, plan_line_id, delta_kg=delta_kg, delta_units=delta_units,
+            user=actor, reason=f"Live job-card edit (line {plan_line_id})",
+        )
         await conn.execute(
             """UPDATE job_card_v2
                   SET planned_qty_kg=$1,
@@ -2299,14 +2750,10 @@ async def apply_live_job_card_edits(
         )
         await conn.execute(
             """UPDATE production_plan_line_v2
-                  SET planned_qty_kg=$1,
-                      planned_qty_units=COALESCE($2, planned_qty_units)
-                WHERE plan_line_id=$3""",
-            new_kg, eff_units, plan_line_id,
-        )
-        so_sync = await sync_so_from_qty_delta(
-            conn, plan_line_id, delta_kg=delta_kg, delta_units=delta_units,
-            user=actor, reason=f"Live job-card edit (line {plan_line_id})",
+                  SET planned_qty_kg = planned_qty_kg + $1,
+                      planned_qty_units = planned_qty_units + $2
+                WHERE plan_line_id = $3""",
+            delta_kg, delta_units, plan_line_id,
         )
         audit.append(("qty_change", None,
                       {"qty_kg": cur_kg, "qty_units": cur_units},
@@ -2317,20 +2764,14 @@ async def apply_live_job_card_edits(
         rsn = remove_reasons.get(jid) or remove_reasons.get(str(jid)) or "Removed via live edit"
         res = await _force_record_and_cancel_jc(
             conn, job_card_id=jid, reason=rsn, deleted_by=actor)
-        if res.get("error"):
-            return res
+        # Checked above on the locked rows, so this can't refuse; if it did, it
+        # follows the qty / SO writes — raised, so they roll back with it.
+        raise_if_refused(res)
         audit.append(("remove_process", jid, res.get("snapshot"), None, rsn))
 
     # ── additions: create new WIP JCs (locked/awaiting) in the un-started tail
-    meta = await conn.fetchrow(
-        """SELECT l.bom_id, l.fg_sku_name, l.customer_name, p.entity, p.warehouse
-           FROM production_plan_line_v2 l
-           JOIN production_plan_v2 p ON p.plan_id = l.plan_id
-           WHERE l.plan_line_id = $1""",
-        plan_line_id,
-    )
-    factory, entity = meta["warehouse"], meta["entity"]
-    fg_sku_name, customer_name, bom_id = meta["fg_sku_name"], meta["customer_name"], meta["bom_id"]
+    factory, entity = line["warehouse"], line["entity"]
+    fg_sku_name, customer_name, bom_id = line["fg_sku_name"], line["customer_name"], line["bom_id"]
 
     # New steps are inserted at a temporary high step_order (above every current
     # order on the line) so the INSERT can't collide with an existing survivor's
@@ -2353,7 +2794,7 @@ async def apply_live_job_card_edits(
             continue
         proc = (s.get("process") or "").strip() or "WIP"
         stage = proc.lower().replace(" ", "_") or "wip"
-        floor = (s.get("floor") or "").strip() or None
+        floor = new_floor_at.get(pos)
 
         async def _ins_step(_p=proc, _st=stage, _fl=floor, _ord=step_order_base + 1 + pos):
             return await conn.fetchval(
@@ -2364,7 +2805,8 @@ async def apply_live_job_card_edits(
             )
         new_step_id = await insert_with_pk_retry(conn, _ins_step)
 
-        async def _ins_jc(_sid=new_step_id, _p=proc, _st=stage, _fl=floor, _ord=pos + 1):
+        async def _ins_jc(_sid=new_step_id, _p=proc, _st=stage, _fl=floor, _ord=pos + 1,
+                          _num=f"PLAN-{plan_id}-L{plan_line_id}-ADD{add_no + len(created_ids)}"):
             return await conn.fetchval(
                 """INSERT INTO job_card_v2 (
                        job_card_id, job_card_number, plan_id, plan_line_id, plan_step_id, bom_id,
@@ -2374,7 +2816,7 @@ async def apply_live_job_card_edits(
                    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'KGS','SFG','WIP',
                              $15,$16,$17,TRUE,'awaiting_previous_stage','locked')
                    RETURNING job_card_id""",
-                new_short_time_id(), f"PLAN-{plan_id}-L{plan_line_id}-ADD{_ord}",
+                new_short_time_id(), _num,
                 plan_id, plan_line_id, _sid, bom_id,
                 _ord, _p, _st, fg_sku_name, customer_name,
                 _batch_number(plan_id, plan_line_id, _ord),
@@ -2386,14 +2828,13 @@ async def apply_live_job_card_edits(
         step_for[new_jc_id] = s
         audit.append(("add_process", new_jc_id, None, {"process": proc, "floor": floor}, None))
 
-    if not final_wip_ids:
-        return {"error": "no_wip_steps", "message": "At least one WIP process is required"}
-
     # ── relink the surviving + new chain (WIP order) + packaging ──────────
+    # No WIP left is a one-card chain: its card is both first and last.
     full_chain = final_wip_ids + [pkg_row["job_card_id"]]
     n = len(full_chain)
     chain_rows = await conn.fetch(
-        """SELECT job_card_id, status, floor, process_name, stage, output_code, plan_step_id
+        """SELECT job_card_id, status, locked_reason, floor, process_name, stage, output_code,
+                  plan_step_id
            FROM job_card_v2 WHERE job_card_id = ANY($1)""",
         full_chain,
     )
@@ -2409,7 +2850,7 @@ async def apply_live_job_card_edits(
         started = r["status"] not in EDITABLE       # started or terminal → preserve seam
 
         if is_last:
-            desired_floor = (str(pkg_floor).strip() if pkg_floor else None) or r["floor"]
+            desired_floor = pkg_floor_to or r["floor"]
             # Allow renaming the terminal step (e.g. a merged "Sorting + Packing")
             # while keeping its packaging stage. Started/terminal cards preserve
             # their process below regardless (real material flow is untouched).
@@ -2418,7 +2859,9 @@ async def apply_live_job_card_edits(
             sfg_out = None
         else:
             s = step_for[jid]
-            desired_floor = ((s.get("floor") or "").strip() or None) or r["floor"]
+            # Settled before the first write (_settle_floor); an added card was
+            # inserted on its floor already.
+            desired_floor = floor_for.get(jid) or r["floor"]
             desired_proc = (s.get("process") or "").strip() or r["process_name"]
             desired_stage = (desired_proc or "").strip().lower().replace(" ", "_") or "wip"
             sfg_out = (s.get("sfg_output") or "").strip() or None
@@ -2473,6 +2916,27 @@ async def apply_live_job_card_edits(
         await jc_bom_changes.repoint_after_rebuild(
             conn, plan_line_id=plan_line_id, new_head=full_chain[0], old_heads=old_heads)
 
+    # The RM / PM list is written for the first card only, when it is created
+    # (_materialise_indents). While nothing has been drawn on the first card
+    # (locked / unlocked / assigned), a new one (stage 1 removed, a step added in
+    # front) or a new qty gets the list again at the qty this edit settled; an
+    # old first card staying on as a later stage loses its list, and a removed
+    # one keeps it (its cancelled record). A started first card keeps its list
+    # as it is. Only consumption points at indent rows (ON DELETE SET NULL), and
+    # a card nothing was drawn on has none.
+    head_id, old_head_id = full_chain[0], first["job_card_id"]
+    if by_id[head_id]["status"] in UNDRAWN and (qty_changed or head_id != old_head_id):
+        stale = [head_id] + ([old_head_id] if old_head_id != head_id and old_head_id in by_id
+                             and by_id[old_head_id]["status"] in UNDRAWN else [])
+        await conn.execute("DELETE FROM job_card_rm_indent_v2 WHERE job_card_id = ANY($1::bigint[])", stale)
+        await conn.execute("DELETE FROM job_card_pm_indent_v2 WHERE job_card_id = ANY($1::bigint[])", stale)
+        await _materialise_indents(
+            conn, job_card_id=head_id, bom_id=bom_id,
+            planned_qty_kg=new_kg if qty_changed else cur_kg, is_first_stage=True,
+            fg_sku_name=fg_sku_name,
+            planned_qty_units=eff_units if eff_units is not None else cur_units,
+        )
+
     # ── renumber plan_step.step_order: two-pass park→final so the DEFERRABLE
     # INITIALLY IMMEDIATE uq_pps_v2_line_order never sees a duplicate. Pass 1
     # parks EVERY step on the line (incl. removed ones) above the current max;
@@ -2499,8 +2963,17 @@ async def apply_live_job_card_edits(
 
     # If the previously-running stage was removed, the new head may be a locked
     # card with nothing upstream to release it — unlock it so work can resume.
-    head_id = full_chain[0]
     unlocked_head = await _unlock_new_head(conn, head_id, by_id[head_id]["status"])
+    unlocked_ids = [unlocked_head] if unlocked_head else []
+    # A card waiting for the stage before whose new previous stage has finished
+    # (the stage between was removed) is released, as _join_chain_around does
+    # after a cancel or a stop: otherwise it waited on a stage that dispatches no
+    # more. Close still sends that stage's remaining output on to it.
+    for prev_id, jid in zip(full_chain, full_chain[1:]):
+        r = by_id[jid]
+        if (r["status"] == 'locked' and r["locked_reason"] == 'awaiting_previous_stage'
+                and by_id[prev_id]["status"] in ('completed', 'closed')):
+            unlocked_ids.append(await _unlock_new_head(conn, jid, r["status"]))
 
     # ── audit log ─────────────────────────────────────────────────────────
     for action, jid, before, after, rsn in audit:
@@ -2524,8 +2997,9 @@ async def apply_live_job_card_edits(
         # Named apart from the chain so the route can tell a card this edit created
         # from one it merely moved — only the new ones earn a floor notice.
         "created_job_card_ids": created_ids,
-        # A locked card this edit made the head and released — it earns the unlock notice.
-        "unlocked_job_card_ids": [unlocked_head] if unlocked_head else [],
+        # Locked cards this edit released (the new head, or a card after a finished
+        # stage) — they earn the unlock notice.
+        "unlocked_job_card_ids": unlocked_ids,
         "removed": len(removed_ids),
         "added": sum(1 for a in audit if a[0] == 'add_process'),
         "floors_changed": sum(1 for a in audit if a[0] == 'floor_change'),
@@ -3558,6 +4032,95 @@ async def materialise_wip_dispatch(conn, *, producer_job_card_id: int,
     return wip_batch_id
 
 
+# ---------------------------------------------------------------------------
+# What a stage has left to send on
+# ---------------------------------------------------------------------------
+
+# Output and dispatch kg are kept to the gram, so two figures within half a gram
+# are the same figure (fg_from_boxes compares box kg by the same rule). The
+# dispatch cap, the send-on at complete / close / stop, Distribute and the job
+# card's remaining_to_send_kg all use it; they used 0.000001, 0.001 and 0.05 kg.
+SEND_ON_EPS_KG = SAME_KG
+
+_PRODUCED_SQL = ("SELECT COALESCE(SUM(output_qty_kg), 0) FROM job_card_output_v2 "
+                 "WHERE job_card_id=$1 AND deleted_at IS NULL")
+
+
+def kg_left_to_send(produced, dispatched) -> float:
+    """What a stage produced but hasn't sent on, to the gram; 0.0 when that is
+    nothing (or less) within SEND_ON_EPS_KG."""
+    left = round(float(produced or 0) - float(dispatched or 0), 3)
+    return left if left > SEND_ON_EPS_KG else 0.0
+
+
+async def produced_kg(conn, job_card_id: int) -> float:
+    """The card's recorded output: its live output rows (one per batch), open
+    batches included — what was saved on them was made."""
+    return float(await conn.fetchval(_PRODUCED_SQL, job_card_id) or 0)
+
+
+async def output_of_other_batches_kg(conn, job_card_id: int, batch_id: int | None) -> float:
+    """The card's recorded output leaving out this batch's row."""
+    return float(await conn.fetchval(
+        "SELECT COALESCE(SUM(output_qty_kg), 0) FROM job_card_output_v2 "
+        "WHERE job_card_id = $1 AND deleted_at IS NULL "
+        "AND COALESCE(batch_id, 0) <> COALESCE($2::bigint, 0)",
+        job_card_id, batch_id,
+    ) or 0)
+
+
+def output_below_dispatched_refusal(job_card_id: int, *, dispatched, other_kg,
+                                    batch_kg) -> dict | None:
+    """Refusal for a batch output of `batch_kg` that would leave the card's total
+    (`other_kg` from its other batches plus this one) below what it has already
+    sent on: the next card's carried kg and WIP stock would stay too high."""
+    sent = round(float(dispatched or 0), 3)
+    other = round(float(other_kg or 0), 3)
+    total = round(other + float(batch_kg or 0), 3)
+    if total >= sent - SEND_ON_EPS_KG:
+        return None
+    least = round(sent - other, 3)
+    return {
+        "error": "output_below_dispatched",
+        "dispatched_kg": sent, "output_kg": total, "least_batch_kg": least,
+        "message": (f"Job card {job_card_id} has already sent {sent:.3f} kg on to the next "
+                    f"stage, so its output can't go down to {total:.3f} kg. Enter at least "
+                    f"{least:.3f} kg for this batch."),
+    }
+
+
+# The card's box lock, the first lock close_batch and the box writes take on a card.
+_CARD_BOX_LOCK_SQL = "SELECT pg_advisory_xact_lock($1)"
+_DISPATCHED_FOR_UPDATE_SQL = (
+    "SELECT dispatched_to_next_kg FROM job_card_v2 WHERE job_card_id = $1 FOR UPDATE")
+
+
+async def output_below_dispatched(conn, *, job_card_id: int, batch_id: int | None,
+                                  output_qty_kg, dispatched=None) -> dict | None:
+    """output_below_dispatched_refusal for saving `output_qty_kg` on this batch.
+    `dispatched` is the card's dispatched_to_next_kg when the caller has read it
+    under the card's FOR UPDATE. Callers run it before their first write.
+
+    Reading it here locks the card first: its box lock, then the card row FOR
+    UPDATE — the order close_batch takes them (box lock, batch, card), so a Save
+    Output that goes on to complete its batch can't deadlock with a batch close
+    or a box write on the card. A dispatch (dispatch_to_next and close_batch's
+    auto-send lock the card row too) then waits for this save and sums the new
+    output, and a save after a dispatch sees what it sent; unlocked, both could
+    pass and leave the card having sent more than it made.
+    """
+    if output_qty_kg is None:
+        return None
+    if dispatched is None:
+        await conn.execute(_CARD_BOX_LOCK_SQL, job_card_id)
+        dispatched = await conn.fetchval(_DISPATCHED_FOR_UPDATE_SQL, job_card_id)
+    if dispatched is None or float(dispatched) <= SEND_ON_EPS_KG:
+        return None                     # nothing sent on yet: any output stands
+    other = await output_of_other_batches_kg(conn, job_card_id, batch_id)
+    return output_below_dispatched_refusal(job_card_id, dispatched=dispatched,
+                                           other_kg=other, batch_kg=output_qty_kg)
+
+
 async def dispatch_to_next(conn, *, job_card_id: int, qty_kg: float,
                            qty_units: float | None = None,
                            dispatched_by: str | None = None,
@@ -3571,7 +4134,12 @@ async def dispatch_to_next(conn, *, job_card_id: int, qty_kg: float,
         4. If the next JC is locked with reason='awaiting_previous_stage',
            unlock it (status='unlocked', is_locked=false, locked_reason=NULL)
            so the downstream floor can start work on the received material.
+
+    Capped at the card's recorded output minus what it already sent on
+    (kg_left_to_send), always: with no output saved there is nothing to send.
     """
+    # To the gram, as it is stored, so the cap below judges the stored figure.
+    qty_kg = round(float(qty_kg or 0), 3)
     if qty_kg <= 0:
         return {"error": "invalid_qty", "message": "qty_kg must be > 0"}
 
@@ -3602,17 +4170,26 @@ async def dispatch_to_next(conn, *, job_card_id: int, qty_kg: float,
     if (src["status"] or "") in ('closed', 'cancelled'):
         return {"error": "jc_terminal",
                 "message": f"Cannot dispatch from a {src['status']} job card"}
-    produced = float(await conn.fetchval(
-        "SELECT COALESCE(SUM(output_qty_kg), 0) FROM job_card_output_v2 "
-        "WHERE job_card_id=$1 AND deleted_at IS NULL",
-        job_card_id,
-    ) or 0)
+    produced = await produced_kg(conn, job_card_id)
     already = float(src["dispatched_to_next_kg"] or 0)
-    if produced > 0 and already + qty_kg > produced + 1e-6:
-        return {"error": "over_dispatch",
-                "message": (f"Dispatching {qty_kg} would exceed produced output: "
-                            f"{already} already dispatched of {produced} produced."),
-                "produced_kg": produced, "already_dispatched_kg": already}
+    # The cap used to apply only once output existed, so a dispatch before the
+    # first save minted WIP stock that was never made.
+    if produced <= SEND_ON_EPS_KG:
+        return {"error": "no_output",
+                "message": (f"Job card {job_card_id} has no output saved yet. Save this "
+                            "stage's output before dispatching it to the next stage.")}
+    left = kg_left_to_send(produced, already)
+    if qty_kg > left + SEND_ON_EPS_KG:
+        if left <= 0:
+            msg = (f"Everything job card {job_card_id} made ({produced:.3f} kg) has already "
+                   "been sent on to the next stage. Save more output before dispatching again.")
+        else:
+            msg = (f"Only {left:.3f} kg of job card {job_card_id}'s output is left to send on "
+                   f"({already:.3f} kg of the {produced:.3f} kg made has already gone), so "
+                   f"{qty_kg:.3f} kg can't be dispatched. Dispatch {left:.3f} kg or less.")
+        return {"error": "over_dispatch", "message": msg,
+                "produced_kg": produced, "already_dispatched_kg": already,
+                "remaining_kg": left}
     # The next stage must still be live: a cancelled one used to receive the
     # material (and its WIP stock) with nowhere for it to go.
     nxt = await conn.fetchrow(
@@ -3778,12 +4355,8 @@ async def dispatch_process_group(conn, *, process_job_card_id: int,
     if (src["status"] or "") == 'cancelled':
         return {"error": "jc_terminal", "message": "Process card is cancelled."}
 
-    produced = float(await conn.fetchval(
-        "SELECT COALESCE(SUM(output_qty_kg),0) FROM job_card_output_v2 "
-        "WHERE job_card_id=$1 AND deleted_at IS NULL",
-        process_job_card_id,
-    ) or 0)
-    if produced <= 0:
+    produced = await produced_kg(conn, process_job_card_id)
+    if produced <= SEND_ON_EPS_KG:
         return {"error": "no_output",
                 "message": "Record the process output before distributing to packaging."}
 
@@ -3806,8 +4379,8 @@ async def dispatch_process_group(conn, *, process_job_card_id: int,
     # old rule fed each member once, capped at its plan, so output above the plan
     # never moved and the card could never close (audit 2026-10-23).
     already = float(src["dispatched_to_next_kg"] or 0)
-    budget  = round(max(0.0, produced - already), 3)
-    if budget < 0.001:
+    budget  = kg_left_to_send(produced, already)
+    if budget <= 0:
         return {"error": "nothing_to_distribute",
                 "message": "Everything this card produced has already been sent to packaging."}
     sent_rows = await conn.fetch(
@@ -3948,12 +4521,22 @@ async def record_output(conn, *, job_card_id: int,
     rm_consumed_kg = calc["rm_consumed_kg"]
     yield_pct = calc["yield_pct"]
 
+    # FOR UPDATE: the check below and the save can't interleave with a dispatch
+    # (output_below_dispatched). /outputs has taken this lock already, after the
+    # card's box lock.
     jc = await conn.fetchrow(
-        "SELECT job_card_id, output_kind FROM job_card_v2 WHERE job_card_id=$1 AND deleted_at IS NULL",
+        "SELECT job_card_id, output_kind, dispatched_to_next_kg FROM job_card_v2 "
+        "WHERE job_card_id=$1 AND deleted_at IS NULL FOR UPDATE",
         job_card_id,
     )
     if not jc:
         return {"error": "job_card_not_found"}
+    # A re-save can't take the card's output below what it already sent on.
+    below = await output_below_dispatched(conn, job_card_id=job_card_id, batch_id=batch_id,
+                                          output_qty_kg=output_qty_kg,
+                                          dispatched=jc["dispatched_to_next_kg"])
+    if below is not None:
+        return below
 
     kind = output_kind or jc["output_kind"]
 
@@ -4532,11 +5115,9 @@ async def complete_job_card(conn, *, job_card_id: int,
     An open shift segment is ended here (as the Stop button would) rather
     than refusing — the web has no shift controls, so it blocked people.
 
-    NOTE: v2 does NOT auto-unlock the next stage on complete. The dispatch
-    flow (POST /dispatch-to-next) handles that — handing off material to
-    the downstream JC is what makes "I finished" actionable downstream.
-    Calling complete without dispatching means "I'm done at this stage
-    but no material has flowed yet"; the next stage stays locked.
+    What this stage produced but hasn't dispatched is sent on to the next
+    stage when it completes (send_on_remaining_output, agreed 2026-10-24),
+    which unlocks a next stage still waiting for it.
     """
     jc = await conn.fetchrow(
         """
@@ -4981,6 +5562,19 @@ _CARD_FOR_CANCEL_SQL = """
     WHERE  job_card_id = $1 AND deleted_at IS NULL
 """
 
+# The stage before a card, locked before the card itself (then the card, then
+# the next): the step order dispatch takes them in. A Save Output on the stage
+# before holds that card and then dispatches into this one; a stop or cancel
+# that held this card and then joined the chain (UPDATE of the stage before)
+# deadlocked with it. A cancelled stage before isn't touched by the join.
+_PREV_CARD_LOCK_SQL = """
+    SELECT p.job_card_id
+    FROM   job_card_v2 p
+    WHERE  p.job_card_id = (SELECT c.prev_job_card_id FROM job_card_v2 c WHERE c.job_card_id = $1)
+      AND  p.deleted_at IS NULL
+    FOR    UPDATE
+"""
+
 
 async def _cancel_refusal(conn, card) -> dict | None:
     """Why this stage can't be cancelled / stopped on its own, or None.
@@ -5074,7 +5668,9 @@ async def cancel_job_card(conn, *, job_card_id: int,
     if not reason or not reason.strip():
         return {"error": "missing_reason", "message": "reason is required"}
 
-    jc = await conn.fetchrow(_CARD_FOR_CANCEL_SQL, job_card_id)
+    # The stage before, then this card (step order, _PREV_CARD_LOCK_SQL).
+    await conn.execute(_PREV_CARD_LOCK_SQL, job_card_id)
+    jc = await conn.fetchrow(_CARD_FOR_CANCEL_SQL + " FOR UPDATE", job_card_id)
     if not jc:
         return {"error": "job_card_not_found"}
     if jc["status"] not in ('locked', 'unlocked', 'assigned', 'material_received'):
@@ -5150,7 +5746,9 @@ async def stop_job_card(conn, *, job_card_id: int,
     # operators racing the button can't both pass the status check and
     # overwrite each other's cancellation_reason. asyncpg passes the
     # row-lock through the wrapping conn.transaction(); the lock releases
-    # when the txn commits/rolls back at the router layer.
+    # when the txn commits/rolls back at the router layer. The stage before
+    # is locked first (step order, _PREV_CARD_LOCK_SQL).
+    await conn.execute(_PREV_CARD_LOCK_SQL, job_card_id)
     jc = await conn.fetchrow(_CARD_FOR_CANCEL_SQL + " FOR UPDATE", job_card_id)
     if not jc:
         return {"error": "job_card_not_found"}
@@ -5166,20 +5764,14 @@ async def stop_job_card(conn, *, job_card_id: int,
         return refusal
 
     # What this stage produced but hasn't dispatched goes on to the next stage
-    # before the stage is cancelled (it can't be dispatched afterwards).
-    released: int | None = None
-    if jc["next_job_card_id"] is not None:
-        produced = float(await conn.fetchval(
-            "SELECT COALESCE(SUM(output_qty_kg), 0) FROM job_card_output_v2 "
-            "WHERE job_card_id = $1 AND deleted_at IS NULL",
-            job_card_id,
-        ) or 0)
-        left = round(produced - float(jc["dispatched_to_next_kg"] or 0), 3)
-        if left >= 0.001:
-            sent = await dispatch_to_next(conn, job_card_id=job_card_id, qty_kg=left,
-                                          dispatched_by=stopped_by,
-                                          notes="Sent on when the stage was stopped")
-            released = sent.get("unlocked_job_card_id")
+    # before the stage is cancelled (it can't be dispatched afterwards) — output
+    # saved on the open batch too: it was made, though the batch is cancelled
+    # below. A refused send doesn't stop the stop; the reply says what happened
+    # (`sent_on`).
+    sent_on = await send_on_remaining_output(
+        conn, job_card_id, sent_by=stopped_by, why="Sent on when the stage was stopped",
+        card=jc)
+    released: int | None = next(iter((sent_on or {}).get("unlocked_job_card_ids") or []), None)
 
     # Close any open shift segment so the partial-unique index
     # uq_jcsl_v2_one_open doesn't leave a dangling open row that future
@@ -5233,7 +5825,8 @@ async def stop_job_card(conn, *, job_card_id: int,
         job_card_id, stopped_by, reason.strip(), prefix,
     )
     released = await _join_chain_around(conn, jc) or released
-    return {"stopped": True, "job_card": _serialize(row), "unlocked_job_card_id": released}
+    return {"stopped": True, "job_card": _serialize(row), "unlocked_job_card_id": released,
+            "sent_on": sent_on}
 
 
 # ---------------------------------------------------------------------------
@@ -5267,30 +5860,31 @@ def missing_sign_offs_message(missing) -> str:
 
 
 async def send_on_remaining_output(conn, job_card_id: int, *, sent_by: str | None,
-                                   why: str) -> dict | None:
+                                   why: str, card=None) -> dict | None:
     """Send what this stage produced but hasn't dispatched on to the next stage
     (agreed 2026-10-24). Completing / closing used to only change the status, so a
     stage finished without a Dispatch left the next one locked for good. A merged
     run's process card (no next card) shares it across its packaging cards.
 
+    `card` is the caller's row of this card (next_job_card_id, output_kind,
+    dispatched_to_next_kg, process_group_id), already read FOR UPDATE; without it
+    the row is read and locked here, so the kg left is worked out under the lock.
+
     None when there's nothing to send or nowhere to send it. A refused send (e.g.
     the next stage was cancelled) is returned as-is with no unlocks, and does not
     block the completion. Always `unlocked_job_card_ids` otherwise.
     """
-    card = await conn.fetchrow(
-        "SELECT next_job_card_id, output_kind, dispatched_to_next_kg, process_group_id "
-        "FROM job_card_v2 WHERE job_card_id = $1 AND deleted_at IS NULL",
-        job_card_id,
-    )
+    if card is None:
+        card = await conn.fetchrow(
+            "SELECT next_job_card_id, output_kind, dispatched_to_next_kg, process_group_id "
+            "FROM job_card_v2 WHERE job_card_id = $1 AND deleted_at IS NULL FOR UPDATE",
+            job_card_id,
+        )
     if card is None or (card["output_kind"] or "").upper() == 'FG':
         return None
-    produced = float(await conn.fetchval(
-        "SELECT COALESCE(SUM(output_qty_kg), 0) FROM job_card_output_v2 "
-        "WHERE job_card_id = $1 AND deleted_at IS NULL",
-        job_card_id,
-    ) or 0)
-    left = round(produced - float(card["dispatched_to_next_kg"] or 0), 3)
-    if left < 0.001:
+    produced = await produced_kg(conn, job_card_id)
+    left = kg_left_to_send(produced, card["dispatched_to_next_kg"])
+    if left <= 0:
         return None
     if card["next_job_card_id"] is not None:
         sent = await dispatch_to_next(conn, job_card_id=job_card_id, qty_kg=left,
@@ -5311,20 +5905,28 @@ async def close_job_card(conn, *, job_card_id: int,
                          allow_partial: bool = False,
                          closed_by: str | None = None) -> dict:
     """Transition a v2 JC to status='closed'. Refuses when:
+        - the JC is already closed or cancelled
+        - the JC is not completed (COMPLETE's open-batch and balance gates
+          must have run; this used to close straight from in_progress)
+        - a batch is still open (open_batch)
         - any required sign-off role is missing
         - any open shift segment exists
-        - the JC is already closed or cancelled
 
     `allow_partial` skips the sign-off check (admin override). Use sparingly.
+    It does not skip the completed check.
 
     After a successful close, the caller should run maybe_close_plan_from_jcs
     to roll up plan status. (Endpoint wrapper handles that.)
     """
+    # FOR UPDATE before the status check: two closes (or a close and a
+    # dispatch) can't both work out the send-on from the same figures.
     jc = await conn.fetchrow(
         """
-        SELECT job_card_id, status, plan_id
+        SELECT job_card_id, status, plan_id, next_job_card_id, output_kind,
+               dispatched_to_next_kg, process_group_id
         FROM   job_card_v2
         WHERE  job_card_id=$1 AND deleted_at IS NULL
+        FOR    UPDATE
         """,
         job_card_id,
     )
@@ -5332,6 +5934,30 @@ async def close_job_card(conn, *, job_card_id: int,
         return {"error": "job_card_not_found"}
     if jc["status"] in ('closed', 'cancelled'):
         return {"error": "terminal_state", "current_status": jc["status"]}
+    if jc["status"] != 'completed':
+        now = (jc["status"] or "not started").replace("_", " ")
+        return {"error": "not_completed", "current_status": jc["status"],
+                "message": (f"Complete this job card before closing it: job card "
+                            f"{job_card_id} is still {now}.")}
+    # A batch left open (an admin's added batch, or one from before R13): once
+    # the card is closed it can be neither completed nor, holding output,
+    # cancelled, so it would stay open for good. POST .../batches/{id}/cancel
+    # (Cancel batch on the Accounting tab) takes one with no output, dispatch,
+    # shift time or boxes on it. The batch is named as that tab names it: its
+    # typed label, else its 8-digit code.
+    open_batch = await conn.fetchrow(
+        "SELECT batch_id, batch_number, "
+        "COALESCE(NULLIF(btrim(batch_label), ''), batch_id::text) AS name "
+        "FROM job_card_batch_v2 "
+        "WHERE job_card_id = $1 AND status = 'open' ORDER BY batch_number LIMIT 1",
+        job_card_id,
+    )
+    if open_batch:
+        return {"error": "open_batch", "batch_id": open_batch["batch_id"],
+                "batch_number": open_batch["batch_number"],
+                "message": (f"Batch {open_batch['name']} is still open. Complete it, or use "
+                            "Cancel batch on the job card's Accounting tab if nothing has been "
+                            "recorded on it yet, before closing this job card.")}
 
     # Block close while a shift is still open — closing while clock is
     # running would make total_time_min permanently wrong.
@@ -5358,7 +5984,7 @@ async def close_job_card(conn, *, job_card_id: int,
     # can't dispatch any more (agreed 2026-10-24).
     sent_on = await send_on_remaining_output(
         conn, job_card_id, sent_by=closed_by,
-        why="Sent on automatically when the stage was closed")
+        why="Sent on automatically when the stage was closed", card=jc)
 
     closed = await conn.fetchrow(
         """
@@ -5892,9 +6518,17 @@ async def get_job_card(conn, job_card_id: int) -> dict | None:
         section_2a_rm_indent, section_2b_pm_indent,
     )
 
+    # What this stage still has to send on, by the rule the dispatch cap and the
+    # send-on at complete / close use, so screens don't keep a threshold of their
+    # own. outputs holds every live output row, as produced_kg sums them. The last
+    # (FG) stage sends nothing on.
+    remaining_to_send = 0.0 if (h.get("output_kind") or "").upper() == 'FG' else kg_left_to_send(
+        sum(_accf(r["output_qty_kg"]) for r in outputs), h.get("dispatched_to_next_kg"))
+
     return {
         # v2 native shape
         **h,
+        "remaining_to_send_kg": remaining_to_send,
         "shift_log":  shifts,
         "outputs":    [_serialize(r) for r in outputs],
         "rm_indents":        section_2a_rm_indent,

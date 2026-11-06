@@ -27,8 +27,11 @@ from app.modules.production.services import job_card_notify
 from app.modules.production.services import job_card_unlock_notify
 from app.core.sites import scope_keys
 from app.core.warehouse_scope import (
-    FLOOR_NORM_SQL, WAREHOUSE_NORM_ANY_SQL, floor_scope_values, user_has_floor, user_has_warehouse,
+    FLOOR_NORM_SQL, WAREHOUSE_NORM_ANY_SQL, floor_scope_values, normalise_floor,
+    user_has_floor, user_has_warehouse,
 )
+# Which floors a chain change touches and who may touch them (decided 2026-10-27).
+from app.modules.production.services.chain_floors import FloorGate
 
 logger = logging.getLogger(__name__)
 
@@ -3468,10 +3471,18 @@ async def day_end_summary(
 async def day_end_dispatch(request: Request, body: BulkDispatchRequest, user: AuthUser = Depends(require_permission("production", "day_end", "dispatch", action="create"))):
     """Bulk update dispatch quantities for completed job cards."""
     from app.modules.production.services.day_end import bulk_dispatch
+    from app.modules.production.services.refusals import (
+        ServiceRefusal, raise_if_refused, to_http,
+    )
     pool = request.app.state.db_pool
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            return await bulk_dispatch(conn, [d.model_dump() for d in body.dispatches], body.entity)
+    try:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                return raise_if_refused(await bulk_dispatch(
+                    conn, [d.model_dump() for d in body.dispatches], body.entity))
+    except ServiceRefusal as refusal:
+        # A card with no output, or a qty above it: refused before any write.
+        raise to_http(refusal)
 
 
 # ---------------------------------------------------------------------------
@@ -4908,6 +4919,21 @@ async def split_plan_v2(
     return result
 
 
+def _refuse_outside_warehouse(user, warehouse: str | None, *, what: str = "plan") -> None:
+    """403 for a non-admin acting on a plan (or card) outside their assigned factories."""
+    if getattr(user, "is_admin", False) or not getattr(user, "allowed_warehouses", None):
+        return
+    if warehouse is not None and not user_has_warehouse(user.allowed_warehouses, warehouse):
+        mine = [str(w).strip() for w in user.allowed_warehouses if str(w).strip()]
+        raise HTTPException(status_code=403, detail={
+            "error": "outside_factory",
+            "message": (f"This {what} is in {warehouse}, which is not one of your factories "
+                        f"({', '.join(mine)}). Ask an admin to add {warehouse} to your profile "
+                        "if you work on it."),
+            "details": {"warehouse": warehouse, "allowed_warehouses": mine},
+        })
+
+
 async def _refuse_outside_factory(conn, user, plan_id: int) -> None:
     """403 for a non-admin acting on a plan outside their assigned factories."""
     if getattr(user, "is_admin", False) or not getattr(user, "allowed_warehouses", None):
@@ -4915,8 +4941,38 @@ async def _refuse_outside_factory(conn, user, plan_id: int) -> None:
     wh = await conn.fetchval(
         "SELECT warehouse FROM production_plan_v2 WHERE plan_id = $1", plan_id,
     )
-    if wh is not None and not user_has_warehouse(user.allowed_warehouses, wh):
-        raise HTTPException(status_code=403, detail="Plan outside your factory scope")
+    _refuse_outside_warehouse(user, wh)
+
+
+# The factory of the plan a line belongs to: every chain route checks it first.
+_LINE_FACTORY_SQL = """
+    SELECT p.warehouse
+    FROM   production_plan_line_v2 l
+    JOIN   production_plan_v2 p ON p.plan_id = l.plan_id
+    WHERE  l.plan_line_id = $1
+"""
+
+
+async def _plans_any_floor(conn, user) -> bool:
+    """Whether the user may put work on any floor of the plan's factory: no floor
+    grants, or a planner (plans › approve). Decided 2026-10-27 — floor grants
+    limit floor managers and team leaders, not the people who plan the route."""
+    if getattr(user, "is_admin", False) or not getattr(user, "allowed_floors", None):
+        return True
+    return await _may_approve_plans(conn, user)
+
+
+async def _chain_floor_gate(conn, user, warehouse: str | None, *, what: str = "plan") -> FloorGate:
+    """Refuses a plan outside the user's factories; returns the floor rules for
+    the rest of the request (services/chain_floors). Call it inside the route's
+    transaction, before the first write."""
+    _refuse_outside_warehouse(user, warehouse, what=what)
+    return FloorGate(user=user, warehouse=warehouse,
+                     any_floor_in_factory=await _plans_any_floor(conn, user))
+
+
+async def _line_floor_gate(conn, user, plan_line_id: int) -> FloorGate:
+    return await _chain_floor_gate(conn, user, await conn.fetchval(_LINE_FACTORY_SQL, plan_line_id))
 
 
 @router.post("/plans-v2/{plan_id}/cancel")
@@ -5063,7 +5119,10 @@ async def update_plan_line_v2(request: Request, plan_line_id: int, body: PlanLin
 
 @router.put("/plans-v2/lines/{plan_line_id}/steps/reorder")
 async def reorder_steps_v2(request: Request, plan_line_id: int, body: StepV2Reorder, user=Depends(require_permission("production", "plans", action="edit"))):
-    """Bulk reorder: step_ids[0] becomes step_order=1, etc."""
+    """Bulk reorder: step_ids[0] becomes step_order=1, etc.
+
+    409 steps_locked_by_cards, before any write, on a line in a merged process
+    run or carded as several chains (plan_v2._steps_locked_refusal)."""
     from app.modules.production.services.plan_v2 import reorder_steps
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
@@ -5071,6 +5130,8 @@ async def reorder_steps_v2(request: Request, plan_line_id: int, body: StepV2Reor
             result = await reorder_steps(conn, plan_line_id, body.step_ids)
     if result.get("error") == "step_set_mismatch":
         raise HTTPException(status_code=400, detail=result.get("message"))
+    if result.get("error") == "steps_locked_by_cards":
+        raise HTTPException(status_code=409, detail=result)
     return result
 
 
@@ -5084,24 +5145,32 @@ async def add_step_v2(
 ):
     """Append a step at the end of the line.
 
-    Enforces the user-level floor lock — same rules as update_step_v2.
+    The plan's factory must be the user's, and the step's floor one of its
+    production floors (stored in the declared spelling) that the user may use —
+    services/chain_floors, the same rule as update_step_v2 and the chain routes.
     """
-    if (body.floor
-            and not user.is_admin
-            and user.allowed_floors
-            and not user_has_floor(user.allowed_floors, body.floor)):
-        raise HTTPException(
-            status_code=403,
-            detail=f"User is not assigned to floor '{body.floor}'",
-        )
-
     from app.modules.production.services.plan_v2 import add_step
     pool = request.app.state.db_pool
+    data = body.model_dump()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            result = await add_step(conn, plan_line_id, body.model_dump())
+            warehouse = await conn.fetchval(_LINE_FACTORY_SQL, plan_line_id)
+            _refuse_outside_warehouse(user, warehouse)
+            if (data.get("floor") or "").strip():
+                gate = await _chain_floor_gate(conn, user, warehouse)
+                floor = gate.spell(data["floor"])
+                if floor is None:
+                    raise HTTPException(status_code=400, detail=gate.unknown([data["floor"].strip()]))
+                refusal = gate.refusal([floor])
+                if refusal:
+                    raise HTTPException(status_code=403, detail=refusal)
+                data["floor"] = floor
+            result = await add_step(conn, plan_line_id, data)
     if result.get("error") == "missing_process_name":
         raise HTTPException(status_code=400, detail=result.get("message"))
+    if result.get("error") == "steps_locked_by_cards":
+        # A merged run's or a several-chain line: refused before the step was written.
+        raise HTTPException(status_code=409, detail=result)
     # A step added to an already-carded line spawns a job card — tell its floor.
     _notify_new_job_cards(request, background_tasks, user, [result.get("spawned_job_card_id")])
     return result
@@ -5144,18 +5213,10 @@ async def create_line_job_cards_v2(
 
     One job card per WIP process → a terminating Packaging card; stage-1 is
     unlocked on its floor, the rest await the previous stage's handoff.
-    Enforces the user-level floor lock for every WIP + packaging floor (same
-    rule as add_step_v2), runs in one transaction, and is idempotent per line.
+    The plan's factory must be the user's and every floor of the new chain one
+    they may use (services/chain_floors: planners any floor of the factory,
+    others their own); runs in one transaction, and is idempotent per line.
     """
-    floors = [s.floor for s in body.wip_steps] + [body.pkg_floor]
-    if not user.is_admin and user.allowed_floors:
-        bad = sorted({f for f in floors if f and not user_has_floor(user.allowed_floors, f)})
-        if bad:
-            raise HTTPException(
-                status_code=403,
-                detail=f"User is not assigned to floor(s): {', '.join(bad)}",
-            )
-
     from app.modules.production.services.job_card_v2 import (
         create_job_cards_for_line, maybe_release_plan_from_jcs,
         consolidate_plan_lines_for_merge,
@@ -5167,6 +5228,12 @@ async def create_line_job_cards_v2(
     try:
         async with pool.acquire() as conn:
             async with conn.transaction():
+                # Every floor of a new chain is touched; refused before the merge
+                # below writes anything.
+                gate = await _line_floor_gate(conn, user, plan_line_id)
+                floors, refusal = gate.check_chain(
+                    [], [s.floor for s in body.wip_steps] + [body.pkg_floor])
+                raise_if_refused(refusal)
                 # Same-article merge: fold sibling same-SKU lines into this primary
                 # line first (union SO refs + sum qty + delete siblings), so the chain
                 # below is ONE set of job cards for the combined article referencing
@@ -5179,8 +5246,9 @@ async def create_line_job_cards_v2(
                     plan_line_id,
                     qty_kg=body.qty_kg,
                     qty_units=body.qty_units,
-                    wip_steps=[s.model_dump() for s in body.wip_steps],
-                    pkg_floor=body.pkg_floor,
+                    wip_steps=[{**s.model_dump(), "floor": f}
+                               for s, f in zip(body.wip_steps, floors)],
+                    pkg_floor=floors[-1],
                     pkg_process=body.pkg_process,
                 ))
                 # If this create means EVERY article on the plan now has job
@@ -5265,14 +5333,11 @@ async def create_merged_process_run_v2(
     """Merge several products that share factory + floor + RM articles into ONE
     shared process job card (summed qty) whose output feeds each product's own
     packaging card. All cards are tagged with a single process_group_id.
-    """
-    floors = [s.floor for s in body.wip_steps] + [m.pkg_floor for m in body.per_member]
-    if not user.is_admin and user.allowed_floors:
-        bad = sorted({f for f in floors if f and not user_has_floor(user.allowed_floors, f)})
-        if bad:
-            raise HTTPException(status_code=403,
-                                detail=f"User is not assigned to floor(s): {', '.join(bad)}")
 
+    Every member's plan must be in the user's factories; the service checks the
+    floors it touches against the floors of the member cards it rebuilds
+    (services/chain_floors), before it deletes them.
+    """
     from app.modules.production.services.job_card_v2 import (
         create_merged_process_run, maybe_release_plan_from_jcs,
     )
@@ -5283,12 +5348,21 @@ async def create_merged_process_run_v2(
     try:
         async with pool.acquire() as conn:
             async with conn.transaction():
+                factories = [r["warehouse"] for r in await conn.fetch(
+                    "SELECT DISTINCT p.warehouse FROM production_plan_line_v2 l "
+                    "JOIN production_plan_v2 p ON p.plan_id = l.plan_id "
+                    "WHERE l.plan_line_id = ANY($1::int[])", body.plan_line_ids)]
+                for wh in factories[1:]:
+                    _refuse_outside_warehouse(user, wh)
+                # Members on two factories are refused by the service (not_a_group).
+                gate = await _chain_floor_gate(conn, user, factories[0] if factories else None)
                 result = raise_if_refused(await create_merged_process_run(
                     conn,
                     plan_line_ids=body.plan_line_ids,
                     wip_steps=[s.model_dump() for s in body.wip_steps],
                     per_member=[m.model_dump() for m in body.per_member],
                     created_by=(getattr(user, "full_name", None) or None),
+                    floor_gate=gate,
                 ))
                 # A merged run can card lines across several plans — release any
                 # plan that is now fully carded (no-op otherwise), only for
@@ -5367,16 +5441,8 @@ async def replace_line_job_cards_v2(
 ):
     """Edit (replace) a plan line's job cards from the wizard. Deletes the
     current chain and recreates it; refused once any stage has started. Same
-    floor-lock + transaction rules as the create endpoint."""
-    floors = [s.floor for s in body.wip_steps] + [body.pkg_floor]
-    if not user.is_admin and user.allowed_floors:
-        bad = sorted({f for f in floors if f and not user_has_floor(user.allowed_floors, f)})
-        if bad:
-            raise HTTPException(
-                status_code=403,
-                detail=f"User is not assigned to floor(s): {', '.join(bad)}",
-            )
-
+    factory + transaction rules as the create endpoint; the floors checked are
+    only those the rebuild touches, against the chain it deletes (the service)."""
     from app.modules.production.services.job_card_v2 import replace_job_cards_for_line
     from app.modules.production.services.refusals import (
         ServiceRefusal, raise_if_refused, to_http,
@@ -5385,6 +5451,7 @@ async def replace_line_job_cards_v2(
     try:
         async with pool.acquire() as conn:
             async with conn.transaction():
+                gate = await _line_floor_gate(conn, user, plan_line_id)
                 result = raise_if_refused(await replace_job_cards_for_line(
                     conn,
                     plan_line_id,
@@ -5393,6 +5460,7 @@ async def replace_line_job_cards_v2(
                     wip_steps=[s.model_dump() for s in body.wip_steps],
                     pkg_floor=body.pkg_floor,
                     pkg_process=body.pkg_process,
+                    floor_gate=gate,
                 ))
     except ServiceRefusal as refusal:
         # Replace deletes the old cards before recreating; a refusal from the
@@ -5417,7 +5485,8 @@ class JobCardLineApplyEdits(BaseModel):
     """POST /plans-v2/lines/{plan_line_id}/job-cards/apply-edits — constrained
     live edit of a STARTED chain (floor/qty change, add in the un-started tail,
     remove with forced JC-data snapshot). Any existing WIP job_card_id absent
-    from `steps` is treated as a removal."""
+    from `steps` is treated as a removal. `steps` is [] for a one-card chain;
+    `pkg_job_card_id` is the card the screen shows last, refused when it isn't."""
     qty_kg: float
     qty_units: float | None = None
     steps: list[JobCardLineEditStep]
@@ -5438,17 +5507,9 @@ async def apply_line_job_card_edits_v2(
     """Apply constrained LIVE edits to a plan line's job cards even after stages
     have started: real-time floor change, add a process (un-started tail), qty
     change (synced to the linked SO — ledger + so_line), and remove a process
-    (force-records the JC's data then cancels it). Same floor-lock + single
-    transaction as create/replace."""
-    floors = [s.floor for s in body.steps] + [body.pkg_floor]
-    if not user.is_admin and user.allowed_floors:
-        bad = sorted({f for f in floors if f and not user_has_floor(user.allowed_floors, f)})
-        if bad:
-            raise HTTPException(
-                status_code=403,
-                detail=f"User is not assigned to floor(s): {', '.join(bad)}",
-            )
-
+    (force-records the JC's data then cancels it). Same factory check + single
+    transaction as create/replace; the service checks only the floors the edit
+    touches (added, moved, removed cards), so a quantity-only edit checks none."""
     from app.modules.production.services.job_card_v2 import apply_live_job_card_edits
     from app.modules.production.services.refusals import (
         ServiceRefusal, raise_if_refused, to_http,
@@ -5458,6 +5519,7 @@ async def apply_line_job_card_edits_v2(
     try:
         async with pool.acquire() as conn:
             async with conn.transaction():
+                gate = await _line_floor_gate(conn, user, plan_line_id)
                 result = raise_if_refused(await apply_live_job_card_edits(
                     conn,
                     plan_line_id,
@@ -5469,6 +5531,7 @@ async def apply_line_job_card_edits_v2(
                     pkg_job_card_id=body.pkg_job_card_id,
                     user=actor,
                     remove_reasons=body.remove_reasons or {},
+                    floor_gate=gate,
                 ))
     except ValueError as exc:
         # Over-allocation against so_fulfillment_v2 pending bounds (qty sync).
@@ -5477,8 +5540,9 @@ async def apply_line_job_card_edits_v2(
             detail={"error": "over_allocation", "message": str(exc)},
         )
     except ServiceRefusal as refusal:
-        # Inside the transaction: a refusal after the qty / SO sync rolls those
-        # back too. Every code is an error, never a 200.
+        # The service refuses before its first write; raised inside the
+        # transaction, its removal backstop rolls back the qty / SO sync too.
+        # Every code is an error, never a 200.
         raise to_http(refusal)
     # Only the processes this edit ADDED are new cards; the rest stayed in place.
     _notify_new_job_cards(request, background_tasks, user, result.get("created_job_card_ids"))
@@ -5549,6 +5613,25 @@ async def dispatch_line_fg_v2(
     return result
 
 
+# A step's floor, its plan's factory, and the floors of the job cards that move
+# when it changes (the cards _sync_jc_attrs_from_step updates: locked / unlocked)
+# — where those cards are, which can differ from the step's own floor. Its line
+# is taken FOR KEY SHARE first (lock-order rule spec 2c): the update writes the
+# step and then those cards, so it waits for a live edit of the line (line, its
+# cards, then its steps) instead of deadlocking with it.
+_STEP_FACTORY_SQL = """
+    SELECT s.floor, p.warehouse,
+           ARRAY(SELECT DISTINCT j.floor FROM job_card_v2 j
+                 WHERE  j.plan_step_id = s.step_id AND j.deleted_at IS NULL
+                   AND  j.status IN ('locked', 'unlocked')) AS card_floors
+    FROM   production_plan_step_v2 s
+    JOIN   production_plan_line_v2 l ON l.plan_line_id = s.plan_line_id
+    JOIN   production_plan_v2 p ON p.plan_id = l.plan_id
+    WHERE  s.step_id = $1
+    FOR    KEY SHARE OF l
+"""
+
+
 @router.put("/plans-v2/steps/{step_id}")
 async def update_step_v2(
     request: Request,
@@ -5562,25 +5645,45 @@ async def update_step_v2(
     user clearing the floor dropdown) is treated as "set this column to NULL"
     rather than being silently filtered out as a missing field.
 
-    Enforces the user-level floor lock: a non-admin user assigned to a
-    specific list of floors cannot set a step's floor to a value outside
-    that list. Clearing the floor (sending null) is always permitted.
-    """
-    fields = body.model_dump(exclude_unset=True)
-    new_floor = fields.get("floor")
-    if (new_floor
-            and not user.is_admin
-            and user.allowed_floors
-            and not user_has_floor(user.allowed_floors, new_floor)):
-        raise HTTPException(
-            status_code=403,
-            detail=f"User is not assigned to floor '{new_floor}'",
-        )
+    The plan's factory must be the user's. A new floor must be a production
+    floor of it (stored in the declared spelling) that the user may use. The
+    step's job cards that move with it (locked / unlocked,
+    plan_v2._sync_jc_attrs_from_step) are checked where they actually are: every
+    floor they leave, and then the new floor too — services/chain_floors. A
+    floor sent unchanged (ignoring case) with no card to move keeps its stored
+    value and checks nothing.
 
+    Clearing the floor (null, blank or spaces) stores NULL on the step and
+    leaves its cards where they are, so it checks nothing. (Blank used to be
+    written onto the cards, taking them off their floor unchecked; and a
+    clear-then-set moved them off a floor nobody checked, as the step's floor
+    was then empty.)
+    """
     from app.modules.production.services.plan_v2 import update_step
+    fields = body.model_dump(exclude_unset=True)
+    if "floor" in fields and not str(fields["floor"] or "").strip():
+        fields["floor"] = None
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
         async with conn.transaction():
+            step = await conn.fetchrow(_STEP_FACTORY_SQL, step_id)
+            if step is not None:
+                _refuse_outside_warehouse(user, step["warehouse"])
+                if fields.get("floor") is not None:
+                    # A card with no floor moves too (onto the new floor); it
+                    # leaves none, so only the new floor is checked for it.
+                    card_floors = list(step["card_floors"] or [])
+                    gate = await _chain_floor_gate(conn, user, step["warehouse"])
+                    floor = gate.spell(fields["floor"], keep=[step["floor"], *card_floors])
+                    if floor is None:
+                        raise HTTPException(status_code=400,
+                                            detail=gate.unknown([fields["floor"].strip()]))
+                    moved = [f for f in card_floors if normalise_floor(f) != normalise_floor(floor)]
+                    if moved or normalise_floor(floor) != normalise_floor(step["floor"]):
+                        refusal = gate.refusal(moved + [floor])
+                        if refusal:
+                            raise HTTPException(status_code=403, detail=refusal)
+                    fields["floor"] = floor
             result = await update_step(conn, step_id, fields)
     if result.get("error") == "not_found":
         raise HTTPException(status_code=404, detail="Step not found")
@@ -5598,6 +5701,9 @@ async def delete_step_v2(request: Request, step_id: int, user=Depends(require_pe
             result = await delete_step(conn, step_id)
     if result.get("error") == "not_found":
         raise HTTPException(status_code=404, detail="Step not found")
+    if result.get("error") == "steps_locked_by_cards":
+        # A merged run's or a several-chain line: refused before any write.
+        raise HTTPException(status_code=409, detail=result)
     if result.get("error") == "jc_exists":
         # Approved-plan path: the matching JC still references this
         # step.  409 (Conflict) so the client can distinguish "step
@@ -6707,6 +6813,19 @@ async def _fg_from_boxes_into(conn, job_card_id: int, batch_id: int | None,
     return note
 
 
+async def _refuse_output_below_dispatched(conn, job_card_id: int, batch_id: int | None,
+                                          body: "RecordOutputV2Request") -> None:
+    """Before a save writes anything: its FG kg can't take the card's output below
+    what the card has already sent on to the next stage. Checked under the card's
+    box lock and row lock (output_below_dispatched), taken after the plan line's,
+    so a dispatch can't slip in between the check and the save."""
+    from app.modules.production.services.job_card_v2 import output_below_dispatched
+    refusal = await output_below_dispatched(conn, job_card_id=job_card_id, batch_id=batch_id,
+                                            output_qty_kg=body.output_qty_kg)
+    if refusal is not None:
+        raise HTTPException(status_code=409, detail=refusal)
+
+
 @router.post("/job-cards-v2/{job_card_id}/outputs")
 async def record_output_v2(
     request: Request,
@@ -6746,6 +6865,15 @@ async def record_output_v2(
             # row lock in this transaction (before the admin-override batch updates).
             from app.modules.production.services import jc_bom_changes as _bomc
             await _bomc.lock_line_for_card(conn, job_card_id)
+            # Completing a batch on a closed / cancelled card would send output on
+            # past its close: refused before anything is written.
+            if body.complete_batch:
+                from app.modules.production.services.job_card_batch_v2 import finished_card_refusal
+                finished = finished_card_refusal(job_card_id, await conn.fetchval(
+                    "SELECT status FROM job_card_v2 WHERE job_card_id = $1", job_card_id),
+                    closing=True)
+                if finished is not None:
+                    raise HTTPException(status_code=409, detail=finished)
             # R10 — diff-on-save: rm_consumed / pm_consumed are
             # Optional. None = "section omitted, leave alone" (treated
             # like empty here — no rows to validate or upsert).
@@ -6783,6 +6911,7 @@ async def record_output_v2(
                     resolved_batch_id = open_rows[0]["batch_id"]
                     fg_note = await _fg_from_boxes_into(
                         conn, job_card_id, resolved_batch_id, body, user.full_name or user.phone)
+                    await _refuse_output_below_dispatched(conn, job_card_id, resolved_batch_id, body)
                 elif len(open_rows) == 0:
                     raise HTTPException(
                         status_code=400,
@@ -6852,6 +6981,10 @@ async def record_output_v2(
                                     ),
                                 },
                             )
+                        # A correction after close can't take the output below
+                        # what was already sent on (before the updates below).
+                        await _refuse_output_below_dispatched(
+                            conn, job_card_id, resolved_batch_id, body)
                         # Audit: append a marker to the batch row's notes
                         # so a future reviewer can see this batch was
                         # edited post-close.  Stamped once per save.
@@ -6908,6 +7041,9 @@ async def record_output_v2(
                                            "admin_override=true.",
                             },
                         )
+                else:
+                    await _refuse_output_below_dispatched(
+                        conn, job_card_id, resolved_batch_id, body)
             # ── Per-BOM-line consumption ──────────────────────────────
             # Checked above against the job card's BOM (bom_line for its bom_id,
             # minus removed articles, plus added ones). Every stage can record
@@ -6971,6 +7107,8 @@ async def record_output_v2(
                     batch_id=resolved_batch_id,
                 )
                 _raise_if_locked(result)
+                if result.get("error") == "output_below_dispatched":
+                    raise HTTPException(status_code=409, detail=result)
             else:
                 result = {"recorded": False, "skipped": "no_output_payload"}
             # ── Byproducts (v2) ───────────────────────────────────────
@@ -7160,7 +7298,8 @@ async def record_output_v2(
                         # that the batch stayed open.
                         raise HTTPException(
                             status_code=409 if close_res["error"] in (
-                                "batch_not_open", "batch_already_closed")
+                                "batch_not_open", "batch_already_closed",
+                                "job_card_finished", "output_below_dispatched")
                             else 400,
                             detail=close_res,
                         )
@@ -7285,7 +7424,11 @@ async def batch_open_v2(
     user=Depends(require_permission("production", "job_cards", "overview", action="start")),
 ):
     """R13: open a new batch row for this JC. Stage 1 still enforces "at
-    most one open batch per JC" (drops in Stage 2)."""
+    most one open batch per JC" (drops in Stage 2).
+
+    Refused (409 job_card_finished) on a completed, closed or cancelled card,
+    except that an admin may open one on a completed card to add a batch that
+    was forgotten (job_card_batch_v2.finished_card_refusal)."""
     from app.modules.production.services import job_card_batch_v2 as svc
     pool = request.app.state.db_pool
     body = body or BatchOpenRequest()
@@ -7299,7 +7442,10 @@ async def batch_open_v2(
                 input_qty_kg=body.input_qty_kg,
                 batch_label=body.batch_label,
                 notes=body.notes,
+                is_admin=bool(getattr(user, "is_admin", False)),
             )
+            if result.get("error") == "job_card_finished":
+                raise HTTPException(status_code=409, detail=result)
     _raise_if_locked(result)
     if result.get("error") == "job_card_not_found":
         raise HTTPException(status_code=404, detail="Job card not found")
@@ -7356,6 +7502,8 @@ async def batch_close_v2(
                 override_reason=reason,
                 closed_by=user.full_name or user.phone,
             )
+            if result.get("error") in ("job_card_finished", "output_below_dispatched"):
+                raise HTTPException(status_code=409, detail=result)
     _raise_if_locked(result)
     if result.get("error") in ("batch_not_found", "job_card_not_found"):
         raise HTTPException(status_code=404, detail=result.get("message", result["error"]))
@@ -7419,6 +7567,9 @@ async def batch_cancel_v2(
     _raise_if_locked(result)
     if result.get("error") == "batch_not_found":
         raise HTTPException(status_code=404, detail="Batch not found")
+    if result.get("error") == "job_card_not_found":
+        # A cancelled card: nothing was cancelled, so this is not a 200.
+        raise HTTPException(status_code=404, detail="Job card not found")
     if result.get("error") == "batch_jc_mismatch":
         raise HTTPException(status_code=404, detail=result)
     if result.get("error") in ("batch_not_open", "batch_has_attached_rows"):
@@ -7883,7 +8034,13 @@ async def stop_jc_v2(
     Approval composition with R8 row 8 (floor_manager maker, admin or
     production_manager checker) lives at the /amendments layer - this
     endpoint executes once the request is approved.
+
+    The card's plan line is locked first (KEY SHARE, lock-order rule spec 2c):
+    the stop locks the previous card, this card and the next one (step order, as
+    dispatch takes them), so it waits for a live edit of the line (line, then its
+    cards) or a Save Output on the stage before instead of deadlocking with them.
     """
+    from app.modules.production.services import jc_bom_changes
     from app.modules.production.services.job_card_v2 import stop_job_card
     from app.modules.production.services.refusals import (
         ServiceRefusal, raise_if_refused, to_http,
@@ -7892,6 +8049,7 @@ async def stop_jc_v2(
     try:
         async with pool.acquire() as conn:
             async with conn.transaction():
+                await jc_bom_changes.lock_line_for_card(conn, job_card_id)
                 result = raise_if_refused(await stop_job_card(
                     conn,
                     job_card_id=job_card_id,
@@ -7919,13 +8077,32 @@ async def patch_jc_v2(
 ):
     """Partial update of header fields. Use lifecycle endpoints for
     status / start / complete / close / cancel — those aren't patchable
-    through this surface."""
+    through this surface.
+
+    A floor change moves the card: its factory must be the user's and both the
+    floor it leaves and the one it goes to floors they may use, the new one a
+    production floor of the factory (services/chain_floors, as Edit Job Card)."""
     from app.modules.production.services.job_card_v2 import patch_job_card
     pool = request.app.state.db_pool
     # exclude_unset so omitted fields don't get blanked.
     fields = body.model_dump(exclude_unset=True)
     async with pool.acquire() as conn:
         async with conn.transaction():
+            if "floor" in fields:
+                card = await conn.fetchrow(
+                    "SELECT factory, floor FROM job_card_v2 "
+                    "WHERE job_card_id = $1 AND deleted_at IS NULL", job_card_id)
+                if card is not None:
+                    gate = await _chain_floor_gate(conn, user, card["factory"], what="job card")
+                    floor = gate.spell(fields["floor"], keep=[card["floor"]])
+                    if floor is None:
+                        raise HTTPException(status_code=400,
+                                            detail=gate.unknown([str(fields["floor"]).strip()]))
+                    if normalise_floor(floor) != normalise_floor(card["floor"]):
+                        refusal = gate.refusal([card["floor"], floor])
+                        if refusal:
+                            raise HTTPException(status_code=403, detail=refusal)
+                    fields["floor"] = floor or None
             result = await patch_job_card(
                 conn,
                 job_card_id=job_card_id,
@@ -7958,7 +8135,11 @@ async def cancel_jc_v2(
     behind the admin gate. The cancel_job_card service stamps a JSONB
     snapshot of the full pre-cancel state on the row before flipping
     status (migration 043) so a future read can reconstruct what the
-    operator saw at the moment they hit Cancel."""
+    operator saw at the moment they hit Cancel.
+
+    The card's plan line is locked first (KEY SHARE, lock-order rule spec 2c),
+    as on Stop: the cancel waits for a live edit of the line instead of
+    deadlocking with it over the cards on each side."""
     if not getattr(user, "is_admin", False):
         raise HTTPException(
             status_code=403,
@@ -7967,6 +8148,7 @@ async def cancel_jc_v2(
                 "message": "Only admin users can cancel a job card.",
             },
         )
+    from app.modules.production.services import jc_bom_changes
     from app.modules.production.services.job_card_v2 import cancel_job_card
     from app.modules.production.services.refusals import (
         ServiceRefusal, raise_if_refused, to_http,
@@ -7975,6 +8157,7 @@ async def cancel_jc_v2(
     try:
         async with pool.acquire() as conn:
             async with conn.transaction():
+                await jc_bom_changes.lock_line_for_card(conn, job_card_id)
                 result = raise_if_refused(await cancel_job_card(
                     conn,
                     job_card_id=job_card_id,
@@ -8034,11 +8217,13 @@ async def close_job_card_v2(
     body: CloseJobCardV2Request | None = None,
     user=Depends(require_permission("production", "job_cards", "overview", action="close")),
 ):
-    """Close a v2 job card. Refuses on missing sign-offs or an open shift
-    segment. After a successful close, if every JC on the linked plan has
-    reached a terminal state, the plan is auto-flipped to 'executed'.
+    """Close a v2 job card. Refuses a card that isn't completed or still has an
+    open batch (409), missing sign-offs or an open shift segment. After a
+    successful close, if every JC on the linked plan has reached a terminal
+    state, the plan is auto-flipped to 'executed'.
 
-    `allow_partial=true` skips the sign-off check — admin-only.
+    `allow_partial=true` skips the sign-off check — admin-only. It does not
+    let a card that isn't completed be closed.
     """
     from app.modules.production.services.job_card_v2 import (
         close_job_card, maybe_close_plan_from_jcs,
@@ -8058,6 +8243,10 @@ async def close_job_card_v2(
                 conn, job_card_id=job_card_id, allow_partial=allow_partial,
                 closed_by=user.full_name or user.phone,
             )
+            if result.get("error") in ("not_completed", "open_batch"):
+                # Admins' allow_partial too: COMPLETE's batch and balance gates come
+                # first, and a batch still open must be completed or cancelled.
+                raise HTTPException(status_code=409, detail=result)
             if "error" not in result and result.get("plan_id") is not None:
                 try:
                     plan_closed = await maybe_close_plan_from_jcs(conn, result["plan_id"])

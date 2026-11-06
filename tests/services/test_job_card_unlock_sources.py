@@ -65,8 +65,8 @@ class _CloseConn(_InTx):
             return {"batch_id": 55, "job_card_id": UPSTREAM, "batch_number": 1, "status": "open", "notes": None}
         if "FROM job_card_v2" in s and s.startswith("SELECT job_card_id, next_job_card_id"):
             return {"job_card_id": UPSTREAM, "next_job_card_id": DOWNSTREAM, "output_kind": "WIP",
-                    "uom": "kg", "dispatched_to_next_kg": 0, "entity": "cfpl", "output_code": None,
-                    "fg_sku_name": "Roasted Almonds 200g"}
+                    "uom": "kg", "status": "in_progress", "dispatched_to_next_kg": 0,
+                    "entity": "cfpl", "output_code": None, "fg_sku_name": "Roasted Almonds 200g"}
         if s.startswith("SELECT is_balanced, balance_difference_qty, total_input_qty FROM job_card_accounting_v2"):
             # The balance lock now always reads the saved accounting (so an
             # override is only recorded when it was really needed). Balanced
