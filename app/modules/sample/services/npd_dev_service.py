@@ -16,12 +16,13 @@ surfaced everywhere — there is no separate house number.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import asyncpg
 from fastapi import HTTPException
 
-from app.core.helpers import new_short_time_id
+from app.core.helpers import PK_RETRY_DELAY_S, new_short_time_id
 from app.modules.sample.services import npd_auth
 from app.modules.sample.services import sample_inventory_service as inv
 
@@ -1085,6 +1086,197 @@ async def request_promote(conn, dev_jc_id, *, payload: dict, user) -> dict:
     return await pas.open_promote_request(conn, dev_jc_id, payload=payload, user=user)
 
 
+async def _lock_closed_card(conn, dev_jc_id: int):
+    """The card, row-locked for the caller's transaction (serializes every sum-check
+    against concurrent dispatches), refusing anything that is not CLOSED."""
+    jc = await conn.fetchrow(
+        "SELECT * FROM npd_dev_job_cards WHERE id = $1 FOR UPDATE", dev_jc_id)
+    if not jc:
+        raise HTTPException(404, detail={"error": "not_found",
+                                         "message": f"NPD development job card {dev_jc_id} not found",
+                                         "details": {"id": dev_jc_id}})
+    if jc["status"] != "CLOSED":
+        raise HTTPException(409, detail={"error": "wrong_status",
+                                         "message": "Only a CLOSED development job card can dispatch its sample",
+                                         "details": {"status": jc["status"]}})
+    return jc
+
+
+async def _dispatch_part(conn, jc, *, article_id: int | None, qty, uom: str | None,
+                         recipient: str | None, user) -> dict:
+    """ONE partial out: a 265 Goods Issue out of the R&D location + one npd_dev_dispatch
+    row (its outpass sub-number). The caller holds the card's FOR UPDATE lock inside its
+    own transaction. Omit qty to send the whole remaining balance. Returns the part."""
+    dev_jc_id = jc["id"]
+    if article_id is not None:
+        # This article's own FG batch + output balance (Σ dispatch scoped to the article).
+        art = await conn.fetchrow(
+            "SELECT * FROM npd_dev_job_card_articles WHERE article_id = $1 AND dev_jc_id = $2",
+            article_id, dev_jc_id)
+        if not art:
+            raise HTTPException(404, detail={"error": "article_not_found",
+                                             "message": "That article is not on this job card",
+                                             "details": {"article_id": article_id, "dev_jc_id": dev_jc_id}})
+        batch_id = art["fg_sample_batch_id"]
+        sku_name = art["name"]
+        src_uom = art["output_uom"] or jc["uom"] or "kg"
+        output_qty = float(art["output_qty"] or 0)
+        if not batch_id:
+            raise HTTPException(422, detail={"error": "no_fg_sample",
+                                             "message": f"Article '{art['name']}' has no FG sample to dispatch — promote with an output quantity first",
+                                             "details": {"article_id": article_id}})
+        dispatched = float(await conn.fetchval(
+            "SELECT COALESCE(SUM(qty), 0) FROM npd_dev_dispatch WHERE dev_jc_id = $1 AND article_id = $2",
+            dev_jc_id, article_id))
+    else:
+        # A per-article card must dispatch per article (its card-level output_qty is the
+        # SUM across articles but fg_sample_batch_id is only article #1's batch — a
+        # card-level dispatch would over-issue that one batch against the total). Require
+        # article_id so the balance + batch resolve to the right article.
+        if await _is_per_article(conn, dev_jc_id):
+            raise HTTPException(422, detail={"error": "article_required",
+                                             "message": "This card develops per-article outputs — dispatch each article (article_id required)",
+                                             "details": {"dev_jc_id": dev_jc_id}})
+        if not jc["fg_sample_batch_id"]:
+            raise HTTPException(422, detail={"error": "no_fg_sample",
+                                             "message": "No FG sample to dispatch — close with an output quantity first",
+                                             "details": {"id": dev_jc_id}})
+        batch_id = jc["fg_sample_batch_id"]
+        sku_name = jc["fg_sku_name"] or jc["title"]
+        # The unit output_qty (and the FG batch, received at promote) is in — not the
+        # card's planning uom: 360 "gm" of output used to go out as a "360 kg" issue.
+        src_uom = jc.get("output_uom") or jc["uom"] or "kg"
+        output_qty = float(jc["output_qty"] or 0)
+        dispatched = await _card_level_dispatched(conn, jc)
+    remaining = output_qty - dispatched
+    # Normalize to the ledger's 3-dp storage granularity so a value that rounds
+    # to 0.000 is rejected here (not by the qty>0 CHECK as a 500); and treat an
+    # OMITTED qty (None) — NOT an explicit 0 — as "dispatch the whole balance".
+    q = round(float(qty) if qty is not None else remaining, 3)
+    if q <= 0:
+        raise HTTPException(422, detail={"error": "invalid_qty",
+                                         "message": "Dispatch quantity must be greater than zero",
+                                         "details": {"qty": q, "remaining": round(remaining, 3)}})
+    if q > remaining + 1e-6:
+        raise HTTPException(422, detail={"error": "over_dispatch",
+                                         "message": f"Cannot dispatch {round(q, 3)} — only {round(remaining, 3)} remains of the finalized output",
+                                         "details": {"requested": q, "remaining": round(remaining, 3),
+                                                     "output_qty": output_qty, "dispatched": dispatched}})
+    # Custom unit for this part (084) — the label on the 265 doc + the outpass; qty is
+    # NOT converted (see the docstring). Falls back to the article/card uom.
+    disp_uom = (uom or src_uom or "kg").strip() or src_uom
+    # 265 Goods Issue for THIS part out of the R&D location (from the resolved batch).
+    res = await inv.issue_named_batch(
+        conn, batch_id=batch_id, sku_name=sku_name,
+        qty_kg=q, reference_id=dev_jc_id, reference_type="NPD_DEV_JC", entity=_BOM_ENTITY,
+        uom=disp_uom, to_location=(recipient or "SAMPLE_OUT"), user=user,
+        notes=f"Dev sample partial dispatch ({jc['id']}) to {recipient or '-'}")
+    # seq is global per card (UNIQUE(dev_jc_id, seq)) — the outpass sub-number.
+    seq = int(await conn.fetchval(
+        "SELECT COALESCE(MAX(seq), 0) + 1 FROM npd_dev_dispatch WHERE dev_jc_id = $1", dev_jc_id))
+    # Persist the custom uom only if 084 is applied (the column exists) — else the row
+    # is written without it and the outpass falls back to the article uom. No exception,
+    # so the legacy/083-only path is unaffected.
+    has_uom = bool(await conn.fetchval(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_name = 'npd_dev_dispatch' AND column_name = 'uom'"))
+    # dispatch_id is an app-supplied 8-digit time-based BIGINT (new_short_time_id),
+    # the same handle pattern as the phase/card ids. Retry on the rare collision.
+    # Per-article rows carry article_id (083); the legacy INSERT omits the column so it
+    # keeps working when 083 is unapplied.
+    dispatch_id = None
+    for _attempt in range(5):
+        cand = new_short_time_id()
+        try:
+            async with conn.transaction():
+                if article_id is not None and has_uom:
+                    await conn.execute(
+                        """INSERT INTO npd_dev_dispatch
+                               (dispatch_id, dev_jc_id, article_id, seq, qty, uom, recipient, mat_doc_id, dispatched_by)
+                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)""",
+                        cand, dev_jc_id, article_id, seq, q, disp_uom, recipient, res["mat_doc_id"], user.user_id)
+                elif article_id is not None:
+                    await conn.execute(
+                        """INSERT INTO npd_dev_dispatch
+                               (dispatch_id, dev_jc_id, article_id, seq, qty, recipient, mat_doc_id, dispatched_by)
+                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)""",
+                        cand, dev_jc_id, article_id, seq, q, recipient, res["mat_doc_id"], user.user_id)
+                else:
+                    await conn.execute(
+                        """INSERT INTO npd_dev_dispatch
+                               (dispatch_id, dev_jc_id, seq, qty, recipient, mat_doc_id, dispatched_by)
+                           VALUES ($1, $2, $3, $4, $5, $6, $7)""",
+                        cand, dev_jc_id, seq, q, recipient, res["mat_doc_id"], user.user_id)
+            dispatch_id = cand
+            break
+        except asyncpg.UniqueViolationError:
+            if _attempt == 4:
+                raise
+            # The id is epoch-ms: retrying in the same millisecond mints the same id again.
+            # Dispatch-all mints one per article back to back, so let the clock move.
+            await asyncio.sleep(PK_RETRY_DELAY_S)
+    # Mirror the latest partial onto the card (046 columns) — single-product card only.
+    # A per-article card's card-level dispatch_* would be ambiguous (which article?), so
+    # its per-article dispatch balances are read from the ledger rows instead.
+    if article_id is None:
+        await conn.execute(
+            """UPDATE npd_dev_job_cards
+                  SET dispatched_at = NOW(), dispatched_by = $1, dispatch_recipient = $2,
+                      dispatch_qty = $3, dispatch_mat_doc_id = $4, updated_at = NOW()
+                WHERE id = $5""",
+            user.user_id, recipient, q, res["mat_doc_id"], dev_jc_id)
+    return {"dispatch_id": dispatch_id, "seq": seq, "qty": q, "uom": disp_uom,
+            "name": sku_name, "article_id": article_id}
+
+
+async def _card_level_dispatched(conn, jc) -> float:
+    """What a single-product card has already sent. NOTE: no article_id in this SQL — the
+    legacy path must work when 083 is unapplied."""
+    dispatched = float(await conn.fetchval(
+        "SELECT COALESCE(SUM(qty), 0) FROM npd_dev_dispatch WHERE dev_jc_id = $1", jc["id"]))
+    # Legacy safety net: a card dispatched under the old single-shot 046 model has
+    # dispatched_at + dispatch_qty set but no ledger row (if the 078 backfill was
+    # not run). Count the mirror so remaining can't overstate → no duplicate GI.
+    if dispatched == 0 and jc["dispatched_at"] is not None and jc["dispatch_qty"]:
+        dispatched = float(jc["dispatch_qty"])
+    return dispatched
+
+
+async def _close_request_if_done(conn, jc, *, user, outpass_no: str, ref) -> None:
+    """These parts may be the ones that finish the request the card was developed for.
+    Its own savepoint: a failure to close must never undo the goods issue just recorded."""
+    if not jc.get("source_requisition_id"):
+        return
+    from app.modules.sample.services import requisition_service as rs
+    try:
+        async with conn.transaction():
+            await rs.close_if_fully_dispatched(
+                conn, jc["source_requisition_id"], user=user,
+                remarks=(f"Closed automatically: everything has been dispatched "
+                         f"(development job card {jc['id']}, outpass {outpass_no})"))
+    except Exception:  # noqa: BLE001
+        logger.exception("Auto-close of requisition %s after dispatch %s failed",
+                         jc["source_requisition_id"], ref)
+
+
+async def _mail_dispatch(conn, dev_jc_id: int, parts: list[dict], *, recipient, user) -> None:
+    """Close the dispatch out in the job card's mail trail, AFTER commit — the summary plus
+    a link to the Delivery Challan + Gate Pass covering exactly these parts. Threads into
+    the source requisition's trail when the card came from one. Best-effort: a mail
+    failure must never undo a recorded goods issue."""
+    try:
+        from app.modules.sample.services import sample_mail_service as mail
+        one = parts[0]
+        await mail.notify_dev_dispatch_email(
+            conn, dev_jc_id=dev_jc_id, dispatch_id=one["dispatch_id"], seq=one["seq"],
+            qty=one["qty"], uom=one["uom"], recipient=recipient,
+            actor_user_id=getattr(user, "user_id", None),
+            actor_name=getattr(user, "full_name", None),
+            **({"parts": parts} if len(parts) > 1 else {}))
+    except Exception:  # noqa: BLE001
+        logger.exception("Dispatch DC email failed for dev JC %s", dev_jc_id)
+
+
 async def dispatch_dev_sample(conn, dev_jc_id: int, *, recipient: str | None, qty, user,
                               article_id: int | None = None, uom: str | None = None) -> dict:
     """Section 2 Step C — issue the developed FG sample out of the R&D location (265) to a
@@ -1100,162 +1292,59 @@ async def dispatch_dev_sample(conn, dev_jc_id: int, *, recipient: str | None, qt
     per-part label used on the 265 doc + the outpass — the qty is NOT unit-converted, so the
     remaining balance stays in the article's output unit and the bound is numeric."""
     async with conn.transaction():
-        jc = await conn.fetchrow(
-            "SELECT * FROM npd_dev_job_cards WHERE id = $1 FOR UPDATE", dev_jc_id)
-        if not jc:
-            raise HTTPException(404, detail={"error": "not_found",
-                                             "message": f"NPD development job card {dev_jc_id} not found",
-                                             "details": {"id": dev_jc_id}})
-        if jc["status"] != "CLOSED":
-            raise HTTPException(409, detail={"error": "wrong_status",
-                                             "message": "Only a CLOSED development job card can dispatch its sample",
-                                             "details": {"status": jc["status"]}})
-        if article_id is not None:
-            # This article's own FG batch + output balance (Σ dispatch scoped to the article).
-            art = await conn.fetchrow(
-                "SELECT * FROM npd_dev_job_card_articles WHERE article_id = $1 AND dev_jc_id = $2",
-                article_id, dev_jc_id)
-            if not art:
-                raise HTTPException(404, detail={"error": "article_not_found",
-                                                 "message": "That article is not on this job card",
-                                                 "details": {"article_id": article_id, "dev_jc_id": dev_jc_id}})
-            batch_id = art["fg_sample_batch_id"]
-            sku_name = art["name"]
-            src_uom = art["output_uom"] or jc["uom"] or "kg"
-            output_qty = float(art["output_qty"] or 0)
-            if not batch_id:
-                raise HTTPException(422, detail={"error": "no_fg_sample",
-                                                 "message": f"Article '{art['name']}' has no FG sample to dispatch — promote with an output quantity first",
-                                                 "details": {"article_id": article_id}})
-            dispatched = float(await conn.fetchval(
-                "SELECT COALESCE(SUM(qty), 0) FROM npd_dev_dispatch WHERE dev_jc_id = $1 AND article_id = $2",
-                dev_jc_id, article_id))
-        else:
-            # A per-article card must dispatch per article (its card-level output_qty is the
-            # SUM across articles but fg_sample_batch_id is only article #1's batch — a
-            # card-level dispatch would over-issue that one batch against the total). Require
-            # article_id so the balance + batch resolve to the right article.
-            if await _is_per_article(conn, dev_jc_id):
-                raise HTTPException(422, detail={"error": "article_required",
-                                                 "message": "This card develops per-article outputs — dispatch each article (article_id required)",
-                                                 "details": {"dev_jc_id": dev_jc_id}})
-            if not jc["fg_sample_batch_id"]:
-                raise HTTPException(422, detail={"error": "no_fg_sample",
-                                                 "message": "No FG sample to dispatch — close with an output quantity first",
-                                                 "details": {"id": dev_jc_id}})
-            batch_id = jc["fg_sample_batch_id"]
-            sku_name = jc["fg_sku_name"] or jc["title"]
-            src_uom = jc["uom"] or "kg"
-            output_qty = float(jc["output_qty"] or 0)
-            # NOTE: no article_id in this SQL — the legacy path must work when 083 is unapplied.
-            dispatched = float(await conn.fetchval(
-                "SELECT COALESCE(SUM(qty), 0) FROM npd_dev_dispatch WHERE dev_jc_id = $1", dev_jc_id))
-            # Legacy safety net: a card dispatched under the old single-shot 046 model has
-            # dispatched_at + dispatch_qty set but no ledger row (if the 078 backfill was
-            # not run). Count the mirror so remaining can't overstate → no duplicate GI.
-            if dispatched == 0 and jc["dispatched_at"] is not None and jc["dispatch_qty"]:
-                dispatched = float(jc["dispatch_qty"])
-        remaining = output_qty - dispatched
-        # Normalize to the ledger's 3-dp storage granularity so a value that rounds
-        # to 0.000 is rejected here (not by the qty>0 CHECK as a 500); and treat an
-        # OMITTED qty (None) — NOT an explicit 0 — as "dispatch the whole balance".
-        q = round(float(qty) if qty is not None else remaining, 3)
-        if q <= 0:
-            raise HTTPException(422, detail={"error": "invalid_qty",
-                                             "message": "Dispatch quantity must be greater than zero",
-                                             "details": {"qty": q, "remaining": round(remaining, 3)}})
-        if q > remaining + 1e-6:
-            raise HTTPException(422, detail={"error": "over_dispatch",
-                                             "message": f"Cannot dispatch {round(q, 3)} — only {round(remaining, 3)} remains of the finalized output",
-                                             "details": {"requested": q, "remaining": round(remaining, 3),
-                                                         "output_qty": output_qty, "dispatched": dispatched}})
-        # Custom unit for this part (084) — the label on the 265 doc + the outpass; qty is
-        # NOT converted (see the docstring). Falls back to the article/card uom.
-        disp_uom = (uom or src_uom or "kg").strip() or src_uom
-        # 265 Goods Issue for THIS part out of the R&D location (from the resolved batch).
-        res = await inv.issue_named_batch(
-            conn, batch_id=batch_id, sku_name=sku_name,
-            qty_kg=q, reference_id=dev_jc_id, reference_type="NPD_DEV_JC", entity=_BOM_ENTITY,
-            uom=disp_uom, to_location=(recipient or "SAMPLE_OUT"), user=user,
-            notes=f"Dev sample partial dispatch ({jc['id']}) to {recipient or '-'}")
-        # seq is global per card (UNIQUE(dev_jc_id, seq)) — the outpass sub-number.
-        seq = int(await conn.fetchval(
-            "SELECT COALESCE(MAX(seq), 0) + 1 FROM npd_dev_dispatch WHERE dev_jc_id = $1", dev_jc_id))
-        # Persist the custom uom only if 084 is applied (the column exists) — else the row
-        # is written without it and the outpass falls back to the article uom. No exception,
-        # so the legacy/083-only path is unaffected.
-        has_uom = bool(await conn.fetchval(
-            "SELECT 1 FROM information_schema.columns "
-            "WHERE table_name = 'npd_dev_dispatch' AND column_name = 'uom'"))
-        # dispatch_id is an app-supplied 8-digit time-based BIGINT (new_short_time_id),
-        # the same handle pattern as the phase/card ids. Retry on the rare collision.
-        # Per-article rows carry article_id (083); the legacy INSERT omits the column so it
-        # keeps working when 083 is unapplied.
-        dispatch_id = None
-        for _attempt in range(5):
-            cand = new_short_time_id()
-            try:
-                async with conn.transaction():
-                    if article_id is not None and has_uom:
-                        await conn.execute(
-                            """INSERT INTO npd_dev_dispatch
-                                   (dispatch_id, dev_jc_id, article_id, seq, qty, uom, recipient, mat_doc_id, dispatched_by)
-                               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)""",
-                            cand, dev_jc_id, article_id, seq, q, disp_uom, recipient, res["mat_doc_id"], user.user_id)
-                    elif article_id is not None:
-                        await conn.execute(
-                            """INSERT INTO npd_dev_dispatch
-                                   (dispatch_id, dev_jc_id, article_id, seq, qty, recipient, mat_doc_id, dispatched_by)
-                               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)""",
-                            cand, dev_jc_id, article_id, seq, q, recipient, res["mat_doc_id"], user.user_id)
-                    else:
-                        await conn.execute(
-                            """INSERT INTO npd_dev_dispatch
-                                   (dispatch_id, dev_jc_id, seq, qty, recipient, mat_doc_id, dispatched_by)
-                               VALUES ($1, $2, $3, $4, $5, $6, $7)""",
-                            cand, dev_jc_id, seq, q, recipient, res["mat_doc_id"], user.user_id)
-                dispatch_id = cand
-                break
-            except asyncpg.UniqueViolationError:
-                if _attempt == 4:
-                    raise
-        # Mirror the latest partial onto the card (046 columns) — single-product card only.
-        # A per-article card's card-level dispatch_* would be ambiguous (which article?), so
-        # its per-article dispatch balances are read from the ledger rows instead.
-        if article_id is None:
-            await conn.execute(
-                """UPDATE npd_dev_job_cards
-                      SET dispatched_at = NOW(), dispatched_by = $1, dispatch_recipient = $2,
-                          dispatch_qty = $3, dispatch_mat_doc_id = $4, updated_at = NOW()
-                    WHERE id = $5""",
-                user.user_id, recipient, q, res["mat_doc_id"], dev_jc_id)
-        # This part may be the one that finishes the request it was developed for. Its own
-        # savepoint: a failure to close must never undo the goods issue just recorded.
-        if jc.get("source_requisition_id"):
-            from app.modules.sample.services import requisition_service as rs
-            try:
-                async with conn.transaction():
-                    await rs.close_if_fully_dispatched(
-                        conn, jc["source_requisition_id"], user=user,
-                        remarks=(f"Closed automatically: everything has been dispatched "
-                                 f"(development job card {dev_jc_id}, outpass {dev_jc_id}-{seq})"))
-            except Exception:  # noqa: BLE001
-                logger.exception("Auto-close of requisition %s after dispatch %s failed",
-                                 jc["source_requisition_id"], dispatch_id)
-    # Close this dispatch out in the job card's mail trail, AFTER commit — the dispatch
-    # summary plus a link to THIS partial out's Delivery Challan + Gate Pass. Threads into
-    # the source requisition's trail when the card came from one. Best-effort: a mail
-    # failure must never undo a recorded goods issue.
-    try:
-        from app.modules.sample.services import sample_mail_service as mail
-        await mail.notify_dev_dispatch_email(
-            conn, dev_jc_id=dev_jc_id, dispatch_id=dispatch_id, seq=seq, qty=q,
-            uom=disp_uom, recipient=recipient,
-            actor_user_id=getattr(user, "user_id", None),
-            actor_name=getattr(user, "full_name", None))
-    except Exception:  # noqa: BLE001
-        logger.exception("Dispatch DC email failed for dev JC %s", dev_jc_id)
+        jc = await _lock_closed_card(conn, dev_jc_id)
+        part = await _dispatch_part(conn, jc, article_id=article_id, qty=qty, uom=uom,
+                                    recipient=recipient, user=user)
+        await _close_request_if_done(conn, jc, user=user, outpass_no=f"{dev_jc_id}-{part['seq']}",
+                                     ref=part["dispatch_id"])
+    await _mail_dispatch(conn, dev_jc_id, [part], recipient=recipient, user=user)
     return await get_dev_job_card(conn, dev_jc_id)
+
+
+async def dispatch_all_remaining(conn, dev_jc_id: int, *, recipient: str | None, user) -> dict:
+    """Dispatch EVERYTHING still to send on a CLOSED card, in one go — the action behind
+    the job card's "Dispatch all remaining & print outpass" button.
+
+    That button used to only print: the combined outpass (and, on a single-product card,
+    the "full outpass") was a read-only page, so the samples left the building on paper
+    while every article still read as remaining, the R&D sample stock was never issued,
+    and the request was never closed — 93 of 100 closed cards on 2026-11-06. Now the print
+    comes AFTER this records each balance as a normal partial out.
+
+    Every article with a balance (or the card's own balance) becomes one part, in line
+    order: one 265 Goods Issue + one ledger row each, all in ONE transaction — if any part
+    fails, none is recorded. Articles already fully sent are skipped. One mail, and one
+    check of whether the request is now complete. Returns the new parts' dispatch ids (the
+    outpass to print) and the refreshed card."""
+    async with conn.transaction():
+        jc = await _lock_closed_card(conn, dev_jc_id)
+        if await _is_per_article(conn, dev_jc_id):
+            rows = await conn.fetch(
+                """SELECT a.article_id, COALESCE(a.output_qty, 0) AS output_qty,
+                          COALESCE((SELECT SUM(d.qty) FROM npd_dev_dispatch d
+                                     WHERE d.dev_jc_id = a.dev_jc_id
+                                       AND d.article_id = a.article_id), 0) AS sent
+                     FROM npd_dev_job_card_articles a
+                    WHERE a.dev_jc_id = $1 AND a.article_id IS NOT NULL
+                    ORDER BY a.line_order, a.article_id""", dev_jc_id)
+            todo = [r["article_id"] for r in rows
+                    if round(float(r["output_qty"]) - float(r["sent"]), 3) > 0]
+        else:
+            left = float(jc["output_qty"] or 0) - await _card_level_dispatched(conn, jc)
+            todo = [None] if round(left, 3) > 0 else []
+        if not todo:
+            raise HTTPException(409, detail={"error": "nothing_to_dispatch",
+                                             "message": "Everything on this job card has already been dispatched",
+                                             "details": {"dev_jc_id": dev_jc_id}})
+        parts = [await _dispatch_part(conn, jc, article_id=aid, qty=None, uom=None,
+                                      recipient=recipient, user=user)
+                 for aid in todo]
+        outpass_no = f"{dev_jc_id}-" + "+".join(str(p["seq"]) for p in parts)
+        await _close_request_if_done(conn, jc, user=user, outpass_no=outpass_no,
+                                     ref=[p["dispatch_id"] for p in parts])
+    await _mail_dispatch(conn, dev_jc_id, parts, recipient=recipient, user=user)
+    return {"dispatch_ids": [p["dispatch_id"] for p in parts],
+            "job_card": await get_dev_job_card(conn, dev_jc_id)}
 
 
 async def link_to_requisition(conn, dev_jc_id: int, *, requisition_id: int, user) -> dict:

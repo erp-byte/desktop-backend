@@ -1,10 +1,19 @@
-"""/api/v1/bom/* — BOM module (rolled-up Bill of Materials browser).
+"""/api/v1/bom/* — BOM module (rolled-up Bill of Materials browser + editor).
 
-Two read endpoints, both gated on the single ('bom', NULL, NULL, 'view')
-permission seeded by app/db/095_bom_module_rbac.sql:
+Seven endpoints. Five are gated on one ('bom', NULL, NULL, <action>) permission
+tuple — 'view' and 'create' are seeded by app/db/095_bom_module_rbac.sql,
+'update' and 'delete' by app/db/139_bom_module_rbac_update_delete.sql. The two
+lookups need only a login (see below):
 
-    GET /api/v1/bom/aggregate  — one row per BOM, figures rolled up in SQL.
-    GET /api/v1/bom/{bom_id}   — header + lines + process route + counts.
+    GET    /api/v1/bom/aggregate           view    one row per BOM, figures rolled up in SQL
+    GET    /api/v1/bom/lookups/materials   (login) type-ahead over all_sku for the line picker
+    GET    /api/v1/bom/lookups/processes   (login) distinct process names for the route picker
+    GET    /api/v1/bom/{bom_id}            view    header + lines + process route + counts
+    POST   /api/v1/bom                     create  header + lines (+ route), strict
+    PATCH  /api/v1/bom/{bom_id}            update  partial header edit; lines / route
+                                                   replaced only when sent
+    DELETE /api/v1/bom/{bom_id}            delete  SOFT delete — is_active = FALSE, nothing
+                                                   is removed
 
 Deliberately a NEW module rather than more routes on production/router.py: that
 file is past 7k lines and the BOM screen shares no state with it.
@@ -16,13 +25,15 @@ module docstring of services/bom_aggregate_service.py for why.
 from __future__ import annotations
 
 from datetime import date
-from typing import Optional
+from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from app.modules.auth.middleware import AuthUser, require_permission
-from app.modules.bom.services import bom_aggregate_service, bom_write_service
+from app.modules.auth.middleware import AuthUser, get_current_user, require_permission
+from app.modules.bom.services import (
+    bom_aggregate_service, bom_lookup_service, bom_write_service,
+)
 
 router = APIRouter(prefix="/api/v1/bom", tags=["BOM"])
 
@@ -39,6 +50,15 @@ def _not_found(bom_id: int) -> HTTPException:
             "details": {"bom_id": bom_id},
         },
     )
+
+
+# Service error codes that mean "someone else holds this" rather than "your
+# payload is malformed". Everything else the services return is a 400.
+_CONFLICT_CODES = frozenset({"bom_exists", "line_referenced"})
+
+
+def _status_for(err: str) -> int:
+    return 409 if err in _CONFLICT_CODES else 400
 
 
 # Declared BEFORE /{bom_id} so the literal segment is matched first.
@@ -64,6 +84,58 @@ async def list_bom_aggregate(
             item_type=item_type, page=page, page_size=page_size)
 
 
+# ── Lookups (type-ahead for the form) ────────────────────────────────────────
+# Two-segment literal paths, so they can never be captured by GET /{bom_id};
+# still declared ahead of it for the same reason /aggregate is.
+#
+# AUTHENTICATION ONLY, no bom.* gate — the same reasoning as /so/sku-lookup:
+# all_sku names and the process names already on BOM routes are shared
+# reference data, and the pickers that read them are embedded in OTHER modules'
+# screens (the plan-builder's inline BOM editor on SO Creation is used by
+# planners, who do not hold bom.view, which is admin-only). Gating per module
+# would 403 a different role every time another screen reuses the picker, and
+# the picker would render that as "no matches". Nothing here reveals a BOM.
+
+@router.get("/lookups/materials")
+async def lookup_materials(
+    request: Request,
+    q: str = Query("", max_length=200,
+                   description="type-ahead text; every token must appear; blank returns nothing"),
+    item_type: Optional[str] = Query(
+        None, description="rm | pm | sfg | fg — omit to search every type (hampers use FG as rm)"),
+    limit: int = Query(20, ge=1, le=100),
+    user: AuthUser = Depends(get_current_user),
+):
+    """Ranked all_sku matches for the BOM line Material picker.
+
+    Returns {results: [{sku_id, particulars, item_type, item_group, sub_group}]}.
+    See services/bom_lookup_service.py for why this is not /so/sku-lookup.
+    """
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        rows = await bom_lookup_service.search_materials(
+            conn, q, item_type=item_type, limit=limit)
+    return {"results": rows}
+
+
+@router.get("/lookups/processes")
+async def lookup_processes(
+    request: Request,
+    q: str = Query("", max_length=200, description="substring; blank lists every process"),
+    limit: int = Query(30, ge=1, le=100),
+    user: AuthUser = Depends(get_current_user),
+):
+    """Distinct process names already used on any BOM route, most-used first.
+
+    Returns {results: [{process_name, stage, boms}]}. The form still accepts a
+    name that is not in this list — this is a suggestion source, not a master.
+    """
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        rows = await bom_lookup_service.search_processes(conn, q, limit=limit)
+    return {"results": rows}
+
+
 @router.get("/{bom_id}")
 async def get_bom_detail(
     request: Request,
@@ -78,9 +150,7 @@ async def get_bom_detail(
     return detail
 
 
-# ── Create ───────────────────────────────────────────────────────────────────
-# Declared after the GETs; POST /api/v1/bom has no path parameter so it cannot
-# collide with GET /{bom_id}.
+# ── Request bodies ───────────────────────────────────────────────────────────
 
 class BomLineIn(BaseModel):
     material_sku_name: str
@@ -98,6 +168,15 @@ class BomLineIn(BaseModel):
     # No line_number: it is assigned 1..N from array order server-side, because
     # it is UNIQUE(bom_id, line_number) and a client-chosen value turns a
     # duplicate into a constraint error the operator cannot act on.
+
+
+class BomLineUpdateIn(BomLineIn):
+    # Present  -> UPDATE that existing line in place (its bom_line_id survives,
+    #             so job-card indents / consumption keep pointing at it).
+    # Absent   -> INSERT a new line.
+    # An existing line whose id is NOT in the payload is DELETEd — unless a job
+    # card references it, which is a 409 `line_referenced`.
+    bom_line_id: int | None = None
 
 
 class BomRouteStepIn(BaseModel):
@@ -153,6 +232,56 @@ class BomCreateRequest(BaseModel):
     # version / is_active / bom_id are server-assigned and deliberately absent.
 
 
+class BomUpdateRequest(BaseModel):
+    """Every field optional. Only the fields actually SENT are touched (the
+    router dumps with exclude_unset=True), so `{"notes": null}` clears notes
+    while omitting `notes` leaves it alone. bom_id, version and created_at are
+    not here and cannot be changed."""
+    # Identity
+    fg_sku_name: str | None = None
+    entity: str | None = None
+    customer_name: str | None = None
+    pack_size_kg: float | None = None
+    output_uom: str | None = None
+
+    # Classification / routing metadata
+    item_group: str | None = None
+    sub_group: str | None = None
+    process_category: str | None = None
+    business_unit: str | None = None
+    factory: str | None = None
+    floors: list[str] | None = None
+    machines: list[str] | None = None
+    bar_line_process: str | None = None
+
+    # Commercial / compliance
+    shelf_life_days: int | None = None
+    gst_rate: float | None = None
+    hsn_sac: str | None = None
+    inventory_group: str | None = None
+    customer_code: str | None = None
+    allowed_balance_tolerance_pct: float | None = None   # null is refused (NOT NULL)
+
+    # Validity
+    effective_from: date | None = None
+    effective_to: date | None = None
+    notes: str | None = None
+
+    # Status. `true` re-activates a deactivated BOM (409 if another active BOM
+    # holds the FG name); `false` is the same soft delete DELETE performs.
+    is_active: bool | None = None
+
+    # Collections. Omitted = untouched. `lines` must hold at least one line when
+    # sent (a BOM with no lines is the broken state the browser exists to find);
+    # `route` may be an empty list, which clears the route.
+    lines: Annotated[list[BomLineUpdateIn], Field(min_length=1)] | None = None
+    route: list[BomRouteStepIn] | None = None
+
+
+# ── Create ───────────────────────────────────────────────────────────────────
+# Declared after the GETs; POST /api/v1/bom has no path parameter so it cannot
+# collide with GET /{bom_id}.
+
 @router.post("", status_code=201)
 async def create_bom(
     request: Request,
@@ -179,13 +308,87 @@ async def create_bom(
             if err:
                 # 409 only for the "someone already has this" case; every other
                 # rejection is a malformed payload.
-                raise HTTPException(409 if err == "bom_exists" else 400,
-                                    detail=result)
+                raise HTTPException(_status_for(err), detail=result)
+    return result
+
+
+# ── Update ───────────────────────────────────────────────────────────────────
+
+@router.patch("/{bom_id}")
+async def update_bom(
+    request: Request,
+    bom_id: int,
+    body: BomUpdateRequest,
+    user: AuthUser = Depends(require_permission("bom", action="update")),
+):
+    """Partially update one BOM, in one transaction.
+
+    Header fields are updated only when sent. `lines`, when sent, replaces the
+    line set matched by bom_line_id (existing ids are updated in place, new
+    lines inserted, missing ones deleted — a 409 `line_referenced` if a job
+    card still points at one). `route`, when sent, replaces the whole route.
+
+    Returns the change summary plus the fresh `detail` (header, lines, route,
+    counts — the same shape as GET /{bom_id}) so a client can refresh in place.
+    """
+    provided = body.model_dump(exclude_unset=True)
+    if not provided:
+        raise HTTPException(
+            400,
+            detail={"error": "empty_update",
+                    "message": "Provide at least one field to update",
+                    "details": {"bom_id": bom_id}},
+        )
+
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await bom_write_service.update_bom(
+                conn, bom_id, provided, updated_by=_actor(user))
+            if result is None:
+                raise _not_found(bom_id)
+            err = result.get("error")
+            if err:
+                # Raised INSIDE the transaction block so every write the
+                # service made before refusing (line deletes that did succeed,
+                # the header UPDATE) is rolled back with it.
+                raise HTTPException(_status_for(err), detail=result)
+            result["detail"] = await bom_aggregate_service.get_bom_detail(conn, bom_id)
+    return result
+
+
+# ── Delete (soft) ────────────────────────────────────────────────────────────
+
+@router.delete("/{bom_id}")
+async def deactivate_bom(
+    request: Request,
+    bom_id: int,
+    user: AuthUser = Depends(require_permission("bom", action="delete")),
+):
+    """Mark one BOM inactive. NOTHING is deleted.
+
+    bom_id is referenced from plan lines, job cards, QC and costing, so a hard
+    delete is never safe; `is_active = FALSE` hides the BOM from every resolver
+    (they all filter on it) while every existing job card keeps its recipe.
+    Idempotent — a second call is a 200 with `already_inactive: true`. Reverse
+    it with PATCH {"is_active": true}.
+
+    200 with a body rather than 204: the caller needs to know whether this call
+    did the deactivating or found it already done.
+    """
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await bom_write_service.deactivate_bom(
+                conn, bom_id, deactivated_by=_actor(user))
+    if result is None:
+        raise _not_found(bom_id)
     return result
 
 
 def _actor(user: AuthUser) -> str:
-    """Display name for created_by, from the token — never the request body."""
+    """Display name for created_by / updated_by, from the token — never the
+    request body."""
     return (getattr(user, "full_name", None)
             or getattr(user, "email", None)
             or getattr(user, "phone", None)

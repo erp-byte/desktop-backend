@@ -431,6 +431,11 @@ class DevDispatchBody(BaseModel):
     uom: Optional[str] = None
 
 
+class DevDispatchAllBody(BaseModel):
+    """Dispatch every remaining balance on the card at once (one part per article)."""
+    recipient: Optional[str] = None
+
+
 # Trial phases (multi-day) on a development job card.
 class DevPhaseCreate(BaseModel):
     name: str = Field(min_length=1)

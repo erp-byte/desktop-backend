@@ -1154,6 +1154,21 @@ async def dispatch_dev_sample(
             uom=body.uom, user=user)
 
 
+@router.post("/npd-dev-job-cards/{dev_jc_id}/dispatch-all")
+async def dispatch_dev_sample_all(
+    request: Request,
+    dev_jc_id: int,
+    body: schemas.DevDispatchAllBody,
+    user: AuthUser = Depends(require_permission("sample", "npd", action="create")),
+):
+    """Record every remaining balance as dispatched (one part per article), so the combined
+    outpass printed next is backed by goods issues. Returns {dispatch_ids, job_card}."""
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        return await npd_dev_service.dispatch_all_remaining(
+            conn, dev_jc_id, recipient=body.recipient, user=user)
+
+
 @router.post("/npd-dev-job-cards/{dev_jc_id}/cancel")
 async def cancel_dev_job_card(
     request: Request,

@@ -835,30 +835,63 @@ def _promote_status_html(jc: dict, *, gate: str, action: str, actor_name,
                   inner=inner, footer=_TRAIL_FOOTER)
 
 
+def _qty_by_uom(parts) -> str:
+    """'1.5 kg + 20 pcs' — summed per unit label, never across them (a part's quantity
+    is not unit-converted, so one figure over mixed labels would mean nothing)."""
+    totals: dict[str, float] = {}
+    for p in parts:
+        u = (p.get("uom") or "kg").strip() or "kg"
+        totals[u] = round(totals.get(u, 0.0) + float(p.get("qty") or 0), 3)
+    # Fixed 3 dp (the ledger's precision), trailing zeros dropped — not :g, which keeps 6
+    # significant digits and prints 1234.567 as 1234.57 or 1234567.5 as 1.23457e+06.
+    return " + ".join(f"{q:.3f}".rstrip("0").rstrip(".") + f" {u}" for u, q in totals.items())
+
+
 def _dispatch_html(jc: dict, *, dispatch_id, seq, qty, uom, recipient, actor_name,
-                   dc_url: str) -> str:
+                   dc_url: str, parts=None) -> str:
     """The closing entry in the trail — the FG sample has gone out. Carries the dispatch
     summary in full text (so it stands alone) plus a link to the Delivery Challan + Gate
-    Pass print page for this specific partial out."""
+    Pass print page for this specific partial out.
+
+    `parts` (several dispatched at once — every remaining balance on the card) lists each
+    part on its own row under ONE combined outpass number, instead of one mail per part."""
+    many = bool(parts) and len(parts) > 1
     fields = [
         ("Recipient", _fmt(recipient)),
         ("Dispatched by", _fmt(actor_name)),
         ("Dev job card", _fmt(jc.get("id"))),
-        ("FG article", _fmt(jc.get("fg_sku_name") or jc.get("title"))),
+        ("FG article", _fmt(f"{len(parts)} articles" if many
+                            else jc.get("fg_sku_name") or jc.get("title"))),
         ("Sales POC", _fmt(jc.get("sales_poc_name") or jc.get("sales_poc_email"))),
         ("Warehouse", _fmt(jc.get("warehouse"))),
         ("Company", _fmt(jc.get("company_name"))),
         ("Customer", _fmt(jc.get("customer_name"))),
     ]
+    if many:
+        qty_label = _fmt(_qty_by_uom(parts))
+        outpass_no = _fmt(f"{jc.get('id')}-" + "+".join(str(p.get("seq")) for p in parts))
+        part_rows = (f'<p style="margin:14px 0 4px;font-size:11px;color:{_MUTED};'
+                     'text-transform:uppercase;letter-spacing:.06em">Parts on this outpass</p>'
+                     '<table role="presentation" width="100%" cellpadding="0" cellspacing="0">'
+                     + _kv_rows([(_fmt(p.get("name")), f'{_fmt(p.get("qty"))} {_fmt(p.get("uom"))}', "num")
+                                 for p in parts])
+                     + '</table>')
+        lead = ('Everything still to send on this job card has been dispatched together. '
+                'One Delivery Challan &amp; Gate Pass covers every part below.')
+    else:
+        qty_label = f"{_fmt(qty)} {_fmt(uom)}"
+        outpass_no = _fmt(f"{jc.get('id')}-{seq}" if seq else dispatch_id)
+        part_rows = ""
+        lead = ('The developed FG sample has been dispatched. The Delivery Challan &amp; Gate Pass '
+                'for this dispatch is available below.')
     inner = (
         f'<tr><td style="padding:26px 26px 6px">{_pill("Dispatched", "#0f766e")}'
         f'<p style="margin:0 0 18px;font-size:{_T_LEAD}px;color:{_INK};line-height:1.6">'
-        'The developed FG sample has been dispatched. The Delivery Challan &amp; Gate Pass '
-        'for this dispatch is available below.</p>'
-        + _key_figures([("Dispatched qty", f"{_fmt(qty)} {_fmt(uom)}"),
-                        ("Outpass no", _fmt(f"{jc.get('id')}-{seq}" if seq else dispatch_id))])
+        f'{lead}</p>'
+        + _key_figures([("Dispatched qty", qty_label), ("Outpass no", outpass_no)])
         + f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0">{_kv_rows(fields)}</table>'
-        '</td></tr>'
+        + part_rows
+        + '</td></tr>'
         f'{_buttons([("&#128196;&nbsp; Open Delivery Challan", dc_url, "#0f766e")])}')
     return _shell(hdr="#0f766e", eyebrow="SAMPLE DISPATCHED — DELIVERY CHALLAN",
                   title=f"Dev JC {_fmt(jc.get('id'))}", inner=inner,
@@ -977,10 +1010,11 @@ async def notify_promote_status_email(conn, *, dev_jc_id, gate: str, action: str
 
 async def notify_dev_dispatch_email(conn, *, dev_jc_id, dispatch_id=None, seq=None,
                                     qty=None, uom=None, recipient=None,
-                                    actor_user_id=None, actor_name=None) -> None:
+                                    actor_user_id=None, actor_name=None, parts=None) -> None:
     """The closing entry in the trail — the FG sample has gone out, with a link to this
     dispatch's Delivery Challan + Gate Pass. Called from dispatch_dev_sample after commit.
-    Best-effort, never raises."""
+    `parts` ([{dispatch_id, seq, qty, uom, name}]) — several parts dispatched together:
+    one mail, linking the ONE outpass that covers all of them. Best-effort, never raises."""
     jc = await conn.fetchrow("SELECT * FROM npd_dev_job_cards WHERE id = $1", dev_jc_id)
     if jc is None:
         return
@@ -988,11 +1022,13 @@ async def notify_dev_dispatch_email(conn, *, dev_jc_id, dispatch_id=None, seq=No
     rec = await resolve_recipients(conn, src)
     web = Settings().WEB_APP_URL.rstrip("/")
     dc_url = f"{web}/modules/npd-development/job-cards/{dev_jc_id}/gate-pass"
-    if dispatch_id is not None:
+    if parts:
+        dc_url += "?dispatch=" + ",".join(str(p["dispatch_id"]) for p in parts)
+    elif dispatch_id is not None:
         dc_url += f"?dispatch={dispatch_id}"
     actor = await _name_for_user(conn, actor_user_id, actor_name)
     html = _dispatch_html(_with_sales_poc(dict(jc), src), dispatch_id=dispatch_id, seq=seq, qty=qty, uom=uom,
-                          recipient=recipient, actor_name=actor, dc_url=dc_url)
+                          recipient=recipient, actor_name=actor, dc_url=dc_url, parts=parts)
     _broadcast(subject, html, rec, thread=thread)
 
 

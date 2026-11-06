@@ -631,6 +631,11 @@ SQL_FILES = [
     # of what 136 granted. MUST follow 136. Checked by the web app's /api/collections
     # Route Handlers, so it may run before or after either deploys. Idempotent.
     DB_DIR / "138_debtors_collection_full_access.sql",
+    # 139 seeds the BOM module's update + delete permission tuples (PATCH / DELETE
+    # /api/v1/bom/{bom_id}) and grants them to admin, as 095 did for view + create.
+    # MUST run before the backend that gates on them, or both endpoints 403 for
+    # every non-admin. Idempotent (same NOT EXISTS guard as 095).
+    DB_DIR / "139_bom_module_rbac_update_delete.sql",
 ]
 
 # ── Optional: drop the v1 legacy job-card stack (TEST / Supabase DB ONLY) ──────
