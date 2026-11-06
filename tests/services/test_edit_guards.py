@@ -30,6 +30,10 @@ class _Conn:
     async def fetchrow(self, sql, *args):
         if "process_group_id" in sql and "prev_job_card_id IS NULL" in sql:
             return {"heads": self.heads, "group_id": self.group_id}
+        if "FROM production_plan_line_v2 l" in sql and "FOR UPDATE OF l" in sql:
+            # Live edit locks the line and reads its plan first.
+            return {"plan_status": "approved", "fg_sku_name": "Roasted Peanuts",
+                    "planned_qty_kg": 100, "planned_qty_units": 10}
         return None
 
     async def fetch(self, sql, *args):

@@ -64,6 +64,36 @@ async def get_day_end_summary(conn, entity: str, target_date: date | None = None
     }
 
 
+async def _dispatch_refusal(conn, job_card_id: int, qty) -> dict | None:
+    """Refusal for a day-end dispatch of `qty` kg from this (v1) card: it is
+    capped at the card's recorded output (job_card_output.fg_actual_kg). The
+    dispatch SETS dispatched_to_next_kg, so the cap is the output itself."""
+    from app.modules.production.services.job_card_v2 import SEND_ON_EPS_KG
+    row = await conn.fetchrow(
+        "SELECT jc.job_card_number, o.fg_actual_kg FROM job_card jc "
+        "LEFT JOIN job_card_output o ON o.job_card_id = jc.job_card_id "
+        "WHERE jc.job_card_id = $1",
+        job_card_id,
+    )
+    if row is None:
+        return {"error": "job_card_not_found", "job_card_id": job_card_id,
+                "message": f"Job card {job_card_id} was not found, so nothing was dispatched."}
+    card = row["job_card_number"] or job_card_id
+    made = round(float(row["fg_actual_kg"] or 0), 3)
+    if made <= SEND_ON_EPS_KG:
+        return {"error": "no_output", "job_card_id": job_card_id,
+                "message": (f"Job card {card} has no output saved yet. Save its output "
+                            "before dispatching it; nothing was dispatched.")}
+    want = round(float(qty or 0), 3)
+    if want > made + SEND_ON_EPS_KG:
+        return {"error": "over_dispatch", "job_card_id": job_card_id,
+                "produced_kg": made, "dispatch_qty": want,
+                "message": (f"Job card {card} made {made:.3f} kg, so {want:.3f} kg can't be "
+                            f"dispatched from it. Dispatch {made:.3f} kg or less; nothing was "
+                            "dispatched.")}
+    return None
+
+
 async def bulk_dispatch(conn, dispatches: list[dict], entity: str) -> dict:
     """Bulk update dispatch quantity for multiple job cards.
 
@@ -71,7 +101,16 @@ async def bulk_dispatch(conn, dispatches: list[dict], entity: str) -> dict:
     migration 011. Dispatch quantity is now tracked on the job_card row itself
     via `dispatched_to_next_kg`. The side-effects below (fulfillment update,
     floor_movement audit, fg_store deduction) are still authoritative.
+
+    Each dispatch is capped at its card's recorded output, and refused for a
+    card with none (it used to take any qty). Every card is checked before the
+    first write, so a refusal leaves the whole request unwritten.
     """
+    for d in dispatches:
+        refusal = await _dispatch_refusal(conn, d['job_card_id'], d['dispatch_qty'])
+        if refusal is not None:
+            return refusal
+
     updated = 0
     for d in dispatches:
         jc_id = d['job_card_id']

@@ -435,8 +435,8 @@ class _CloseConn(Conn):
             return {"batch_id": OPEN, "job_card_id": JC, "batch_number": 1, "status": "open", "notes": None}
         if s.startswith("SELECT job_card_id, next_job_card_id"):
             return {"job_card_id": JC, "next_job_card_id": None, "output_kind": "SFG", "uom": "kg",
-                    "dispatched_to_next_kg": 0, "entity": "cfpl", "output_code": None,
-                    "fg_sku_name": "Seeds", "next_live": None}
+                    "status": "in_progress", "dispatched_to_next_kg": 0, "entity": "cfpl",
+                    "output_code": None, "fg_sku_name": "Seeds", "next_live": None}
         if s.startswith("SELECT is_balanced, balance_difference_qty, total_input_qty"):
             return {"is_balanced": True, "balance_difference_qty": 0, "total_input_qty": 30}
         if s.startswith("UPDATE job_card_batch_v2"):

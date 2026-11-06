@@ -53,6 +53,8 @@ class _Conn:
     async def fetchval(self, sql, *args):
         if "FROM auth_role" in sql:           # holds_role
             return bool(self.user.held & set(args[1]))
+        if sql == R._LINE_FACTORY_SQL:        # the chain routes' factory check
+            return "A185"
         raise AssertionError(sql[:60])
 
     async def fetchrow(self, sql, *args):

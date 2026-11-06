@@ -45,6 +45,11 @@ class _Conn:
     async def fetch(self, sql, *args):
         return []
 
+    async def fetchval(self, sql, *args):
+        # The line's plan factory, read by every chain route before it writes.
+        assert sql == R._LINE_FACTORY_SQL, sql
+        return "A-185"
+
 
 class _Pool:
     def __init__(self, conn): self.conn = conn
@@ -132,11 +137,28 @@ def test_edit_above_the_plan_rolls_the_delete_back(conn, monkeypatch):
 
 
 def test_live_edit_refusal_rolls_back(conn, monkeypatch):
-    async def live(conn, line, **kw): return {"error": "no_wip_steps", "message": "At least one process"}
+    async def live(conn, line, **kw): return {"error": "missing_floor", "message": "Pick a floor for Sorting."}
     monkeypatch.setattr(jcv2, "apply_live_job_card_edits", live)
     body = R.JobCardLineApplyEdits(qty_kg=100, steps=[], pkg_floor="FG store")
 
     with pytest.raises(HTTPException) as exc:
         asyncio.run(R.apply_line_job_card_edits_v2(_request(conn), LINE, body, BackgroundTasks(), user=USER))
     assert exc.value.status_code == 400
+    assert conn.tx_exits[0] is not None
+
+
+def test_a_raised_live_edit_refusal_is_a_409_and_rolls_back(conn, monkeypatch):
+    """The service's removal backstop raises rather than returns: still the
+    refusal's own status and message, and nothing commits."""
+    from app.modules.production.services.refusals import ServiceRefusal
+
+    async def live(conn, line, **kw):
+        raise ServiceRefusal({"error": "cannot_remove_terminal", "message": "Sorting is completed."})
+    monkeypatch.setattr(jcv2, "apply_live_job_card_edits", live)
+    body = R.JobCardLineApplyEdits(qty_kg=100, steps=[], pkg_floor="FG store")
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(R.apply_line_job_card_edits_v2(_request(conn), LINE, body, BackgroundTasks(), user=USER))
+    assert exc.value.status_code == 409
+    assert exc.value.detail == {"error": "cannot_remove_terminal", "message": "Sorting is completed."}
     assert conn.tx_exits[0] is not None

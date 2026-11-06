@@ -222,6 +222,42 @@ def test_completion_runs_after_every_other_section_is_persisted(client_with, spy
     assert order[-1] == "close_batch", order
 
 
+class _ClosedCardConn(_Conn):
+    """The card was closed (or cancelled) while a batch was left open."""
+
+    def __init__(self, status):
+        super().__init__()
+        self.status = status
+
+    async def fetchval(self, sql, *args):
+        if sql.startswith("SELECT status FROM job_card_v2"):
+            self.calls.append((sql, args))
+            return self.status
+        return await super().fetchval(sql, *args)
+
+
+@pytest.mark.parametrize("status", ["closed", "cancelled"])
+def test_completing_a_batch_on_a_closed_card_is_refused_before_any_write(client_with, spy, status):
+    """Closing the card was the last send-on; a batch completed after it would
+    auto-dispatch past the close."""
+    conn = _ClosedCardConn(status)
+    res = client_with(conn).post(URL, json=_body(complete_batch=True, is_balanced=True))
+    assert res.status_code == 409, res.text
+    body = res.json()                              # the app's error envelope
+    assert body["error"] == "job_card_finished" and body["details"]["status"] == status
+    assert body["message"].startswith(f"Job card {JC} is {status}")
+    assert spy["order"] == []                      # nothing saved, nothing closed
+    assert not [c for c in conn.calls if c[0].lstrip().startswith(("UPDATE", "INSERT"))]
+
+
+def test_a_plain_save_on_a_closed_card_is_not_gated_here(client_with, spy):
+    """Only completing a batch is refused; a save without complete_batch reads no status."""
+    conn = _ClosedCardConn("closed")
+    res = client_with(conn).post(URL, json=_body())
+    assert res.status_code == 200, res.text
+    assert not [c for c in conn.calls if c[0].startswith("SELECT status FROM job_card_v2")]
+
+
 def test_operator_partial_dispatch_choice_reaches_close_batch(client_with, spy):
     """Removing the Close Batch button must not remove the DECISION it carried:
     omitting dispatch_qty_kg means the whole produced qty flows downstream."""
@@ -423,7 +459,7 @@ def _output_insert_sql() -> str:
                 return {"is_locked": False, "locked_reason": None,
                         "force_unlocked": False, "status": "in_progress"}
             if "output_kind" in sql:
-                return {"job_card_id": JC, "output_kind": "SFG"}
+                return {"job_card_id": JC, "output_kind": "SFG", "dispatched_to_next_kg": 0}
             return None
 
         async def fetch(self, sql, *args):

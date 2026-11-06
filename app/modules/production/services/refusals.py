@@ -24,7 +24,13 @@ CONFLICT = frozenset({
     "multiple_chains", "merged_run", "nothing_to_distribute", "no_open_packaging",
     "packaging_has_previous_stage",
     "not_a_group", "already_started", "no_common_rm", "bom_changes_on_merged_lines",
+    # Edit Job Card (job_card_v2.apply_live_job_card_edits / replace_job_cards_for_line).
+    "terminal_mismatch", "unknown_job_card", "cannot_add_before_released",
+    "cannot_remove_started_first", "card_finished", "chain_finished", "rebuild_blocked",
+    "cannot_remove_holding_material", "first_stage_requested",
 })
+# services/chain_floors: a floor the user may not put work on or take it off.
+FORBIDDEN = frozenset({"floor_not_allowed"})
 
 
 class ServiceRefusal(Exception):
@@ -46,6 +52,8 @@ def refusal_status(code: str | None) -> int:
         return 404
     if code in CONFLICT:
         return 409
+    if code in FORBIDDEN:
+        return 403
     return 400
 
 

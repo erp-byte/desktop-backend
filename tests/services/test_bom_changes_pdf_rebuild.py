@@ -142,12 +142,21 @@ class _NullCtx:
 
 class ScriptConn:
     """Answers the plain SQL of replace_job_cards_for_line / apply_live_job_card_edits by
-    fragment and the jc_bom_changes queries by tag. `log` keeps every statement in order."""
+    fragment and the jc_bom_changes queries by tag. `log` keeps every statement in order.
 
-    def __init__(self, cards, heads, changes=()):
+    `line` overrides the plan line row (plan status, planned qty), `cancelled_numbers`
+    are the job card numbers of the line's soft-deleted cards, `blockers` the
+    rebuild_refusal row."""
+
+    def __init__(self, cards, heads, changes=(), *, line=None, cancelled_numbers=(), blockers=None):
         self.cards = {c["job_card_id"]: c for c in cards}
         self.order = [c["job_card_id"] for c in cards]
         self.heads, self.changes = heads, list(changes)
+        self.line = {"bom_id": 9, "fg_sku_name": "FG", "customer_name": "C", "entity": "cfpl",
+                     "warehouse": "W202", "plan_status": "approved",
+                     "planned_qty_kg": 100, "planned_qty_units": 10, **(line or {})}
+        self.cancelled_numbers = list(cancelled_numbers)
+        self.blockers = {"cancelled": 0, "requested_on": None, "amended_on": None, **(blockers or {})}
         self.log: list[tuple[str, tuple]] = []
 
     def _s(self, sql, a):
@@ -161,12 +170,18 @@ class ScriptConn:
             return [{"job_card_id": h} for h in self.heads]
         if "jcbc:line_changes" in s:
             return self.changes
+        if s == "SELECT job_card_number FROM job_card_v2 WHERE plan_line_id = $1":
+            # Every number the line ever used, its cancelled cards' too (next_add_no).
+            return [{"job_card_number": n} for n in
+                    [self.cards[i]["job_card_number"] for i in self.order] + self.cancelled_numbers]
         if "FROM job_card_v2 WHERE plan_line_id" in s and "deleted_at IS NULL" in s:
             return [self.cards[i] for i in self.order]
         if "FROM job_card_v2 WHERE job_card_id = ANY($1)" in s:
             return [self.cards[i] for i in a[0]]
         if "SELECT step_id FROM production_plan_step_v2" in s:
             return []
+        if "FROM bom_line WHERE bom_id = $1" in s:
+            return []                                       # _materialise_indents: no BOM lines
         raise AssertionError(s)
 
     async def fetchrow(self, sql, *a):
@@ -175,20 +190,25 @@ class ScriptConn:
             # line_edit_refusal (Edit is refused for several chains / a merged run).
             return {"heads": len(self.heads), "group_id": None}
         if "FROM production_plan_line_v2 l JOIN production_plan_v2 p" in s:
-            return {"bom_id": 9, "fg_sku_name": "FG", "customer_name": "C", "entity": "cfpl", "warehouse": "W202"}
+            return dict(self.line)
+        if "AS cancelled" in s and "bom_amendment_request_v2" in s:
+            return dict(self.blockers)                      # rebuild_refusal
         raise AssertionError(s)
 
     async def fetchval(self, sql, *a):
         s = self._s(sql, a)
         if "jcbc:table" in s:
             return True
+        if "to_regclass('public.floor_requisition')" in s:
+            return True
         if "MAX(step_order)" in s:
             return 3
         if "INSERT INTO production_plan_step_v2" in s:
             return 5001
         if "INSERT INTO job_card_v2" in s:
-            self.cards[900] = card(900, 0, "locked", plan_step_id=5001)
-            return 900
+            jid = 900 + sum(1 for i in self.cards if i >= 900)
+            self.cards[jid] = card(jid, 0, "locked", plan_step_id=5001, job_card_number=a[1])
+            return jid
         raise AssertionError(s)
 
     async def execute(self, sql, *a):
@@ -209,9 +229,14 @@ class ScriptConn:
 
 
 def card(jid, step, status, **over):
-    row = {"job_card_id": jid, "step_number": step, "process_name": f"P{jid}", "stage": f"p{jid}",
+    # carried_qty_kg / has_output / has_requisition: what Edit reads it holds; a
+    # locked card waits for the stage before unless told otherwise.
+    row = {"job_card_id": jid, "job_card_number": f"PLAN-7-L70-S{step}", "step_number": step,
+           "process_name": f"P{jid}", "stage": f"p{jid}",
            "floor": "F1", "status": status, "planned_qty_kg": 100, "planned_qty_units": None,
-           "output_code": None, "plan_step_id": 5000 + jid, "plan_id": 7}
+           "output_code": None, "plan_step_id": 5000 + jid, "plan_id": 7,
+           "carried_qty_kg": 0, "has_output": False, "has_requisition": False,
+           "locked_reason": "awaiting_previous_stage" if status == "locked" else None}
     row.update(over)
     return row
 
@@ -228,16 +253,26 @@ def test_live_edit_locks_the_line_first():
     conn = ScriptConn([card(1, 1, "unlocked"), card(2, 2, "locked"), card(3, 3, "locked")], heads=[1])
     _edit(conn, [{"job_card_id": 1, "process": "P1", "floor": "F1"},
                  {"job_card_id": 2, "process": "P2", "floor": "F1"}])
-    first = conn.log[0][0]
-    assert "FROM production_plan_line_v2 WHERE plan_line_id = $1 FOR UPDATE" in first and conn.log[0][1] == (70,)
+    # The plan row first (FOR KEY SHARE, the order Cancel plan takes), then the line.
+    assert conn.log[0][0].startswith("SELECT 1 FROM production_plan_v2 WHERE plan_id = (")
+    assert conn.log[0][0].endswith("FOR KEY SHARE") and conn.log[0][1] == (70,)
+    first = conn.log[1][0]
+    assert "FROM production_plan_line_v2 l JOIN production_plan_v2 p" in first
+    assert first.endswith("WHERE l.plan_line_id = $1 FOR UPDATE OF l") and conn.log[1][1] == (70,)
+    # Then the line's cards, locked in step order (dispatch's order; stop and cancel
+    # take the line first, so they wait for the edit).
+    cards_at = conn.index("FROM job_card_v2 WHERE plan_line_id=$1 AND deleted_at IS NULL "
+                          "ORDER BY step_number FOR UPDATE")
+    assert 0 < cards_at
 
 
 def test_live_edit_removing_stage_1_carries_the_changes_to_the_new_first_card(monkeypatch):
-    # S1 Sorting (in progress) -> S2 Roasting (locked) -> PKG; the planner removes Sorting.
+    # S1 Sorting (released, not started) -> S2 Roasting (locked) -> PKG; the planner
+    # removes Sorting. (A started stage 1 is refused: test_live_edit_single_and_atomic.)
     async def _cancel(conn, *, job_card_id, reason, deleted_by):
         return {"removed": True, "snapshot": {}}
     monkeypatch.setattr(jcv2, "_force_record_and_cancel_jc", _cancel)
-    conn = ScriptConn([card(1, 1, "in_progress"), card(2, 2, "locked"), card(3, 3, "locked")],
+    conn = ScriptConn([card(1, 1, "unlocked"), card(2, 2, "locked"), card(3, 3, "locked")],
                       heads=[1], changes=LIVE_CHANGES)
     out = _edit(conn, [{"job_card_id": 2, "process": "Roasting", "floor": "F1"}])
     assert out["job_card_ids"] == [2, 3]
@@ -248,7 +283,9 @@ def test_live_edit_removing_stage_1_carries_the_changes_to_the_new_first_card(mo
 
 
 def test_live_edit_inserting_a_step_in_front_carries_the_changes():
-    conn = ScriptConn([card(1, 1, "unlocked"), card(2, 2, "locked"), card(3, 3, "locked")],
+    # Only in front of a card still locked (here the first card is held, not yet
+    # released to its floor); a released one refuses the add.
+    conn = ScriptConn([card(1, 1, "locked"), card(2, 2, "locked"), card(3, 3, "locked")],
                       heads=[1], changes=LIVE_CHANGES)
     out = _edit(conn, [{"job_card_id": None, "process": "Cleaning", "floor": "F1"},
                        {"job_card_id": 1, "process": "P1", "floor": "F1"},
@@ -282,8 +319,9 @@ def test_replace_carries_only_the_chains_that_were_live(monkeypatch):
                                                       pkg_floor="F2"))
     assert out["bom_changes_carried"] == 2
     # Heads are read before the cards are deleted; a cancelled chain's head is not
-    # among them, so its changes stay where they are.
-    assert conn.index("jcbc:heads", ([21, 22],)) < conn.index("DELETE FROM job_card_v2")
+    # among them, so its changes stay where they are. Only live cards are deleted.
+    assert conn.index("jcbc:heads", ([21, 22],)) < conn.index(
+        "DELETE FROM job_card_v2 WHERE plan_line_id = $1 AND deleted_at IS NULL")
     conn.index("jcbc:line_changes", (70, [21, 900]))
     conn.index("jcbc:repoint", ([61, 62], 900))
 

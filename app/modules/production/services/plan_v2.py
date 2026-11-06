@@ -371,7 +371,12 @@ async def get_plan(conn, plan_id: int) -> dict | None:
                (SELECT COUNT(*) FROM job_card_v2 j
                  WHERE j.plan_line_id = l.plan_line_id
                    AND j.prev_job_card_id IS NULL
-                   AND j.deleted_at IS NULL) AS job_card_count
+                   AND j.deleted_at IS NULL) AS job_card_count,
+               -- A live card in a merged process run (steps_locked below).
+               EXISTS (SELECT 1 FROM job_card_v2 j
+                        WHERE j.plan_line_id = l.plan_line_id
+                          AND j.deleted_at IS NULL
+                          AND j.process_group_id IS NOT NULL) AS in_merged_run
         FROM production_plan_line_v2 l
         WHERE l.plan_id = $1
         ORDER BY l.plan_line_id ASC
@@ -382,11 +387,24 @@ async def get_plan(conn, plan_id: int) -> dict | None:
 
     steps_by_line: dict[int, list[dict]] = {i: [] for i in line_ids}
     if line_ids:
+        # `carded`: the step has job cards that move with it when its floor
+        # changes (locked / unlocked, the cards _sync_jc_attrs_from_step updates);
+        # `card_floors`: the floors those cards are on, which can differ from
+        # the step's own. PUT /plans-v2/steps/{id} checks every floor they leave
+        # plus the new one (router._STEP_FACTORY_SQL), so Plan Detail checks
+        # the same before its first request.
         step_rows = await conn.fetch(
             """
-            SELECT * FROM production_plan_step_v2
-            WHERE plan_line_id = ANY($1)
-            ORDER BY plan_line_id, step_order
+            SELECT s.*,
+                   EXISTS (SELECT 1 FROM job_card_v2 j
+                           WHERE  j.plan_step_id = s.step_id AND j.deleted_at IS NULL
+                             AND  j.status IN ('locked', 'unlocked')) AS carded,
+                   ARRAY(SELECT DISTINCT j.floor FROM job_card_v2 j
+                         WHERE  j.plan_step_id = s.step_id AND j.deleted_at IS NULL
+                           AND  j.status IN ('locked', 'unlocked')) AS card_floors
+            FROM production_plan_step_v2 s
+            WHERE s.plan_line_id = ANY($1)
+            ORDER BY s.plan_line_id, s.step_order
             """,
             line_ids,
         )
@@ -396,6 +414,13 @@ async def get_plan(conn, plan_id: int) -> dict | None:
     lines = []
     for r in line_rows:
         d = _serialize_row(r)
+        # `steps_locked`: the step routes' 409 steps_locked_by_cards for this
+        # line's live cards (_steps_locked_refusal), or None — so Plan Detail
+        # refuses an add / move / delete before it sends any step change.
+        locked = _steps_locked_by(merged_run=bool(d.pop('in_merged_run')),
+                                  heads=int(r['job_card_count'] or 0))
+        d['steps_locked'] = (None if locked is None
+                             else {"reason": locked["reason"], "message": locked["message"]})
         d['steps'] = steps_by_line.get(r['plan_line_id'], [])
         lines.append(d)
 
@@ -791,8 +816,11 @@ async def validate_process_merge(conn, plan_ids: list[int]) -> dict:
     articles" rule), NOT bom_id equality.
 
     Read-only. Returns {"groups": [...], "ineligible": [...]}: every group with
-    >=2 members is mergeable; singletons and carded / RM-less lines come back as
-    ineligible with a reason so the UI can explain why nothing merged.
+    >=2 members is mergeable; singletons, started / RM-less lines, and lines whose
+    cards the merge could not delete (job_card_v2.rebuild_refusal) come back as
+    ineligible with a reason so the UI can explain why nothing merged. Each group
+    carries suggested_sfg, the shared SFG the wizard starts from
+    (_stamp_suggested_sfg).
     """
     ids = [int(p) for p in (plan_ids or []) if p is not None]
     if not ids:
@@ -829,7 +857,10 @@ async def validate_process_merge(conn, plan_ids: list[int]) -> dict:
                (SELECT COUNT(*) FROM job_card_v2 j
                  WHERE j.plan_line_id = l.plan_line_id
                    AND j.deleted_at IS NULL
-                   AND j.status NOT IN ('locked','unlocked')) AS jc_started
+                   AND j.status NOT IN ('locked','unlocked')) AS jc_started,
+               -- Any card, cancelled ones too: the merge deletes them all.
+               EXISTS (SELECT 1 FROM job_card_v2 j
+                        WHERE j.plan_line_id = l.plan_line_id) AS has_cards
         FROM production_plan_line_v2 l
         JOIN production_plan_v2 p ON p.plan_id = l.plan_id
         WHERE l.plan_id = ANY($1::int[])
@@ -875,6 +906,14 @@ async def validate_process_merge(conn, plan_ids: list[int]) -> dict:
         if r["jc_started"]:
             ineligible.append({**base, "reason": "Job cards already started"})
             continue
+        if r["has_cards"]:
+            # Cards the merge can't delete (the floor asked material for one, a
+            # BOM amendment names one, or cancelled cards whose records are kept):
+            # create_merged_process_run refuses them, so they are never offered.
+            blocked = await job_card_v2.rebuild_refusal(conn, r["plan_line_id"])
+            if blocked is not None:
+                ineligible.append({**base, "reason": blocked["reason"]})
+                continue
         if not r["rm_fingerprint"]:
             ineligible.append({**base, "reason": "BOM has no raw-material lines"})
             continue
@@ -927,7 +966,69 @@ async def validate_process_merge(conn, plan_ids: list[int]) -> dict:
         if base["plan_line_id"] not in grouped:
             ineligible.append({**base, "reason": "No other selected product shares its factory + floor + any RM article"})
 
+    await _stamp_suggested_sfg(conn, out_groups)
     return {"groups": out_groups, "ineligible": ineligible}
+
+
+async def _stamp_suggested_sfg(conn, groups: list[dict]) -> None:
+    """Set each merge group's suggested_sfg: the SFG its products already make,
+    so the wizard starts from it instead of a made-up name. A product's own SFG
+    is what its cards feed packing (carded lines), else the SFG#### its routing
+    makes; when every member has one and they are the same, that is it. Failing
+    that, the articles' standard SFG (sfg_canonical_map) when they all share one;
+    else None — the planner types one, or a blank lets the merge use the first
+    product's routed SFG."""
+    members = {m["plan_line_id"]: m for g in groups for m in g["members"]}
+    if not members:
+        return
+    card_sfg: dict[int, str] = {}
+    carded = [plid for plid, m in members.items() if m["carded"]]
+    if carded:
+        for r in await conn.fetch(
+            """
+            SELECT plan_line_id, array_agg(DISTINCT input_code) AS codes
+              FROM job_card_v2
+             WHERE plan_line_id = ANY($1::int[]) AND deleted_at IS NULL
+               AND output_kind = 'FG' AND input_code IS NOT NULL
+             GROUP BY plan_line_id
+            """,
+            carded,
+        ):
+            codes = {c.strip() for c in (r["codes"] or []) if c and c.strip()}
+            if len(codes) == 1:
+                card_sfg[r["plan_line_id"]] = codes.pop()
+    routed: dict[int, str] = {}
+    bom_ids = sorted({m["bom_id"] for m in members.values() if m["bom_id"]})
+    if bom_ids:
+        # _resolve_sfg_seam_code for every member BOM at once.
+        for r in await conn.fetch(
+            """
+            SELECT DISTINCT ON (bom_id) bom_id, output_code
+              FROM bom_process_route
+             WHERE bom_id = ANY($1::int[]) AND output_kind = 'SFG'
+               AND output_code IS NOT NULL
+             ORDER BY bom_id, step_number
+            """,
+            bom_ids,
+        ):
+            if (r["output_code"] or "").strip():
+                routed[r["bom_id"]] = r["output_code"].strip()
+
+    def _agreed(values) -> str | None:
+        vals = set(values)
+        return vals.pop() if len(vals) == 1 and None not in vals else None
+
+    from app.modules.production.services.sfg_canonical import resolve_canonical_sfg_db
+    standard: dict[int, str | None] = {}
+    for g in groups:
+        sfg = _agreed(card_sfg.get(m["plan_line_id"]) or routed.get(m["bom_id"]) for m in g["members"])
+        if sfg is None:
+            for m in g["members"]:
+                if m["plan_line_id"] not in standard:
+                    name = await resolve_canonical_sfg_db(conn, m["fg_sku_name"], g["key"]["entity"])
+                    standard[m["plan_line_id"]] = (name or "").strip() or None
+            sfg = _agreed(standard[m["plan_line_id"]] for m in g["members"])
+        g["suggested_sfg"] = sfg
 
 
 async def split_plan(conn, plan_id: int, mode: str = "per_line") -> dict:
@@ -1258,7 +1359,7 @@ async def _line_jcs_safety(conn, plan_line_id: int) -> dict:
     rows = await conn.fetch(
         """
         SELECT job_card_id, plan_step_id, step_number, status,
-               prev_job_card_id, next_job_card_id
+               prev_job_card_id, next_job_card_id, output_code, process_group_id
         FROM job_card_v2
         WHERE plan_line_id = $1 AND deleted_at IS NULL
         ORDER BY step_number
@@ -1271,6 +1372,46 @@ async def _line_jcs_safety(conn, plan_line_id: int) -> dict:
         if j["status"] not in _JC_SAFE_TO_MUTATE
     ]
     return {"safe": not blocking, "jcs": jcs, "blocking": blocking}
+
+
+def _steps_locked_refusal(jcs: list[dict]) -> dict | None:
+    """Why a line's plan steps can't be added, reordered or deleted while it has
+    these live cards (_line_jcs_safety's), or None.
+
+    The job-card resync after a step change (_resync_jcs_after_step_change)
+    rewires the line's cards as ONE chain of their own. On a line in a merged
+    process run that cut its packaging off the shared process card (or fed the
+    whole run to one product); on a line carded as several chains it joined them
+    into one. Both are refused before anything is written, as Edit refuses them
+    (job_card_v2.line_edit_refusal).
+    """
+    return _steps_locked_by(
+        merged_run=any(j.get("process_group_id") is not None for j in jcs),
+        heads=sum(1 for j in jcs if j.get("prev_job_card_id") is None),
+    )
+
+
+def _steps_locked_by(*, merged_run: bool, heads: int) -> dict | None:
+    """_steps_locked_refusal from what it counts on the line's live cards: whether
+    any is in a merged process run, and how many chain heads there are. get_plan
+    sends the same (steps_locked) so Plan Detail refuses before its first request."""
+    if merged_run:
+        return {
+            "error": "steps_locked_by_cards", "reason": "merged_run",
+            "message": ("This article's job cards are part of a merged process run shared "
+                        "with other products, so its steps can't be added, moved or removed "
+                        "here: the job cards would be cut off from the run. Leave the steps "
+                        "as they are."),
+        }
+    if heads > 1:
+        return {
+            "error": "steps_locked_by_cards", "reason": "multiple_chains", "chains": heads,
+            "message": (f"This article was carded in {heads} separate chains, so its steps "
+                        "can't be added, moved or removed here: the job cards would be joined "
+                        "into one chain. Leave the steps as they are, or ask an admin to "
+                        "cancel the chains that are no longer needed."),
+        }
+    return None
 
 
 async def _sync_jc_attrs_from_step(
@@ -1357,6 +1498,14 @@ async def _resync_jcs_after_step_change(
     safety = await _line_jcs_safety(conn, plan_line_id)
     if not safety["jcs"]:
         return {"applied": False, "skipped_reason": "no_jcs"}
+    # A merged run's line: never rewired as one chain of its own (the step routes
+    # refuse it first, _steps_locked_refusal). Heads are not counted here: the
+    # card add_step just spawned is a head until this resync links it after the
+    # tail, and the routes refuse a several-chain line on its cards as they were
+    # before any write.
+    if any(j.get("process_group_id") is not None for j in safety["jcs"]):
+        locked = _steps_locked_by(merged_run=True, heads=0)
+        return {"applied": False, "skipped_reason": locked["reason"], "message": locked["message"]}
     if not safety["safe"]:
         return {
             "applied": False,
@@ -1401,45 +1550,41 @@ async def _resync_jcs_after_step_change(
     # avoid a transient collision if we ever rebuild it.  We don't
     # rebuild job_card_number — historical identifier — so a single
     # pass is enough.
-    # Slice 3: re-resolve the article's SFG#### so the reorder/add/delete keeps
-    # the seam codes consistent with the new ordering. Mirrors
-    # create_job_cards_from_plan's seam logic. A routed SFG article's route is
-    # exactly 2 steps, so the position-based seam is only trustworthy at n==2;
-    # if an add/delete diverged the chain, skip the seam (clear codes) + warn
-    # rather than stamp the wrong step. NOTE: this re-derives the seam from the
-    # CURRENT bom_process_route, so editing steps on an unstarted pre-Slice-3
-    # plan will (re)materialise the seam to current routing — intended, and
-    # gated to safe-state JCs by _line_jcs_safety above.
-    bom_id = await conn.fetchval(
-        "SELECT bom_id FROM production_plan_line_v2 WHERE plan_line_id = $1",
-        plan_line_id,
-    )
-    sfg_code = await _resolve_sfg_seam_code(conn, bom_id)
-
+    # SFG codes: each card keeps the SFG it makes (output_code) — a reorder or
+    # an added step moves cards, it doesn't change what they make, and these
+    # codes are the planner's (Create / Edit Job Card) or Approve's. The next card
+    # opens with its predecessor's code; the last makes the finished goods. This
+    # used to clear every code on chains of 3+ cards and swap a 2-card chain's
+    # code for the routed SFG####.
     n = len(ordered_jcs)
-    if sfg_code and n != 2:
-        logger.warning(
-            "plan_line %s: routed 2-stage article (SFG %s) but chain has %d JC(s) "
-            "after %s — SFG seam not materialised (expected 2)",
-            plan_line_id, sfg_code, n, reason,
+    kept = [(item.get("output_code") or "").strip() or None for item in ordered_jcs]
+    if not any(kept):
+        # A chain with no code at all (e.g. approved before Slice 3) still gets
+        # the routed seam, as create_job_cards_from_plan stamps it. A routed SFG
+        # article's route is exactly 2 steps, so the position-based seam is only
+        # trustworthy at n==2.
+        bom_id = await conn.fetchval(
+            "SELECT bom_id FROM production_plan_line_v2 WHERE plan_line_id = $1",
+            plan_line_id,
         )
+        sfg_code = await _resolve_sfg_seam_code(conn, bom_id)
+        if sfg_code and n != 2:
+            logger.warning(
+                "plan_line %s: routed 2-stage article (SFG %s) but chain has %d JC(s) "
+                "after %s — SFG seam not materialised (expected 2)",
+                plan_line_id, sfg_code, n, reason,
+            )
+        kept = [sfg_code if (sfg_code and n == 2 and idx == 0) else None for idx in range(n)]
     prev_jc_id: int | None = None
+    prev_code: str | None = None
     for idx, item in enumerate(ordered_jcs):
         is_first = idx == 0
         is_last  = idx == n - 1
         input_kind  = "RM" if is_first else "SFG"
-        output_kind = "FG" if is_last  else "WIP"
-        # SFG seam: producer (step 1 / Create WIP) emits SFG####; consumer
-        # (step 2 / Final FG) opens with it. Cleared on every other row so a step
-        # demoted out of the seam by a reorder doesn't keep a stale code.
-        input_code:  str | None = None
-        output_code: str | None = None
-        if sfg_code and n == 2:
-            if idx == 0:
-                output_kind = "SFG"
-                output_code = sfg_code
-            else:
-                input_code = sfg_code
+        input_code: str | None = None if is_first else prev_code
+        output_code: str | None = None if is_last else kept[idx]
+        output_kind = "FG" if is_last else ("SFG" if output_code else "WIP")
+        prev_code = output_code
         new_step_number = idx + 1
         await conn.execute(
             """
@@ -1593,6 +1738,9 @@ async def reorder_steps(conn, plan_line_id: int, step_ids: list[int]) -> dict:
     """Reassign step_order to match the given step_ids sequence (1..N).
     Two-pass swap so the UNIQUE(plan_line_id, step_order) constraint isn't
     violated by intermediate states.
+
+    Refused (steps_locked_by_cards) before any write on a line in a merged
+    process run or carded as several chains (_steps_locked_refusal).
     """
     # Validate: all step_ids belong to plan_line_id
     rows = await conn.fetch(
@@ -1606,6 +1754,11 @@ async def reorder_steps(conn, plan_line_id: int, step_ids: list[int]) -> dict:
             "message": f"Provided step_ids must exactly match the {len(valid_ids)} "
                        f"steps belonging to plan_line_id={plan_line_id}",
         }
+    # Before any write: the resync below would rewire a merged run's or a
+    # several-chain line's cards as one chain.
+    locked = _steps_locked_refusal((await _line_jcs_safety(conn, plan_line_id))["jcs"])
+    if locked is not None:
+        return locked
 
     # Pass 1: park each row in a positive offset above any current
     # step_order so neither the UNIQUE(plan_line_id, step_order) nor the
@@ -1736,6 +1889,9 @@ async def add_step(conn, plan_line_id: int, step_data: dict) -> dict:
     stage NULL (the dropdown only edits process). We derive a sensible
     stage token here so the downstream job_card_v2 INSERT (which has
     stage NOT NULL) doesn't 500 when the plan is approved.
+
+    Refused (steps_locked_by_cards) before the step is written on a line in a
+    merged process run or carded as several chains (_steps_locked_refusal).
     """
     next_order = await conn.fetchval(
         "SELECT COALESCE(MAX(step_order), 0) + 1 FROM production_plan_step_v2 "
@@ -1746,6 +1902,12 @@ async def add_step(conn, plan_line_id: int, step_data: dict) -> dict:
     if not process_name:
         return {"error": "missing_process_name",
                 "message": "process_name is required"}
+    # The line's cards as they are before the new step (its INSERT touches
+    # none): a merged run's or a several-chain line is refused before it.
+    safety = await _line_jcs_safety(conn, plan_line_id)
+    locked = _steps_locked_refusal(safety["jcs"])
+    if locked is not None:
+        return locked
     stage = step_data.get('stage') or derive_stage_from_process(process_name)
     async def _insert_step():
         return await conn.fetchrow(
@@ -1774,7 +1936,6 @@ async def add_step(conn, plan_line_id: int, step_data: dict) -> dict:
     # _line_jcs_safety inside the resync helper — when any existing JC
     # has progressed past 'unlocked' we leave the chain untouched and
     # report the skip so the admin sees the gap.
-    safety = await _line_jcs_safety(conn, plan_line_id)
     jc_sync: dict | None = None
     new_jc_id: int | None = None
     if safety["jcs"] and safety["safe"]:
@@ -1823,6 +1984,9 @@ async def delete_step(conn, step_id: int) -> dict:
     So when a matching JC exists we refuse the plan-side delete with a
     clear message — the admin's path forward is to cancel the offending
     JC (existing endpoint) or revoke the plan approval and re-plan.
+
+    Refused (steps_locked_by_cards) first on a line in a merged process run or
+    carded as several chains (_steps_locked_refusal).
     """
     old = await conn.fetchrow(
         "SELECT plan_line_id, step_order FROM production_plan_step_v2 WHERE step_id = $1",
@@ -1833,6 +1997,11 @@ async def delete_step(conn, step_id: int) -> dict:
 
     plan_line_id = old['plan_line_id']
     removed_order = old['step_order']
+    # Renumbering the steps under a merged run's or a several-chain line's cards
+    # is refused like add / reorder, before any write.
+    locked = _steps_locked_refusal((await _line_jcs_safety(conn, plan_line_id))["jcs"])
+    if locked is not None:
+        return locked
 
     matching_jc = await conn.fetchrow(
         "SELECT job_card_id, status FROM job_card_v2 "
