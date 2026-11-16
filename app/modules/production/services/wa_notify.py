@@ -30,6 +30,7 @@ from typing import Any, Iterable, Optional
 import httpx
 
 from app.config import Settings
+from app.core.sites import scope_keys, site_key
 from app.modules.stock_take import place_scope
 
 logger = logging.getLogger(__name__)
@@ -117,10 +118,27 @@ def assigned(holders: list[dict[str, Any]], warehouse: str, floor: str) -> list[
             if assigned_to_place(h["allowed_warehouses"], h["allowed_floors"], warehouse, floor)]
 
 
-def covering(holders: list[dict[str, Any]], warehouse: str, floor: str) -> list[dict[str, Any]]:
-    """The holders whose granted places include this warehouse and floor."""
+def covers_site(allowed_warehouses: Optional[Iterable[str]], allowed_floors: Optional[Iterable[str]],
+                warehouse: str, floor: str) -> bool:
+    """covers_place with the warehouse matched as a SITE (app.core.sites): a grant
+    of 'W202', 'w-202' or 'Warehouse W202' covers a card at 'W-202'. The job card
+    lists filter factories the same way (WAREHOUSE_NORM_ANY_SQL + scope_keys), so
+    QC is told about the cards it can open. The floor axis is covers_place's."""
+    grants = [w for w in (allowed_warehouses or []) if str(w).strip()]
+    if grants:
+        keys = set(scope_keys(warehouse))
+        if not any(site_key(w) in keys for w in grants):
+            return False
+    return covers_place([], allowed_floors, warehouse, floor)
+
+
+def covering(holders: list[dict[str, Any]], warehouse: str, floor: str,
+             *, by_site: bool = False) -> list[dict[str, Any]]:
+    """The holders whose granted places include this warehouse and floor.
+    by_site matches the warehouse by site (covers_site) rather than by code."""
+    covers = covers_site if by_site else covers_place
     return [h for h in holders
-            if covers_place(h["allowed_warehouses"], h["allowed_floors"], warehouse, floor)]
+            if covers(h["allowed_warehouses"], h["allowed_floors"], warehouse, floor)]
 
 
 # ── what ─────────────────────────────────────────────────────────────────────

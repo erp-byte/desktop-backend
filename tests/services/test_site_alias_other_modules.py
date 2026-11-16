@@ -32,14 +32,13 @@ import pytest
 from fastapi import HTTPException
 
 from app.core import openapi_tags
-from app.core.sites import canonical_site, scope_keys, site_aliases, to_sites
-from app.core.warehouse_scope import WAREHOUSE_NORM_SQL
+from app.core.sites import canonical_site, site_aliases, to_sites
 from app.modules.auth.services import permission_service
 from app.modules.customer_returns.services import box_service, mail_service
 from app.modules.ledger.services import godown_alias
 from app.modules.production import router as production_router
-from app.modules.production.services import lot_issuance_service, qc_notify
-from tests.services.test_cold_pick_and_search_r3 import _norm, _predicate
+from app.modules.production.services import lot_issuance_service, qc_notify, wa_notify
+from tests.services.test_cold_pick_and_search_r3 import _predicate
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -314,20 +313,29 @@ class _QCConn:
 
 
 def test_the_qc_recipients_match_a_roles_warehouse_scope_by_site(monkeypatch):
-    async def _dispatch(conn, **kw):
-        return {"notification_id": 1}
-    monkeypatch.setattr(qc_notify, "dispatch", _dispatch)
-    conn = _QCConn("W-202")
-    out = asyncio.run(production_router.notify_qc_v2(_request(conn), 5, None, user=SimpleNamespace(user_id=9)))
-    assert out["warning"] == "no_qc_recipients_in_scope"
-    ((sql, args),) = conn.recipient_calls
-    assert _ws(f"OR EXISTS (SELECT 1 FROM unnest(rp.allowed_warehouses) AS aw "
-               f"WHERE {WAREHOUSE_NORM_SQL('aw')} = ANY($2::text[])))") in sql
-    assert "$2 = ANY(rp.allowed_warehouses)" not in sql
-    assert args == ("cfpl", scope_keys("W-202"), "floor-1")
-    # What that clause decides, per role scope (WAREHOUSE_NORM_SQL is _norm):
+    # Notify QC emails the QC holders whose grants cover the card (wa_notify.covering,
+    # by_site): the factory is matched as a site, so a role scoped 'Warehouse W202'
+    # or 'w-202' is told about a card at 'W-202', as the job card lists filter.
     scopes = (["W202"], ["Warehouse W202"], ["w-202", "A185"], ["A185"], ["Cold Storage"])
-    assert [any(_norm(w) in args[1] for w in s) for s in scopes] == [True, True, True, False, False]
+    holders = [{"user_id": i, "name": f"qc{i}", "email": f"qc{i}@example.com", "phone": None,
+                "allowed_warehouses": s, "allowed_floors": []} for i, s in enumerate(scopes)]
+    sent: dict = {}
+
+    async def _holders(conn, roles):
+        return holders
+
+    async def _dispatch(conn, **kw):
+        sent.update(kw)
+        return {"notification_id": 1,
+                "outcomes": [{"name": r["full_name"], "delivered": True} for r in kw["recipients"]]}
+    monkeypatch.setattr(wa_notify, "role_holders", _holders)
+    monkeypatch.setattr(qc_notify, "dispatch", _dispatch)
+    user = SimpleNamespace(user_id=9, full_name="Floor", email=None, phone=None)
+    out = asyncio.run(production_router.notify_qc_v2(_request(_QCConn("W-202")), 5, None, user=user))
+    assert [r["user_id"] for r in sent["recipients"]] == [0, 1, 2]
+    assert out["message"] == "Emailed qc0, qc1, qc2."
+    assert wa_notify.covers_site(["Warehouse W202"], [], "W-202", "floor-1")
+    assert not wa_notify.covers_place(["Warehouse W202"], [], "W-202", "floor-1")   # code match only
 
 
 # ── P1-09: the ledger's godowns ──────────────────────────────────────────────

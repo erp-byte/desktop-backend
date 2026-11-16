@@ -7631,8 +7631,9 @@ async def notify_qc_v2(
 
     QC is anyone holding qc_inspector or qc_manager among ALL their roles, with
     an account that can sign in, whose granted places cover the card's factory
-    and floor (wa_notify.covering — the notices' rule). The old query read the
-    primary role only and its hook did nothing, so nobody was ever told while
+    and floor (wa_notify.covering, by_site: the factory matched as a site, so a
+    grant of 'Warehouse W202' covers 'W-202'). The old query read the primary
+    role only and its hook did nothing, so nobody was ever told while
     the screen reported success (audit 2026-10-23). Every attempt is logged to
     qc_notification_log_v2; when nobody was reached the answer is a 409 naming
     why, never a success.
@@ -7668,7 +7669,7 @@ async def notify_qc_v2(
                 },
             )
         holders = await wa_notify.role_holders(conn, qc_notify.QC_ROLES)
-    people = wa_notify.covering(holders, jc["factory"] or "", jc["floor"] or "")
+    people = wa_notify.covering(holders, jc["factory"] or "", jc["floor"] or "", by_site=True)
     card = {**dict(jc), "asked_by": _actor_name(user)}
     place = " · ".join(x for x in (jc["factory"], jc["floor"]) if x) or "this place"
 
