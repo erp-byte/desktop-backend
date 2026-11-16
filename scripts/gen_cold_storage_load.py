@@ -40,7 +40,9 @@ import openpyxl
 ROOT = Path(__file__).resolve().parent.parent
 ENTERED_BY = 'Kaushal'
 SKIP_UNITS = {'A-185'}
-PLACES = [('D-39', 'Savla'), ('D-514', 'Savla'), ('D-514', 'Savla Bond'), ('Rishi', 'Rishi'), ('Eskimo', 'Eskimo')]
+PLACES = [('D-39', 'Savla'), ('D-514', 'Savla'), ('D-514', 'Savla Bond'), ('Rishi', 'Rishi'), ('Eskimo', 'Eskimo'),
+          # First in the 7 Nov 2026 report; the user confirmed it is a cold store of its own.
+          ('PM Cold', 'PM Cold')]
 # Tally Names with no all_sku row of their own (precedent: COLD0913 / COLD1019).
 ALIASES = {
     'AL BARAKAH FARD DATES PREMIUM A 10KG': 'AL BARAKAH FARD DATES PREMIUM - 10KG',
@@ -48,6 +50,9 @@ ALIASES = {
     'FARD DATES SEEDLESS B GRADE': 'AL BARAKAH FARD DATES SEEDLESS',
     'WET DATES SEEDLESS KHALAS(TAJIR RTV)': 'WET DATES SEEDLESS KHALAS',
     'AL BARAKAH CHOPPED DATES 10KG': 'AL BARAKAH CHOPPED DATES',
+    'ANJEER FIGS': 'ANJEER (FIGS)',
+    # 5 kg boxes, so not AL BARAKAH BARHI DATES 10KG; the user chose this on 2026-11-12.
+    'BARHI': 'BARHI DATES',
 }
 OFF_GRADE = re.compile(r'rej|burn|off-?grade', re.I)
 
@@ -189,7 +194,7 @@ def build(xlsx: Path, sku: list[dict], earlier: dict[str, str]) -> tuple[Path, s
 --        from all_sku); warehouse = Unit; floor_name = Storage Location; quantity =
 --        cartons, unit_uom = kg per box, total_weight = kg.
 --        Off Grade/Rejection: {off_desc}.
---   2. A 0 kg COUNT row for every article still showing stock at those five places
+--   2. A 0 kg COUNT row for every article still showing stock at those {len(PLACES)} places
 --      that is NOT in the report (latest stock is per article per place, so without
 --      this an article gone since the last load would keep its old quantity).
 --

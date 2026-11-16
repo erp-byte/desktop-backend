@@ -48,6 +48,7 @@ WAREHOUSE_LABELS: dict[str, str] = {
     "RISHI": "Rishi",
     "ESKIMO": "Eskimo",
     "SUPREME": "Supreme",
+    "PM COLD": "PM Cold",
 }
 
 #: The third-party cold stores, listed after the factories on screens and sheets.

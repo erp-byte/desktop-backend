@@ -361,7 +361,7 @@ async def main(a) -> None:
     cold_val = sum(t[3][1] for t in cold)
     subject = f"Stock summary - cold storage {cold_day}, warehouses {wh_day}"
     names = [n for n, _ in images]
-    stores = "Savla, Savla Bond, Rishi, Eskimo; A-185 Cold is in the A185 warehouse image"
+    stores = "Savla, Savla Bond, Rishi, Eskimo, PM Cold; A-185 Cold is in the A185 warehouse image"
     plain = (f"Stock Take updated with the cold storage opening stock of {cold_day}.\n"
              f"Cold storage ({stores}): {inr(cold_kg)} kg, approx. Rs {inr(cold_val)}.\n"
              f"Warehouses: current Stock Take figures as on {now:%d-%b-%y %H:%M} IST, kg only.\n"
