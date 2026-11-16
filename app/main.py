@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -121,6 +122,8 @@ async def lifespan(fastapi_app: FastAPI):
     await _wait_for_db(pool)
     master_items = await load_master_items(pool)
     fastapi_app.state.master_items = master_items
+    # Uploads refresh this list via item_matcher.current_master_items (TTL).
+    fastapi_app.state.master_items_loaded_at = time.monotonic()
 
     data_dir = Path(__file__).parent / "data"
     if not data_dir.exists():

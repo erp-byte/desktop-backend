@@ -2000,21 +2000,15 @@ async def sync_so_from_qty_delta(conn, plan_line_id: int, *,
             f"({getattr(exc, 'constraint_name', None)})"
         ) from exc
 
+    # revision_id is app-supplied (migration 019) — the shared helper mints it.
+    from app.modules.production.services.fulfillment_v2 import log_so_revision
     for fid in fids:
         if abs(dk) >= 1e-9:
-            await conn.execute(
-                """INSERT INTO so_revision_log_v2
-                       (so_fulfillment_id, revision_type, old_value, new_value, reason, revised_by)
-                   VALUES ($1, 'qty_change', NULL, $2, $3, $4)""",
-                fid, f"{dk:+.3f} kg (planned)", reason or "Live job-card edit", user,
-            )
+            await log_so_revision(conn, fid, 'qty_change', None, f"{dk:+.3f} kg (planned)",
+                                  reason or "Live job-card edit", user)
         if abs(du) >= 1e-9:
-            await conn.execute(
-                """INSERT INTO so_revision_log_v2
-                       (so_fulfillment_id, revision_type, old_value, new_value, reason, revised_by)
-                   VALUES ($1, 'units_change', NULL, $2, $3, $4)""",
-                fid, f"{du:+.3f} pcs (planned)", reason or "Live job-card edit", user,
-            )
+            await log_so_revision(conn, fid, 'units_change', None, f"{du:+.3f} pcs (planned)",
+                                  reason or "Live job-card edit", user)
 
     # ── so_line writeback: resolve fulfillments → so_lines, apportion the delta.
     frows = await conn.fetch(
@@ -2030,23 +2024,24 @@ async def sync_so_from_qty_delta(conn, plan_line_id: int, *,
             so_line_ids,
         )
         # Apportion proportionally to each line's current kg; equal split when all
-        # are zero. so_line.quantity_units is INT (kg) so kg rounds; quantity (pcs)
-        # is NUMERIC. Clamp at zero so a decrement can't go negative.
+        # are zero. so_line.quantity_units (kg) keeps 3 decimals since migration 140
+        # (it was INTEGER, which zeroed every line under 1 kg); quantity (pcs) is
+        # NUMERIC. Clamp at zero so a decrement can't go negative.
         total_kg = sum(float(r["quantity_units"] or 0) for r in lrows)
         nlines = len(lrows)
         for r in lrows:
             cur_kg = float(r["quantity_units"] or 0)
             cur_pcs = float(r["quantity"] or 0)
             share = (cur_kg / total_kg) if total_kg > 0 else (1.0 / nlines)
-            new_kg = max(0, round(cur_kg + dk * share))
+            new_kg = max(0.0, round(cur_kg + dk * share, 3))
             new_pcs = max(0.0, cur_pcs + du * share)
             await conn.execute(
                 "UPDATE so_line SET quantity_units=$1, quantity=$2 WHERE so_line_id=$3",
-                int(new_kg), new_pcs, r["so_line_id"],
+                new_kg, new_pcs, r["so_line_id"],
             )
             updated_lines.append({
                 "so_line_id": r["so_line_id"],
-                "new_kg": int(new_kg), "new_pcs": new_pcs,
+                "new_kg": new_kg, "new_pcs": new_pcs,
             })
 
     return {

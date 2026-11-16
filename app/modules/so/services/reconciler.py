@@ -318,7 +318,8 @@ async def reconcile_existing_so(
                     """,
                     so_line_id,
                     new_quantity,
-                    int(round(new_quantity_units)) if new_quantity_units is not None else None,
+                    # kg keeps 3 decimals (migration 140 makes the column NUMERIC(15,3)).
+                    round(new_quantity_units, 3) if new_quantity_units is not None else None,
                     row.get("item_category"),
                     row.get("sub_category"),
                     row.get("uom"),

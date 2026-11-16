@@ -1,4 +1,5 @@
 import logging
+import time
 from dataclasses import dataclass
 
 import asyncpg
@@ -36,6 +37,29 @@ async def load_master_items(pool: asyncpg.Pool) -> list[MasterItem]:
     return items
 
 
+MASTER_ITEMS_TTL_S = 60.0
+
+
+async def current_master_items(app) -> list[MasterItem]:
+    """The all_sku list uploads match against, reloaded once it is older than
+    MASTER_ITEMS_TTL_S. It used to be loaded only at startup, so an article added
+    to all_sku, or a kg-per-unit (uom) corrected there, stayed invisible to SO/PO
+    uploads until the backend restarted. A failed reload keeps the cached list."""
+    state = app.state
+    now = time.monotonic()
+    loaded_at = getattr(state, "master_items_loaded_at", None)
+    cached = getattr(state, "master_items", None)
+    if cached is None or loaded_at is None or now - loaded_at > MASTER_ITEMS_TTL_S:
+        try:
+            state.master_items = await load_master_items(state.db_pool)
+            state.master_items_loaded_at = now
+        except Exception:
+            if cached is None:
+                raise
+            logger.exception("all_sku reload failed; matching against the cached list")
+    return state.master_items
+
+
 def match_sku(
     sku_name: str,
     master_items: list[MasterItem],
@@ -49,7 +73,10 @@ def match_sku(
         return None, 0.0
 
     query = sku_name.lower().strip()
-    choices = [item.particulars for item in master_items]
+    # Both sides lower-cased: rapidfuzz 3.x applies no processor by default, so a
+    # mixed-case master name ("RB Date Bites Choco fudge Monocarton (...)") scored
+    # 72.6 against its own lower-cased spelling and fell under the 75 cut-off.
+    choices = [(item.particulars or "").lower().strip() for item in master_items]
 
     result = process.extractOne(
         query,

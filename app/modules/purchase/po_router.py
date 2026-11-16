@@ -25,6 +25,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, File, Query, Request, UploadFile
 from pydantic import BaseModel, Field
 
+from app.modules.so.services.item_matcher import current_master_items
 from app.core.middleware.request_context import AuthError
 from app.modules.auth.middleware import AuthUser, require_permission
 from app.modules.purchase.schemas.po_api import (
@@ -122,7 +123,7 @@ async def preview(
     contents = await file.read()
 
     pool = request.app.state.db_pool
-    master_items = request.app.state.master_items
+    master_items = await current_master_items(request.app)
 
     return await po_preview.preview(
         pool, file_bytes=contents, filename=file.filename,

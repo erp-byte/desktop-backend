@@ -13,17 +13,31 @@ from app.modules.so.services.parser import parse_sales_register
 logger = logging.getLogger(__name__)
 
 
-def _compute_quantity_units(matched_item, quantity) -> tuple[float | None, str | None]:
+def _excel_kg(alt_kg) -> float | None:
+    """The kg the Excel itself reports (Tally SO Book "Alt. Units"), when usable."""
+    try:
+        kg = float(alt_kg) if alt_kg is not None else None
+    except (TypeError, ValueError):
+        return None
+    return round(kg, 3) if kg is not None and kg > 0 else None
+
+
+def _compute_quantity_units(matched_item, quantity, alt_kg=None) -> tuple[float | None, str | None]:
     """Replicate the qty→kg computation used by the ingest path.
 
-    Returns (computed_qty_units_in_kg, rate_type) — both None when no
-    master match exists or the row carries no qty.
+    kg = quantity × all_sku.uom (the master's kg per unit). When the master has no
+    usable kg per unit, fall back to the kg the Excel reports (`alt_kg`, the SO
+    Book's Alt. Units) instead of saving no kg — a NULL kg shows as 0 kg on the
+    SO page and in planning, and a re-upload could never fill it in.
+
+    Returns (computed_qty_units_in_kg, rate_type) — both None when there is no
+    usable kg from either source.
     """
     if not matched_item or matched_item.uom is None:
-        return None, None
+        return _excel_kg(alt_kg), None
     rate_type = "per_kg" if matched_item.uom == 1 else "per_unit"
     if quantity is None or matched_item.uom <= 0:
-        return None, rate_type
+        return _excel_kg(alt_kg), rate_type
     # round() to preserve fractional units; int() silently truncates.
     return round(quantity * matched_item.uom, 3), rate_type
 
@@ -106,7 +120,9 @@ def _build_so_book_normalized_rows(
             matched_item.sub_group if matched_item else None
         )
         quantity = line.get("quantity")
-        computed_qty_units, rate_type = _compute_quantity_units(matched_item, quantity)
+        computed_qty_units, rate_type = _compute_quantity_units(
+            matched_item, quantity, alt_kg=line.get("alt_units"),
+        )
 
         recon_input = {
             "amount_inr": line.get("amount_inr"),
@@ -889,14 +905,11 @@ async def ingest_so_book(
                     item_cat = line.get("item_category") or (matched_item.group if matched_item else None)
                     item_subcat = line.get("sub_category") or (matched_item.sub_group if matched_item else None)
 
-                    quantity_units = None
-                    rate_type = None
-                    if matched_item and matched_item.uom is not None:
-                        rate_type = "per_kg" if matched_item.uom == 1 else "per_unit"
-                        qty = line.get("quantity")
-                        if qty is not None and matched_item.uom > 0:
-                            # Bug 5: round() preserves fractional units.
-                            quantity_units = round(qty * matched_item.uom, 3)
+                    # kg = qty × master kg-per-unit; when the master has none, the
+                    # SO Book's own Alt. Units kg (see _compute_quantity_units).
+                    quantity_units, rate_type = _compute_quantity_units(
+                        matched_item, line.get("quantity"), alt_kg=line.get("alt_units"),
+                    )
 
                     if matched_item:
                         total_matched += 1

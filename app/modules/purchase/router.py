@@ -7,6 +7,7 @@ from datetime import date, datetime
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, UploadFile, File
 from pydantic import BaseModel, Field
 
+from app.modules.so.services.item_matcher import current_master_items
 from app.modules.auth.middleware import require_permission
 
 from app.modules.purchase.schemas import (
@@ -87,7 +88,7 @@ async def upload_po_book_endpoint(
         raise HTTPException(400, detail="File too large. Maximum 50 MB.")
 
     pool = request.app.state.db_pool
-    master_items = request.app.state.master_items
+    master_items = await current_master_items(request.app)
 
     try:
         result = await ingest_po_book(pool, contents, master_items, entity)

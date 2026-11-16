@@ -5,6 +5,7 @@ from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, UploadFile, File
 
+from app.modules.so.services.item_matcher import current_master_items
 from app.modules.auth.middleware import get_current_user, require_permission
 from app.modules.production.services.response_filters import strip_cost_fields
 from app.modules.so.schemas import (
@@ -62,7 +63,7 @@ async def upload_excel(request: Request, file: UploadFile = File(...),
         raise HTTPException(400, detail="File too large. Maximum 50 MB.")
 
     pool = request.app.state.db_pool
-    master_items = request.app.state.master_items
+    master_items = await current_master_items(request.app)
 
     try:
         result = await ingest_sales_register(pool, contents, master_items)
@@ -97,7 +98,7 @@ async def upload_so_book(request: Request, file: UploadFile = File(...),
         raise HTTPException(400, detail="File too large. Maximum 50 MB.")
 
     pool = request.app.state.db_pool
-    master_items = request.app.state.master_items
+    master_items = await current_master_items(request.app)
 
     try:
         result = await ingest_so_book(pool, contents, master_items)
@@ -159,7 +160,7 @@ async def update_confirm(request: Request, body: SOUpdateConfirmRequest, file_ha
     Pass the file_hash from the preview response and the so_ids to update.
     """
     pool = request.app.state.db_pool
-    master_items = request.app.state.master_items
+    master_items = await current_master_items(request.app)
 
     pending = getattr(request.app.state, "pending_updates", {})
     file_bytes = pending.get(file_hash)
@@ -195,7 +196,7 @@ async def manual_update(request: Request, body: SOManualUpdateRequest,
         raise HTTPException(400, detail="At least one line is required in new_lines.")
 
     pool = request.app.state.db_pool
-    master_items = request.app.state.master_items
+    master_items = await current_master_items(request.app)
 
     try:
         result = await manual_update_so(pool, body.model_dump(), master_items)
@@ -217,7 +218,7 @@ async def create_so(request: Request, body: SOCreateRequest,
         raise HTTPException(400, detail="At least one article line is required.")
 
     pool = request.app.state.db_pool
-    master_items = request.app.state.master_items
+    master_items = await current_master_items(request.app)
 
     try:
         result = await ingest_manual_so(pool, body.model_dump(), master_items)
@@ -1061,7 +1062,7 @@ async def get_so(request: Request, so_id: int, user=Depends(require_permission("
                 uom=l.get("uom"),
                 grp_code=l.get("grp_code"),
                 quantity=float(l["quantity"]) if l.get("quantity") is not None else None,
-                quantity_units=int(l["quantity_units"]) if l.get("quantity_units") is not None else None,
+                quantity_units=float(l["quantity_units"]) if l.get("quantity_units") is not None else None,
                 rate_inr=float(l["rate_inr"]) if l.get("rate_inr") is not None else None,
                 rate_type=l.get("rate_type"),
                 amount_inr=float(l["amount_inr"]) if l.get("amount_inr") is not None else None,

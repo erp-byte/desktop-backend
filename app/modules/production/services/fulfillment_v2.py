@@ -24,6 +24,26 @@ from app.webhooks import events
 logger = logging.getLogger(__name__)
 
 
+async def log_so_revision(conn, so_fulfillment_id: int, revision_type: str,
+                          old_value: str | None, new_value: str | None,
+                          reason: str | None, revised_by: str | None) -> None:
+    """One so_revision_log_v2 row. revision_id has no default since migration 019
+    (app-supplied IDs), so it is minted here with the PK-collision retry; an INSERT
+    without it fails NOT NULL and rolls back the caller's whole transaction.
+    Must run inside the caller's transaction (insert_with_pk_retry uses a SAVEPOINT)."""
+    async def _insert():
+        return await conn.execute(
+            """
+            INSERT INTO so_revision_log_v2 (
+                revision_id, so_fulfillment_id, revision_type, old_value, new_value, reason, revised_by
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+            """,
+            new_short_time_id(), so_fulfillment_id, revision_type,
+            old_value, new_value, reason, revised_by,
+        )
+    await insert_with_pk_retry(conn, _insert)
+
+
 def _derive_fy(so_date: date) -> str:
     """Apr–Mar fiscal year string. 2026-04-01 → '2026-27', 2026-03-31 → '2025-26'."""
     if so_date.month >= 4:
@@ -201,13 +221,8 @@ async def revise_order(conn, so_fulfillment_id: int, *,
             "UPDATE so_fulfillment_v2 SET original_qty_kg = $2 WHERE so_fulfillment_id = $1",
             so_fulfillment_id, new_qty,
         )
-        await conn.execute(
-            """
-            INSERT INTO so_revision_log_v2 (
-                so_fulfillment_id, revision_type, old_value, new_value, reason, revised_by
-            ) VALUES ($1, 'qty_change', $2, $3, $4, $5)
-            """,
-            so_fulfillment_id,
+        await log_so_revision(
+            conn, so_fulfillment_id, 'qty_change',
             str(float(old['original_qty_kg'])) if old['original_qty_kg'] is not None else None,
             str(new_qty), reason, revised_by,
         )
@@ -224,13 +239,8 @@ async def revise_order(conn, so_fulfillment_id: int, *,
             "UPDATE so_fulfillment_v2 SET original_qty_units = $2 WHERE so_fulfillment_id = $1",
             so_fulfillment_id, new_units,
         )
-        await conn.execute(
-            """
-            INSERT INTO so_revision_log_v2 (
-                so_fulfillment_id, revision_type, old_value, new_value, reason, revised_by
-            ) VALUES ($1, 'units_change', $2, $3, $4, $5)
-            """,
-            so_fulfillment_id,
+        await log_so_revision(
+            conn, so_fulfillment_id, 'units_change',
             str(float(old['original_qty_units'])) if old['original_qty_units'] is not None else None,
             str(new_units), reason, revised_by,
         )
@@ -240,13 +250,8 @@ async def revise_order(conn, so_fulfillment_id: int, *,
             "UPDATE so_fulfillment_v2 SET deadline_date = $2 WHERE so_fulfillment_id = $1",
             so_fulfillment_id, new_date,
         )
-        await conn.execute(
-            """
-            INSERT INTO so_revision_log_v2 (
-                so_fulfillment_id, revision_type, old_value, new_value, reason, revised_by
-            ) VALUES ($1, 'date_change', $2, $3, $4, $5)
-            """,
-            so_fulfillment_id,
+        await log_so_revision(
+            conn, so_fulfillment_id, 'date_change',
             old['deadline_date'].isoformat() if old['deadline_date'] is not None else None,
             new_date.isoformat(), reason, revised_by,
         )
@@ -620,14 +625,7 @@ async def cancel_orders(conn, so_fulfillment_ids: list[int], *,
             """,
             fid, cancelled_by, reason,
         )
-        await conn.execute(
-            """
-            INSERT INTO so_revision_log_v2
-                (so_fulfillment_id, revision_type, old_value, new_value, reason, revised_by)
-            VALUES ($1, 'cancel', $2, 'cancelled', $3, $4)
-            """,
-            fid, old['order_status'], reason, cancelled_by,
-        )
+        await log_so_revision(conn, fid, 'cancel', old['order_status'], 'cancelled', reason, cancelled_by)
         cancelled += 1
     return {"cancelled": cancelled, "total_requested": len(so_fulfillment_ids)}
 
@@ -693,14 +691,7 @@ async def carryforward_orders(conn, so_fulfillment_ids: list[int], new_fy: str,
             "UPDATE so_fulfillment_v2 SET order_status = 'carryforward' WHERE so_fulfillment_id = $1",
             fid,
         )
-        await conn.execute(
-            """
-            INSERT INTO so_revision_log_v2
-                (so_fulfillment_id, revision_type, old_value, new_value, reason, revised_by)
-            VALUES ($1, 'carryforward', $2, $3, 'FY transition', $4)
-            """,
-            fid, old['financial_year'], new_fy, revised_by,
-        )
+        await log_so_revision(conn, fid, 'carryforward', old['financial_year'], new_fy, 'FY transition', revised_by)
         carried += 1
 
     logger.info("Carryforward v2: %d of %d carried to %s", carried, len(so_fulfillment_ids), new_fy)
@@ -839,18 +830,21 @@ async def save_bom_overrides(conn, so_fulfillment_id: int, overrides: list[dict]
             mat_name = (ov.get('material_sku_name') or '').strip()
             if not mat_name:
                 continue
-            await conn.execute(
-                """
-                INSERT INTO fulfillment_bom_override_v2 (
-                    so_fulfillment_id, bom_line_id, material_sku_name, quantity_per_unit,
-                    loss_pct, uom, godown, is_removed, override_reason, overridden_by
-                ) VALUES ($1, NULL, $2, $3, $4, $5, $6, FALSE, $7, $8)
-                """,
-                so_fulfillment_id, mat_name,
-                ov.get('quantity_per_unit'), ov.get('loss_pct'),
-                ov.get('uom'), ov.get('godown'),
-                ov.get('override_reason', 'Added item'), overridden_by,
-            )
+            # override_id has no default (migration 019) — mint it, retry on PK collision.
+            async def _insert_added(mat_name=mat_name, ov=ov):
+                return await conn.execute(
+                    """
+                    INSERT INTO fulfillment_bom_override_v2 (
+                        override_id, so_fulfillment_id, bom_line_id, material_sku_name, quantity_per_unit,
+                        loss_pct, uom, godown, is_removed, override_reason, overridden_by
+                    ) VALUES ($1, $2, NULL, $3, $4, $5, $6, $7, FALSE, $8, $9)
+                    """,
+                    new_short_time_id(), so_fulfillment_id, mat_name,
+                    ov.get('quantity_per_unit'), ov.get('loss_pct'),
+                    ov.get('uom'), ov.get('godown'),
+                    ov.get('override_reason', 'Added item'), overridden_by,
+                )
+            await insert_with_pk_retry(conn, _insert_added)
             added += 1
             continue
 
@@ -859,37 +853,36 @@ async def save_bom_overrides(conn, so_fulfillment_id: int, overrides: list[dict]
 
         # Partial unique index is WHERE bom_line_id IS NOT NULL; ON CONFLICT
         # arbiter must include the same predicate so Postgres can match it.
-        await conn.execute(
-            """
-            INSERT INTO fulfillment_bom_override_v2 (
-                so_fulfillment_id, bom_line_id, material_sku_name, quantity_per_unit,
-                loss_pct, uom, godown, is_removed, override_reason, overridden_by
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-            ON CONFLICT (so_fulfillment_id, bom_line_id) WHERE bom_line_id IS NOT NULL
-            DO UPDATE SET
-                material_sku_name = $3, quantity_per_unit = $4, loss_pct = $5,
-                uom = $6, godown = $7, is_removed = $8,
-                override_reason = $9, overridden_by = $10, updated_at = NOW()
-            """,
-            so_fulfillment_id, blid,
-            ov.get('material_sku_name'), ov.get('quantity_per_unit'),
-            ov.get('loss_pct'), ov.get('uom'), ov.get('godown'),
-            ov.get('is_removed', False), ov.get('override_reason', ''),
-            overridden_by,
-        )
+        # override_id has no default (migration 019) — mint it (an upsert keeps the
+        # existing row's id), retry on PK collision.
+        async def _upsert(blid=blid, ov=ov):
+            return await conn.execute(
+                """
+                INSERT INTO fulfillment_bom_override_v2 (
+                    override_id, so_fulfillment_id, bom_line_id, material_sku_name, quantity_per_unit,
+                    loss_pct, uom, godown, is_removed, override_reason, overridden_by
+                ) VALUES ($11, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                ON CONFLICT (so_fulfillment_id, bom_line_id) WHERE bom_line_id IS NOT NULL
+                DO UPDATE SET
+                    material_sku_name = $3, quantity_per_unit = $4, loss_pct = $5,
+                    uom = $6, godown = $7, is_removed = $8,
+                    override_reason = $9, overridden_by = $10, updated_at = NOW()
+                """,
+                so_fulfillment_id, blid,
+                ov.get('material_sku_name'), ov.get('quantity_per_unit'),
+                ov.get('loss_pct'), ov.get('uom'), ov.get('godown'),
+                ov.get('is_removed', False), ov.get('override_reason', ''),
+                overridden_by, new_short_time_id(),
+            )
+        await insert_with_pk_retry(conn, _upsert)
         applied += 1
 
     total = applied + added
     if total > 0:
-        await conn.execute(
-            """
-            INSERT INTO so_revision_log_v2
-                (so_fulfillment_id, revision_type, old_value, new_value, reason, revised_by)
-            VALUES ($1, 'bom_override', NULL, $2, 'BOM override applied', $3)
-            """,
-            so_fulfillment_id,
+        await log_so_revision(
+            conn, so_fulfillment_id, 'bom_override', None,
             f"{applied} lines overridden, {added} items added",
-            overridden_by,
+            'BOM override applied', overridden_by,
         )
 
     return {"fulfillment_id": so_fulfillment_id, "overrides_applied": applied, "items_added": added}
@@ -1037,16 +1030,19 @@ async def save_floor_stock(conn, so_fulfillment_id: int, entries: list[dict],
         floor = (e.get('floor_location') or '').strip()
         if not mat or not floor or qty <= 0:
             continue
-        await conn.execute(
-            """
-            INSERT INTO fulfillment_floor_stock_v2
-                (so_fulfillment_id, material_sku_name, item_type, quantity_kg,
-                 unit, floor_location, added_by, notes)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            """,
-            so_fulfillment_id, mat, e.get('item_type', 'pm'), qty,
-            e.get('unit', 'KG'), floor, added_by, e.get('notes', ''),
-        )
+        # floor_stock_id has no default (migration 019) — mint it, retry on PK collision.
+        async def _insert(mat=mat, qty=qty, floor=floor, e=e):
+            return await conn.execute(
+                """
+                INSERT INTO fulfillment_floor_stock_v2
+                    (floor_stock_id, so_fulfillment_id, material_sku_name, item_type, quantity_kg,
+                     unit, floor_location, added_by, notes)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                """,
+                new_short_time_id(), so_fulfillment_id, mat, e.get('item_type', 'pm'), qty,
+                e.get('unit', 'KG'), floor, added_by, e.get('notes', ''),
+            )
+        await insert_with_pk_retry(conn, _insert)
         saved += 1
 
     return {"fulfillment_id": so_fulfillment_id, "entries_saved": saved}
