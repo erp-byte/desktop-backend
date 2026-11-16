@@ -27,6 +27,9 @@ gen_pdf.py
 # Local business data + scratch (never publish to shared remote)
 scratch/
 data/
+# The supplier master (real PAN / GSTIN / bank details): the reference copy the
+# vendor-export test reads for layout, and any saved download of it.
+/001_A_MIS Master_Suppliers_data_*.xlsx
 
 # build artifacts (embed .env) — never commit
 *.zip

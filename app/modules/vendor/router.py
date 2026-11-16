@@ -17,9 +17,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile
 from pydantic import ValidationError
+from starlette.concurrency import run_in_threadpool
 
 from app.modules.auth.middleware import AuthUser, require_permission
 from app.modules.auth.services.permission_service import check_permission
@@ -67,6 +69,8 @@ from app.modules.vendor.services import (
     banking_service,
     contract_service,
     document_service,
+    export_service,
+    export_xlsx,
     extraction_service,
     history_service,
     vendor_service,
@@ -273,6 +277,39 @@ async def search_vendors_endpoint(
         vendors=[VendorListRow.model_validate(r) for r in rows],
         total_returned=len(rows),
         truncated=truncated,
+    )
+
+
+@router.get("/export")
+async def export_supplier_master_endpoint(
+    request: Request,
+    user: AuthUser = Depends(require_permission("vendor", "master", action="view")),
+    _banking: AuthUser = Depends(require_permission("vendor", "banking", action="view")),
+) -> Response:
+    """Every vendor as one .xlsx laid out like the company's "MIS Master -
+    Suppliers data" workbook: sheet "Registered" holds all of them, sheet
+    "INACTIVE" the inactive ones again, 51 columns each. Unpaginated, no filters.
+
+    Needs BOTH `vendor/master` view and `vendor/banking` view: the sheet
+    carries bank account numbers.
+
+    Declared BEFORE `/{vendor_id}` on purpose — routes match in declaration
+    order, so below it "export" would be read as a vendor id and 404."""
+    rows = await export_service.fetch_supplier_master_rows(request.app.state.db_pool)
+    # openpyxl is CPU-bound; build the workbook off the event loop.
+    stream = await run_in_threadpool(export_xlsx.build_supplier_master_workbook, rows)
+    # The date in the file name is today on the IST clock, not the server's.
+    today = datetime.now(timezone(timedelta(hours=5, minutes=30))).date()
+    filename = export_xlsx.export_filename(today)
+    # Sent whole, with a Content-Length: iterating the BytesIO would go out as
+    # thousands of tiny chunks.
+    return Response(
+        content=stream.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Total-Rows": str(len(rows)),
+        },
     )
 
 
