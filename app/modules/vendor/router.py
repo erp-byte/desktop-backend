@@ -20,10 +20,10 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile
-from pydantic import ValidationError
+from pydantic import BaseModel, Field, ValidationError
 from starlette.concurrency import run_in_threadpool
 
-from app.modules.auth.middleware import AuthUser, require_permission
+from app.modules.auth.middleware import AuthUser, get_current_user, require_permission
 from app.modules.auth.services.permission_service import check_permission
 
 # Hard cap on files-per-request for /with-documents and /extract-bulk to
@@ -33,6 +33,7 @@ from app.modules.auth.services.permission_service import check_permission
 # soft-ceiling we treat as comfortable for a single HTTP request.
 _MAX_DOCS_PER_REQUEST = 20
 from app.modules.vendor import storage as vendor_storage
+from app.modules.vendor import upload_staging
 from app.modules.vendor.schemas import (
     BankingCreateRequest,
     BankingResponse,
@@ -106,7 +107,7 @@ def _patch_to_400(e: vendor_service.NotNullPatchError) -> HTTPException:
 
 
 async def _sniff_and_read_upload(
-    file: UploadFile,
+    file: UploadFile | upload_staging.StagedUpload,
 ) -> tuple[bytes, str, str]:
     """Read upload bytes, run magic-byte sniff, reject on size / MIME issues.
 
@@ -146,6 +147,63 @@ async def _sniff_and_read_upload(
             },
         )
     return content, sniffed, file.filename or ""
+
+
+def _one_file(file: UploadFile | None, upload_id: str | None, user: AuthUser):
+    """An endpoint's file: the one posted in the form, or the one the browser
+    sent in pieces (upload_id, see upload_staging) because it was too big for
+    the proxies in front of the backend."""
+    if file is not None:
+        return file
+    if upload_id:
+        return upload_staging.StagedUpload(upload_id, user.user_id)
+    raise HTTPException(422, detail={"code": "file_required", "msg": "Attach a file."})
+
+
+# ── uploads in pieces (upload_staging) ───────────────────────────────────
+
+# Any vendor write permission: onboarding, or a vendor's documents / contracts.
+_VENDOR_UPLOAD_PERMS = (
+    ("vendor", "master", "create"),
+    ("vendor", "document", "create"),
+    ("vendor", "document", "update"),
+    ("vendor", "contract", "create"),
+    ("vendor", "contract", "update"),
+)
+
+
+async def _vendor_upload_user(request: Request, user: AuthUser = Depends(get_current_user)) -> AuthUser:
+    if user.is_admin:
+        return user
+    async with request.app.state.db_pool.acquire() as conn:
+        for module, sub, action in _VENDOR_UPLOAD_PERMS:
+            if await check_permission(conn, user.role_ids, False, module, sub, None, action):
+                return user
+    raise HTTPException(403, detail={"code": "forbidden", "msg": "You can't upload vendor documents."})
+
+
+class UploadStartRequest(BaseModel):
+    filename: str = Field(max_length=255)
+    content_type: str | None = Field(default=None, max_length=128)
+    size: int = Field(gt=0)
+
+
+@router.post("/uploads", status_code=201)
+async def start_upload(body: UploadStartRequest, user: AuthUser = Depends(_vendor_upload_user)):
+    """Start a document upload sent in pieces: returns its upload_id and the
+    piece size. Pass the id to an upload endpoint once every piece is in."""
+    return upload_staging.start(user.user_id, body.filename, body.content_type, body.size)
+
+
+@router.put("/uploads/{upload_id}/chunks/{index}")
+async def put_upload_chunk(request: Request, upload_id: str, index: int,
+                           user: AuthUser = Depends(_vendor_upload_user)):
+    """One piece of an upload, as the raw request body. Sending a piece again
+    replaces it."""
+    data = await request.body()
+    if len(data) > upload_staging.CHUNK_BYTES:
+        raise HTTPException(413, detail={"code": "chunk_too_large", "limit_bytes": upload_staging.CHUNK_BYTES})
+    return upload_staging.put_chunk(user.user_id, upload_id, index, data)
 
 
 # ── vendor_master ────────────────────────────────────────────────────────
@@ -423,6 +481,11 @@ async def create_vendor_with_documents(
         default_factory=list,
         description="Uploaded compliance documents (PDF / JPEG / PNG).",
     ),
+    upload_ids: str = Form(
+        "[]",
+        description="JSON array of upload ids of documents sent in pieces (POST /uploads), "
+                    "after any files[], in docs_meta order.",
+    ),
     user: AuthUser = Depends(require_permission("vendor", "master", action="create")),
 ):
     """One-shot vendor onboarding: create the vendor row, then push each
@@ -441,6 +504,7 @@ async def create_vendor_with_documents(
     pool = request.app.state.db_pool
     settings = request.app.state.settings
     actor_user_id = str(user.user_id)
+    files = list(files or []) + upload_staging.staged_files(upload_ids, user.user_id)
 
     # ── parse the JSON form fields ──────────────────────────────────────
     try:
@@ -782,7 +846,8 @@ async def extract_document_dry_run(
     request: Request,
     vendor_id: str,
     doc_type: str = Form(...),
-    file: UploadFile = File(...),
+    file: UploadFile | None = File(None),
+    upload_id: str | None = Form(None),
     user: AuthUser = Depends(require_permission("vendor", "document", action="create")),
 ):
     """Upload file to S3 + run Claude extraction; DOES NOT save a row.
@@ -791,7 +856,7 @@ async def extract_document_dry_run(
     /documents to persist (passing s3_url back in the s3_urls CSV).
     """
     vendor = await _require_vendor(request, vendor_id)
-    content, mime, filename = await _sniff_and_read_upload(file)
+    content, mime, filename = await _sniff_and_read_upload(_one_file(file, upload_id, user))
     try:
         s3_url, extracted = await document_service.extract_only(
             request.app.state.settings,
@@ -817,7 +882,8 @@ async def upload_and_save_document(
     vendor_id: str,
     doc_type: str = Form(...),
     doc_number: str | None = Form(None),
-    file: UploadFile = File(...),
+    file: UploadFile | None = File(None),
+    upload_id: str | None = Form(None),
     user: AuthUser = Depends(require_permission("vendor", "document", action="create")),
 ):
     """One-shot: S3 upload + Claude extraction + insert row.
@@ -827,7 +893,7 @@ async def upload_and_save_document(
     only; the caller can PATCH afterwards to refine them.
     """
     vendor = await _require_vendor(request, vendor_id)
-    content, mime, filename = await _sniff_and_read_upload(file)
+    content, mime, filename = await _sniff_and_read_upload(_one_file(file, upload_id, user))
     try:
         row, extracted = await document_service.upload_and_save(
             request.app.state.db_pool,
@@ -857,7 +923,8 @@ async def append_document_file(
     request: Request,
     vendor_id: str,
     doc_id: str,
-    file: UploadFile = File(...),
+    file: UploadFile | None = File(None),
+    upload_id: str | None = Form(None),
     user: AuthUser = Depends(require_permission("vendor", "document", action="update")),
 ):
     """Append a file to an existing document — pushes the new URL onto the
@@ -869,7 +936,7 @@ async def append_document_file(
     if not cur or cur.get("vendor_id") != vendor_id:
         raise HTTPException(404, detail={"code": "document_not_found"})
 
-    content, mime, filename = await _sniff_and_read_upload(file)
+    content, mime, filename = await _sniff_and_read_upload(_one_file(file, upload_id, user))
     try:
         row = await document_service.append_file(
             pool,
@@ -959,11 +1026,12 @@ async def delete_contract_endpoint(
 async def extract_contract_dry_run(
     request: Request,
     vendor_id: str,
-    file: UploadFile = File(...),
+    file: UploadFile | None = File(None),
+    upload_id: str | None = Form(None),
     user: AuthUser = Depends(require_permission("vendor", "contract", action="create")),
 ):
     vendor = await _require_vendor(request, vendor_id)
-    content, mime, filename = await _sniff_and_read_upload(file)
+    content, mime, filename = await _sniff_and_read_upload(_one_file(file, upload_id, user))
     try:
         s3_url, extracted = await contract_service.extract_only(
             request.app.state.settings,
@@ -985,12 +1053,13 @@ async def extract_contract_dry_run(
 async def upload_and_save_contract(
     request: Request,
     vendor_id: str,
-    file: UploadFile = File(...),
+    file: UploadFile | None = File(None),
+    upload_id: str | None = Form(None),
     contract_type: str | None = Form(None),
     user: AuthUser = Depends(require_permission("vendor", "contract", action="create")),
 ):
     vendor = await _require_vendor(request, vendor_id)
-    content, mime, filename = await _sniff_and_read_upload(file)
+    content, mime, filename = await _sniff_and_read_upload(_one_file(file, upload_id, user))
     base = {"contract_type": contract_type} if contract_type else None
     try:
         row, extracted = await contract_service.upload_and_save(
@@ -1020,7 +1089,8 @@ async def append_contract_file(
     request: Request,
     vendor_id: str,
     contract_id: str,
-    file: UploadFile = File(...),
+    file: UploadFile | None = File(None),
+    upload_id: str | None = Form(None),
     user: AuthUser = Depends(require_permission("vendor", "contract", action="update")),
 ):
     pool = request.app.state.db_pool
@@ -1029,7 +1099,7 @@ async def append_contract_file(
     if not cur or cur.get("vendor_id") != vendor_id:
         raise HTTPException(404, detail={"code": "contract_not_found"})
 
-    content, mime, filename = await _sniff_and_read_upload(file)
+    content, mime, filename = await _sniff_and_read_upload(_one_file(file, upload_id, user))
     try:
         row = await contract_service.append_file(
             pool,
@@ -1062,6 +1132,11 @@ async def extract_bulk_endpoint(
         ),
     ),
     files: list[UploadFile] = File(default_factory=list),
+    upload_ids: str = Form(
+        "[]",
+        description="JSON array of upload ids of documents sent in pieces (POST /uploads), "
+                    "after any files[], in docs_meta order.",
+    ),
     user: AuthUser = Depends(require_permission("vendor", "master", action="create")),
 ):
     """Phase 1 of the new onboarding flow. Uploads files BEFORE a vendor
@@ -1071,6 +1146,7 @@ async def extract_bulk_endpoint(
 
     No vendor / banking / document / contract rows are written here.
     """
+    files = list(files or []) + upload_staging.staged_files(upload_ids, user.user_id)
     if not files:
         raise HTTPException(400, detail={"code": "no_files"})
     if len(files) > _MAX_DOCS_PER_REQUEST:
