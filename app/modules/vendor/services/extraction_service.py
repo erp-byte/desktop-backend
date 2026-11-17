@@ -4,7 +4,8 @@ Phase 1 — `extract_bulk()`:
     Accepts N files BEFORE any vendor row exists. For each file:
         1. MIME-sniff + size validate (caller does this).
         2. PUT to S3 under a temp staging prefix `vendors/_staging/{staging_id}/...`.
-        3. Run `claude_extractor.extract_document_fields(...)` per file.
+        3. Run `claude_extractor.extract_document_fields(...)` per file
+           (a multi-page PDF is read page by page).
         4. Aggregate vendor / banking / document / contract suggestions
            across files; surface cross-doc conflicts.
         5. INSERT one `vendor_extraction_staging` row (payload as JSONB).
@@ -347,6 +348,23 @@ def _detect_conflicts(
 # ── aggregation ──────────────────────────────────────────────────────────
 
 
+def _page_extractions(
+    doc_label: str, ext: ExtractedDocFields,
+) -> list[tuple[str, ExtractedDocFields]]:
+    """(source label, extraction) for each page of a file read page by page
+    (pages that couldn't be read are left out), else the file's own
+    extraction under the doc label."""
+    if not ext.pages:
+        return [(doc_label, ext)]
+    out = []
+    for page in ext.pages:
+        if page.get("extraction_status", "ok") != "ok":
+            continue
+        fields = {k: v for k, v in page.items() if k != "page"}
+        out.append((f"{doc_label} page {page.get('page')}", ExtractedDocFields.model_validate(fields)))
+    return out
+
+
 def _aggregate(
     extracted_per_doc: list[tuple[str, str, ExtractedDocFields]],
 ) -> tuple[
@@ -442,18 +460,26 @@ def _aggregate(
             "additional_notes":   ext.additional_notes,
             "extraction_status":  ext.extraction_status,
             "extraction_error":   ext.extraction_error,
+            # What each page gave, when a multi-page PDF was read page by page.
+            "pages":              ext.pages,
         })
+
+        # A multi-page PDF was read page by page: each page proposes its
+        # own values, so two pages showing different GSTINs surface as a
+        # conflict, and each page with account details gives a bank row.
+        page_exts = _page_extractions(effective_type, ext)
 
         # Every typed slot the model populated lands on the vendor master.
         # No doc-type gating: a PAN doc that happens to show the GSTIN
         # contributes both. First non-empty value per column wins;
         # conflict detection runs on the full set of seen values.
-        for src_key, vendor_col in _DIRECT_MAP.items():
-            val = getattr(ext, src_key, None)
-            if val is None or (isinstance(val, str) and not val.strip()):
-                continue
-            field_sources.setdefault(vendor_col, []).append((effective_type, val))
-            vendor_fields.setdefault(vendor_col, val)
+        for source, page_ext in page_exts:
+            for src_key, vendor_col in _DIRECT_MAP.items():
+                val = getattr(page_ext, src_key, None)
+                if val is None or (isinstance(val, str) and not val.strip()):
+                    continue
+                field_sources.setdefault(vendor_col, []).append((source, val))
+                vendor_fields.setdefault(vendor_col, val)
 
         # Dropdown label hints — same idea but the value is a free-text
         # label the frontend matches against its lookup-backed select.
@@ -463,10 +489,24 @@ def _aggregate(
                 vendor_fields.setdefault(hint_key, val.strip())
 
         # Banking row if the doc carried account details (cancelled
-        # cheque, passbook, bank letter, invoice letterhead).
-        b_row = _maybe_banking_row(ext)
-        if b_row:
-            banking_fields.append(b_row)
+        # cheque, passbook, bank letter, invoice letterhead). An account
+        # printed on every page of a file (a letterhead footer) is one row,
+        # and a page naming only the bank adds nothing when another page of
+        # the file gives the account.
+        accounts_seen: set[tuple[str, str]] = set()
+        file_banks: list[dict[str, Any]] = []
+        for _, page_ext in page_exts:
+            b_row = _maybe_banking_row(page_ext)
+            if not b_row:
+                continue
+            account = ("".join(b_row["account_no"].split()).upper(), b_row["ifsc"].strip().upper())
+            if account in accounts_seen:
+                continue
+            accounts_seen.add(account)
+            file_banks.append(b_row)
+        if any(b["account_no"].strip() for b in file_banks):
+            file_banks = [b for b in file_banks if b["account_no"].strip()]
+        banking_fields.extend(file_banks)
 
         # Contract row if the doc is itself a contract / MSA / NDA.
         c_row = _maybe_contract_row(s3_url, ext)

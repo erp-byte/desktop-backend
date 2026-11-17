@@ -29,6 +29,7 @@ dependencies = [
     "python-dotenv==1.1.0",
     "reportlab==4.4.0",
     "pillow==12.2.0",
+    "pypdf==7.1.0",
 ]
 
 # Test-only dependencies. Deliberately NOT in requirements.txt — the Dockerfile

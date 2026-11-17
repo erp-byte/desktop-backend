@@ -564,6 +564,13 @@ class ExtractedDocFields(BaseModel):
     extraction_status: ExtractionStatus = "ok"
     extraction_error:  str | None = None
 
+    # ── Per page (multi-page PDFs only) ────────────────────────────────
+    # A multi-page PDF is read one page at a time (claude_extractor); the
+    # fields above are the pages merged, and this lists what each page gave:
+    # {"page": 1, "extraction_status": "ok", "gstin": "...", ...}, with the
+    # fields a page didn't show left out. None for images and one-page PDFs.
+    pages: list[dict[str, Any]] | None = None
+
 
 class DocExtractResponse(BaseModel):
     """Dry-run extraction result — file is in S3 but no DB row written."""

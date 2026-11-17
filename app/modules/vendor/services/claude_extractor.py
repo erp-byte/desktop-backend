@@ -3,6 +3,10 @@
 Uses `claude-sonnet-4-6` with `messages.parse()` for typed structured
 extraction. The model is overridable via the `VENDOR_DOC_MODEL` env var.
 
+A multi-page PDF is read one page at a time and the pages' results merged
+(extract_document_fields, merge_page_results). Contracts are still read
+whole: their value, dates and summary span pages.
+
 Prompt-caching note: the system prompt and per-doc-type instructions
 are frozen and applied with `cache_control={"type": "ephemeral"}` so the
 1.25x write premium amortizes after the second call. Volatile content
@@ -11,15 +15,18 @@ are frozen and applied with `cache_control={"type": "ephemeral"}` so the
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import os
+import weakref
 from typing import Any
 
 from anthropic import AsyncAnthropic
 from pydantic import BaseModel
 
 from app.modules.vendor.schemas import ExtractedContractFields, ExtractedDocFields
+from app.modules.vendor.services import pdf_pages
 
 logger = logging.getLogger(__name__)
 
@@ -357,18 +364,150 @@ async def extract_document_fields(
 ) -> ExtractedDocFields:
     """Run Claude over a vendor document; return a typed extraction.
 
-    Uses `messages.create()` with a JSON-mode prompt (not `messages.parse()`)
-    because the structured-output grammar compiler times out on
-    ExtractedDocFields. We parse + validate the response client-side with
-    Pydantic, which is more permissive (missing keys → defaults, extra
-    keys → ignored).
+    A PDF of more than one page is split (pdf_pages) and each page is read on
+    its own, several at a time; the page results are merged by
+    merge_page_results() and kept in `pages`. Images, one-page PDFs and PDFs
+    that can't be split are read whole in one call.
 
     Never raises — failure modes return an ExtractedDocFields whose
     `extraction_status` is "failed" with `extraction_error` populated.
     The caller can still persist the S3 URL and surface the failure to
     the UI for manual entry.
     """
+    if mime_type != "application/pdf":
+        return await _extract_one(file_bytes, mime_type, doc_type, model)
+    limit = pdf_pages.max_pages()
+    split = await asyncio.to_thread(pdf_pages.split_pages, file_bytes, limit)
+    if split is None or split[1] <= 1:
+        return await _extract_one(file_bytes, mime_type, doc_type, model)
+    pages, total = split
+    results = await asyncio.gather(*[
+        _extract_one(page, mime_type, doc_type, model, page_no=i, page_count=total)
+        for i, page in enumerate(pages, 1)
+    ])
+    return merge_page_results(list(results), doc_type, total)
+
+
+# Calls to Claude in flight at once, across every upload in this process
+# (a 20-file onboarding drop of 10-page scans would otherwise fire 200).
+_CONCURRENCY_DEFAULT = 12
+_LIMITS: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = weakref.WeakKeyDictionary()
+
+
+def _call_slot() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    sem = _LIMITS.get(loop)
+    if sem is None:
+        try:
+            n = max(1, int(os.environ.get("VENDOR_DOC_CONCURRENCY") or _CONCURRENCY_DEFAULT))
+        except ValueError:
+            n = _CONCURRENCY_DEFAULT
+        sem = _LIMITS[loop] = asyncio.Semaphore(n)
+    return sem
+
+
+# The identifier slot each declared doc type is about (prompt rule 6:
+# doc_number carries the same value).
+_TYPED_SLOT: dict[str, str] = {
+    "GST": "gstin", "PAN": "pan", "CIN": "cin", "FSSAI": "fssai", "IEC": "iec",
+    "UDYAM": "udyam", "MSME": "udyam", "TIN": "tin", "TAN": "tan",
+    "POLLUTION": "pollution_epr", "EPR": "pollution_epr", "BRC": "brc_other",
+}
+_NOT_MERGED = {"doc_number", "additional_notes", "extraction_status", "extraction_error", "pages"}
+
+
+def _filled(v: Any) -> bool:
+    return v is not None and not (isinstance(v, str) and not v.strip())
+
+
+def merge_page_results(
+    results: list[ExtractedDocFields], doc_type: str, total_pages: int,
+) -> ExtractedDocFields:
+    """One extraction for the whole file from its pages' (results[i] is page
+    i + 1).
+
+    Each field takes the first page, in page order, that shows it. doc_number
+    comes from the page whose number is the declared type's identifier (a GST
+    upload takes the GSTIN even when page 1 is the PAN card), else the first
+    page with that identifier, else the first page with any number. Notes
+    from each page are kept with their page number, and so are pages that
+    couldn't be read; the file fails only when every page failed.
+    """
+    pages = [
+        {"page": i, **r.model_dump(exclude_none=True, exclude={"pages"})}
+        for i, r in enumerate(results, 1)
+    ]
+    ok = [(i, r) for i, r in enumerate(results, 1) if r.extraction_status == "ok"]
+    notes: list[str] = []
+    if total_pages > len(results):
+        notes.append(
+            f"Only pages 1-{len(results)} of {total_pages} were read "
+            "(VENDOR_DOC_MAX_PAGES); enter anything from the later pages by hand."
+        )
+    for i, r in enumerate(results, 1):
+        if r.extraction_status != "ok":
+            notes.append(f"Page {i} could not be read: {(r.extraction_error or '')[:200]}")
+        elif _filled(r.additional_notes):
+            notes.append(f"Page {i}: {r.additional_notes.strip()}")
+
+    if not ok:
+        return ExtractedDocFields(
+            extraction_status="failed",
+            extraction_error=f"none of the {len(results)} pages could be read; "
+                             f"page 1: {(results[0].extraction_error or '')[:200]}",
+            additional_notes="\n".join(notes) or None,
+            pages=pages,
+        )
+
+    merged: dict[str, Any] = {}
+    for name in ExtractedDocFields.model_fields:
+        if name in _NOT_MERGED:
+            continue
+        for _, r in ok:
+            v = getattr(r, name)
+            if _filled(v):
+                merged[name] = v
+                break
+
+    slot = _TYPED_SLOT.get(doc_type)
+    numbers = [r.doc_number for _, r in ok if _filled(r.doc_number)]
+    matching = [r.doc_number for _, r in ok
+                if slot and _filled(r.doc_number) and r.doc_number == getattr(r, slot)]
+    merged["doc_number"] = (matching or ([merged[slot]] if slot and slot in merged else []) or numbers or [None])[0]
+
+    return ExtractedDocFields(
+        **merged,
+        additional_notes="\n".join(notes) or None,
+        extraction_status="ok",
+        pages=pages,
+    )
+
+
+async def _extract_one(
+    file_bytes: bytes,
+    mime_type: str,
+    doc_type: str,
+    model: str | None = None,
+    *,
+    page_no: int | None = None,
+    page_count: int | None = None,
+) -> ExtractedDocFields:
+    """One Claude call over a file, or over one page of it (page_no of
+    page_count).
+
+    Uses `messages.create()` with a JSON-mode prompt (not `messages.parse()`)
+    because the structured-output grammar compiler times out on
+    ExtractedDocFields. We parse + validate the response client-side with
+    Pydantic, which is more permissive (missing keys → defaults, extra
+    keys → ignored). Never raises.
+    """
     instr = _DOC_TYPE_INSTRUCTIONS.get(doc_type, _DOC_TYPE_INSTRUCTIONS["OTHER"])
+    page_line = (
+        f"This is page {page_no} of {page_count} of the uploaded file; the other "
+        "pages are read separately. Extract only what this page shows, and leave "
+        "out fields it doesn't show.\n\n"
+        if page_no else ""
+    )
     user_blocks = [
         _content_block_for_file(file_bytes, mime_type),
         {
@@ -376,29 +515,31 @@ async def extract_document_fields(
             "text": (
                 f"doc_type: {doc_type}\n\n"
                 f"Per-type instructions: {instr}\n\n"
+                f"{page_line}"
                 "Extract the fields now and respond with the JSON object only."
             ),
         },
     ]
 
     try:
-        response = await _client().messages.create(
-            model=model or _default_model(),
-            max_tokens=2048,
-            # Frozen system prompt → cache-friendly per the prompt-caching
-            # invariant (any byte change anywhere in the prefix invalidates
-            # everything after it).
-            system=[
-                {
-                    "type": "text",
-                    "text": _SYSTEM_PROMPT,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
-            messages=[{"role": "user", "content": user_blocks}],
-        )
+        async with _call_slot():
+            response = await _client().messages.create(
+                model=model or _default_model(),
+                max_tokens=2048,
+                # Frozen system prompt → cache-friendly per the prompt-caching
+                # invariant (any byte change anywhere in the prefix invalidates
+                # everything after it).
+                system=[
+                    {
+                        "type": "text",
+                        "text": _SYSTEM_PROMPT,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                messages=[{"role": "user", "content": user_blocks}],
+            )
     except Exception as e:  # noqa: BLE001
-        logger.warning("vendor.extract.failed doc_type=%s err=%r", doc_type, e)
+        logger.warning("vendor.extract.failed doc_type=%s page=%s err=%r", doc_type, page_no, e)
         return _failed_doc(repr(e))
 
     text = _response_text(response)
@@ -409,6 +550,7 @@ async def extract_document_fields(
         )
         return _failed_doc(f"no_json_in_response: {text[:200]!r}")
 
+    data.pop("pages", None)   # ours, never the model's
     try:
         return ExtractedDocFields.model_validate(data)
     except Exception as e:  # noqa: BLE001
