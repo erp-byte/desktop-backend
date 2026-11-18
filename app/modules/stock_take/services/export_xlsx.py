@@ -65,7 +65,11 @@ def _describe(filters: dict[str, Any]) -> str:
                        ("operation", "Operation"), ("date", "Date"),
                        ("dateFrom", "From"), ("dateTo", "To")):
         if filters.get(key):
-            parts.append(f"{label}: {filters[key]}")
+            v = filters[key]
+            if key == "location":
+                # The filter carries the stored name; the sheet shows the floor's.
+                v = _floors.floor_display_any(v, filters.get("warehouse"))
+            parts.append(f"{label}: {v}")
     return "Filters — " + "; ".join(parts) if parts else "No filters — every recorded transaction."
 
 
@@ -100,6 +104,8 @@ def build_ledger_workbook(rows: list[dict[str, Any]], filters: dict[str, Any],
                 v = str(row.get("created_at") or "").replace("T", " ")[:19]
             elif key in ("is_new_article", "is_reversal"):
                 v = "Yes" if row.get(key) else ""
+            elif key == "location":
+                v = _floors.floor_display(row.get("warehouse"), row.get(key))
             else:
                 v = row.get(key)
             c = ws.cell(row=r, column=i, value=v)
@@ -202,6 +208,8 @@ def _entry_cell(row: dict[str, Any], key: str) -> Any:
         return _dt(row.get(key))
     if key in _NUM3 or key in _NUM2:
         return _num(row.get(key))
+    if key == "floor_name":
+        return _floors.floor_display(row.get("warehouse"), row.get(key))
     return row.get(key) or ""
 
 
@@ -442,6 +450,9 @@ def _describe_stock(filters: dict[str, Any]) -> str:
                        ("subcategory", "Sub-group"), ("stockType", "Stock type"),
                        ("search", "Search"), ("asOf", "As of")):
         v = filters.get(key)
+        if v and key == "floorName":
+            # The filter carries the stored name; the sheet shows the floor's.
+            v = [_floors.floor_display_any(f, whs) for f in (v if isinstance(v, list) else [v])]
         if v:
             parts.append(f"{label}: {', '.join(v) if isinstance(v, list) else v}")
     return "; ".join(parts)
@@ -462,15 +473,30 @@ def _floor_order(code: str, floor_key: str) -> tuple[int, str]:
 
 
 def _floor_label(code: str, floor_key: str, spelled: str) -> str:
-    """The declared spelling when there is one ("Store", not "STORE"), else as recorded."""
+    """The declared spelling when there is one ("Store", not "STORE"), else as
+    recorded -- under the name Stock Take shows it by (floors.FLOOR_DISPLAY)."""
     for f in _floors.FLOORS_BY_WAREHOUSE.get(code, []):
         if f.upper() == floor_key:
-            return f
-    return (spelled or "").strip() or "(no floor)"
+            return _floors.floor_display(code, f)
+    return _floors.floor_display(code, spelled) or "(no floor)"
+
+
+def _empty_merged(r: dict[str, Any]) -> bool:
+    """A line on a floor merged into another that holds nothing: left off the
+    sheet. One that still holds something stays, so no stock goes unseen.
+
+    "Nothing" means its counted and adjusted kg are 0 as well, not just its
+    total: a line counted +X and adjusted -X nets to 0 but still adds X to each
+    of the Counted and Adjustments totals on the page, and dropping it would
+    leave the sheet's totals short of the page's."""
+    return (_floors.is_merged_floor(r.get("warehouse"), r.get("floor_key") or r.get("floor"))
+            and all(abs(float(r.get(k) or 0)) < 0.0005
+                    for k in ("total_weight", "total_quantity", "counted_weight", "net_adjustment_kg")))
 
 
 def build_stock_workbook(rows: list[dict[str, Any]], filters: dict[str, Any],
                          generated_by: str) -> BytesIO:
+    rows = [r for r in rows if not _empty_merged(r)]
     # A place is warehouse + floor KEY, not the floor as spelled: one floor can
     # reach here as "STORE" from its counts and "Store" from its adjustments.
     places: dict[tuple[str, str], list[dict[str, Any]]] = {}

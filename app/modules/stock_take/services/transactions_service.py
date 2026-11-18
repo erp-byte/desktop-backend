@@ -170,6 +170,9 @@ def effective_scope(
     by_wh: dict[str, list[str]] = {}
     for wh in whs:
         offered = _floors.FLOORS_BY_WAREHOUSE.get(wh) or places.get(wh) or []
+        # A floor merged into another is not offered, so nothing new lands on
+        # it (resolve_scope refuses it too, through this list).
+        offered = _floors.visible_floors(wh, offered)
         if not floors_unrestricted:
             keep = {_norm(f) for f in granted_floors}
             offered = [f for f in offered if _norm(f) in keep]

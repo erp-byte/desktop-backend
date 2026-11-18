@@ -368,6 +368,9 @@ async def filter_options(
         places = await latest_stock_service.fetch_places(conn)
 
     whs, by_wh = _read_scope(user, places)
+    # Floors merged into others are not offered. Only the dropdowns lose them:
+    # _read_scope itself is shared with Floor Requisition and stays as it was.
+    by_wh = {wh: _floors.visible_floors(wh, fl) for wh, fl in by_wh.items()}
     floors: list[str] = []
     for wh in whs:
         for f in by_wh[wh]:
@@ -382,6 +385,8 @@ async def filter_options(
         "floors_by_warehouse": by_wh,
         # "Savla D-39" rather than "D39" in the dropdown; the value stays the code.
         "warehouse_labels": {w: _floors.warehouse_label(w) for w in whs},
+        # "Packing Area" for "Dmart Packing Area"; the value stays the stored name.
+        "floor_labels": _floors.floor_labels(),
         "cold_warehouses": [w for w in whs if w in _floors.COLD_WAREHOUSES],
     }
 
@@ -505,6 +510,7 @@ async def my_scope(
     return {
         **scope,
         "warehouse_labels": {w: _floors.warehouse_label(w) for w in warehouses},
+        "floor_labels": _floors.floor_labels(),
         "can_post": bool(warehouses and floors),
         # Named so the UI renders the ACTUAL cause. "unrestricted but nothing
         # available" is a server/database misconfiguration, not a permissions
@@ -997,7 +1003,8 @@ async def export_entries(
     stream = export_xlsx.build_entries_workbook(rows, applied, drafts, _actor(user))
     stamp = (date_to or date_from or date.today().isoformat())
     filename = (f"StockTakeEntries_{stamp}"
-                f"{_slug(warehouse)}{_slug(floor_name)}"
+                f"{_slug(warehouse)}"
+                f"{_slug([_floors.floor_display_any(f, warehouse) for f in floor_name or []])}"
                 f"{('_' + ''.join(entered_by.split())) if entered_by else ''}.xlsx")
     return StreamingResponse(
         stream,
