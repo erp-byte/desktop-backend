@@ -426,15 +426,26 @@ STOCK_COLUMNS: tuple[tuple[str, str, int], ...] = (
     ("item_subcategory",  "Sub-group",           20),
     ("stock_type",        "Stock type",          18),
     ("total_quantity",    "Qty (units)",         12),
-    ("counted_weight",    "Counted (kg)",        14),
-    ("net_adjustment_kg", "Adjustments (kg)",    15),
     ("total_weight",      "Current stock (kg)",  17),
-    ("last_counted_date", "Last counted",        13),
-    ("days_since_count",  "Days since count",    11),
 )
+# Only what the stock is read by (asked for on 19 Nov 2026). Counted (kg),
+# Adjustments (kg), Last counted and Days since count were dropped: people
+# deleted them from the sheet by hand before using it.
 _KG = "#,##0.00"
-_UNITS = "#,##0.###"
-_DATE = "dd-mmm-yyyy"
+
+
+def _units_cell(c: Any, v: Any) -> None:
+    """Write a unit count without a stray decimal point.
+
+    One fixed format cannot do it: "#,##0.###" prints 2 as "2." and -83 as
+    "-83.", which reads as a cut-off value. So whole numbers get "#,##0" and the
+    rest "#,##0.0##" (4.5, -0.7, 1.125), decided per cell after rounding to 3
+    places, so float noise such as 2.0000000001 still counts as whole."""
+    q = round(float(v or 0), 3) + 0.0  # + 0.0 turns -0.0 into 0.0
+    if q == int(q):
+        c.value, c.number_format = int(q), "#,##0"
+    else:
+        c.value, c.number_format = q, "#,##0.0##"
 _WH_TOTAL_FILL = PatternFill(start_color="E8EDF5", end_color="E8EDF5", fill_type="solid")
 _COLD_FILL = PatternFill(start_color="E3F2FD", end_color="E3F2FD", fill_type="solid")
 # The server runs on UTC (Lambda); the people reading this work to IST.
@@ -482,16 +493,13 @@ def _floor_label(code: str, floor_key: str, spelled: str) -> str:
 
 
 def _empty_merged(r: dict[str, Any]) -> bool:
-    """A line on a floor merged into another that holds nothing: left off the
-    sheet. One that still holds something stays, so no stock goes unseen.
-
-    "Nothing" means its counted and adjusted kg are 0 as well, not just its
-    total: a line counted +X and adjusted -X nets to 0 but still adds X to each
-    of the Counted and Adjustments totals on the page, and dropping it would
-    leave the sheet's totals short of the page's."""
+    """A line on a floor merged into another that holds nothing -- 0 kg and 0
+    units now -- is left off the sheet. One that still holds something stays, so
+    no stock goes unseen. (The sheet no longer carries Counted and Adjustments
+    columns, so a line that only nets to 0 has no total to keep in step.)"""
     return (_floors.is_merged_floor(r.get("warehouse"), r.get("floor_key") or r.get("floor"))
             and all(abs(float(r.get(k) or 0)) < 0.0005
-                    for k in ("total_weight", "total_quantity", "counted_weight", "net_adjustment_kg")))
+                    for k in ("total_weight", "total_quantity")))
 
 
 def build_stock_workbook(rows: list[dict[str, Any]], filters: dict[str, Any],
@@ -518,27 +526,22 @@ def build_stock_workbook(rows: list[dict[str, Any]], filters: dict[str, Any],
             value=f"Exported {_dt(datetime.now(_IST))} IST by {generated_by}").font = _META_FONT
 
     head = 6
-    headers = ("Warehouse", "Floor", "Items", "Counted (kg)", "Adjustments (kg)",
-               "Current stock (kg)", "Off grade (kg)", "Last counted")
-    for i, (header, width) in enumerate(zip(headers, (18, 22, 8, 15, 16, 18, 15, 13)), start=1):
+    headers = ("Warehouse", "Floor", "Items", "Current stock (kg)", "Off grade (kg)")
+    for i, (header, width) in enumerate(zip(headers, (18, 22, 8, 18, 15)), start=1):
         c = ws.cell(row=head, column=i, value=header)
         c.font, c.fill, c.border = _HEADER_FONT, _HEADER_FILL, _BORDER
         c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         ws.column_dimensions[get_column_letter(i)].width = width
 
     def totals(data: list[dict[str, Any]]) -> tuple:
-        dates = [d["last_counted_date"] for d in data if d.get("last_counted_date")]
         # Items as the screen counts them: an item + stock type once, however
         # many floors it is on. Equal to the row count on a single floor.
         items = {(d.get("item_key") or (d.get("item_name") or "").strip().upper(),
                   d.get("stock_type")) for d in data}
         return (len(items),
-                sum(_num(d["counted_weight"]) for d in data),
-                sum(_num(d["net_adjustment_kg"]) for d in data),
                 sum(_num(d["total_weight"]) for d in data),
                 sum(_num(d["total_weight"]) for d in data
-                    if d.get("stock_type") == "Off Grade/Rejection"),
-                max(dates) if dates else None)
+                    if d.get("stock_type") == "Off Grade/Rejection"))
 
     r = head
 
@@ -553,10 +556,8 @@ def build_stock_workbook(rows: list[dict[str, Any]], filters: dict[str, Any],
                 c.font = font
             if fill:
                 c.fill = fill
-            if i in (4, 5, 6, 7):
+            if i in (4, 5):
                 c.number_format = _KG
-            elif i == 8:
-                c.number_format = _DATE
 
     by_wh: dict[str, list[tuple[str, str]]] = {}
     for p in order:
@@ -597,11 +598,9 @@ def build_stock_workbook(rows: list[dict[str, Any]], filters: dict[str, Any],
                      else labels[p] if key == "floor" else item.get(key))
                 c = ds.cell(row=n, column=i, value=v)
                 if key == "total_quantity":
-                    c.number_format = _UNITS
-                elif key in ("counted_weight", "net_adjustment_kg", "total_weight"):
+                    _units_cell(c, v)
+                elif key == "total_weight":
                     c.number_format = _KG
-                elif key == "last_counted_date":
-                    c.number_format = _DATE
             if item["warehouse"] in _floors.COLD_WAREHOUSES:
                 ds.cell(row=n, column=1).fill = _COLD_FILL
     ds.freeze_panes = "C2"

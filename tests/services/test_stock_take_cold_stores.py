@@ -249,10 +249,10 @@ def test_summary_has_every_floor_a_total_per_warehouse_and_the_split():
         ("Factories and godowns", None), ("Cold storage", None), ("GRAND TOTAL", None),
     ], "factories first in walking order, then the cold stores, STORE/Store as one floor"
     by = {r[0] if r[1] is None else (r[0], r[1]): r for r in lines}
-    assert by[("W202", "Store")][2] == 2 and by[("W202", "Store")][5] == 15.0
-    assert by["Savla D-39 total"][5] == 52650.0 and by["Savla D-39 total"][6] == 100.0
-    assert by["Cold storage"][5] == 52650.0 + 243800.0
-    assert by["GRAND TOTAL"][5] == sum(r["total_weight"] for r in ROWS)
+    assert by[("W202", "Store")][2] == 2 and by[("W202", "Store")][3] == 15.0
+    assert by["Savla D-39 total"][3] == 52650.0 and by["Savla D-39 total"][4] == 100.0
+    assert by["Cold storage"][3] == 52650.0 + 243800.0
+    assert by["GRAND TOTAL"][3] == sum(r["total_weight"] for r in ROWS)
     assert by["GRAND TOTAL"][2] == len(ROWS)
     detail = list(wb["Stock by floor"].iter_rows(min_row=2, values_only=True))
     assert len(detail) == len(ROWS)
@@ -303,7 +303,7 @@ def test_warehouse_totals_count_an_item_once_however_many_floors_hold_it():
     by = {r[0] if r[1] is None else (r[0], r[1]): r for r in lines}
     assert by[("W202", "First Floor")][2] == 2
     assert by["W202 total"][2] == 2, "Almonds fresh + Almonds off grade"
-    assert by["GRAND TOTAL"][2] == 2 and by["GRAND TOTAL"][5] == 15.0
+    assert by["GRAND TOTAL"][2] == 2 and by["GRAND TOTAL"][3] == 15.0
 
 
 # ── Narrow or whole is decided by the grants, never by today's rows ────────

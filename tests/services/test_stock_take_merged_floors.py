@@ -149,12 +149,11 @@ def test_download_headers_name_the_floor_as_shown():
     assert "Floor: Terrace" in X._describe({"warehouse": "W202", "location": "Terrace"})
 
 
-def test_a_merged_floor_line_that_only_nets_to_zero_stays_on_the_sheet():
-    """Counted +135 and adjusted -135 (posted on the merge day before the merge):
-    current stock 0, but the page's Counted and Adjustments totals include both,
-    so the sheet keeps the line to add up to the same."""
+def test_a_merged_floor_line_that_only_nets_to_zero_is_left_off():
+    """Counted +135 and adjusted -135: 0 kg and 0 units now. The sheet has no
+    Counted or Adjustments column any more, so there is nothing to keep it for."""
     line = {**_line("FFS Packing Area", 0.0, 0.0), "counted_weight": 135.0, "net_adjustment_kg": -135.0}
-    assert not X._empty_merged(line)
-    assert X._empty_merged(_line("FFS Packing Area", 0.0, 0.0))
+    assert X._empty_merged(line)
+    assert not X._empty_merged(_line("FFS Packing Area", 0.0, 3.0)), "units left: keep it"
     vals = _sheet_values(X.build_stock_workbook([line, _line("FG store", 10.0, 1.0)], {}, "test"), "Stock by floor")
-    assert any(v[1] == "FFS Packing Area" for v in vals if v)
+    assert not any(v[1] == "FFS Packing Area" for v in vals if v)
