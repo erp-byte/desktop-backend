@@ -4,10 +4,11 @@ import time
 from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, UploadFile, File
+from fastapi.responses import Response
 
 from app.modules.so.services.item_matcher import current_master_items
 from app.modules.auth.middleware import get_current_user, require_permission
-from app.modules.production.services.response_filters import strip_cost_fields
+from app.modules.production.services.response_filters import sees_cost, strip_cost_fields
 from app.modules.so.schemas import (
     SOUploadResponse,
     SOCreateRequest,
@@ -41,6 +42,13 @@ from app.modules.so.services.updater import (
     confirm_sales_register_update,
     manual_update_so,
 )
+from app.modules.so.schemas.sales_invoice import SalesInvoiceUploadResponse
+from app.modules.so.services.sales_invoices import (
+    InvoiceTablesMissing,
+    process_sales_invoices,
+    save_sales_invoices,
+)
+from app.modules.so.services import pending_orders
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +120,115 @@ async def upload_so_book(request: Request, file: UploadFile = File(...),
         raise HTTPException(500, detail=f"Failed to process SO Book: {error_msg}")
 
     return SOUploadResponse(**result)
+
+
+@router.post("/upload-sales-invoices", response_model=SalesInvoiceUploadResponse)
+async def upload_sales_invoices(request: Request, file: UploadFile = File(...),
+                                save: bool = Query(False),
+                                user=Depends(require_permission("so", action="create"))):
+    """SO Creation's second upload: the Tally Sales Register (invoices raised).
+
+    Without ?save=true it only reads and checks the file and returns what it
+    found: each invoice with its SO, the SO line and master-list article and kg
+    of every item, and any problems. With ?save=true it also writes the
+    invoices to sales_invoice / sales_invoice_line (migration 141): an invoice
+    number already saved is updated, so the same file can be uploaded again.
+    """
+    if not file or not file.filename:
+        raise HTTPException(400, detail="No file attached.")
+
+    if not file.filename.lower().endswith((".xlsx", ".xls")):
+        raise HTTPException(400, detail="Only Excel files (.xlsx) are accepted.")
+
+    contents = await file.read()
+    if len(contents) > 50 * 1024 * 1024:
+        raise HTTPException(400, detail="File too large. Maximum 50 MB.")
+
+    pool = request.app.state.db_pool
+    master_items = await current_master_items(request.app)
+
+    try:
+        result = await process_sales_invoices(pool, contents, master_items)
+    except ValueError as e:
+        raise HTTPException(400, detail=str(e))
+    except Exception as e:
+        logger.exception("Sales Register (invoices) read failed")
+        raise HTTPException(500, detail=f"Failed to read the Sales Register: {e}")
+    if not save:
+        return result
+
+    who = (getattr(user, "full_name", None) or getattr(user, "email", None)
+           or f"user:{getattr(user, 'user_id', '?')}")
+    try:
+        result["save_result"] = await save_sales_invoices(
+            pool, result, uploaded_by=who, source_file=file.filename)
+    except InvoiceTablesMissing:
+        raise HTTPException(409, detail="The invoice tables aren't created yet (migration 141), so nothing was saved.")
+    except ValueError as e:
+        raise HTTPException(400, detail=str(e))
+    except Exception as e:
+        logger.exception("Sales Register (invoices) save failed")
+        raise HTTPException(500, detail=f"Failed to save the invoices: {e}")
+    result["saved"] = True
+    return result
+
+
+def _ist_today():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("Asia/Kolkata")).date()
+
+
+def _user_sees_cost(user) -> bool:
+    return sees_cost(getattr(user, "role_name", None), is_admin=getattr(user, "is_admin", False))
+
+
+@router.get("/pending-orders")
+async def get_pending_orders(request: Request, user=Depends(require_permission("so", action="view"))):
+    """The Pending Orders dashboard's data: every SO line in the sheet's
+    columns (ordered - invoiced = pending), dispatched ones included so the
+    screen can filter, plus what the dispatch side rests on (saved invoices).
+    Money columns are left out for roles that may not see cost."""
+    today = _ist_today()
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        lines, dispatches, plans, _ = await pending_orders.fetch_inputs(conn)
+        invoices = await pending_orders.invoice_status(conn)
+    shows_cost = _user_sees_cost(user)
+    columns = pending_orders.visible_columns(shows_cost)
+    keep = set(columns) | {"so_line_id"}
+    rows = [{k: v for k, v in r.items() if k in keep and v is not None}
+            for r in pending_orders.pending_rows(lines, dispatches, plans, today, include_dispatched=True)]
+    return {"as_of": today, "columns": columns, "sees_cost": shows_cost,
+            "so_lines": len(lines), "invoices": invoices, "rows": rows}
+
+
+@router.get("/pending-orders/export")
+async def export_pending_orders(request: Request, include_dispatched: bool = Query(False),
+                                user=Depends(require_permission("so", action="view"))):
+    """The "Pending orders - Floor wise plan" sheet built from the ERP: per SO
+    line, ordered - invoiced = pending (invoices from the Sales Register
+    upload), with dispatch date, invoice numbers, values, ageing and the
+    planned floor. Only lines still pending unless include_dispatched. Money
+    columns are left out for roles that may not see cost."""
+    today = _ist_today()
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        lines, dispatches, plans, have_invoices = await pending_orders.fetch_inputs(conn)
+    rows = pending_orders.pending_rows(lines, dispatches, plans, today, include_dispatched=include_dispatched)
+    note = None if have_invoices else (
+        f"Pending orders as of {today:%d.%m.%Y} — no invoices saved yet, so nothing counts as dispatched")
+    body = pending_orders.pending_orders_xlsx(
+        rows, today, note=note, columns=pending_orders.visible_columns(_user_sees_cost(user)))
+    return Response(
+        content=body,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f'attachment; filename="Pending orders {today:%d.%m.%Y}.xlsx"',
+            # Both listed in main.py's CORS expose_headers.
+            "X-Total-Rows": str(len(rows)),
+        },
+    )
 
 
 @router.post("/update-preview", response_model=SOUpdatePreviewResponse)
