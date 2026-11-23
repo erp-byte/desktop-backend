@@ -712,6 +712,109 @@ When `particulars` is provided:
 
 ---
 
+### 10. POST /box-batch — Desktop station: box-wise entry
+
+**Who:** Stores Team, from the desktop app (permission `purchase.material_in.create`; changing a saved box or the header fields also needs `purchase.material_in.edit`)
+
+The desktop app saves each box on the station, prints its label at once and sends the saved boxes here in the background, up to 10 per request. Because the label is printed before the server sees the box, the station first **reserves** box ids, and each box arrives with its final `box_id`. The station sends a box again whenever it got no answer for it; that is harmless (see *Sending again*).
+
+The request has three lists, all optional, applied in this order: `reserve`, `headers`, `boxes`.
+
+**Request:**
+```json
+{
+  "reserve": [{ "transaction_no": "TR-20261019162053", "count": 100 }],
+  "headers": [
+    {
+      "transaction_no": "TR-20261019162053",
+      "warehouse": "Savla D-39",
+      "invoice_number": "INV/77",
+      "inward_authority": "Asha Kulkarni"
+    }
+  ],
+  "boxes": [
+    {
+      "box_id": "69842816-41",
+      "transaction_no": "TR-20261019162053",
+      "line_number": 1,
+      "section_number": 2,
+      "section": null,
+      "box_number": 7,
+      "net_weight": 30.0,
+      "gross_weight": 32.6,
+      "lot_number": "CF290926",
+      "count": null,
+      "client_key": "c0a8f1d2-6b3e-4a5f-9c7d-1e2f3a4b5c6d:7",
+      "weighed_by": "Asha Kulkarni",
+      "weighed_at": "2026-11-23T06:41:07.512Z"
+    },
+    {
+      "box_id": "69842816-42",
+      "transaction_no": "TR-20261019162053",
+      "line_number": 2,
+      "section_number": null,
+      "section": {
+        "client_key": "7e1f0a2b-93c4-4d5e-8f60-a1b2c3d4e5f6",
+        "lot_number": "CF300926",
+        "manufacturing_date": "2026-09-30",
+        "expiry_date": "2027-09-29"
+      },
+      "box_number": 1,
+      "net_weight": 24.9,
+      "gross_weight": 25.5,
+      "lot_number": "CF300926",
+      "count": null,
+      "client_key": "7e1f0a2b-93c4-4d5e-8f60-a1b2c3d4e5f6:1",
+      "weighed_by": "Asha Kulkarni",
+      "weighed_at": "2026-11-23T06:41:19.004Z"
+    }
+  ]
+}
+```
+
+| List | Limit | Field notes |
+|------|-------|-------------|
+| `reserve` | 20 entries, `count` 1–500 | |
+| `headers` | 20 entries | `warehouse`, `invoice_number`, `challan_number`, `inward_authority`: a field left out or null keeps its value |
+| `boxes` | 10 boxes | `box_id` max 20 chars. The box's section: `section_number` (a saved section), or `section` (a new one, found again by `section.client_key`). `weighed_by` / `weighed_at` are stored where `po_box` has those columns. |
+
+**Response (200)** — whenever the request was understood, whatever happened to single boxes:
+```json
+{
+  "reserved": [
+    { "transaction_no": "TR-20261019162053", "base": "69842816", "from_seq": 141, "to_seq": 240 }
+  ],
+  "boxes": [
+    { "box_id": "69842816-41", "status": "created", "section_number": 2, "box_number": 7 },
+    { "box_id": "69842816-42", "status": "created", "section_number": 1, "box_number": 1 },
+    { "box_id": "69842816-17", "status": "rejected", "message": "This box id was not reserved for this PO." }
+  ]
+}
+```
+
+**`reserve`** gives out the ids `{base}-{from_seq}` … `{base}-{to_seq}` for the PO, after every id given out so far. The range is recorded (a `reserved` row in `box_edit_logs`), so no other save — this endpoint, `POST /{transaction_no}/box` or `POST /{transaction_no}/boxes` — ever gets those ids. Ids the station doesn't use are never used. Reserving again gives a new range.
+
+**`headers`** update the PO before its boxes, because a new box's stock is booked to the PO's warehouse. Skipped (silently) for users without the edit permission, and for a PO the user can't see.
+
+**`boxes`** are saved one at a time, each in its own transaction, in the order sent. One result per box, matched by `box_id`:
+
+| `status` | Meaning |
+|----------|---------|
+| `created` | A new box, saved under exactly the `box_id` sent. With `section_number` and `box_number` as saved: the box number sent is kept when free in the section, else the next free one. A weighed box gets its stock batch. |
+| `updated` | The `box_id` was already saved on this PO: its weights, lot and count are updated as in `PUT /{transaction_no}/box/{box_id}` (only the fields sent). Sent again with the same values it changes nothing. |
+| `rejected` | Final: the box was not saved and won't be on a resend; `message` says why. The station should have the box saved and printed again. |
+
+Rejection messages: `This box id was not reserved for this PO.` · `This box id belongs to another PO.` · `This box is already saved as {box_id}.` (its `client_key` is on another box) · `Line {n} not found on this PO.` · `Section {n} not found for line {m}.` · `The box names no section.` · `You don't have permission to change saved boxes.` · `Transaction not found.` · the stock message of a weight correction refused because the stock is used up.
+
+**Sending again:** a box sent twice is saved once. The second time its id is on the PO, so it comes back `updated` and nothing changes: no second box, batch or section count. A user who may only create boxes can resend; only a real change needs the edit permission.
+
+**Errors (whole request):**
+- **404** — a `reserve` entry names a PO that is missing or outside the user's sites; no ids are given out.
+- **503** — `box_edit_logs` is missing (ids can't be reserved), or a box names its section by key before migration 131.
+- **5xx** — a database failure. Boxes saved before it stay saved; send the boxes again and those come back `updated`.
+
+---
+
 ## Complete Data Flow
 
 ### Flow 1: Purchase Team — Excel Upload

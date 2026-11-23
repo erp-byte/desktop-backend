@@ -2,13 +2,17 @@
 
 import logging
 import math
+import time
 from datetime import date, datetime
+from typing import Literal
 
+import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, UploadFile, File
 from pydantic import BaseModel, Field
 
 from app.modules.so.services.item_matcher import current_master_items
 from app.modules.auth.middleware import require_permission
+from app.modules.auth.services.permission_service import check_permission
 
 from app.modules.purchase.schemas import (
     POHeaderOut,
@@ -369,6 +373,342 @@ async def get_summary(
         total_tax=float(row["total_tax"]) if row["total_tax"] else None,
         total_net_weight=float(row["total_net_weight"]) if row["total_net_weight"] else None,
     )
+
+
+# ---------------------------------------------------------------------------
+# Stores Team: box-wise entry from the desktop station (POST /box-batch)
+# ---------------------------------------------------------------------------
+#
+# The desktop app saves each box on the station, prints its label at once and
+# sends the saved boxes here in the background, ten at a time. The label's QR
+# carries a box id the station reserved here beforehand (`reserve`), so a box
+# arrives with its final id and is created under exactly that id. A box sent
+# again (its reply was lost) is harmless: the second time the id exists on the
+# PO, and the same values change nothing.
+#
+# Declared before the /{transaction_no} routes so "box-batch" is never read as
+# a transaction number. The box helpers it reuses (_next_box_ids,
+# _insert_boxes, _sync_box_corrections, ...) are further down.
+
+
+class BoxBatchReserve(BaseModel):
+    transaction_no: str = Field(min_length=1, max_length=64)
+    count: int = Field(ge=1, le=500)
+
+
+class BoxBatchHeader(BaseModel):
+    transaction_no: str = Field(min_length=1, max_length=64)
+    warehouse: str | None = None
+    invoice_number: str | None = None
+    challan_number: str | None = None
+    inward_authority: str | None = None
+
+
+class BoxBatchSection(BaseModel):
+    client_key: str = Field(min_length=1, max_length=64)
+    lot_number: str | None = None
+    manufacturing_date: str | None = None
+    expiry_date: str | None = None
+
+
+class BoxBatchBox(BaseModel):
+    box_id: str = Field(min_length=1, max_length=20)   # box_edit_logs.box_id is varchar(20)
+    transaction_no: str = Field(min_length=1, max_length=64)
+    line_number: int
+    section_number: int | None = None
+    section: BoxBatchSection | None = None
+    box_number: int | None = None
+    net_weight: float | None = None
+    gross_weight: float | None = None
+    lot_number: str | None = None
+    count: int | None = None
+    client_key: str | None = Field(default=None, max_length=80)
+    weighed_by: str | None = None
+    weighed_at: datetime | None = None
+
+
+class BoxBatchRequest(BaseModel):
+    reserve: list[BoxBatchReserve] = Field(default_factory=list, max_length=20)
+    headers: list[BoxBatchHeader] = Field(default_factory=list, max_length=20)
+    boxes: list[BoxBatchBox] = Field(default_factory=list, max_length=10)
+
+
+class BoxBatchReserved(BaseModel):
+    transaction_no: str
+    base: str
+    from_seq: int
+    to_seq: int
+
+
+class BoxBatchResult(BaseModel):
+    box_id: str
+    status: Literal["created", "updated", "rejected"]
+    section_number: int | None = None
+    box_number: int | None = None
+    message: str | None = None
+
+
+class BoxBatchResponse(BaseModel):
+    reserved: list[BoxBatchReserved] = []
+    boxes: list[BoxBatchResult] = []
+
+
+# Whether {base}-{seq} lies in a range reserved for this PO. The casts sit
+# behind CASE so no row's text is cast before it is known to be a number.
+_RESERVED_ID_SQL = """
+    SELECT 1 FROM box_edit_logs
+     WHERE transaction_no = $1 AND field_name = 'reserved'
+       AND regexp_replace(box_id, '-[0-9]+$', '') = $2
+       AND old_value ~ '^[0-9]{1,9}$' AND new_value ~ '^[0-9]{1,9}$'
+       AND $3 BETWEEN (CASE WHEN old_value ~ '^[0-9]{1,9}$' THEN old_value::int END)
+                  AND (CASE WHEN new_value ~ '^[0-9]{1,9}$' THEN new_value::int END)
+     LIMIT 1
+"""
+
+
+def _rejection(detail) -> str:
+    if isinstance(detail, dict):
+        return str(detail.get("message") or detail)
+    return str(detail)
+
+
+def _unchanged(stored, sent) -> bool:
+    """Whether a box field as sent leaves the saved value as it is: a field
+    not sent keeps its value, and weights are kept to 3 decimals."""
+    if sent is None:
+        return True
+    if stored is None:
+        return False
+    if isinstance(sent, float):
+        return round(float(stored), 3) == round(sent, 3)
+    return stored == sent
+
+
+def _batch_result(row, status: str) -> dict:
+    return {"box_id": row["box_id"], "status": status,
+            "section_number": row["section_number"], "box_number": row["box_number"]}
+
+
+async def _may_edit_material_in(pool, user) -> bool:
+    if getattr(user, "is_admin", False):
+        return True
+    async with pool.acquire() as conn:
+        return await check_permission(conn, user.role_ids, user.is_admin,
+                                      "purchase", "material_in", None, "edit")
+
+
+async def _reserve_box_ids(pool, user, transaction_no: str, count: int) -> dict:
+    """Give out `count` box ids for the PO, past every id given out so far, and
+    record the range in box_edit_logs (a 'reserved' row whose box_id is the
+    range's last id), so _next_box_ids never gives them to another box. Not
+    through _log_box: an unrecorded range would be given out twice, so a
+    failed insert fails the request."""
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            if not await _box_log(conn):
+                raise HTTPException(503, detail="Box ids can't be reserved: box_edit_logs is missing.")
+            await conn.execute(_BOX_LOCK_SQL, transaction_no)
+            proposed = f"{str(int(time.time() * 1000))[-8:]}-1"   # seeds the base of a PO with no box yet
+            base, from_seq = await _next_box_ids(conn, transaction_no, proposed)
+            to_seq = from_seq + count - 1
+            await conn.execute(
+                """
+                INSERT INTO box_edit_logs (email_id, description, transaction_no, box_id,
+                                           field_name, old_value, new_value, edited_at)
+                VALUES ($1, $2, $3, $4, 'reserved', $5, $6, NOW())
+                """,
+                _actor(user), f"Box ids {base}-{from_seq} to {base}-{to_seq} reserved for box-wise entry",
+                transaction_no, f"{base}-{to_seq}", str(from_seq), str(to_seq),
+            )
+    return {"transaction_no": transaction_no, "base": base, "from_seq": from_seq, "to_seq": to_seq}
+
+
+async def _batch_update_box(conn, user, header, b: BoxBatchBox, old, can_edit: bool) -> dict:
+    """A box already saved on the PO: change it as PUT /{txn}/box/{box_id} does.
+    Sent again with the values it has (a retry) it changes nothing and needs no
+    edit permission, so a user who may only create boxes can still resend."""
+    txn = b.transaction_no
+    sent = {"net_weight": b.net_weight, "gross_weight": b.gross_weight,
+            "lot_number": b.lot_number, "count": b.count}
+    if all(_unchanged(old[f], v) for f, v in sent.items()):
+        return _batch_result(old, "updated")
+    if not can_edit:
+        raise HTTPException(403, detail="You don't have permission to change saved boxes.")
+    before = await _lock_box_batches(conn, txn, [b.box_id])
+    await conn.execute(
+        """
+        UPDATE po_box SET
+            net_weight   = COALESCE($3, net_weight),
+            gross_weight = COALESCE($4, gross_weight),
+            lot_number   = COALESCE($5, lot_number),
+            count        = COALESCE($6, count)
+        WHERE box_id = $1 AND transaction_no = $2
+        """,
+        b.box_id, txn, b.net_weight, b.gross_weight, b.lot_number, b.count,
+    )
+    await _sync_box_corrections(conn, txn, before, getattr(user, "full_name", None))
+    await _book_missing_inward_batches(conn, header, txn, [b.box_id])
+    new = await conn.fetchrow("SELECT * FROM po_box WHERE box_id = $1", b.box_id)
+    for f in _BOX_FIELDS:
+        if old[f] != new[f]:
+            await _log_box(conn, user, txn, b.box_id, f, old[f], new[f],
+                           f"Material In: box {new['box_number']} {f} {old[f]} -> {new[f]}")
+    await _refresh_receiving_status(conn, txn)
+    return _batch_result(new, "updated")
+
+
+async def _batch_create_box(conn, header, b: BoxBatchBox, keys: bool, weighed: bool) -> dict:
+    """A box not saved yet: create it under exactly the id it carries (its
+    label is printed), as POST /{txn}/box creates a box. The id must be one
+    reserved for this PO."""
+    txn, line = b.transaction_no, b.line_number
+    base = _base_of(b.box_id)
+    seq = b.box_id[len(base) + 1:] if base != b.box_id else ""
+    if not (seq.isascii() and seq.isdigit() and len(seq) <= 9) or not await conn.fetchval(
+        _RESERVED_ID_SQL, txn, base, int(seq),
+    ):
+        raise HTTPException(409, detail="This box id was not reserved for this PO.")
+    if keys and b.client_key:
+        other = await conn.fetchval(
+            "SELECT box_id FROM po_box WHERE transaction_no = $1 AND client_key = $2", txn, b.client_key)
+        if other:
+            raise HTTPException(409, detail=f"This box is already saved as {other}.")
+    if not await conn.fetchval(
+        "SELECT 1 FROM po_line WHERE transaction_no = $1 AND line_number = $2", txn, line,
+    ):
+        raise HTTPException(404, detail=f"Line {line} not found on this PO.")
+
+    section_number = b.section_number
+    if section_number is not None:
+        if not await conn.fetchval(
+            "SELECT 1 FROM po_section WHERE transaction_no = $1 AND line_number = $2 AND section_number = $3",
+            txn, line, section_number,
+        ):
+            raise HTTPException(404, detail=f"Section {section_number} not found for line {line}.")
+    elif b.section is not None:
+        # The section an earlier box of this draft section made, else a new one.
+        section_number = await conn.fetchval(
+            "SELECT section_number FROM po_section "
+            "WHERE transaction_no = $1 AND line_number = $2 AND client_key = $3",
+            txn, line, b.section.client_key,
+        )
+        if section_number is None:
+            section_number = await conn.fetchval(
+                "SELECT COALESCE(MAX(section_number), 0) + 1 FROM po_section "
+                "WHERE transaction_no = $1 AND line_number = $2",
+                txn, line,
+            )
+            await _insert_section(conn, txn, line, section_number, b.section.lot_number, 0,
+                                  b.section.manufacturing_date, b.section.expiry_date, b.section.client_key)
+    else:
+        raise HTTPException(422, detail="The box names no section.")
+    sec = await conn.fetchrow(
+        "SELECT manufacturing_date, expiry_date FROM po_section "
+        "WHERE transaction_no = $1 AND line_number = $2 AND section_number = $3",
+        txn, line, section_number,
+    )
+
+    taken = await _taken_box_numbers(conn, txn, line, section_number)
+    box_number = _pick_box_number(b.box_number, taken)
+    await _insert_boxes(conn, header, txn, line, section_number,
+                        sec["manufacturing_date"], sec["expiry_date"], [{
+                            "box_id": b.box_id, "box_number": box_number,
+                            "net_weight": b.net_weight, "gross_weight": b.gross_weight,
+                            "lot_number": b.lot_number, "count": b.count,
+                            "client_key": b.client_key if keys else None,
+                        }], keys)
+    await conn.execute(
+        "UPDATE po_section SET box_count = COALESCE(box_count, 0) + 1 "
+        "WHERE transaction_no = $1 AND line_number = $2 AND section_number = $3",
+        txn, line, section_number,
+    )
+    if weighed:
+        await conn.execute("UPDATE po_box SET weighed_by = $2, weighed_at = $3 WHERE box_id = $1",
+                           b.box_id, b.weighed_by, b.weighed_at)
+    await _refresh_receiving_status(conn, txn)
+    return {"box_id": b.box_id, "status": "created", "section_number": section_number, "box_number": box_number}
+
+
+async def _batch_save_box(pool, user, header, b: BoxBatchBox, can_edit: bool, keys: bool, weighed: bool) -> dict:
+    """One box in a transaction of its own, under the PO's box lock."""
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(_BOX_LOCK_SQL, b.transaction_no)
+            old = await conn.fetchrow("SELECT * FROM po_box WHERE box_id = $1 FOR UPDATE", b.box_id)
+            if old is None:
+                return await _batch_create_box(conn, header, b, keys, weighed)
+            if old["transaction_no"] != b.transaction_no:
+                raise HTTPException(409, detail="This box id belongs to another PO.")
+            return await _batch_update_box(conn, user, header, b, old, can_edit)
+
+
+@router.post("/box-batch", response_model=BoxBatchResponse)
+async def stores_box_batch(request: Request, body: BoxBatchRequest,
+                           user=Depends(require_permission("purchase", "material_in", action="create"))):
+    """Box-wise entry from the desktop station, in this order:
+
+    * `reserve`: box ids handed out in advance, `count` per PO, each range
+      recorded so no other save is ever given them. A PO the user can't have
+      fails the whole request, before any id is given out.
+    * `headers`: a PO's warehouse, invoice and challan numbers and inward
+      authority (only the fields sent), for users who may edit Material In;
+      skipped otherwise. Applied before the boxes, whose stock is booked to
+      the PO's warehouse.
+    * `boxes`: each in a transaction of its own, in the order given. A box id
+      already on the PO updates that box (as PUT /{txn}/box/{box_id}); a new
+      one creates the box under exactly that id (as POST /{txn}/box), which
+      must be reserved for the PO. A box that can't be saved comes back
+      `rejected` with the reason and the others are still saved; a database
+      failure fails the request (5xx) and the station sends its boxes again.
+
+    Sending the same boxes again changes nothing: a box already saved with
+    those values comes back `updated`."""
+    pool = request.app.state.db_pool
+    keys = weighed = False
+    if body.boxes:
+        async with pool.acquire() as conn:
+            keys = await _client_keys(conn)
+            weighed = await _weighed_cols(conn)
+        if not keys and any(b.section_number is None and b.section is not None for b in body.boxes):
+            raise HTTPException(503, detail="Sections can't be found by key: apply migration 131.")
+
+    for r in body.reserve:
+        await _po_header_or_404(pool, user, r.transaction_no)
+    reserved = [await _reserve_box_ids(pool, user, r.transaction_no, r.count) for r in body.reserve]
+    if not (body.headers or body.boxes):
+        return {"reserved": reserved, "boxes": []}
+
+    can_edit = await _may_edit_material_in(pool, user)
+    for h in body.headers:
+        try:
+            await _po_header_or_404(pool, user, h.transaction_no)
+        except HTTPException:
+            continue                      # its boxes are rejected one by one below
+        if can_edit:
+            await pool.execute(
+                """
+                UPDATE po_header SET
+                    warehouse        = COALESCE($2, warehouse),
+                    invoice_number   = COALESCE($3, invoice_number),
+                    challan_number   = COALESCE($4, challan_number),
+                    inward_authority = COALESCE($5, inward_authority)
+                WHERE transaction_no = $1
+                """,
+                h.transaction_no, h.warehouse, h.invoice_number, h.challan_number, h.inward_authority,
+            )
+
+    results, po_headers = [], {}
+    for b in body.boxes:
+        try:
+            header = po_headers.get(b.transaction_no)
+            if header is None:                  # read after `headers`: the warehouse just set
+                header = po_headers[b.transaction_no] = await _po_header_or_404(pool, user, b.transaction_no)
+            results.append(await _batch_save_box(pool, user, header, b, can_edit, keys, weighed))
+        except HTTPException as e:
+            results.append({"box_id": b.box_id, "status": "rejected", "message": _rejection(e.detail)})
+        except asyncpg.exceptions.UniqueViolationError:
+            results.append({"box_id": b.box_id, "status": "rejected", "message": "This box id is already in use."})
+    return {"reserved": reserved, "boxes": results}
 
 
 # ---------------------------------------------------------------------------
@@ -972,6 +1312,23 @@ async def _box_log(conn) -> bool:
     return _box_log_ready
 
 
+# po_box.weighed_by / weighed_at exist on the live database but not in app/db.
+_weighed_cols_ready = False
+
+
+async def _weighed_cols(conn) -> bool:
+    """Whether po_box carries weighed_by and weighed_at."""
+    global _weighed_cols_ready
+    if not _weighed_cols_ready:
+        n = await conn.fetchval(
+            "SELECT count(*) FROM information_schema.columns "
+            "WHERE table_schema = 'public' AND table_name = 'po_box' "
+            "AND column_name IN ('weighed_by', 'weighed_at')"
+        )
+        _weighed_cols_ready = n == 2
+    return _weighed_cols_ready
+
+
 async def _saved_box_keys(conn, transaction_no: str, keys: list[str | None]) -> set[str]:
     """The given box keys already saved on this PO."""
     keys = [k for k in keys if k]
@@ -997,9 +1354,12 @@ async def _next_box_ids(conn, transaction_no: str, proposed: str | None) -> tupl
     transaction's existing 8-digit base (the client's proposed id seeds it for
     a PO's first boxes) and take the next counter GLOBALLY for that base --
     past the ids of deleted boxes too (box_edit_logs), because a deleted box's
-    printed label and stock batch still carry its id. Boxes copied from IMS
-    (client_key 'ims:...') don't lend their base: an IMS save's other boxes,
-    not copied, still carry ids in that series. Call under _BOX_LOCK_SQL."""
+    printed label and stock batch still carry its id, and past ids reserved for
+    a desktop station (POST /box-batch: a 'reserved' row whose box_id is the
+    last id of the range), which it prints before the box reaches the server.
+    Boxes copied from IMS (client_key 'ims:...') don't lend their base: an IMS
+    save's other boxes, not copied, still carry ids in that series. Call under
+    _BOX_LOCK_SQL."""
     logged = await _box_log(conn)
     not_ims = "AND (client_key IS NULL OR client_key NOT LIKE 'ims:%')" if await _client_keys(conn) else ""
     latest = await conn.fetchval(
@@ -1008,7 +1368,7 @@ async def _next_box_ids(conn, transaction_no: str, proposed: str | None) -> tupl
     )
     if not latest and logged:
         latest = await conn.fetchval(
-            "SELECT box_id FROM box_edit_logs WHERE transaction_no = $1 AND field_name = 'deleted' "
+            "SELECT box_id FROM box_edit_logs WHERE transaction_no = $1 AND field_name IN ('deleted', 'reserved') "
             "ORDER BY edited_at DESC NULLS LAST LIMIT 1",
             transaction_no,
         )
@@ -1016,7 +1376,8 @@ async def _next_box_ids(conn, transaction_no: str, proposed: str | None) -> tupl
     # A deleted weighed box keeps its (discarded) batch under its id, so the
     # PO's batches guard those ids even where the audit row is missing.
     deleted_ids = (
-        "UNION ALL SELECT box_id FROM box_edit_logs WHERE field_name = 'deleted' AND box_id LIKE $1 || '-%'"
+        "UNION ALL SELECT box_id FROM box_edit_logs "
+        "WHERE field_name IN ('deleted', 'reserved') AND box_id LIKE $1 || '-%'"
         if logged else ""
     )
     max_seq = await conn.fetchval(
