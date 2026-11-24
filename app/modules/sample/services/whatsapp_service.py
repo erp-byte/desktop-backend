@@ -1511,6 +1511,15 @@ async def handle_inbound(conn, *, from_phone: str, text: str, context_id: str | 
     if trq_res is not None:
         return trq_res
 
+    # ── STOCK TAKE daily floor check Approve / Reject (inventory manager): a tap with a
+    #    stfc:<approve|reject>:<check_id> payload on the no_mov_inv_approval notice.
+    #    Early, like the taps above: "Approve" and "Reject" are verbs the business-head
+    #    and promote flows below read too. None when the tap is not ours. ──
+    from app.modules.stock_take.services import floor_check_notify as _stfc  # lazy: avoid cycle
+    stfc_res = await _stfc.handle_tap(conn, wa, _button_payload(raw) if raw else None)
+    if stfc_res is not None:
+        return stfc_res
+
     # ── CUSTOMER-RETURNS head approval (context.id → wa_return_message) — resolved FIRST,
     #    since the BU-Head approver is neither an npd_team reviewer nor a promote approver.
     #    Returns None when the tap isn't a customer-return message, so the flows below run. ──

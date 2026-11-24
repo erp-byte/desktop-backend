@@ -9,6 +9,11 @@
     GET /api/v1/stock-take/entries/export  every matching count row as .xlsx
     GET /api/v1/stock-take/floor-stock     everything on one warehouse + floor,
                                            netted (the job card's material tab)
+    GET  /api/v1/stock-take/floor-checks   each floor's day: last entry, entries
+                                           that day, its "no movement" check
+    POST /api/v1/stock-take/floor-checks   a floor reports "checked, no movement"
+    POST /api/v1/stock-take/floor-checks/{id}/decision
+                                           an inventory manager approves / rejects
 
 Rows come from `new_stock_entries` (business_day.ENTRIES_TABLE), the canonical
 copy of the `stocktake_entries` that the separate Stock Take app
@@ -46,7 +51,7 @@ from decimal import Decimal
 from typing import Any, Optional
 
 import asyncpg
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -54,8 +59,8 @@ from app.modules.auth.middleware import AuthUser, require_permission
 from app.modules.stock_take import floors as _floors
 from app.modules.stock_take import place_scope
 from app.modules.stock_take.services import (
-    entries_export, export_xlsx, floor_stock_service, latest_stock_service,
-    transactions_service,
+    entries_export, export_xlsx, floor_check_notify, floor_check_service,
+    floor_stock_service, latest_stock_service, transactions_service,
 )
 
 log = logging.getLogger(__name__)
@@ -1019,3 +1024,157 @@ async def export_entries(
             "X-Draft-Rows": str(drafts),
         },
     )
+
+
+# ── Daily floor checks (migration 142) ─────────────────────────────────────
+# A floor where nothing moved has nothing to post, so its last entry date goes
+# stale; management wants every floor stock-taken every day. The floor reports
+# "checked, no movement" for today and an inventory manager approves or rejects
+# it, here or from the WhatsApp notice (floor_check_notify). No stock changes.
+# The rules live in floor_check_service so both ways in apply the same ones.
+
+class FloorCheckCreate(BaseModel):
+    """Body for POST /floor-checks. warehouse and floor only CHOOSE among the
+    places the caller may post to; they are resolved against the token."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    warehouse: Optional[str] = None
+    floor: Optional[str] = None
+    note: Optional[str] = Field(None, max_length=500)
+
+
+class FloorCheckDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: str = Field(pattern="^(approve|reject)$")
+    reason: Optional[str] = Field(None, max_length=500)
+
+
+def _check_failure(exc: floor_check_service.FloorCheckError) -> HTTPException:
+    return HTTPException(exc.status, detail={
+        "error": exc.code, "message": exc.message, "details": exc.details})
+
+
+def _check_floors(user: AuthUser, places: dict[str, list[str]],
+                  warehouse: Optional[str]) -> dict[str, list[str]]:
+    """The floors this caller may look at, per warehouse, for the day's list:
+    the declared floors (W202, A185) less the merged ones, in walking order."""
+    whs, by_wh = _read_scope(user, places)
+    if warehouse:
+        code = transactions_service._normalise_warehouse(warehouse)
+        if code not in whs:
+            raise HTTPException(403, detail={
+                "error": "warehouse_not_allowed",
+                "message": f"You are not assigned to warehouse {warehouse!r}.",
+                "details": {"allowed_warehouses": whs}})
+        whs = [code]
+    out: dict[str, list[str]] = {}
+    for wh, declared in _floors.FLOORS_BY_WAREHOUSE.items():
+        if wh not in whs:
+            continue
+        mine = {f.strip().upper() for f in by_wh.get(wh, [])}
+        floors = [f for f in _floors.visible_floors(wh, declared) if f.strip().upper() in mine]
+        if floors:
+            out[wh] = floors
+    return out
+
+
+@router.get("/floor-checks")
+async def floor_checks(
+    request: Request,
+    day: Optional[str] = Query(None, description="YYYY-MM-DD; today (IST) when omitted"),
+    warehouse: Optional[str] = Query(None, description="One warehouse; all of yours when omitted"),
+    user: AuthUser = Depends(require_permission("stock_take", action="view")),
+) -> dict[str, Any]:
+    """Every floor you may see, for one day: its last entry up to that day, how
+    many entries that day, its "no movement" check and what those add up to."""
+    today = floor_check_service.ist_today()
+    the_day = latest_stock_service.normalise_date(day) if day else today
+    if the_day is None:
+        raise HTTPException(400, detail={"error": "invalid_day",
+                                         "message": f"Invalid day {day!r}; expected YYYY-MM-DD"})
+    if the_day > today:
+        raise HTTPException(400, detail={"error": "future_day",
+                                         "message": "That day has not happened yet."})
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        places = await latest_stock_service.fetch_places(conn)
+        floors = _check_floors(user, places, warehouse)
+        return await floor_check_service.floor_status(conn, day=the_day, floors_by_warehouse=floors)
+
+
+@router.post("/floor-checks", status_code=201)
+async def report_floor_check(
+    request: Request,
+    background: BackgroundTasks,
+    body: FloorCheckCreate = Body(...),
+    user: AuthUser = Depends(require_permission("stock_take", action="create")),
+) -> dict[str, Any]:
+    """Report "checked, no movement" for one of your floors, for today. Needs
+    `create`, the right to post adjustments on that floor: the same people who
+    would have posted had anything moved. The inventory managers are told on
+    WhatsApp once the check is saved."""
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        avail_w, avail_f, places = await _available(conn)
+        try:
+            warehouse, floor = transactions_service.resolve_scope(
+                user, warehouse=body.warehouse, location=body.floor,
+                available_warehouses=avail_w, available_floors=avail_f, places=places)
+        except transactions_service.ScopeError as exc:
+            status = 400 if exc.code in ("floor_required", "warehouse_required") else 403
+            raise HTTPException(status, detail={
+                "error": exc.code, "message": exc.message, "details": exc.details}) from exc
+        if warehouse not in _floors.FLOORS_BY_WAREHOUSE:
+            raise HTTPException(400, detail={
+                "error": "not_a_factory_floor",
+                "message": "Daily floor checks are for the floors of "
+                           + " and ".join(_floors.FLOORS_BY_WAREHOUSE) + "."})
+        async with conn.transaction():
+            try:
+                check = await floor_check_service.submit_check(
+                    conn, warehouse=warehouse, floor=floor, note=body.note,
+                    actor=_actor(user), user_id=getattr(user, "user_id", None))
+            except floor_check_service.FloorCheckError as exc:
+                raise _check_failure(exc) from exc
+            except asyncpg.PostgresError as exc:
+                raise _db_failure(exc, "report_floor_check", warehouse=warehouse,
+                                  floor=floor, actor=_actor(user)) from exc
+    # After the commit: the notice must never hold up, or undo, the check.
+    background.add_task(floor_check_notify.notify_approvers, pool, check["check_id"])
+    return check
+
+
+@router.post("/floor-checks/{check_id}/decision")
+async def decide_floor_check(
+    request: Request,
+    check_id: int,
+    body: FloorCheckDecision = Body(...),
+    user: AuthUser = Depends(require_permission("stock_take", action="approve")),
+) -> dict[str, Any]:
+    """Approve or reject a floor's pending check. Gated on `approve`
+    (inventory_manager, migration 142). Nobody decides their own check."""
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        places = await latest_stock_service.fetch_places(conn)
+        whs, _ = _read_scope(user, places)
+        async with conn.transaction():
+            try:
+                check = await floor_check_service.get_check(conn, check_id)
+                if check is None:
+                    raise floor_check_service.FloorCheckError(
+                        "not_found", f"There is no floor check #{check_id}.", status=404)
+                if check["warehouse"] not in whs:
+                    raise floor_check_service.FloorCheckError(
+                        "warehouse_not_allowed",
+                        f"You are not assigned to warehouse {check['warehouse']}.", status=403)
+                return await floor_check_service.decide(
+                    conn, check_id=check_id, approve=body.decision == "approve",
+                    reason=body.reason, actor=_actor(user),
+                    user_id=getattr(user, "user_id", None), via="erp")
+            except floor_check_service.FloorCheckError as exc:
+                raise _check_failure(exc) from exc
+            except asyncpg.PostgresError as exc:
+                raise _db_failure(exc, "decide_floor_check", check_id=check_id,
+                                  decision=body.decision, actor=_actor(user)) from exc

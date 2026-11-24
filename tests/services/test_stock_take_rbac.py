@@ -39,6 +39,12 @@ EXPECTED = {
     # read like latest-stock, so the same gate.
     "/api/v1/stock-take/floor-stock":         {"GET": "view"},
     "/api/v1/stock-take/entries/export":      {"GET": "export"},
+    # Daily floor checks (migration 142). The list is a read. Reporting "checked,
+    # no movement" needs create, the right to post on that floor. Deciding needs
+    # approve, which inventory_manager holds and the stock_take role does not, so
+    # nobody both reports a floor's check and approves it.
+    "/api/v1/stock-take/floor-checks":        {"GET": "view", "POST": "create"},
+    "/api/v1/stock-take/floor-checks/{check_id}/decision": {"POST": "approve"},
 }
 
 
@@ -95,7 +101,7 @@ def test_route_requires_the_stock_take_permission(route):
 def test_reads_and_writes_are_not_the_same_permission():
     """Posting, exporting and signing off are each reachable on their own."""
     actions = {a for r in ROUTES if (p := _permission_of(r)) for a in (p[1],)}
-    assert actions == {"view", "create", "export", "verify"}, actions
+    assert actions == {"view", "create", "export", "verify", "approve"}, actions
 
 
 def test_posting_and_verifying_are_different_actions():
@@ -124,3 +130,9 @@ def test_no_route_still_uses_bare_authentication():
     for r in ROUTES:
         calls = {d.call for d in r.dependant.dependencies}
         assert get_current_user not in calls, f"{r.path} still uses get_current_user"
+
+
+def test_reporting_a_floor_check_and_approving_it_are_different_actions():
+    report = _permission_of(_by_path("/api/v1/stock-take/floor-checks", "POST"))
+    decide = _permission_of(_by_path("/api/v1/stock-take/floor-checks/{check_id}/decision", "POST"))
+    assert report == ("stock_take", "create") and decide == ("stock_take", "approve")
