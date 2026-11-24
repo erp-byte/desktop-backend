@@ -65,6 +65,13 @@ COLD_SKIP = {"A-185 Cold"}
 CATEGORIES = [("Dates", "Dates"), ("Other than dates", "Other than Dates")]
 
 
+def _category(group: str) -> str:
+    """Dates for a dates group (Premium Dates, Date Paste, OFF-GRADE DATES, ...), else Other than
+    dates. Not the report's own Dates/OTD column: it is hand-filled, and the 12 and 16 Nov reports
+    tagged two California Pista lots (20,950 kg) and a Pecan line as Dates."""
+    return "Dates" if "date" in group.lower() else "Other than dates"
+
+
 # ── numbers ──────────────────────────────────────────────────────────────────
 
 def inr(v: float, dec: int = 0) -> str:
@@ -155,13 +162,21 @@ def cold_tables(report: Path) -> tuple[str, list[tuple[str, list]]]:
     day = report_day.strftime("%d-%b-%y") if hasattr(report_day, "strftime") else str(report_day)
 
     agg = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: [0.0, 0.0]))))
+    mistagged = defaultdict(float)
     for r in rows[h + 1:]:
         if not r or r[col["Storage Location"]] is None or str(r[col["Storage Location"]]).strip() in COLD_SKIP:
             continue
-        cell = agg[r[col["Dates/OTD"]]][str(r[col["Storage Location"]]).strip()][
-            str(r[col["Group Name*"]]).strip()][str(r[col["Sub Group Name*"]]).strip()]
-        cell[0] += float(r[col["Total Inventory Kgs"]] or 0)
+        loc, group = str(r[col["Storage Location"]]).strip(), str(r[col["Group Name*"]]).strip()
+        sub, kg = str(r[col["Sub Group Name*"]]).strip(), float(r[col["Total Inventory Kgs"]] or 0)
+        category = _category(group)
+        if kg and str(r[col["Dates/OTD"]] or "").strip().lower() != category.lower():
+            mistagged[(loc, group, sub, r[col["Dates/OTD"]])] += kg
+        cell = agg[category][loc][group][sub]
+        cell[0] += kg
         cell[1] += float(r[col["Value"]] or 0)
+    for (loc, group, sub, tag), kg in sorted(mistagged.items()):
+        print(f"report tags {loc} / {group} / {sub} ({kg:,.2f} kg) as {tag!r}; "
+              f"summarised under {_category(group)!r} by its group")
 
     tables = []
     for key, title in CATEGORIES:
@@ -215,7 +230,7 @@ def warehouse_tables(stock: list[dict], day: str) -> list[tuple[str, list, list,
         if r["warehouse"] in F.COLD_WAREHOUSES:
             continue
         fl = r["floor_key"] or ""
-        labels.setdefault((r["warehouse"], fl), (r["floor"] or "").strip() or "(no floor)")
+        labels.setdefault((r["warehouse"], fl), F.floor_display(r["warehouse"], r["floor"]) or "(no floor)")
         cell = agg[r["warehouse"]][fl][_group_label(r["item_category"])]
         cell[0 if r["stock_type"] == "Fresh Stock" else 1] += r["total_weight"]
         if round(r["total_weight"]):
