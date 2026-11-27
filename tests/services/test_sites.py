@@ -62,7 +62,7 @@ def test_no_key_belongs_to_two_sites_and_no_alias_is_redundant():
 
 def test_every_row_is_well_formed():
     assert [r["canonical"] for r in TABLE] == [
-        "W202", "A185", "A101", "A68", "F53", "Rishi", "Savla D-39", "Savla D-514",
+        "W202", "A185", "A101", "A68", "F53", "Unazo", "Rishi", "Savla D-39", "Savla D-514",
         "Savla Bond", "Supreme", "Eskimo", "Cold Storage", "Dev Int",
     ]
     for row in TABLE:
@@ -91,6 +91,7 @@ SPELLINGS = {
     "A101": ["A101", "A-101", "Warehouse A101"],
     "A68": ["A68", "A-68", "Warehouse A68"],
     "F53": ["F53", "Warehouse F53", "APMC F53", "apmc-f53"],
+    "Unazo": ["Unazo", "UNAZO", "Unazo Corporation", "UNAZO CORPORATION", "unazo-corporation"],
     "Rishi": ["Rishi", "RISHI", "Rishi Cold", "Rishi Cold Storage", "Rishi Cold Storage Pvt Ltd"],
     "Savla D-39": ["Savla D-39", "savla d39", "savla-d39", "savla-d-39", "D-39", "D39",
                    "Savla D-39 Cold", "savla d39 cold", "Savla D-39 Cold Storage",
@@ -244,10 +245,10 @@ def test_scope_keys_bound_into_the_norm_any_clause_match_every_stored_spelling()
 # ── The lists ──────────────────────────────────────────────────────────────
 
 def test_lists():
-    assert S.warehouse_sites() == ["W202", "A185", "A101", "A68", "F53"]
+    assert S.warehouse_sites() == ["W202", "A185", "A101", "A68", "F53", "Unazo"]
     assert S.cold_sites() == ["Rishi", "Savla D-39", "Savla D-514", "Savla Bond", "Supreme", "Eskimo"]
     assert S.to_sites() == S.warehouse_sites() + S.cold_sites()
-    assert S.grantable_codes() == ["W202", "A185", "A101", "A68", "F53", "Rishi", "D-39", "D-514",
+    assert S.grantable_codes() == ["W202", "A185", "A101", "A68", "F53", "Unazo", "Rishi", "D-39", "D-514",
                                    "Savla Bond", "Supreme", "Eskimo"]
 
 

@@ -57,6 +57,16 @@
       "aliases": ["APMC F53"]
     },
     {
+      "canonical": "Unazo",
+      "kind": "warehouse",
+      "company": null,
+      "grant_code": "Unazo",
+      "display": "Unazo Corporation",
+      "address": "",
+      "destination": true,
+      "aliases": []
+    },
+    {
       "canonical": "Rishi",
       "kind": "cold",
       "company": "cdpl",
